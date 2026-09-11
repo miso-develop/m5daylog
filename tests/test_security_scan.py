@@ -67,7 +67,8 @@ class SecurityScanTests(unittest.TestCase):
 
     def test_env_example_rejects_nonempty_values_without_echoing_them(self) -> None:
         marker = "synthetic-local-value"
-        content = ("HF_TOKEN=" + marker + "\n").encode()
+        key = "HF_" + "TOKEN"
+        content = (key + "=" + marker + "\n").encode()
         findings = security_scan.scan_content(".env.example", content)
         self.assertEqual(["env-template-value"], [f.rule for f in findings])
         self.assertNotIn(marker, findings[0].message)
