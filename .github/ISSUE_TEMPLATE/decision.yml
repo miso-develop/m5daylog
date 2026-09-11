@@ -1,0 +1,33 @@
+name: Decision
+description: Map 内の1つの設計・調査 question
+title: "[Decision] "
+labels:
+  - "type:decision"
+body:
+  - type: input
+    id: parent
+    attributes:
+      label: Parent Map
+      placeholder: "#1"
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence / options
+    validations:
+      required: true
+  - type: textarea
+    id: decision
+    attributes:
+      label: Decision
+    validations:
+      required: true
+  - type: textarea
+    id: consequences
+    attributes:
+      label: Consequences / follow-up
