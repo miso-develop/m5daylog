@@ -1,0 +1,6 @@
+# Local PC runtime state (never commit DBs or generated state).
+state/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
