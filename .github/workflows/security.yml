@@ -1,0 +1,31 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  security-scan:
+    name: security:scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show Python runtime
+        run: python3 --version
+
+      - name: Test repository security scanner
+        run: python3 -m unittest discover -s tests -p 'test_security_scan.py'
+
+      - name: Scan tracked repository content
+        run: python3 scripts/security_scan.py
