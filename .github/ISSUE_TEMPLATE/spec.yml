@@ -1,0 +1,41 @@
+name: Spec
+description: Implementation-independent feature contract
+title: "[Spec] "
+labels:
+  - "type:spec"
+body:
+  - type: input
+    id: parent
+    attributes:
+      label: Parent Map / Decisions
+  - type: textarea
+    id: purpose
+    attributes:
+      label: Purpose
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: In scope / out of scope
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observable behavior / interfaces
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security / privacy constraints
+      description: SECURITY.md より弱い contract は不可
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+    validations:
+      required: true

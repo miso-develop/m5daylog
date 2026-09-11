@@ -1,0 +1,41 @@
+name: Task
+description: One vertical implementation outcome
+title: "[Task] "
+labels:
+  - "type:task"
+body:
+  - type: input
+    id: parent
+    attributes:
+      label: Parent / Related Spec
+      placeholder: "#34"
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent
+      placeholder: "Device / PC / Integration"
+    validations:
+      required: true
+  - type: input
+    id: blockers
+    attributes:
+      label: Blocked by / Depends on
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+    validations:
+      required: true
+  - type: textarea
+    id: completion
+    attributes:
+      label: Completion criteria
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Secret/private user data を貼らない

@@ -1,0 +1,65 @@
+# Local environment / editor
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+
+# Python / tools
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Dependencies / build output
+node_modules/
+dist/
+build/
+.pio/
+
+# ESP-IDF / local build state
+firmware/sdkconfig
+sdkconfig.old
+managed_components/
+
+# M5Daylog local private data
+.local/
+local-private/
+private/
+secrets/
+credentials/
+recordings/
+audio-recordings/
+transcripts/
+daylogs/
+daily-logs/
+speaker-data/
+model-auth/
+captures/
+dumps/
+
+# Common credential/key containers
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileprovision
+
+# Captures / dumps
+*.pcap
+*.pcapng
+*.core
+*.dump
+*.dmp
+*nvs-dump*
+*flash-dump*
+*ram-dump*
+*env-dump*
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,32 @@
+name: Map
+description: Large/ambiguous work の decision map
+title: "[Map] "
+labels:
+  - "type:map"
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: 解決したい outcome
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope / boundaries
+    validations:
+      required: true
+  - type: textarea
+    id: questions
+    attributes:
+      label: Decision questions
+      description: 個別 Decision に分解する question
+    validations:
+      required: true
+  - type: textarea
+    id: exit
+    attributes:
+      label: Exit condition
+    validations:
+      required: true
