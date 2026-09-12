@@ -79,7 +79,16 @@ component only if ESP-IDF drivers alone are insufficient.
 In scope for #42: scaffold files above, clean `idf.py build`, device boot,
 serial output observable.
 
-Out of scope: PDM/DMA capture (#44), WAV rotation (#45), recovery (#46),
+Task #44 (IM-007) adds `components/recorder/` (PDM→DMA→SD PCM capture:
+16kHz/16bit/mono, 32KB × 2 double buffer with drop counters, `.wav.part`
+continuous write with flush-patched headers, fail-loud mic/SD errors) wired
+into `main/` as a `recorder` FreeRTOS task, plus stdlib-only host contract
+tests in `firmware/tests/` (`python3 -m pytest firmware/tests -v`). Board
+PDM pins and the SD mount stay machine-local setup recorded as PR evidence,
+not committed source. Rotation/finalize (#45), recovery (#46), manifest
+(#47), and state machine (#48) remain out of scope.
+
+Out of scope: WAV rotation (#45), recovery (#46),
 manifest (#47), state machine (#48), USB MSC/CDC (#49/#50), `pc/`,
 `contracts/`, `fixtures/`, `.github/`, and security-rule changes.
 
