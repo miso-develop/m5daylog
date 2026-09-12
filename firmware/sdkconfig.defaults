@@ -1,0 +1,12 @@
+# M5Daylog firmware default configuration.
+#
+# Target: M5Capsule v1.1 (ESP32-S3FN8, 8MB flash).
+# ESP-IDF pin: v5.5.5 (see firmware/README.md for acquisition steps).
+# This file only carries defaults that differ from ESP-IDF Kconfig defaults
+# and that are required for every clean build of this project.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# Keep scaffold boot output at INFO so boot / stage / result lines are
+# visible over serial without enabling verbose subsystems.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
