@@ -109,3 +109,13 @@ rename/recovery/manifest logic in this component).
 - Real board pins used for the run (machine-local setup, not committed).
 
 No real audio, transcripts, or device captures are committed to the repo.
+
+## Hardware-readiness note
+
+This implementation targets the ESP-IDF v5.5.5 API but has **not** been
+compiled with the IDF toolchain or executed on hardware in this session
+(no toolchain/host execution available here). It must **not** be treated
+as hardware-ready until the privileged executor records: `idf.py build`
+success, flash/boot logs, 1-hour run counters, and standard-decoder
+verification of the `.wav.part` output. Any API/compile incompatibility
+found at build time is a blocking defect for this Task.

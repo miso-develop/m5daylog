@@ -37,7 +37,7 @@ static esp_err_t ensure_recording_dirs(void) {
 }
 
 esp_err_t sd_mount_recordings(void) {
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+    esp_vfs_fat_mount_config_t mount_config = {
         // Never format: a mount failure must surface as ERROR, never
         // destroy unacknowledged recordings.
         .format_if_mount_failed = false,
@@ -71,8 +71,9 @@ esp_err_t sd_mount_recordings(void) {
     }
     s_bus_init = true;
 
-    err = esp_vfs_fat_sdspi_mount(RECORDER_SD_MOUNT_POINT, &mount_config,
-                                  &slot_config, &s_host, &s_card);
+    // ESP-IDF v5.5 parameter order: base_path, host, slot, mount, card.
+    err = esp_vfs_fat_sdspi_mount(RECORDER_SD_MOUNT_POINT, &s_host,
+                                  &slot_config, &mount_config, &s_card);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: sd mount");
         spi_bus_free(s_host.slot);

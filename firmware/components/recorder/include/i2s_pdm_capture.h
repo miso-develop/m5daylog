@@ -10,6 +10,7 @@
 // (< 0) fail init fail-loud so the firmware can enter ERROR instead of a
 // silent "recording" state (Spec #36).
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef ESP_PLATFORM

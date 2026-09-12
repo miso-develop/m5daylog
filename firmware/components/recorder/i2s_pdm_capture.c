@@ -6,6 +6,7 @@
 #include "i2s_pdm_capture.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "recorder_config.h"
 
@@ -28,6 +29,7 @@ esp_err_t pdm_capture_init(const pdm_capture_config_t *config,
     i2s_pdm_rx_clk_config_t clk_cfg;
     i2s_pdm_rx_slot_config_t slot_cfg;
     i2s_pdm_rx_gpio_config_t gpio_cfg;
+    i2s_pdm_rx_config_t pdm_rx_cfg;
     esp_err_t err;
 
     if (config == NULL || out_handle == NULL) {
@@ -61,15 +63,23 @@ esp_err_t pdm_capture_init(const pdm_capture_config_t *config,
 
     clk_cfg = (i2s_pdm_rx_clk_config_t)I2S_PDM_RX_CLK_DEFAULT_CONFIG(
         RECORDER_SAMPLE_RATE_HZ);
+    // PCM-output slot config per the ESP-IDF v5.5 PDM RX example: 16bit
+    // samples, mono slot.
     slot_cfg = (i2s_pdm_rx_slot_config_t)I2S_PDM_RX_SLOT_DEFAULT_CONFIG(
         I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    // Zero the GPIO struct first so every field (including invert flags) is
+    // deterministic; PDM RX uses clk + one data line.
+    memset(&gpio_cfg, 0, sizeof(gpio_cfg));
     gpio_cfg.clk = (gpio_num_t)config->pdm_clk_pin;
     gpio_cfg.din = (gpio_num_t)config->pdm_data_pin;
-    // PDM RX uses clk + one data line; inverted lines stay unassigned.
-    gpio_cfg.invert_flags.clk_inv = false;
 
-    err = i2s_channel_init_pdm_rx_mode(handle->rx_chan, &clk_cfg, &slot_cfg,
-                                       &gpio_cfg);
+    // ESP-IDF v5.5 takes a single PDM RX config bundling clk/slot/gpio.
+    memset(&pdm_rx_cfg, 0, sizeof(pdm_rx_cfg));
+    pdm_rx_cfg.clk_cfg = clk_cfg;
+    pdm_rx_cfg.slot_cfg = slot_cfg;
+    pdm_rx_cfg.gpio_cfg = gpio_cfg;
+
+    err = i2s_channel_init_pdm_rx_mode(handle->rx_chan, &pdm_rx_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: pdm rx init");
         i2s_del_channel(handle->rx_chan);

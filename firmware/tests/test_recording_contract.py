@@ -125,3 +125,26 @@ def test_default_part_path_shape():
     main = MAIN.read_text(encoding="utf-8")
     assert ".wav.part" in main
     assert "/sdcard/M5DAYLOG/recordings/" in main
+
+
+def test_esp_idf_v55_api_shape():
+    capture = (COMP / "i2s_pdm_capture.c").read_text(encoding="utf-8")
+    capture_hdr = (COMP / "include/i2s_pdm_capture.h").read_text(
+        encoding="utf-8"
+    )
+    # Public header uses bool: stdbool.h must be explicit, not transitive.
+    assert "stdbool.h" in capture_hdr
+    # ESP-IDF v5.5 PDM RX: single bundled config, two-argument init.
+    assert "i2s_pdm_rx_config_t" in capture
+    assert "I2S_PDM_RX_CLK_DEFAULT_CONFIG" in capture
+    assert "I2S_PDM_RX_SLOT_DEFAULT_CONFIG" in capture
+    assert (
+        "i2s_channel_init_pdm_rx_mode(handle->rx_chan, &pdm_rx_cfg)"
+        in capture
+    )
+    # GPIO struct is zeroed before use: no uninitialized fields.
+    assert "memset(&gpio_cfg, 0, sizeof(gpio_cfg))" in capture
+    # ESP-IDF v5.5 mount order: base_path, host, slot, mount, card.
+    mount = (COMP / "sd_mount.c").read_text(encoding="utf-8")
+    assert "esp_vfs_fat_mount_config_t" in mount
+    assert "&slot_config, &mount_config, &s_card" in mount
