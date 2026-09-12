@@ -38,6 +38,41 @@ extern "C" {
 #define RECORDER_SAMPLES_PER_SLOT \
     (RECORDER_BUFFER_BYTES / RECORDER_BYTES_PER_SAMPLE)
 
+// --- M5Capsule v1.1 board baseline (Task #44 hardware revision) ---------
+// PDM microphone data lines and microSD SPI bus pins below are the verified
+// M5Capsule v1.1 bring-up values. Each is guarded so build flags
+// (`-DRECORDER_...=...`) can override without editing source. Invalid pins
+// fail init fail-loud; the firmware never reports recording while bring-up
+// has failed (Spec #36 silent-state prohibition).
+#ifndef RECORDER_PDM_CLK_PIN
+#define RECORDER_PDM_CLK_PIN 40
+#endif
+#ifndef RECORDER_PDM_DATA_PIN
+#define RECORDER_PDM_DATA_PIN 41
+#endif
+#ifndef RECORDER_SD_MOUNT_POINT
+#define RECORDER_SD_MOUNT_POINT "/sdcard"
+#endif
+#ifndef RECORDER_SD_CS_PIN
+#define RECORDER_SD_CS_PIN 11
+#endif
+#ifndef RECORDER_SD_MOSI_PIN
+#define RECORDER_SD_MOSI_PIN 12
+#endif
+#ifndef RECORDER_SD_CLK_PIN
+#define RECORDER_SD_CLK_PIN 14
+#endif
+#ifndef RECORDER_SD_MISO_PIN
+#define RECORDER_SD_MISO_PIN 39
+#endif
+
+// Filesystem scope for Task #44: only the live-recording directories are
+// created by board bring-up. Finalized-file handling and anything else
+// (rotation/finalize, recovery, retention bookkeeping) belong to later
+// Tasks and must not be created here.
+#define RECORDER_M5DAYLOG_DIR "/sdcard/M5DAYLOG"
+#define RECORDER_RECORDINGS_DIR "/sdcard/M5DAYLOG/recordings"
+
 // Sanity: slots must hold whole samples (even byte count for 16bit PCM).
 _Static_assert((RECORDER_BUFFER_BYTES % RECORDER_BYTES_PER_SAMPLE) == 0,
                "recorder buffer must hold whole 16bit samples");

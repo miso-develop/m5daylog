@@ -22,6 +22,22 @@ components/recorder/
   sd_pcm_sink.c                  # stdio + `esp_timer` latency when available
 ```
 
+## Board bring-up (`sd_mount.c`, `recorder_config.h`)
+
+- PDM mic: CLK GPIO40 / DAT GPIO41 (M5Capsule v1.1 baseline, overridable
+  via `-DRECORDER_PDM_CLK_PIN=...` / `-DRECORDER_PDM_DATA_PIN=...`).
+- microSD: SPI bus CS 11 / MOSI 12 / CLK 14 / MISO 39, mounted at
+  `/sdcard` via `sd_mount_recordings()`. The card is never formatted on
+  mount failure — failures surface as ERROR instead.
+- Only live-recording directories are created: `/sdcard/M5DAYLOG` and
+  `/sdcard/M5DAYLOG/recordings`. Nothing else (no finalized-file,
+  recovery, or manifest/retention state — later Tasks own those).
+- Default recording path has the Spec #36 `.wav.part` shape
+  (`HHMMSS_<recordingId>.wav.part`); runtime RTC/UUID naming arrives with
+  later Tasks, so the committed default is a build-time fallback only.
+- Every bring-up step is fail-loud: mount / mic-init / `.part`-open
+  failures enter ERROR, never a silent "recording" state.
+
 ## Contract
 
 - Audio format is fixed: 16kHz / signed 16bit little-endian / mono PCM.

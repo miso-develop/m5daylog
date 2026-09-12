@@ -14,26 +14,27 @@
 #include "i2s_pdm_capture.h"
 #include "pcm_pipeline.h"
 #include "recorder_config.h"
+#include "sd_mount.h"
 #include "sd_pcm_sink.h"
 
 static const char *TAG = "m5daylog";
 
-// Task #44: PDM -> DMA -> SD continuous PCM capture.
+// Task #44: SD mount -> PDM -> DMA -> SD continuous PCM capture.
 //
-// Board bring-up provides the verified PDM pins and the already-mounted
-// `.part` path. Both stay OUT of committed source as machine-local setup:
-// unset pins fail init fail-loud (ERROR state, never silent recording).
-// The `.part` path below is the mount-relative shape from Spec #36; the SD
-// mount itself is owned by board bring-up / later Tasks (#47/#48).
-#ifndef RECORDER_PDM_CLK_PIN
-#define RECORDER_PDM_CLK_PIN (-1)
-#endif
-#ifndef RECORDER_PDM_DATA_PIN
-#define RECORDER_PDM_DATA_PIN (-1)
-#endif
+// Board pins and SD bus come from recorder_config.h (M5Capsule v1.1
+// baseline: PDM CLK 40 / DAT 41, SD SPI CS 11 MOSI 12 CLK 14 MISO 39,
+// mount /sdcard). Build flags may override them; any bring-up failure
+// (mount, mic init, `.part` open) enters ERROR, never silent recording.
+// Only live-recording directories are created; rotation/finalize,
+// recovery, and manifest/retention state belong to later Tasks.
 #ifndef RECORDER_PART_PATH
-#define RECORDER_PART_PATH "/sdcard/M5DAYLOG/recordings/0000-00-00.part"
+#define RECORDER_PART_PATH \
+    "/sdcard/M5DAYLOG/recordings/000000_pending.wav.part"
 #endif
+// NOTE: the default path above is a build-time fallback with the Spec #36
+// `HHMMSS_<recordingId>.wav.part` shape. Runtime naming (RTC timestamp +
+// recording id) is provided by later Tasks; this Task only guarantees the
+// `.wav.part` suffix and continuous append.
 
 // 32KB x 2 staging in DRAM. 64KB static is within ESP32-S3 SRAM; a later
 // Task may revisit placement (PSRAM) only via an explicit Spec update.
@@ -56,6 +57,11 @@ static void recorder_task(void *arg) {
     pcm_pipeline_init(&pipeline, s_slot0, s_slot1);
     memset(&sink, 0, sizeof(sink));
 
+    if (sd_mount_recordings() != ESP_OK) {
+        ESP_LOGE(TAG, "stage: record, result: error, reason: sd mount");
+        vTaskDelete(NULL);
+        return;
+    }
     if (pdm_capture_init(&cfg, &capture) != ESP_OK) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: mic init");
         vTaskDelete(NULL);
@@ -64,6 +70,7 @@ static void recorder_task(void *arg) {
     if (!sd_pcm_sink_open(&sink, RECORDER_PART_PATH)) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: part open");
         pdm_capture_deinit(capture);
+        sd_mount_unmount();
         vTaskDelete(NULL);
         return;
     }
@@ -137,6 +144,7 @@ static void recorder_task(void *arg) {
 stop:
     sd_pcm_sink_close(&sink);
     pdm_capture_deinit(capture);
+    sd_mount_unmount();
     ESP_LOGE(TAG, "stage: record, result: error, reason: stopped");
     vTaskDelete(NULL);
 }

@@ -44,6 +44,7 @@ def test_fail_loud_symbols():
     for marker in (
         "result: error",
         "mic init",
+        "sd mount",
         "part open",
         "sd write",
         "buffer overflow",
@@ -75,3 +76,52 @@ def test_no_credentials_or_private_data_patterns():
         assert forbidden not in blob, forbidden
     main = MAIN.read_text(encoding="utf-8")
     assert "password" not in main.lower()
+
+
+def test_board_pin_baseline():
+    cfg = (COMP / "include/recorder_config.h").read_text(encoding="utf-8")
+    for line in (
+        "#define RECORDER_PDM_CLK_PIN 40",
+        "#define RECORDER_PDM_DATA_PIN 41",
+        "#define RECORDER_SD_CS_PIN 11",
+        "#define RECORDER_SD_MOSI_PIN 12",
+        "#define RECORDER_SD_CLK_PIN 14",
+        "#define RECORDER_SD_MISO_PIN 39",
+        '#define RECORDER_SD_MOUNT_POINT "/sdcard"',
+    ):
+        assert line in cfg, line
+
+
+def test_sd_mount_creates_only_recording_dirs():
+    src = (COMP / "sd_mount.c").read_text(encoding="utf-8")
+    hdr = (COMP / "include/sd_mount.h").read_text(encoding="utf-8")
+    for symbol in (
+        "sd_mount_recordings",
+        "sd_mount_is_mounted",
+        "sd_mount_unmount",
+    ):
+        assert symbol in src or symbol in hdr, symbol
+    # SPI bus pins and mount point come from the verified board baseline.
+    for token in (
+        "RECORDER_SD_CS_PIN",
+        "RECORDER_SD_MOSI_PIN",
+        "RECORDER_SD_CLK_PIN",
+        "RECORDER_SD_MISO_PIN",
+        "RECORDER_SD_MOUNT_POINT",
+    ):
+        assert token in src, token
+    # Only live-recording directories are created; later-Task state is not.
+    assert "RECORDER_RECORDINGS_DIR" in src
+    assert "mkdir" in src
+    assert "format_if_mount_failed" in src  # never format away audio
+    for keyword in ("quarantine", "manifest", "device.json", "acks/"):
+        assert keyword not in src.lower(), keyword
+    # Mount teardown never deletes or renames audio.
+    assert "rename(" not in src
+    assert "remove(" not in src
+
+
+def test_default_part_path_shape():
+    main = MAIN.read_text(encoding="utf-8")
+    assert ".wav.part" in main
+    assert "/sdcard/M5DAYLOG/recordings/" in main

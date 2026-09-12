@@ -11,10 +11,12 @@ idf_component_register(
         "wav_part.c"
         "i2s_pdm_capture.c"
         "sd_pcm_sink.c"
+        "sd_mount.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
         driver
         esp_timer
         fatfs
+        sdmmc
 )
