@@ -13,16 +13,19 @@
 #include <sys/stat.h>
 
 #include "driver/sdspi_host.h"
+#include "driver/spi_common.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 
 static const char *TAG = "recorder_sd";
 
-static sd_mmc_card_t *s_card = NULL;
+static sdmmc_card_t *s_card = NULL;
 static bool s_mounted = false;
 static bool s_bus_init = false;
-static sdmmc_host_t s_host;
+// Only the SPI host id persists: the sdmmc_host_t itself is a call-local
+// `SDSPI_HOST_DEFAULT()` value, matching the ESP-IDF v5.5.5 SDSPI example.
+static spi_host_device_t s_spi_host = SPI2_HOST;
 
 static esp_err_t ensure_recording_dirs(void) {
     if (mkdir(RECORDER_M5DAYLOG_DIR, 0755) != 0 && errno != EEXIST) {
@@ -44,6 +47,7 @@ esp_err_t sd_mount_recordings(void) {
         .max_files = 4,
         .allocation_unit_size = 16 * 1024,
     };
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = RECORDER_SD_MOSI_PIN,
@@ -59,24 +63,25 @@ esp_err_t sd_mount_recordings(void) {
         return ensure_recording_dirs();
     }
 
-    s_host = SDSPI_HOST_DEFAULT();
-    s_host.slot = SPI2_HOST;
+    // The SPI host value goes to the slot config directly (no invented
+    // wrapper types): host.slot is exactly what spi_bus_initialize takes.
+    slot_config.host_id = host.slot;
     slot_config.gpio_cs = RECORDER_SD_CS_PIN;
-    slot_config.host_id = (sdspi_host_t)s_host.slot;
 
-    err = spi_bus_initialize(s_host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    err = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: spi bus");
         return err;
     }
+    s_spi_host = host.slot;
     s_bus_init = true;
 
     // ESP-IDF v5.5 parameter order: base_path, host, slot, mount, card.
-    err = esp_vfs_fat_sdspi_mount(RECORDER_SD_MOUNT_POINT, &s_host,
+    err = esp_vfs_fat_sdspi_mount(RECORDER_SD_MOUNT_POINT, &host,
                                   &slot_config, &mount_config, &s_card);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: sd mount");
-        spi_bus_free(s_host.slot);
+        spi_bus_free(s_spi_host);
         s_bus_init = false;
         s_card = NULL;
         return err;
@@ -106,7 +111,7 @@ void sd_mount_unmount(void) {
     s_card = NULL;
     s_mounted = false;
     if (s_bus_init) {
-        spi_bus_free(s_host.slot);
+        spi_bus_free(s_spi_host);
         s_bus_init = false;
     }
 }

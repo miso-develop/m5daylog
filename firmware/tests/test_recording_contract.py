@@ -148,3 +148,11 @@ def test_esp_idf_v55_api_shape():
     mount = (COMP / "sd_mount.c").read_text(encoding="utf-8")
     assert "esp_vfs_fat_mount_config_t" in mount
     assert "&slot_config, &mount_config, &s_card" in mount
+    # Real v5.5.5 SDSPI types: declaration-initialized host, direct slot id,
+    # sdmmc_card_t handle shared between mount and unmount.
+    assert "sdmmc_host_t host = SDSPI_HOST_DEFAULT()" in mount
+    assert "slot_config.host_id = host.slot" in mount
+    assert "sdmmc_card_t" in mount
+    blob = "\n".join(_sources().values())
+    assert "sd_mmc_card_t" not in blob  # invalid type, never use
+    assert "sdspi_host_t" not in blob  # nonexistent type, never use
