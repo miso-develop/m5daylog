@@ -33,7 +33,9 @@ def test_format_contract_present():
 def test_part_suffix_discipline():
     srcs = _sources()
     blob = "\n".join(srcs.values())
-    assert ".part" in blob
+    # Only `.wav.part` is accepted for capture output, never bare `.part`.
+    assert ".wav.part" in blob
+    assert '#define RECORDER_PART_SUFFIX ".wav.part"' in blob
     # #44 never finalizes to bare `.wav`: no rename/remove in the component.
     assert "rename(" not in blob
     assert "remove(" not in blob
@@ -125,6 +127,32 @@ def test_default_part_path_shape():
     main = MAIN.read_text(encoding="utf-8")
     assert ".wav.part" in main
     assert "/sdcard/M5DAYLOG/recordings/" in main
+
+
+def test_producer_consumer_structure():
+    main = MAIN.read_text(encoding="utf-8")
+    # Two execution contexts: capture owns PDM/DMA, writer owns the sink.
+    assert "recorder_capture_task" in main
+    assert "recorder_writer_task" in main
+    assert '"rec_capture"' in main and '"rec_writer"' in main
+    # Bounded handoff: mutex-guarded pipeline, notify-driven writer.
+    assert "xSemaphoreCreateMutex" in main
+    assert "xTaskNotifyGive" in main
+    assert "ulTaskNotifyTake" in main
+    # Slow SD writes release the pipeline lock so capture keeps filling
+    # the other slot; both-full still drops loudly instead of overwriting.
+    assert "keeps filling the other slot" in main
+    assert "buffer_overflow" in main or "buffer overflow" in main
+
+
+def test_dma_overrun_accounting_wired():
+    main = MAIN.read_text(encoding="utf-8")
+    # Every driver overrun flag and every short-read gap reaches counters.
+    assert "pcm_pipeline_note_dma_overrun" in main
+    assert "pcm_pipeline_note_dma_gap" in main
+    # Periodic diagnostics expose the overrun evidence next to drop data.
+    assert "dma_overrun_events" in main
+    assert "overrun: %" in main
 
 
 def test_main_component_declares_idf_dependencies():

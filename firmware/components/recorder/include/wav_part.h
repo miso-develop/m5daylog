@@ -1,13 +1,14 @@
 #pragma once
 
-// Portable RIFF/WAVE `.part` framing — Task #44.
+// Portable RIFF/WAVE `.wav.part` framing — Task #44.
 //
 // Recording lifecycle (Spec #36): while capturing, audio lives in
 // `HHMMSS_<recordingId>.wav.part`; rotation/finalize renames it to `.wav`
-// (Task #45, not here). This module writes the `.part` side only: a
+// (Task #45, not here). This module writes the `.wav.part` side only: a
 // standard 44-byte PCM header at open (sizes zeroed), the PCM payload
 // appended as capture proceeds, and header patch-up on flush/close so the
 // file is decodeable by any standard WAV decoder after every flush.
+// Only the `.wav.part` suffix is accepted at open, never a bare `.part`.
 // Power-loss recovery is Task #46 and lives outside this module.
 //
 // Portable: stdio only, no ESP-IDF dependency. Works over ESP-IDF FATFS

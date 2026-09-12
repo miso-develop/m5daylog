@@ -1,6 +1,6 @@
 #pragma once
 
-// microSD `.part` file sink + write-latency diagnostics — Task #44.
+// microSD `.wav.part` file sink + write-latency diagnostics — Task #44.
 //
 // Owns one open `.wav.part` file (see wav_part.h). Each drained 32KB slot
 // from the double buffer is appended via sd_pcm_sink_write_chunk(), which
@@ -8,8 +8,9 @@
 // never a silent recording state). Per-chunk latency is reported so the
 // Task #44 evidence can show SD overflow health (target: overflow 0).
 //
-// The SD mount itself is out of scope (board bring-up / later Tasks): the
-// caller passes an absolute path on an already-mounted filesystem.
+// Mounting is the sibling `sd_mount` module's job (`main.c` mounts before
+// opening the sink): the caller passes an absolute path on the mounted
+// filesystem.
 
 #include <stdbool.h>
 #include <stddef.h>

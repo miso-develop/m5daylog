@@ -18,8 +18,10 @@ components/recorder/
   wav_part.c                     # portable, no ESP-IDF dependency
   include/i2s_pdm_capture.h      # ESP-IDF PDM RX wrapper (pins from caller)
   i2s_pdm_capture.c              # ESP-IDF only (`ESP_PLATFORM`)
-  include/sd_pcm_sink.h          # `.part` file sink + write-latency stats
+  include/sd_pcm_sink.h          # `.wav.part` file sink + write-latency stats
   sd_pcm_sink.c                  # stdio + `esp_timer` latency when available
+  include/sd_mount.h             # microSD SPI mount + recording-dirs API
+  sd_mount.c                     # ESP-IDF only (`ESP_PLATFORM`)
 ```
 
 ## Board bring-up (`sd_mount.c`, `recorder_config.h`)
@@ -53,33 +55,45 @@ components/recorder/
   the accumulated payload length, so a `.part` is decodeable by a standard
   decoder after any flush. Odd trailing bytes are truncated to the sample
   boundary (2 bytes); only the truncated tail is discarded.
-- Rotation / rename `.part → .wav` / recovery / manifest / retention are
-  **out of scope** (Tasks #45/#46/#47). This component never deletes or
-  renames files. `sd_pcm_sink` appends to one caller-provided `.part` path.
-- SD mount is owned by board bring-up / later Tasks. The sink assumes the
-  mount point already exists and the path is writable. Open/write failures
-  are fail-loud (`false` + counter increment + caller logs ERROR); the
-  caller must not report a recording state while the sink is failed.
-- Board-specific PDM pins are **caller-provided** (`pdm_capture_config_t`).
-  There are no hardcoded M5Capsule pin defaults in this component: pin
-  bring-up is verified on hardware and recorded as Task #44 evidence, not
-  guessed in source. Unset pins (`< 0`) fail init with
+- Rotation / rename `.wav.part → .wav` / recovery / retention bookkeeping
+  are **out of scope** (Tasks #45/#46/#47). This component never deletes or
+  renames files. `sd_pcm_sink` appends to one caller-provided `.wav.part`
+  path (suffix enforced at open, never a bare `.part`).
+- microSD mount and recording directories are Task #44 bring-up
+  (`sd_mount.c`: `/sdcard` + `/sdcard/M5DAYLOG/recordings`). The sink
+  writes to the mounted path; open/write failures are fail-loud (`false` +
+  counter increment + caller logs ERROR); the caller must not report a
+  recording state while the sink is failed.
+- PDM pins arrive via `pdm_capture_config_t`, defaulting to the Task #44
+  M5Capsule v1.1 baseline in `recorder_config.h` (CLK 40 / DAT 41,
+  overridable with `-D` flags). Unset pins (`< 0`) fail init with
   `ESP_ERR_INVALID_ARG`.
+- Overrun/drop semantics: every driver-flagged overrun bumps
+  `dma_overrun_events`; any short-read gap joins `dma_drop_*`, so lost
+  samples can never coexist with a drop=0 report. Both appear in the
+  periodic `running` diagnostics alongside capture/write/overflow/SD
+  counters and worst SD latency.
 - Logging carries only stage / count / status-class metadata. No audio
   bytes, transcripts, credentials, or secrets are logged (see `SECURITY.md`).
 
-## Data flow (`main.c`)
+## Data flow (`main.c`: capture task + writer task)
 
 ```text
-PDM mic → I2S DMA → pdm_capture_read → pcm_pipeline_produce (slot A/B)
-     → while full slot → sd_pcm_sink_write_chunk → wav_part_write
-     → periodic wav_part_flush (header patch so `.part` stays decodeable)
+recorder_capture_task (prio 5): PDM mic → I2S DMA → pdm_capture_read
+    → [lock] overrun/gap accounting + pcm_pipeline_produce (slot A/B)
+    → notify writer when a slot is full
+recorder_writer_task (prio 4): on notify → [lock] peek full slot → [unlock]
+    → sd_pcm_sink_write_chunk (slow, lock released: capture fills the
+       other slot meanwhile) → [lock] release + latency note
+    → every 4 slots: wav_part_flush (header patch) + running diagnostics
 ```
 
-`app_main` starts a `recorder` FreeRTOS task after scaffold boot logs. If
-mic init or `.part` open fails, the firmware logs
-`stage: record, result: error` and stays in a non-recording ERROR state —
-it never idles as if recording (Spec #36 silent-state prohibition).
+`app_main` starts the writer (owns mount + sink) then the capture task
+after scaffold boot logs. Any bring-up or I/O failure logs
+`stage: record, result: error` and tears both tasks down into a
+non-recording ERROR state — it never idles as if recording (Spec #36
+silent-state prohibition). When both slots are full, payload is dropped
+and counted, never overwritten.
 Wi-Fi / BLE / RGB LED handling stays at the scaffold default (not enabled
 here); radio/LED policy is owned by Spec #36 and later Tasks.
 
@@ -96,17 +110,20 @@ python3 -m pytest firmware/tests -v
 `test_wav_part.py` checks the 44-byte header vectors, odd-tail truncation,
 and `wave`-module decodeability of synthetic payloads. `test_pcm_pipeline.py`
 locks the ping-pong / overflow-counting rules and the 32KB × 2 constants.
-`test_recording_contract.py` guards the 16kHz/16bit/mono format, `.part`
-suffix discipline, fail-loud symbols, and #45/#46 scope boundaries (no
-rename/recovery/manifest logic in this component).
+`test_recording_contract.py` guards the 16kHz/16bit/mono format, `.wav.part`
+suffix discipline, fail-loud symbols, producer/consumer structure,
+overrun/drop accounting, and #45/#46 scope boundaries (no
+rename/recovery/retention logic in this component).
 
 ## Device evidence (recorded in the Task #44 PR, never in-repo)
 
-- 1-hour run counters: `samples_captured`, `dma_drop_* = 0`,
-  `buffer_overflow = 0`, `sd_write_errors = 0`, max SD latency.
+- 1-hour run counters: `samples_captured`, `dma_drop_* = 0` with
+  `dma_overrun_events = 0`, `buffer_overflow = 0`, `sd_write_errors = 0`,
+  max SD latency.
 - Generated `.wav.part` (+ flushed header) opened with a standard decoder.
 - `idf.py build` / flash / boot log tails, ESP-IDF pin `v5.5.5`.
-- Real board pins used for the run (machine-local setup, not committed).
+- Observed boot/capture log lines; any `-D` pin overrides used for the run
+  (baseline pins are committed in `recorder_config.h`).
 
 No real audio, transcripts, or device captures are committed to the repo.
 

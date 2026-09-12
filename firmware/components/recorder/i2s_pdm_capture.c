@@ -1,7 +1,8 @@
 // ESP-IDF PDM RX capture — Task #44.
 //
-// Format: 16kHz / 16bit / mono PCM (recorder_config.h). Pins come from the
-// caller; no hardcoded board defaults live here (see header).
+// Format: 16kHz / 16bit / mono PCM (recorder_config.h). Pins arrive from
+// the caller; the Task #44 baseline defaults live in recorder_config.h
+// (see header).
 
 #include "i2s_pdm_capture.h"
 

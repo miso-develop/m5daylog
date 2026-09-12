@@ -99,9 +99,9 @@ def test_c_source_implements_contract():
         "wav_part_pcm_bytes",
     ):
         assert symbol in src or symbol in hdr, symbol
-    # .part suffix discipline + sample-boundary truncation must be present.
-    assert ".part" in src
-    assert "RECORDER_PART_SUFFIX" in src or ".part" in hdr
+    # `.wav.part` suffix discipline must be present (never bare `.part`).
+    assert ".wav.part" in src or ".wav.part" in hdr
+    assert "RECORDER_PART_SUFFIX" in src or ".wav.part" in hdr
     assert "ChunkSize" in src or "36u" in src
     # Close must patch sizes (seek back) before fclose — decodeability rule.
     assert "fseek" in src and "fclose" in src

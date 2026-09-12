@@ -29,6 +29,7 @@ class Model:
         self.captured = 0
         self.written = 0
         self.overflow = 0
+        self.overrun_events = 0
         self.drop_bytes = 0
         self.drop_samples = 0
 
@@ -73,6 +74,18 @@ class Model:
         self.written += 1
         return True
 
+    def note_overrun(self):
+        # Mirrors pcm_pipeline_note_dma_overrun: every flagged read counts
+        # as an event, even with a complete payload (no loss claimed).
+        self.overrun_events += 1
+
+    def note_gap(self, missing: int):
+        # Mirrors pcm_pipeline_note_dma_gap: a short-read gap always joins
+        # the drop counters, so it can never report drop=0.
+        if missing:
+            self.drop_bytes += missing
+            self.drop_samples += missing // 2
+
 
 def test_config_constants():
     src = CFG.read_text(encoding="utf-8")
@@ -81,7 +94,7 @@ def test_config_constants():
     assert "#define RECORDER_BITS_PER_SAMPLE 16u" in src
     assert "#define RECORDER_BUFFER_BYTES 32768u" in src
     assert "#define RECORDER_BUFFER_SLOTS 2u" in src
-    assert '#define RECORDER_PART_SUFFIX ".part"' in src
+    assert '#define RECORDER_PART_SUFFIX ".wav.part"' in src
     assert "#define RECORDER_WAV_HEADER_SIZE 44u" in src
 
 
@@ -146,6 +159,21 @@ def test_model_overflow_counts_not_silently_overwrites():
     assert m.produce(bytes(1024)) == 0
 
 
+def test_model_overrun_event_without_gap_claims_no_loss():
+    m = Model()
+    m.note_overrun()
+    assert m.overrun_events == 1
+    assert m.drop_bytes == 0 and m.drop_samples == 0
+
+
+def test_model_gap_always_counts_as_drop():
+    m = Model()
+    m.note_overrun()
+    m.note_gap(4096)
+    assert m.overrun_events == 1
+    assert m.drop_bytes == 4096 and m.drop_samples == 2048
+
+
 def test_model_odd_tail_held_back():
     m = Model()
     assert m.produce(b"\x01\x02\x03") == 1  # held-back byte, not dropped
@@ -164,7 +192,10 @@ def test_c_source_implements_pipeline_contract():
         "pcm_pipeline_release_full",
         "pcm_pipeline_note_sd_write",
         "pcm_pipeline_note_sd_error",
+        "pcm_pipeline_note_dma_overrun",
+        "pcm_pipeline_note_dma_gap",
         "buffer_overflow",
+        "dma_overrun_events",
         "dma_drop_bytes",
         "dma_drop_samples",
         "sd_write_errors",

@@ -3,12 +3,11 @@
 // ESP-IDF PDM microphone capture wrapper — Task #44.
 //
 // Fixed contract: PDM RX configured for 16kHz / 16bit / mono PCM. Board
-// PDM pins (clock/data) are caller-provided in `pdm_capture_config_t` —
-// this component carries NO hardcoded M5Capsule pin defaults. Hardware
-// bring-up passes the verified pins from the board layer and records them
-// as Task #44 evidence (PR text, never committed captures). Unset pins
-// (< 0) fail init fail-loud so the firmware can enter ERROR instead of a
-// silent "recording" state (Spec #36).
+// PDM pins (clock/data) arrive caller-provided in `pdm_capture_config_t`;
+// the Task #44 baseline defaults (M5Capsule v1.1 CLK 40 / DAT 41) live in
+// `recorder_config.h` and are passed in by `main.c` — build flags may
+// override them. Unset pins (`< 0`) fail init fail-loud so the firmware
+// can enter ERROR instead of a silent "recording" state (Spec #36).
 
 #include <stdbool.h>
 #include <stddef.h>

@@ -31,7 +31,9 @@ extern "C" {
 
 // --- WAV framing ----------------------------------------------------------
 #define RECORDER_WAV_HEADER_SIZE 44u
-#define RECORDER_PART_SUFFIX ".part"
+// Spec #36 recording shape: `HHMMSS_<recordingId>.wav.part`. Only this
+// suffix is accepted for capture output — never a bare `.part`.
+#define RECORDER_PART_SUFFIX ".wav.part"
 
 // One full 32KB slot at 16kHz/16bit/mono holds exactly:
 //   32768 bytes / 2 bytes/sample = 16384 samples = 1.024 s of audio.

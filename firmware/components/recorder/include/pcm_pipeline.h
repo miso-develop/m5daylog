@@ -20,10 +20,19 @@ extern "C" {
 
 // Cumulative diagnostics for the Task #44 completion criteria
 // (DMA/sample drop, buffer overflow, SD write health).
+//
+// Overrun/drop semantics (Spec #36, no silent failure):
+// - `dma_overrun_events`: every I2S/DMA read that reports overrun, even
+//   when the full payload still arrived. An event alone claims no loss.
+// - `dma_drop_bytes` / `dma_drop_samples`: samples that never reached the
+//   pipeline — the shortfall of a short DMA read plus any payload dropped
+//   while both slots were full. A short read therefore can NEVER report
+//   drop=0; the gap is counted here at the moment it is observed.
 typedef struct {
     uint32_t samples_captured;   // whole 16bit samples accepted
     uint32_t chunks_written;     // full slots drained to SD
     uint32_t buffer_overflow;    // produce calls that hit two full slots
+    uint32_t dma_overrun_events;  // I2S/DMA reads flagged overrun
     uint32_t dma_drop_bytes;     // payload bytes dropped while full
     uint32_t dma_drop_samples;   // whole samples among dropped bytes
     uint32_t sd_write_errors;    // failed SD chunk writes (fail-loud)
@@ -68,6 +77,17 @@ void pcm_pipeline_release_full(pcm_pipeline_t *pipeline);
 // Record one completed SD slot write (latency in microseconds).
 void pcm_pipeline_note_sd_write(pcm_pipeline_t *pipeline,
                                 uint32_t latency_us);
+
+// Record one I2S/DMA read flagged overrun by the driver. Always counted,
+// even when the payload still arrived in full (event evidence without a
+// loss claim).
+void pcm_pipeline_note_dma_overrun(pcm_pipeline_t *pipeline);
+
+// Record a short-DMA-read gap: `missing_bytes` of expected payload never
+// arrived. Whole samples join the drop counters, so a gap can never be
+// reported as drop=0.
+void pcm_pipeline_note_dma_gap(pcm_pipeline_t *pipeline,
+                               size_t missing_bytes);
 
 // Record one failed SD slot write (fail-loud counter).
 void pcm_pipeline_note_sd_error(pcm_pipeline_t *pipeline);

@@ -1,4 +1,4 @@
-// Portable RIFF/WAVE `.part` framing — Task #44. Stdio only.
+// Portable RIFF/WAVE `.wav.part` framing — Task #44. Stdio only.
 
 #include "wav_part.h"
 

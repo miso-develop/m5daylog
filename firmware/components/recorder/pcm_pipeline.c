@@ -21,6 +21,7 @@ void pcm_pipeline_init(pcm_pipeline_t *pipeline, uint8_t *backing0,
     pipeline->counters.samples_captured = 0;
     pipeline->counters.chunks_written = 0;
     pipeline->counters.buffer_overflow = 0;
+    pipeline->counters.dma_overrun_events = 0;
     pipeline->counters.dma_drop_bytes = 0;
     pipeline->counters.dma_drop_samples = 0;
     pipeline->counters.sd_write_errors = 0;
@@ -133,6 +134,23 @@ void pcm_pipeline_note_sd_write(pcm_pipeline_t *pipeline,
     if (latency_us > pipeline->counters.max_sd_latency_us) {
         pipeline->counters.max_sd_latency_us = latency_us;
     }
+}
+
+void pcm_pipeline_note_dma_overrun(pcm_pipeline_t *pipeline) {
+    if (pipeline == NULL) {
+        return;
+    }
+    pipeline->counters.dma_overrun_events++;
+}
+
+void pcm_pipeline_note_dma_gap(pcm_pipeline_t *pipeline,
+                               size_t missing_bytes) {
+    if (pipeline == NULL || missing_bytes == 0) {
+        return;
+    }
+    pipeline->counters.dma_drop_bytes += (uint32_t)missing_bytes;
+    pipeline->counters.dma_drop_samples +=
+        (uint32_t)(missing_bytes / RECORDER_BYTES_PER_SAMPLE);
 }
 
 void pcm_pipeline_note_sd_error(pcm_pipeline_t *pipeline) {
