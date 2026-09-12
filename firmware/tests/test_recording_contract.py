@@ -127,6 +127,24 @@ def test_default_part_path_shape():
     assert "/sdcard/M5DAYLOG/recordings/" in main
 
 
+def test_main_component_declares_idf_dependencies():
+    cmake = (REPO / "firmware/main/CMakeLists.txt").read_text(
+        encoding="utf-8"
+    )
+    main = MAIN.read_text(encoding="utf-8")
+    # Scaffold boot diagnostics use esp_flash_get_size(); that header and
+    # symbol must keep working.
+    assert '#include "esp_flash.h"' in main
+    assert "esp_flash_get_size" in main
+    # ...so the main component must depend on spi_flash (and recorder for
+    # the capture path) through the supported component graph.
+    assert "spi_flash" in cmake
+    assert "recorder" in cmake
+    # No raw include-path workarounds into IDF internals.
+    assert "IDF_PATH" not in cmake
+    assert "include_directories" not in cmake.lower()
+
+
 def test_esp_idf_v55_api_shape():
     capture = (COMP / "i2s_pdm_capture.c").read_text(encoding="utf-8")
     capture_hdr = (COMP / "include/i2s_pdm_capture.h").read_text(

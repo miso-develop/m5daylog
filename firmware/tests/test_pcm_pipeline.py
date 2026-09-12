@@ -86,11 +86,38 @@ def test_config_constants():
 
 
 def test_one_hour_needs_no_drop_math():
-    # 1h @16kHz/16bit/mono = 115.2MB payload = 3600 full 32KB slots.
+    # 1h @16kHz/16bit/mono = 115,200,000 payload bytes = 57,600,000 samples.
     one_hour_bytes = 16000 * 2 * 3600
     assert one_hour_bytes == 115200000
-    assert one_hour_bytes % BUFFER_BYTES == 0
-    assert one_hour_bytes // BUFFER_BYTES == 3600
+    assert one_hour_bytes // 2 == 57600000
+    # The stream does NOT end on a buffer boundary: 3515 complete 32KB
+    # buffers plus a final 20480-byte partial buffer. The partial tail is
+    # normal and must not be classified as drop or overflow.
+    full, tail = divmod(one_hour_bytes, BUFFER_BYTES)
+    assert (full, tail) == (3515, 20480)
+    assert tail // 2 == 10240  # sample-aligned tail, whole samples only
+
+
+def test_model_one_hour_stream_ends_with_partial_not_drop():
+    # Drive the documented pipeline exactly as main.c does (4096-byte I2S
+    # reads, drain full slots to SD as they appear) over a full hour.
+    m = Model()
+    chunk = bytes(4096)  # device scratch size in main.c
+    total = 16000 * 2 * 3600
+    produced = 0
+    while produced < total:
+        assert m.produce(chunk) == 0
+        produced += len(chunk)
+        while m.has_full():
+            assert m.release_full() is True
+    assert produced == 115200000
+    assert m.captured == 57600000
+    assert m.overflow == 0
+    assert m.drop_bytes == 0 and m.drop_samples == 0
+    assert m.written == 3515
+    # Final partial buffer waits in the active slot: not full, not dropped.
+    assert not m.has_full()
+    assert m.fill[m.write] == 20480
 
 
 def test_model_continuous_capture_no_drop():
