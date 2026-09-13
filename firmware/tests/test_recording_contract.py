@@ -268,6 +268,26 @@ def test_deinit_checks_disable_before_destroy():
     assert "reason: pdm deinit" in main
 
 
+def test_deinit_failure_preserves_caller_ownership():
+    main = MAIN.read_text(encoding="utf-8")
+    # Failed deinit transfers the still-active handle to a persistent
+    # recovery/error context instead of unconditionally dropping it.
+    assert "s_failed_capture" in main
+    assert "s_failed_capture = capture" in main
+    # Success-only teardown: local handle is cleared after success; the
+    # failure path transfers first and exits via ERROR teardown rather than
+    # falling through as success.
+    assert "deinit_err != ESP_OK" in main
+    assert "pdm deinit retry" in main
+    transfer_at = main.index("s_failed_capture = capture")
+    tail = main[transfer_at:]
+    assert "recorder_request_stop()" in tail
+    assert "vTaskDelete(NULL)" in tail
+    # Transfer happens only on the deinit-failure path, after the checked
+    # deinit call.
+    assert main.index("pdm_capture_deinit(capture)") < transfer_at
+
+
 def test_exact_stall_semantics():
     main = MAIN.read_text(encoding="utf-8")
     # Stall = timeout OR ESP_OK short read, only when the same read has no
