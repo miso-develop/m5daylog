@@ -157,10 +157,16 @@ static void recorder_capture_task(void *arg) {
         }
         // Re-check AFTER the blocking read: the sink may have failed or
         // closed while blocked — account overflow/stall but never enqueue
-        // past a dead sink.
+        // past a dead sink. Stall rule (exact): timeout OR ESP_OK short
+        // read counts ONLY when this same read carries no driver overflow
+        // evidence (!snap_pending); overflow and stall are never
+        // double-classified, and neither fabricates dropped samples.
         if (recorder_stop_requested()) {
+            bool timeout = (err == ESP_ERR_TIMEOUT);
+            bool short_read =
+                (err == ESP_OK && got < sizeof(s_dma_scratch));
             if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
-                if (err == ESP_ERR_TIMEOUT) {
+                if ((timeout || short_read) && !snap_pending) {
                     pcm_pipeline_note_read_stall(&s_pipeline);
                 }
                 if (snap_pending) {
@@ -172,7 +178,10 @@ static void recorder_capture_task(void *arg) {
             break;
         }
         if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
-            if (err == ESP_ERR_TIMEOUT) {
+            bool timeout = (err == ESP_ERR_TIMEOUT);
+            bool short_read =
+                (err == ESP_OK && got < sizeof(s_dma_scratch));
+            if ((timeout || short_read) && !snap_pending) {
                 // Stall evidence only: no overflow event, no loss claim.
                 pcm_pipeline_note_read_stall(&s_pipeline);
             }
@@ -195,11 +204,17 @@ static void recorder_capture_task(void *arg) {
         }
     }
 
-    // Final drain: preserve callbacks that fired after the last accounted
-    // read or during teardown before the channel is deleted.
+    // Quiescent teardown: disable the RX channel first so no further
+    // on_recv_q_ovf callback can fire after the final drain, then account
+    // the final snapshot, then delete the channel. This closes the
+    // drain-while-running race (drain -> disable inside deinit).
     {
         pdm_overflow_snapshot_t snap = { 0, 0 };
-        pdm_capture_drain_overflow(capture, &snap);
+        esp_err_t stop_err =
+            pdm_capture_stop_and_drain_final(capture, &snap);
+        if (stop_err != ESP_OK) {
+            ESP_LOGW(TAG, "stage: record, result: error, reason: i2s stop");
+        }
         if ((snap.events != 0 || snap.drop_bytes != 0) &&
             xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
             pcm_pipeline_note_driver_overflow(

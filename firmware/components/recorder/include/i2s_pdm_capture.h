@@ -74,7 +74,18 @@ esp_err_t pdm_capture_read(pdm_capture_t handle, void *dst, size_t len,
 void pdm_capture_drain_overflow(pdm_capture_t handle,
                                 pdm_overflow_snapshot_t *out);
 
-// Disable + release the channel. Safe with NULL (no-op).
+// Quiescent teardown boundary: stop/disable the RX channel first so no
+// further on_recv_q_ovf callback can fire, then drain the final overflow
+// snapshot. Must be called before pdm_capture_deinit(); deinit deletes the
+// channel without re-disabling when already stopped. Returns the disable
+// result (ESP_OK on success); `out` is always drained when non-NULL.
+// ESP_ERR_NOT_SUPPORTED on non-ESP host builds.
+esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
+                                           pdm_overflow_snapshot_t *out);
+
+// Disable (if still running) + release the channel. Safe with NULL
+// (no-op). Prefer pdm_capture_stop_and_drain_final() before this call so
+// the final overflow evidence is preserved without a teardown race.
 void pdm_capture_deinit(pdm_capture_t handle);
 
 #ifdef __cplusplus

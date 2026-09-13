@@ -24,6 +24,7 @@ static const char *TAG = "recorder_pdm";
 
 struct pdm_capture_handle {
     i2s_chan_handle_t rx_chan;
+    bool enabled;
 };
 
 // Single-instance RX queue-overflow evidence. Task #44 owns exactly one
@@ -162,6 +163,7 @@ esp_err_t pdm_capture_init(const pdm_capture_config_t *config,
         return err;
     }
 
+    handle->enabled = true;
     *out_handle = handle;
     ESP_LOGI(TAG, "stage: record, result: pdm ready, rate: %u, bits: %u",
              (unsigned)RECORDER_SAMPLE_RATE_HZ,
@@ -203,11 +205,30 @@ void pdm_capture_drain_overflow(pdm_capture_t handle,
     portEXIT_CRITICAL(&s_ovf_mux);
 }
 
+esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
+                                               pdm_overflow_snapshot_t *out) {
+    esp_err_t err;
+
+    if (handle == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Quiescent boundary first: stop the RX channel so no further
+    // on_recv_q_ovf callback can fire, then drain what fired before
+    // disable completed. Nothing is discarded.
+    err = i2s_channel_disable(handle->rx_chan);
+    handle->enabled = false;
+    pdm_capture_drain_overflow(handle, out);
+    return err;
+}
+
 void pdm_capture_deinit(pdm_capture_t handle) {
     if (handle == NULL) {
         return;
     }
-    i2s_channel_disable(handle->rx_chan);
+    if (handle->enabled) {
+        i2s_channel_disable(handle->rx_chan);
+        handle->enabled = false;
+    }
     i2s_del_channel(handle->rx_chan);
     portENTER_CRITICAL(&s_ovf_mux);
     s_ovf_armed = false;
@@ -240,6 +261,16 @@ void pdm_capture_drain_overflow(pdm_capture_t handle,
         out->events = 0;
         out->drop_bytes = 0;
     }
+}
+
+esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
+                                           pdm_overflow_snapshot_t *out) {
+    (void)handle;
+    if (out != NULL) {
+        out->events = 0;
+        out->drop_bytes = 0;
+    }
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 void pdm_capture_deinit(pdm_capture_t handle) {

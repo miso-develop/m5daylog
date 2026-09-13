@@ -76,10 +76,13 @@ components/recorder/
   deterministically reset on init). Every callback is preserved and
   accumulated exactly (`dma_overrun_events`, `dma_drop_bytes`,
   `dma_drop_samples`) via a drain that runs on EVERY read — including
-  timeouts, zero-byte reads, STOP, and fatal reads — plus a final drain
-  before deinit; never collapsed into a single flag, never inferred from
-  a short read. Read timeouts count as stalls (`dma_read_stalls`),
-  transport evidence only. Diagnostics report `dma_*` separately from
+  timeouts, zero-byte reads, STOP, and fatal reads — plus a quiescent
+  stop-then-final-drain (`pdm_capture_stop_and_drain_final` disables the
+  RX channel before the final drain so no callback can fire afterwards);
+  never collapsed into a single flag, never inferred from a short read.
+  A stall (`dma_read_stalls`) is a timeout OR ESP_OK short read with NO
+  driver overflow on that same read (!snap_pending); overflow and stall
+  are never double-classified. Diagnostics report `dma_*` separately from
   software `buffer_*` alongside `buffer_overflow`, `sd_err`, and worst SD
   latency.
 - PDM slot: the M5Capsule microphone is the RIGHT slot
@@ -95,9 +98,10 @@ recorder_capture_task (prio 5): wait WRITER_READY handshake → re-check STOP
     (never start mic on STOP) → PDM mic → I2S DMA → pdm_capture_read →
     always drain driver overflow snapshot (exact events/bytes, even on
     timeout/zero/STOP/fatal) → re-check STOP (never enqueue past a dead
-    sink) → [lock] stall note + driver-overflow note +
-    pcm_pipeline_produce (slot A/B) → set SLOT_FULL → final drain before
-    deinit
+    sink) → [lock] exact stall note (timeout/short && !overflow) +
+    driver-overflow note + pcm_pipeline_produce (slot A/B) → set SLOT_FULL
+    → quiescent stop-and-final-drain
+    (pdm_capture_stop_and_drain_final) → deinit
 recorder_writer_task (prio 4): mount + dirs + sink open → set WRITER_READY
     → on SLOT_FULL: [lock] peek full slot → [unlock] → sd_pcm_sink_write_chunk
     (slow, lock released: capture fills the other slot meanwhile) →

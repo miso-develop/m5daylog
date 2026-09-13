@@ -174,21 +174,55 @@ def test_dma_overrun_accounting_wired():
     # Proven loss arrives only from the driver overflow drain; stalls are
     # counted separately and never as drops.
     assert "pdm_capture_drain_overflow" in main
+    assert "pdm_capture_stop_and_drain_final" in main
     assert "pcm_pipeline_note_driver_overflow" in main
     assert "pcm_pipeline_note_read_stall" in main
     assert "pdm_overflow_snapshot_t" in main
     assert "dma_overrun_events" in main
     assert "overrun: %" in main
-    # Overflow is drained on EVERY read plus a final teardown drain, never
-    # gated on got > 0, so timeout/zero/STOP/fatal reads cannot lose it.
-    assert "Final drain" in main or "final drain" in main.lower()
-    assert main.count("pdm_capture_drain_overflow") >= 2
+    # Overflow is drained on EVERY read plus a quiescent teardown drain,
+    # never gated on got > 0, so timeout/zero/STOP/fatal reads cannot lose
+    # it. Teardown disables before the final drain (no drain-while-running
+    # race).
+    assert "Quiescent teardown" in main or "quiescent" in main.lower()
     assert "if (got > 0)" in main  # produce still gated, drain is not
-    drain_section = main[main.index("pdm_capture_drain_overflow") :]
-    assert "got > 0" not in drain_section[:600] or "Always preserve" in main
+    assert "Always preserve" in main
     # No inferred evidence: no single-bool overrun, no gap fabrication.
     assert "out_overrun" not in main
     assert "note_dma_gap" not in main
+
+
+def test_quiescent_teardown_ordering():
+    main = MAIN.read_text(encoding="utf-8")
+    src = (COMP / "i2s_pdm_capture.c").read_text(encoding="utf-8")
+    hdr = (COMP / "include/i2s_pdm_capture.h").read_text(encoding="utf-8")
+    # New stop-and-final-drain API exists and is used before deinit.
+    assert "pdm_capture_stop_and_drain_final" in hdr
+    assert "pdm_capture_stop_and_drain_final" in src
+    assert main.index("pdm_capture_stop_and_drain_final") < main.index(
+        "pdm_capture_deinit"
+    )
+    # Implementation disables first, then drains: no callback can fire
+    # after the final drain.
+    fn = src[src.index("pdm_capture_stop_and_drain_final") :]
+    fn = fn[: fn.index("\n}\n") + 3]
+    assert "i2s_channel_disable" in fn
+    assert "pdm_capture_drain_overflow" in fn
+    assert fn.index("i2s_channel_disable") < fn.index(
+        "pdm_capture_drain_overflow"
+    )
+
+
+def test_exact_stall_semantics():
+    main = MAIN.read_text(encoding="utf-8")
+    # Stall = timeout OR ESP_OK short read, only when the same read has no
+    # driver overflow. Overflow and stall are never double-classified.
+    assert "short_read" in main
+    assert "ESP_ERR_TIMEOUT" in main
+    assert "got < sizeof(s_dma_scratch)" in main
+    assert "!snap_pending" in main
+    assert main.count("!snap_pending") >= 2  # STOP path + normal path
+    assert "note_read_stall" in main.lower() or "note_read_stall" in main
 
 
 def test_driver_overflow_wiring():
