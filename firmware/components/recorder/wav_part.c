@@ -102,9 +102,19 @@ bool wav_part_open(wav_part_t *part, const char *path,
         fclose(part->fp);
         part->fp = NULL;
         part->open = false;
+        part->pcm_bytes = 0;
         return false;
     }
-    return fflush(part->fp) == 0;
+    if (fflush(part->fp) != 0) {
+        // A placeholder header that never reached storage must not leave
+        // an open FILE behind: close, clear state, fail-loud.
+        fclose(part->fp);
+        part->fp = NULL;
+        part->open = false;
+        part->pcm_bytes = 0;
+        return false;
+    }
+    return true;
 }
 
 bool wav_part_write(wav_part_t *part, const uint8_t *pcm, size_t len) {

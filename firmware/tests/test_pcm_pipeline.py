@@ -32,6 +32,7 @@ class Model:
         self.overrun_events = 0
         self.drop_bytes = 0
         self.drop_samples = 0
+        self.stalls = 0
 
     def produce(self, data: bytes) -> int:
         usable = data[: len(data) - (len(data) % 2)]
@@ -74,17 +75,17 @@ class Model:
         self.written += 1
         return True
 
-    def note_overrun(self):
-        # Mirrors pcm_pipeline_note_dma_overrun: every flagged read counts
-        # as an event, even with a complete payload (no loss claimed).
-        self.overrun_events += 1
+    def note_driver_overflow(self, events: int, drop_bytes: int):
+        # Mirrors pcm_pipeline_note_driver_overflow: exact sums, never
+        # collapsed; driver bytes imply whole-sample drops.
+        self.overrun_events += events
+        self.drop_bytes += drop_bytes
+        self.drop_samples += drop_bytes // 2
 
-    def note_gap(self, missing: int):
-        # Mirrors pcm_pipeline_note_dma_gap: a short-read gap always joins
-        # the drop counters, so it can never report drop=0.
-        if missing:
-            self.drop_bytes += missing
-            self.drop_samples += missing // 2
+    def note_stall(self):
+        # Mirrors pcm_pipeline_note_read_stall: stall evidence only, never
+        # fabricated into drops.
+        self.stalls += 1
 
 
 def test_config_constants():
@@ -159,19 +160,23 @@ def test_model_overflow_counts_not_silently_overwrites():
     assert m.produce(bytes(1024)) == 0
 
 
-def test_model_overrun_event_without_gap_claims_no_loss():
+def test_model_driver_overflow_accumulates_exactly():
+    # Three callbacks' byte sizes sum exactly: nothing is collapsed into a
+    # single flag, and every byte maps to whole samples.
     m = Model()
-    m.note_overrun()
-    assert m.overrun_events == 1
+    m.note_driver_overflow(1, 4096)
+    m.note_driver_overflow(2, 8192)
+    assert m.overrun_events == 3
+    assert m.drop_bytes == 12288 and m.drop_samples == 6144
+
+
+def test_model_stall_never_fabricates_drop():
+    m = Model()
+    m.note_stall()
+    m.note_stall()
+    assert m.stalls == 2
+    assert m.overrun_events == 0
     assert m.drop_bytes == 0 and m.drop_samples == 0
-
-
-def test_model_gap_always_counts_as_drop():
-    m = Model()
-    m.note_overrun()
-    m.note_gap(4096)
-    assert m.overrun_events == 1
-    assert m.drop_bytes == 4096 and m.drop_samples == 2048
 
 
 def test_model_odd_tail_held_back():
@@ -192,10 +197,11 @@ def test_c_source_implements_pipeline_contract():
         "pcm_pipeline_release_full",
         "pcm_pipeline_note_sd_write",
         "pcm_pipeline_note_sd_error",
-        "pcm_pipeline_note_dma_overrun",
-        "pcm_pipeline_note_dma_gap",
+        "pcm_pipeline_note_driver_overflow",
+        "pcm_pipeline_note_read_stall",
         "buffer_overflow",
         "dma_overrun_events",
+        "dma_read_stalls",
         "dma_drop_bytes",
         "dma_drop_samples",
         "sd_write_errors",

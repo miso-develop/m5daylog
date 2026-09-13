@@ -105,3 +105,11 @@ def test_c_source_implements_contract():
     assert "ChunkSize" in src or "36u" in src
     # Close must patch sizes (seek back) before fclose — decodeability rule.
     assert "fseek" in src and "fclose" in src
+
+
+def test_wav_open_cleanup_closes_file():
+    src = WAV_C.read_text(encoding="utf-8")
+    # Header-write AND header-flush failures in wav_part_open each close
+    # the FILE and clear state (open x2), plus wav_part_close (x1): no path
+    # leaks an open file on failure.
+    assert src.count("fclose(part->fp)") >= 3

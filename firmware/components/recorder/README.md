@@ -68,25 +68,37 @@ components/recorder/
   M5Capsule v1.1 baseline in `recorder_config.h` (CLK 40 / DAT 41,
   overridable with `-D` flags). Unset pins (`< 0`) fail init with
   `ESP_ERR_INVALID_ARG`.
-- Overrun/drop semantics: every driver-flagged overrun bumps
-  `dma_overrun_events`; any short-read gap joins `dma_drop_*`, so lost
-  samples can never coexist with a drop=0 report. Both appear in the
-  periodic `running` diagnostics alongside capture/write/overflow/SD
-  counters and worst SD latency.
+- Overrun/drop semantics: proven DMA loss arrives ONLY from the ESP-IDF
+  I2S RX queue-overflow callback (`i2s_event_data_t.size` per event).
+  Every callback is preserved and accumulated exactly (event count, bytes,
+  whole samples) via ISR-safe state drained by the capture task — never
+  collapsed into a single flag, never inferred from a short read. Read
+  timeouts count as stalls (`dma_read_stalls`), transport evidence only.
+  Both appear in the periodic `running` diagnostics alongside
+  capture/write/overflow/SD counters and worst SD latency.
+- PDM slot: the M5Capsule microphone is the RIGHT slot
+  (`I2S_PDM_SLOT_RIGHT`; M5Unified `input_only_right`), never the
+  mono-default LEFT. Output stays 16kHz / signed 16bit / mono PCM.
 - Logging carries only stage / count / status-class metadata. No audio
   bytes, transcripts, credentials, or secrets are logged (see `SECURITY.md`).
 
-## Data flow (`main.c`: capture task + writer task)
+## Data flow (`main.c`: capture task + writer task, event-group lifecycle)
 
 ```text
-recorder_capture_task (prio 5): PDM mic → I2S DMA → pdm_capture_read
-    → [lock] overrun/gap accounting + pcm_pipeline_produce (slot A/B)
-    → notify writer when a slot is full
-recorder_writer_task (prio 4): on notify → [lock] peek full slot → [unlock]
-    → sd_pcm_sink_write_chunk (slow, lock released: capture fills the
-       other slot meanwhile) → [lock] release + latency note
-    → every 4 slots: wav_part_flush (header patch) + running diagnostics
+recorder_capture_task (prio 5): wait WRITER_READY handshake → PDM mic →
+    I2S DMA → pdm_capture_read → re-check STOP (never enqueue past a dead
+    sink) → [lock] stall note + drain driver overflow snapshot (exact
+    events/bytes) + pcm_pipeline_produce (slot A/B) → set SLOT_FULL
+recorder_writer_task (prio 4): mount + dirs + sink open → set WRITER_READY
+    → on SLOT_FULL: [lock] peek full slot → [unlock] → sd_pcm_sink_write_chunk
+    (slow, lock released: capture fills the other slot meanwhile) →
+    [lock] release + latency note → every 4 slots: wav_part_flush (header
+    patch) + running diagnostics → STOP: drain-then-exit, close, unmount
 ```
+
+One app-lifetime event group is the only cross-task channel (SLOT_FULL,
+STOP, WRITER_READY); no task handle is ever published, so no stale-handle
+signal is possible, and creation order decides nothing under SMP.
 
 `app_main` starts the writer (owns mount + sink) then the capture task
 after scaffold boot logs. Any bring-up or I/O failure logs

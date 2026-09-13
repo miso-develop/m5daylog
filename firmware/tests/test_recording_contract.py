@@ -135,24 +135,76 @@ def test_producer_consumer_structure():
     assert "recorder_capture_task" in main
     assert "recorder_writer_task" in main
     assert '"rec_capture"' in main and '"rec_writer"' in main
-    # Bounded handoff: mutex-guarded pipeline, notify-driven writer.
+    # Bounded handoff: mutex-guarded pipeline plus event-group wakeups.
     assert "xSemaphoreCreateMutex" in main
-    assert "xTaskNotifyGive" in main
-    assert "ulTaskNotifyTake" in main
+    assert "xEventGroupSetBits" in main
+    assert "xEventGroupWaitBits" in main
     # Slow SD writes release the pipeline lock so capture keeps filling
     # the other slot; both-full still drops loudly instead of overwriting.
     assert "keeps filling the other slot" in main
     assert "buffer_overflow" in main or "buffer overflow" in main
 
 
+def test_writer_ready_handshake():
+    main = MAIN.read_text(encoding="utf-8")
+    # Capture never starts the mic until mount + dirs + sink are ready.
+    assert "REC_BIT_WRITER_READY" in main
+    assert "REC_BIT_STOP" in main
+    assert "handshake" in main.lower()
+
+
+def test_safe_stop_lifecycle():
+    main = MAIN.read_text(encoding="utf-8")
+    # One app-lifetime event group is the only cross-task channel: no
+    # published task handle exists, so no stale-handle notify is possible.
+    assert "xEventGroupCreate" in main
+    assert "xEventGroupGetBits" in main
+    assert "xTaskNotifyGive" not in main
+    assert "s_writer_task" not in main
+    assert "volatile bool s_stop" not in main
+
+
 def test_dma_overrun_accounting_wired():
     main = MAIN.read_text(encoding="utf-8")
-    # Every driver overrun flag and every short-read gap reaches counters.
-    assert "pcm_pipeline_note_dma_overrun" in main
-    assert "pcm_pipeline_note_dma_gap" in main
-    # Periodic diagnostics expose the overrun evidence next to drop data.
+    # Proven loss arrives only from the driver overflow drain; stalls are
+    # counted separately and never as drops.
+    assert "pdm_capture_drain_overflow" in main
+    assert "pcm_pipeline_note_driver_overflow" in main
+    assert "pcm_pipeline_note_read_stall" in main
+    assert "pdm_overflow_snapshot_t" in main
     assert "dma_overrun_events" in main
     assert "overrun: %" in main
+    # No inferred evidence: no single-bool overrun, no gap fabrication.
+    assert "out_overrun" not in main
+    assert "note_dma_gap" not in main
+
+
+def test_driver_overflow_wiring():
+    src = (COMP / "i2s_pdm_capture.c").read_text(encoding="utf-8")
+    hdr = (COMP / "include/i2s_pdm_capture.h").read_text(encoding="utf-8")
+    assert "i2s_channel_register_event_callback" in src
+    assert "on_recv_q_ovf" in src
+    assert "i2s_event_data_t" in src
+    assert "portENTER_CRITICAL_ISR" in src
+    assert "pdm_capture_drain_overflow" in src
+    assert "pdm_overflow_snapshot_t" in hdr
+    # No single-bool overrun plumbing remains anywhere.
+    assert "out_overrun" not in src and "out_overrun" not in hdr
+
+
+def test_capsule_right_slot():
+    src = (COMP / "i2s_pdm_capture.c").read_text(encoding="utf-8")
+    # M5Capsule mic is the RIGHT PDM slot, never the mono-default LEFT.
+    assert "I2S_PDM_SLOT_RIGHT" in src
+    assert "slot_mask" in src
+
+
+def test_sd_flush_close_failure_accounting():
+    main = MAIN.read_text(encoding="utf-8")
+    # Write, flush, and close failures each reach the SD error counter.
+    assert main.count("pcm_pipeline_note_sd_error") >= 3
+    assert "part flush" in main
+    assert "part close" in main
 
 
 def test_main_component_declares_idf_dependencies():

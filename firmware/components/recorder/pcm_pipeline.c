@@ -24,6 +24,7 @@ void pcm_pipeline_init(pcm_pipeline_t *pipeline, uint8_t *backing0,
     pipeline->counters.dma_overrun_events = 0;
     pipeline->counters.dma_drop_bytes = 0;
     pipeline->counters.dma_drop_samples = 0;
+    pipeline->counters.dma_read_stalls = 0;
     pipeline->counters.sd_write_errors = 0;
     pipeline->counters.max_sd_latency_us = 0;
 }
@@ -136,21 +137,23 @@ void pcm_pipeline_note_sd_write(pcm_pipeline_t *pipeline,
     }
 }
 
-void pcm_pipeline_note_dma_overrun(pcm_pipeline_t *pipeline) {
+void pcm_pipeline_note_driver_overflow(pcm_pipeline_t *pipeline,
+                                       uint32_t events,
+                                       uint32_t drop_bytes) {
+    if (pipeline == NULL || (events == 0 && drop_bytes == 0)) {
+        return;
+    }
+    pipeline->counters.dma_overrun_events += events;
+    pipeline->counters.dma_drop_bytes += drop_bytes;
+    pipeline->counters.dma_drop_samples +=
+        (uint32_t)(drop_bytes / RECORDER_BYTES_PER_SAMPLE);
+}
+
+void pcm_pipeline_note_read_stall(pcm_pipeline_t *pipeline) {
     if (pipeline == NULL) {
         return;
     }
-    pipeline->counters.dma_overrun_events++;
-}
-
-void pcm_pipeline_note_dma_gap(pcm_pipeline_t *pipeline,
-                               size_t missing_bytes) {
-    if (pipeline == NULL || missing_bytes == 0) {
-        return;
-    }
-    pipeline->counters.dma_drop_bytes += (uint32_t)missing_bytes;
-    pipeline->counters.dma_drop_samples +=
-        (uint32_t)(missing_bytes / RECORDER_BYTES_PER_SAMPLE);
+    pipeline->counters.dma_read_stalls++;
 }
 
 void pcm_pipeline_note_sd_error(pcm_pipeline_t *pipeline) {
