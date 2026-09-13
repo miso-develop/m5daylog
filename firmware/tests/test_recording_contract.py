@@ -270,22 +270,21 @@ def test_deinit_checks_disable_before_destroy():
 
 def test_deinit_failure_preserves_caller_ownership():
     main = MAIN.read_text(encoding="utf-8")
-    # Failed deinit transfers the still-active handle to a persistent
-    # recovery/error context instead of unconditionally dropping it.
-    assert "s_failed_capture" in main
-    assert "s_failed_capture = capture" in main
-    # Success-only teardown: local handle is cleared after success; the
-    # failure path transfers first and exits via ERROR teardown rather than
-    # falling through as success.
-    assert "deinit_err != ESP_OK" in main
-    assert "pdm deinit retry" in main
-    transfer_at = main.index("s_failed_capture = capture")
-    tail = main[transfer_at:]
-    assert "recorder_request_stop()" in tail
-    assert "vTaskDelete(NULL)" in tail
-    # Transfer happens only on the deinit-failure path, after the checked
-    # deinit call.
-    assert main.index("pdm_capture_deinit(capture)") < transfer_at
+    # Owner-task cleanup loop: no orphan global; the owning capture task
+    # retains the handle and retries deinit until it succeeds.
+    assert "s_failed_capture" not in main
+    assert "while (deinit_err != ESP_OK)" in main
+    assert "vTaskDelay" in main
+    assert "reason: pdm deinit" in main
+    # capture=NULL and task deletion happen only after the retry loop, i.e.
+    # after successful ownership release — never on the failing path.
+    loop_at = main.index("while (deinit_err != ESP_OK)")
+    assert main.index("pdm_capture_deinit(capture)") < loop_at
+    null_at = main.index("capture = NULL", loop_at)
+    assert loop_at < null_at
+    assert null_at < main.rindex("vTaskDelete(NULL)")
+    # STOP/error state stays asserted while cleanup is pending.
+    assert "recorder_request_stop()" in main[loop_at:]
 
 
 def test_exact_stall_semantics():

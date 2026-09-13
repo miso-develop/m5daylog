@@ -72,12 +72,6 @@ static pcm_pipeline_t s_pipeline;
 static sd_pcm_sink_t s_sink;
 static SemaphoreHandle_t s_rec_lock = NULL;
 static EventGroupHandle_t s_rec_events = NULL;
-// Persistent recovery/error ownership for a capture handle whose fail-closed
-// deinit did not succeed. Task #44 owns a single capture instance: on deinit
-// failure the owning task transfers the still-active handle here instead of
-// dropping it, so the channel/handle/overflow accounting stay reachable and
-// retryable by the recovery/error path (never an unreachable leak).
-static pdm_capture_t s_failed_capture = NULL;
 
 #define REC_BIT_SLOT_FULL (1u << 0)
 #define REC_BIT_STOP (1u << 1)
@@ -240,35 +234,23 @@ static void recorder_capture_task(void *arg) {
             xSemaphoreGive(s_rec_lock);
         }
     }
-    // Fail-closed deinit with caller ownership preservation: only clear the
-    // local handle and finish teardown after deinit succeeds. On failure the
-    // handle/channel/accounting are preserved inside pdm_capture_deinit
-    // (not deleted/freed/disarmed), so retry with the local handle retained
-    // first; if still failing, transfer ownership explicitly to the
-    // persistent error context instead of dropping the final reference.
+    // Fail-closed deinit with owner-task ownership: the capture task retains
+    // `capture` until pdm_capture_deinit() succeeds, so a failing deinit
+    // can never fall through to capture=NULL/task deletion with an active
+    // channel. STOP stays asserted while cleanup is pending; the loop yields
+    // and stays fail-loud with bounded logging (no tight loop, no spam).
+    recorder_request_stop();
     {
         esp_err_t deinit_err = pdm_capture_deinit(capture);
-        if (deinit_err != ESP_OK) {
-            ESP_LOGE(TAG, "stage: record, result: error, reason: pdm deinit");
-            for (int retry = 0; retry < 3 && deinit_err != ESP_OK; retry++) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-                deinit_err = pdm_capture_deinit(capture);
-                if (deinit_err != ESP_OK) {
-                    ESP_LOGE(TAG,
-                             "stage: record, result: error, "
-                             "reason: pdm deinit retry");
-                }
+        unsigned attempt = 0;
+        while (deinit_err != ESP_OK) {
+            if ((attempt % 20u) == 0u) {
+                ESP_LOGE(TAG,
+                         "stage: record, result: error, reason: pdm deinit");
             }
-        }
-        if (deinit_err != ESP_OK) {
-            // Still failing: transfer the still-active handle to the
-            // persistent recovery/error context (retryable there) and enter
-            // ERROR teardown. Never drop it via an unconditional NULL.
-            s_failed_capture = capture;
-            capture = NULL;
-            recorder_request_stop();
-            vTaskDelete(NULL);
-            return;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            attempt++;
+            deinit_err = pdm_capture_deinit(capture);
         }
     }
     capture = NULL;
