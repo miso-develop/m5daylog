@@ -29,9 +29,11 @@ class Model:
         self.captured = 0
         self.written = 0
         self.overflow = 0
+        self.buf_drop_bytes = 0
+        self.buf_drop_samples = 0
         self.overrun_events = 0
-        self.drop_bytes = 0
-        self.drop_samples = 0
+        self.dma_drop_bytes = 0
+        self.dma_drop_samples = 0
         self.stalls = 0
 
     def produce(self, data: bytes) -> int:
@@ -41,8 +43,8 @@ class Model:
             if self.full[0] and self.full[1]:
                 rest = len(usable) - off
                 self.overflow += 1
-                self.drop_bytes += rest
-                self.drop_samples += rest // 2
+                self.buf_drop_bytes += rest
+                self.buf_drop_samples += rest // 2
                 return len(data) - off
             if self.full[self.write]:
                 self.write = 1 - self.write
@@ -77,10 +79,11 @@ class Model:
 
     def note_driver_overflow(self, events: int, drop_bytes: int):
         # Mirrors pcm_pipeline_note_driver_overflow: exact sums, never
-        # collapsed; driver bytes imply whole-sample drops.
+        # collapsed; driver bytes imply whole-sample drops. Driver loss is
+        # strictly separate from software buffer loss (no double count).
         self.overrun_events += events
-        self.drop_bytes += drop_bytes
-        self.drop_samples += drop_bytes // 2
+        self.dma_drop_bytes += drop_bytes
+        self.dma_drop_samples += drop_bytes // 2
 
     def note_stall(self):
         # Mirrors pcm_pipeline_note_read_stall: stall evidence only, never
@@ -127,7 +130,9 @@ def test_model_one_hour_stream_ends_with_partial_not_drop():
     assert produced == 115200000
     assert m.captured == 57600000
     assert m.overflow == 0
-    assert m.drop_bytes == 0 and m.drop_samples == 0
+    assert m.buf_drop_bytes == 0 and m.buf_drop_samples == 0
+    assert m.dma_drop_bytes == 0 and m.dma_drop_samples == 0
+    assert m.overrun_events == 0
     assert m.written == 3515
     # Final partial buffer waits in the active slot: not full, not dropped.
     assert not m.has_full()
@@ -140,7 +145,8 @@ def test_model_continuous_capture_no_drop():
     for _ in range(8):  # exactly one 32KB slot
         assert m.produce(chunk) == 0
     assert m.has_full()
-    assert m.overflow == 0 and m.drop_bytes == 0
+    assert m.overflow == 0 and m.buf_drop_bytes == 0
+    assert m.dma_drop_bytes == 0 and m.overrun_events == 0
     assert m.captured == BUFFER_BYTES // 2 == 16384
     assert m.release_full() is True
     assert m.written == 1 and not m.has_full()
@@ -154,7 +160,10 @@ def test_model_overflow_counts_not_silently_overwrites():
     dropped = m.produce(bytes(1024))
     assert dropped == 1024
     assert m.overflow == 1
-    assert m.drop_bytes == 1024 and m.drop_samples == 512
+    assert m.buf_drop_bytes == 1024 and m.buf_drop_samples == 512
+    # Software loss never leaks into driver counters (no double count).
+    assert m.overrun_events == 0
+    assert m.dma_drop_bytes == 0 and m.dma_drop_samples == 0
     # Draining one slot re-opens the pipeline.
     assert m.release_full() is True
     assert m.produce(bytes(1024)) == 0
@@ -167,7 +176,10 @@ def test_model_driver_overflow_accumulates_exactly():
     m.note_driver_overflow(1, 4096)
     m.note_driver_overflow(2, 8192)
     assert m.overrun_events == 3
-    assert m.drop_bytes == 12288 and m.drop_samples == 6144
+    assert m.dma_drop_bytes == 12288 and m.dma_drop_samples == 6144
+    # Driver loss never leaks into software counters (strict separation).
+    assert m.overflow == 0
+    assert m.buf_drop_bytes == 0 and m.buf_drop_samples == 0
 
 
 def test_model_stall_never_fabricates_drop():
@@ -176,14 +188,16 @@ def test_model_stall_never_fabricates_drop():
     m.note_stall()
     assert m.stalls == 2
     assert m.overrun_events == 0
-    assert m.drop_bytes == 0 and m.drop_samples == 0
+    assert m.dma_drop_bytes == 0 and m.dma_drop_samples == 0
+    assert m.buf_drop_bytes == 0 and m.buf_drop_samples == 0
 
 
 def test_model_odd_tail_held_back():
     m = Model()
     assert m.produce(b"\x01\x02\x03") == 1  # held-back byte, not dropped
     assert m.captured == 1
-    assert m.overflow == 0 and m.drop_bytes == 0
+    assert m.overflow == 0 and m.buf_drop_bytes == 0
+    assert m.dma_drop_bytes == 0
 
 
 def test_c_source_implements_pipeline_contract():
@@ -200,6 +214,8 @@ def test_c_source_implements_pipeline_contract():
         "pcm_pipeline_note_driver_overflow",
         "pcm_pipeline_note_read_stall",
         "buffer_overflow",
+        "buffer_drop_bytes",
+        "buffer_drop_samples",
         "dma_overrun_events",
         "dma_read_stalls",
         "dma_drop_bytes",
@@ -210,3 +226,24 @@ def test_c_source_implements_pipeline_contract():
         "chunks_written",
     ):
         assert symbol in src or symbol in hdr, symbol
+
+
+def test_driver_and_software_counters_strictly_separate():
+    src = PIPE_C.read_text(encoding="utf-8")
+    # Software both-full path must touch buffer_* only, never dma_*.
+    produce = src[src.index("size_t pcm_pipeline_produce") :]
+    produce = produce[: produce.index("\n}\n") + 3]
+    assert "buffer_overflow" in produce
+    assert "buffer_drop_bytes" in produce
+    assert "buffer_drop_samples" in produce
+    assert "dma_drop_bytes" not in produce
+    assert "dma_drop_samples" not in produce
+    assert "dma_overrun_events" not in produce
+    # Driver note path must touch dma_* only, never buffer_*.
+    note = src[src.index("void pcm_pipeline_note_driver_overflow") :]
+    note = note[: note.index("\n}\n") + 3]
+    assert "dma_overrun_events" in note
+    assert "dma_drop_bytes" in note
+    assert "dma_drop_samples" in note
+    assert "buffer_overflow" not in note
+    assert "buffer_drop_bytes" not in note

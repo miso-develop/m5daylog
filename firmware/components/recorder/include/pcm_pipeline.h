@@ -5,8 +5,10 @@
 // No ESP-IDF dependency: the I2S/DMA producer calls pcm_pipeline_produce()
 // with freshly captured PCM bytes, and the SD writer drains full slots via
 // peek/release. When both slots are full, incoming bytes are DROPPED and
-// counted (buffer_overflow / dma_drop_*) — never silently overwritten.
-// This is the Spec #36 "no silent failure" rule in code.
+// counted (buffer_overflow / buffer_drop_*) — never silently overwritten.
+// Driver DMA loss (dma_*) and software buffer loss (buffer_*) are strictly
+// separate counter families. This is the Spec #36 "no silent failure" rule
+// in code.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -22,25 +24,28 @@ extern "C" {
 // (DMA/sample drop, buffer overflow, SD write health).
 //
 // Overrun/drop semantics (Spec #36, no silent failure, no fabricated
-// evidence):
-// - `dma_overrun_events` / driver byte counts arrive ONLY from the ESP-IDF
-//   I2S RX queue-overflow callback (`i2s_event_data_t.size` per event).
-//   Every callback is preserved and accumulated exactly: event count,
-//   dropped bytes, and whole samples. Callbacks are never collapsed into
-//   a single flag.
-// - `dma_drop_bytes` / `dma_drop_samples`: samples proven lost — the
-//   driver-confirmed overflow bytes plus any payload dropped while both
-//   software slots were full.
+// evidence, no double counting):
+// - `dma_overrun_events` / `dma_drop_bytes` / `dma_drop_samples` arrive
+//   ONLY from the ESP-IDF I2S RX queue-overflow callback
+//   (`i2s_event_data_t.size` per event). Every callback is preserved and
+//   accumulated exactly: event count, dropped bytes, and whole samples.
+//   Callbacks are never collapsed into a single flag.
+// - `buffer_overflow` / `buffer_drop_bytes` / `buffer_drop_samples` count
+//   ONLY software ping-pong loss: payload dropped by pcm_pipeline_produce()
+//   while both 32KB slots were full. Driver overflow bytes must never be
+//   added here and software drops must never be added to dma_*.
 // - `dma_read_stalls`: I2S reads that timed out or returned short WITHOUT
 //   a driver overflow event. A stall is transport evidence, never loss
 //   evidence: it must not be counted as dropped audio.
 typedef struct {
     uint32_t samples_captured;   // whole 16bit samples accepted
     uint32_t chunks_written;     // full slots drained to SD
-    uint32_t buffer_overflow;    // produce calls that hit two full slots
+    uint32_t buffer_overflow;    // software both-full produce events
+    uint32_t buffer_drop_bytes;  // software-dropped payload bytes
+    uint32_t buffer_drop_samples;  // whole samples among software drops
     uint32_t dma_overrun_events;  // driver queue-overflow callbacks
-    uint32_t dma_drop_bytes;     // proven-lost payload bytes
-    uint32_t dma_drop_samples;   // whole samples among proven-lost bytes
+    uint32_t dma_drop_bytes;     // driver-dropped payload bytes
+    uint32_t dma_drop_samples;   // whole samples among driver drops
     uint32_t dma_read_stalls;    // read timeouts/short reads w/o overflow
     uint32_t sd_write_errors;    // failed SD chunk writes (fail-loud)
     uint32_t max_sd_latency_us;  // worst single-slot SD write latency

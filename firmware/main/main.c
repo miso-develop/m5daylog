@@ -26,10 +26,12 @@ static const char *TAG = "m5daylog";
 // Bounded producer/consumer over the 32KB x 2 ping-pong pipeline:
 // - recorder_capture_task (priority 5) owns the PDM handle and DMA scratch.
 //   It never blocks on the pipeline: when both slots are full the payload
-//   is dropped and counted (fail-loud, never silently overwritten). Proven
-//   DMA loss arrives only from the driver's RX queue-overflow callback and
-//   is drained exactly (event count + byte sizes); read timeouts count as
-//   stalls, never as fabricated drops.
+//   is dropped and counted as software buffer loss (fail-loud, never
+//   silently overwritten). Proven driver DMA loss arrives only from the
+//   driver's RX queue-overflow callback and is drained exactly (event count
+//   + byte sizes) on EVERY read — including timeouts, zero-byte reads,
+//   STOP, and fatal reads — plus a final drain before deinit; read timeouts
+//   count as stalls, never as fabricated drops.
 // - recorder_writer_task (priority 4) owns the `.wav.part` sink. It drains
 //   full slots; each slow SD write runs WITHOUT the pipeline lock so
 //   capture keeps filling the other slot — long SD writes are exactly what
@@ -100,10 +102,16 @@ static void recorder_capture_task(void *arg) {
     (void)arg;
     // Startup handshake: the mic stays off until the writer has mount +
     // directories + open sink (or STOP on bring-up failure). Creation order
-    // and priority decide nothing under FreeRTOS SMP.
+    // and priority decide nothing under FreeRTOS SMP. STOP is sticky and is
+    // re-checked explicitly: if STOP is set the mic is never started, even
+    // when WRITER_READY also happens to be set.
     bits = xEventGroupWaitBits(s_rec_events,
                                REC_BIT_WRITER_READY | REC_BIT_STOP,
                                pdFALSE, pdFALSE, portMAX_DELAY);
+    if ((bits & REC_BIT_STOP) != 0) {
+        vTaskDelete(NULL);
+        return;
+    }
     if ((bits & REC_BIT_WRITER_READY) == 0) {
         vTaskDelete(NULL);
         return;
@@ -117,35 +125,62 @@ static void recorder_capture_task(void *arg) {
 
     while (!recorder_stop_requested()) {
         size_t got = 0;
+        pdm_overflow_snapshot_t snap = { 0, 0 };
+        bool snap_pending = false;
+        bool full = false;
         esp_err_t err = pdm_capture_read(capture, s_dma_scratch,
                                          sizeof(s_dma_scratch), &got);
+        // Always preserve driver evidence first: a timeout, zero-byte read,
+        // STOP after the blocking read, or fatal read must not discard
+        // already-fired overflow callbacks.
+        pdm_capture_drain_overflow(capture, &snap);
+        snap_pending =
+            (snap.events != 0 || snap.drop_bytes != 0);
+        if (snap_pending) {
+            ESP_LOGW(TAG,
+                     "stage: record, result: dma overrun, events: %" PRIu32
+                     ", bytes: %" PRIu32,
+                     (uint32_t)snap.events,
+                     (uint32_t)snap.drop_bytes);
+        }
         if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+            // Fatal transport error: account the drained overflow first,
+            // then exit without producing.
+            if (snap_pending &&
+                xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
+                pcm_pipeline_note_driver_overflow(
+                    &s_pipeline, snap.events, snap.drop_bytes);
+                xSemaphoreGive(s_rec_lock);
+            }
             ESP_LOGE(TAG, "stage: record, result: error, reason: i2s read");
             break;
         }
         // Re-check AFTER the blocking read: the sink may have failed or
-        // closed while blocked — never enqueue past a dead sink.
+        // closed while blocked — account overflow/stall but never enqueue
+        // past a dead sink.
         if (recorder_stop_requested()) {
+            if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
+                if (err == ESP_ERR_TIMEOUT) {
+                    pcm_pipeline_note_read_stall(&s_pipeline);
+                }
+                if (snap_pending) {
+                    pcm_pipeline_note_driver_overflow(
+                        &s_pipeline, snap.events, snap.drop_bytes);
+                }
+                xSemaphoreGive(s_rec_lock);
+            }
             break;
         }
-        bool full = false;
         if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
             if (err == ESP_ERR_TIMEOUT) {
                 // Stall evidence only: no overflow event, no loss claim.
                 pcm_pipeline_note_read_stall(&s_pipeline);
             }
+            if (snap_pending) {
+                pcm_pipeline_note_driver_overflow(
+                    &s_pipeline, snap.events, snap.drop_bytes);
+            }
             if (got > 0) {
-                pdm_overflow_snapshot_t snap = { 0, 0 };
-                pdm_capture_drain_overflow(capture, &snap);
-                if (snap.events != 0 || snap.drop_bytes != 0) {
-                    ESP_LOGW(TAG,
-                             "stage: record, result: dma overrun, events: %" PRIu32
-                             ", bytes: %" PRIu32,
-                             (uint32_t)snap.events,
-                             (uint32_t)snap.drop_bytes);
-                    pcm_pipeline_note_driver_overflow(
-                        &s_pipeline, snap.events, snap.drop_bytes);
-                }
                 size_t dropped = pcm_pipeline_produce(&s_pipeline,
                                                       s_dma_scratch, got);
                 if (dropped != 0) {
@@ -160,6 +195,18 @@ static void recorder_capture_task(void *arg) {
         }
     }
 
+    // Final drain: preserve callbacks that fired after the last accounted
+    // read or during teardown before the channel is deleted.
+    {
+        pdm_overflow_snapshot_t snap = { 0, 0 };
+        pdm_capture_drain_overflow(capture, &snap);
+        if ((snap.events != 0 || snap.drop_bytes != 0) &&
+            xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
+            pcm_pipeline_note_driver_overflow(
+                &s_pipeline, snap.events, snap.drop_bytes);
+            xSemaphoreGive(s_rec_lock);
+        }
+    }
     pdm_capture_deinit(capture);
     recorder_request_stop();
     vTaskDelete(NULL);
@@ -169,7 +216,10 @@ static void recorder_log_diagnostics(void) {
     uint32_t captured = 0;
     uint32_t written = 0;
     uint32_t overflow = 0;
-    uint32_t drop = 0;
+    uint32_t dma_drop = 0;
+    uint32_t buf_drop = 0;
+    uint32_t dma_bytes = 0;
+    uint32_t buf_bytes = 0;
     uint32_t overrun = 0;
     uint32_t stalls = 0;
     uint32_t sd_err = 0;
@@ -181,21 +231,28 @@ static void recorder_log_diagnostics(void) {
         captured = c->samples_captured;
         written = c->chunks_written;
         overflow = c->buffer_overflow;
-        drop = c->dma_drop_samples;
+        dma_drop = c->dma_drop_samples;
+        buf_drop = c->buffer_drop_samples;
+        dma_bytes = c->dma_drop_bytes;
+        buf_bytes = c->buffer_drop_bytes;
         overrun = c->dma_overrun_events;
         stalls = c->dma_read_stalls;
         sd_err = c->sd_write_errors;
         max_lat = c->max_sd_latency_us;
         xSemaphoreGive(s_rec_lock);
     }
+    // Driver DMA loss (dma_*) and software buffer loss (buf_*) are reported
+    // separately; buffer_overflow and sd_err are preserved verbatim.
     ESP_LOGI(TAG,
              "stage: record, result: running, captured: %" PRIu32
              ", written: %" PRIu32 ", overflow: %" PRIu32
-             ", drop: %" PRIu32 ", overrun: %" PRIu32
+             ", dma_drop: %" PRIu32 ", buf_drop: %" PRIu32
+             ", dma_bytes: %" PRIu32 ", buf_bytes: %" PRIu32
+             ", overrun: %" PRIu32
              ", stall: %" PRIu32 ", sd_err: %" PRIu32
              ", max_lat: %" PRIu32,
-             captured, written, overflow, drop, overrun, stalls, sd_err,
-             max_lat);
+             captured, written, overflow, dma_drop, buf_drop, dma_bytes,
+             buf_bytes, overrun, stalls, sd_err, max_lat);
 }
 
 static void recorder_writer_task(void *arg) {

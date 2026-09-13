@@ -21,6 +21,8 @@ void pcm_pipeline_init(pcm_pipeline_t *pipeline, uint8_t *backing0,
     pipeline->counters.samples_captured = 0;
     pipeline->counters.chunks_written = 0;
     pipeline->counters.buffer_overflow = 0;
+    pipeline->counters.buffer_drop_bytes = 0;
+    pipeline->counters.buffer_drop_samples = 0;
     pipeline->counters.dma_overrun_events = 0;
     pipeline->counters.dma_drop_bytes = 0;
     pipeline->counters.dma_drop_samples = 0;
@@ -45,13 +47,14 @@ size_t pcm_pipeline_produce(pcm_pipeline_t *pipeline, const uint8_t *data,
 
     while (offset < usable) {
         // Both slots full: nothing can be staged — drop the remainder and
-        // count it. This is the DMA overrun/drop signal (fail-loud, never
-        // silent overwrite).
+        // count it as SOFTWARE buffer loss only (fail-loud, never silent
+        // overwrite). Driver dma_* counters are reserved for on_recv_q_ovf
+        // evidence; never double count here.
         if (pipeline->full[0] && pipeline->full[1]) {
             size_t rest = usable - offset;
             pipeline->counters.buffer_overflow++;
-            pipeline->counters.dma_drop_bytes += (uint32_t)rest;
-            pipeline->counters.dma_drop_samples +=
+            pipeline->counters.buffer_drop_bytes += (uint32_t)rest;
+            pipeline->counters.buffer_drop_samples +=
                 (uint32_t)(rest / RECORDER_BYTES_PER_SAMPLE);
             return len - offset;
         }

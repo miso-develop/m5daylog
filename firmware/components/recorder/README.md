@@ -47,8 +47,9 @@ components/recorder/
 - Double buffer is fixed at `32KB × 2` (`RECORDER_BUFFER_BYTES ×
   RECORDER_BUFFER_SLOTS`). The producer (I2S read) never blocks the DMA
   path: when both slots are full the incoming bytes are **dropped and
-  counted** (`buffer_overflow`, `dma_drop_bytes`, `dma_drop_samples`),
-  never silently overwritten. Silent failure is forbidden (Spec #36).
+  counted as software loss** (`buffer_overflow`, `buffer_drop_bytes`,
+  `buffer_drop_samples`), never silently overwritten and never mixed into
+  driver `dma_*` counters. Silent failure is forbidden (Spec #36).
 - `.part` files carry a standard 44-byte RIFF/WAVE PCM header written at
   open with zeroed sizes, followed by the raw PCM payload. `wav_part_flush`
   / `wav_part_close` seek back and patch `ChunkSize` / `Subchunk2Size` from
@@ -68,14 +69,19 @@ components/recorder/
   M5Capsule v1.1 baseline in `recorder_config.h` (CLK 40 / DAT 41,
   overridable with `-D` flags). Unset pins (`< 0`) fail init with
   `ESP_ERR_INVALID_ARG`.
-- Overrun/drop semantics: proven DMA loss arrives ONLY from the ESP-IDF
-  I2S RX queue-overflow callback (`i2s_event_data_t.size` per event).
-  Every callback is preserved and accumulated exactly (event count, bytes,
-  whole samples) via ISR-safe state drained by the capture task — never
-  collapsed into a single flag, never inferred from a short read. Read
-  timeouts count as stalls (`dma_read_stalls`), transport evidence only.
-  Both appear in the periodic `running` diagnostics alongside
-  capture/write/overflow/SD counters and worst SD latency.
+- Overrun/drop semantics: proven driver DMA loss arrives ONLY from the
+  ESP-IDF I2S RX queue-overflow callback (`i2s_event_data_t.size` per
+  event, `i2s_channel_register_event_callback(handle, &cbs, NULL)`,
+  `IRAM_ATTR`, ISR-safe armed flag + counters under one spinlock,
+  deterministically reset on init). Every callback is preserved and
+  accumulated exactly (`dma_overrun_events`, `dma_drop_bytes`,
+  `dma_drop_samples`) via a drain that runs on EVERY read — including
+  timeouts, zero-byte reads, STOP, and fatal reads — plus a final drain
+  before deinit; never collapsed into a single flag, never inferred from
+  a short read. Read timeouts count as stalls (`dma_read_stalls`),
+  transport evidence only. Diagnostics report `dma_*` separately from
+  software `buffer_*` alongside `buffer_overflow`, `sd_err`, and worst SD
+  latency.
 - PDM slot: the M5Capsule microphone is the RIGHT slot
   (`I2S_PDM_SLOT_RIGHT`; M5Unified `input_only_right`), never the
   mono-default LEFT. Output stays 16kHz / signed 16bit / mono PCM.
@@ -85,10 +91,13 @@ components/recorder/
 ## Data flow (`main.c`: capture task + writer task, event-group lifecycle)
 
 ```text
-recorder_capture_task (prio 5): wait WRITER_READY handshake → PDM mic →
-    I2S DMA → pdm_capture_read → re-check STOP (never enqueue past a dead
-    sink) → [lock] stall note + drain driver overflow snapshot (exact
-    events/bytes) + pcm_pipeline_produce (slot A/B) → set SLOT_FULL
+recorder_capture_task (prio 5): wait WRITER_READY handshake → re-check STOP
+    (never start mic on STOP) → PDM mic → I2S DMA → pdm_capture_read →
+    always drain driver overflow snapshot (exact events/bytes, even on
+    timeout/zero/STOP/fatal) → re-check STOP (never enqueue past a dead
+    sink) → [lock] stall note + driver-overflow note +
+    pcm_pipeline_produce (slot A/B) → set SLOT_FULL → final drain before
+    deinit
 recorder_writer_task (prio 4): mount + dirs + sink open → set WRITER_READY
     → on SLOT_FULL: [lock] peek full slot → [unlock] → sd_pcm_sink_write_chunk
     (slow, lock released: capture fills the other slot meanwhile) →
@@ -129,9 +138,9 @@ rename/recovery/retention logic in this component).
 
 ## Device evidence (recorded in the Task #44 PR, never in-repo)
 
-- 1-hour run counters: `samples_captured`, `dma_drop_* = 0` with
-  `dma_overrun_events = 0`, `buffer_overflow = 0`, `sd_write_errors = 0`,
-  max SD latency.
+- 1-hour run counters: `samples_captured`, driver `dma_drop_* = 0` with
+  `dma_overrun_events = 0`, software `buffer_overflow = 0` with
+  `buffer_drop_* = 0`, `sd_write_errors = 0`, max SD latency.
 - Generated `.wav.part` (+ flushed header) opened with a standard decoder.
 - `idf.py build` / flash / boot log tails, ESP-IDF pin `v5.5.5`.
 - Observed boot/capture log lines; any `-D` pin overrides used for the run

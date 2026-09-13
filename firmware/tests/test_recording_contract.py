@@ -151,6 +151,11 @@ def test_writer_ready_handshake():
     assert "REC_BIT_WRITER_READY" in main
     assert "REC_BIT_STOP" in main
     assert "handshake" in main.lower()
+    # STOP is sticky: after the READY/STOP wait the capture task must
+    # re-check STOP before pdm_capture_init, so a late STOP never starts
+    # the mic even when READY is also set.
+    assert "(bits & REC_BIT_STOP) != 0" in main
+    assert main.index("(bits & REC_BIT_STOP)") < main.index("pdm_capture_init")
 
 
 def test_safe_stop_lifecycle():
@@ -174,6 +179,13 @@ def test_dma_overrun_accounting_wired():
     assert "pdm_overflow_snapshot_t" in main
     assert "dma_overrun_events" in main
     assert "overrun: %" in main
+    # Overflow is drained on EVERY read plus a final teardown drain, never
+    # gated on got > 0, so timeout/zero/STOP/fatal reads cannot lose it.
+    assert "Final drain" in main or "final drain" in main.lower()
+    assert main.count("pdm_capture_drain_overflow") >= 2
+    assert "if (got > 0)" in main  # produce still gated, drain is not
+    drain_section = main[main.index("pdm_capture_drain_overflow") :]
+    assert "got > 0" not in drain_section[:600] or "Always preserve" in main
     # No inferred evidence: no single-bool overrun, no gap fabrication.
     assert "out_overrun" not in main
     assert "note_dma_gap" not in main
@@ -182,14 +194,51 @@ def test_dma_overrun_accounting_wired():
 def test_driver_overflow_wiring():
     src = (COMP / "i2s_pdm_capture.c").read_text(encoding="utf-8")
     hdr = (COMP / "include/i2s_pdm_capture.h").read_text(encoding="utf-8")
+    # ESP-IDF v5.5.5 three-argument registration shape.
     assert "i2s_channel_register_event_callback" in src
+    assert "i2s_channel_register_event_callback(handle->rx_chan, &cbs, NULL)" in src
     assert "on_recv_q_ovf" in src
     assert "i2s_event_data_t" in src
     assert "portENTER_CRITICAL_ISR" in src
+    assert "IRAM_ATTR" in src
+    assert "esp_attr.h" in src
     assert "pdm_capture_drain_overflow" in src
     assert "pdm_overflow_snapshot_t" in hdr
+    assert "stdint.h" in hdr
     # No single-bool overrun plumbing remains anywhere.
     assert "out_overrun" not in src and "out_overrun" not in hdr
+
+
+def test_overflow_state_synchronized():
+    src = (COMP / "i2s_pdm_capture.c").read_text(encoding="utf-8")
+    # Armed flag shares the spinlock discipline: checked inside ISR
+    # critical, reset/armed/disarmed inside task critical sections.
+    assert "s_ovf_armed" in src
+    assert "portENTER_CRITICAL_ISR" in src
+    assert "portENTER_CRITICAL(&s_ovf_mux)" in src
+    assert src.count("portENTER_CRITICAL") >= 4  # reset+arm+disarm+drain
+    assert "Deterministic reset" in src or "deterministic" in src.lower()
+
+
+def test_separate_driver_software_counters():
+    main = MAIN.read_text(encoding="utf-8")
+    hdr = (COMP / "include/pcm_pipeline.h").read_text(encoding="utf-8")
+    for symbol in (
+        "buffer_overflow",
+        "buffer_drop_bytes",
+        "buffer_drop_samples",
+        "dma_overrun_events",
+        "dma_drop_bytes",
+        "dma_drop_samples",
+    ):
+        assert symbol in hdr, symbol
+    # Diagnostics report both families separately while preserving
+    # overflow and sd_err.
+    assert "dma_drop:" in main
+    assert "buf_drop:" in main
+    assert "dma_bytes:" in main
+    assert "buf_bytes:" in main
+    assert "sd_err" in main
 
 
 def test_capsule_right_slot():

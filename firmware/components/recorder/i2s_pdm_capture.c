@@ -14,6 +14,7 @@
 #ifdef ESP_PLATFORM
 
 #include "driver/i2s_pdm.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -28,28 +29,29 @@ struct pdm_capture_handle {
 // Single-instance RX queue-overflow evidence. Task #44 owns exactly one
 // PDM capture channel, so file-static ISR state is explicit and safe: the
 // ISR appends under the spinlock, task context drains (copy + clear) under
-// the same spinlock. Armed by init before enable, disarmed by deinit after
-// the channel is deleted (no callback can fire afterwards).
+// the same spinlock. ALL shared state (armed flag + counters) uses the same
+// spinlock discipline: the ISR checks-and-updates inside
+// portENTER_CRITICAL_ISR, task context resets/arms/disarms inside
+// portENTER_CRITICAL. State is reset deterministically on every init;
+// armed by init before enable, disarmed by deinit after the channel is
+// deleted (no callback can fire afterwards).
 static portMUX_TYPE s_ovf_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_ovf_events = 0;
 static uint32_t s_ovf_drop_bytes = 0;
 static bool s_ovf_armed = false;
 
-static bool recorder_rx_q_ovf_cb(i2s_chan_handle_t chan,
-                                 i2s_event_data_t *event, void *user_ctx) {
-    uint32_t size = 0;
-
+static bool IRAM_ATTR recorder_rx_q_ovf_cb(i2s_chan_handle_t chan,
+                                           i2s_event_data_t *event,
+                                           void *user_ctx) {
+    uint32_t size;
     (void)chan;
     (void)user_ctx;
-    if (event != NULL) {
-        size = (uint32_t)event->size;
-    }
-    if (!s_ovf_armed) {
-        return false;
-    }
+    size = (event != NULL) ? (uint32_t)event->size : 0;
     portENTER_CRITICAL_ISR(&s_ovf_mux);
-    s_ovf_events++;
-    s_ovf_drop_bytes += size;
+    if (s_ovf_armed) {
+        s_ovf_events++;
+        s_ovf_drop_bytes += size;
+    }
     portEXIT_CRITICAL_ISR(&s_ovf_mux);
     return false;
 }
@@ -74,6 +76,14 @@ esp_err_t pdm_capture_init(const pdm_capture_config_t *config,
                  "(board bring-up must provide verified clk/data pins)");
         return ESP_ERR_INVALID_ARG;
     }
+
+    // Deterministic reset of ALL ISR-shared overflow state under the same
+    // spinlock discipline used by the ISR and drain paths.
+    portENTER_CRITICAL(&s_ovf_mux);
+    s_ovf_events = 0;
+    s_ovf_drop_bytes = 0;
+    s_ovf_armed = false;
+    portEXIT_CRITICAL(&s_ovf_mux);
 
     handle = (struct pdm_capture_handle *)calloc(1, sizeof(*handle));
     if (handle == NULL) {
@@ -126,21 +136,27 @@ esp_err_t pdm_capture_init(const pdm_capture_config_t *config,
 
     // Register the RX queue-overflow callback BEFORE enabling: it is the
     // only proven-DMA-loss evidence (i2s_event_data_t.size per event).
+    // ESP-IDF v5.5.5 requires the explicit (handle, callbacks, user_data)
+    // shape.
     memset(&cbs, 0, sizeof(cbs));
     cbs.on_recv_q_ovf = recorder_rx_q_ovf_cb;
-    err = i2s_channel_register_event_callback(handle->rx_chan, &cbs);
+    err = i2s_channel_register_event_callback(handle->rx_chan, &cbs, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: pdm events");
         i2s_del_channel(handle->rx_chan);
         free(handle);
         return err;
     }
+    portENTER_CRITICAL(&s_ovf_mux);
     s_ovf_armed = true;
+    portEXIT_CRITICAL(&s_ovf_mux);
 
     err = i2s_channel_enable(handle->rx_chan);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: pdm enable");
+        portENTER_CRITICAL(&s_ovf_mux);
         s_ovf_armed = false;
+        portEXIT_CRITICAL(&s_ovf_mux);
         i2s_del_channel(handle->rx_chan);
         free(handle);
         return err;
@@ -193,7 +209,9 @@ void pdm_capture_deinit(pdm_capture_t handle) {
     }
     i2s_channel_disable(handle->rx_chan);
     i2s_del_channel(handle->rx_chan);
+    portENTER_CRITICAL(&s_ovf_mux);
     s_ovf_armed = false;
+    portEXIT_CRITICAL(&s_ovf_mux);
     free(handle);
 }
 
