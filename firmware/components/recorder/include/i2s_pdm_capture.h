@@ -86,10 +86,15 @@ void pdm_capture_drain_overflow(pdm_capture_t handle,
 esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
                                            pdm_overflow_snapshot_t *out);
 
-// Disable (if still running) + release the channel. Safe with NULL
-// (no-op). Prefer pdm_capture_stop_and_drain_final() before this call so
-// the final overflow evidence is preserved without a teardown race.
-void pdm_capture_deinit(pdm_capture_t handle);
+// Disable (if still running) + delete the channel + disarm overflow
+// accounting + free the handle. Fail-closed: a failed i2s_channel_disable()
+// or i2s_del_channel() preserves the handle, channel, enabled flag, and
+// overflow accounting and returns the error — it never marks disabled,
+// deletes, disarms, or frees after a failure. NULL is a no-op success.
+// Prefer pdm_capture_stop_and_drain_final() before this call so the final
+// overflow evidence is preserved without a teardown race; the caller must
+// check this result fail-loud and must not claim cleanup on error.
+esp_err_t pdm_capture_deinit(pdm_capture_t handle);
 
 #ifdef __cplusplus
 }

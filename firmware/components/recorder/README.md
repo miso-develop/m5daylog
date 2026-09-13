@@ -103,7 +103,8 @@ recorder_capture_task (prio 5): wait WRITER_READY handshake → re-check STOP
     sink) → [lock] exact stall note (timeout/short && !overflow) +
     driver-overflow note + pcm_pipeline_produce (slot A/B) → set SLOT_FULL
     → quiescent stop-and-final-drain
-    (pdm_capture_stop_and_drain_final) → deinit
+    (pdm_capture_stop_and_drain_final; failed disable stays retryable)
+    → fail-closed deinit (checked fail-loud, never destroys after failure)
 recorder_writer_task (prio 4): mount + dirs + sink open → set WRITER_READY
     → on SLOT_FULL: [lock] peek full slot → [unlock] → sd_pcm_sink_write_chunk
     (slow, lock released: capture fills the other slot meanwhile) →

@@ -238,6 +238,36 @@ def test_disable_failure_never_quiescent():
     assert "else if" in main or "else" in main
 
 
+def test_deinit_checks_disable_before_destroy():
+    src = (COMP / "i2s_pdm_capture.c").read_text(encoding="utf-8")
+    hdr = (COMP / "include/i2s_pdm_capture.h").read_text(encoding="utf-8")
+    main = MAIN.read_text(encoding="utf-8")
+    # Deinit is observable: returns esp_err_t so teardown can fail-loud.
+    assert "esp_err_t pdm_capture_deinit" in hdr
+    assert "esp_err_t pdm_capture_deinit" in src
+    fn = src[src.index("esp_err_t pdm_capture_deinit") :]
+    fn = fn[: fn.index("\n}\n") + 3]
+    # Failed disable preserves everything: enabled stays true and the
+    # channel is never deleted, disarmed, or freed on that path.
+    assert "i2s_channel_disable" in fn
+    assert "if (err != ESP_OK)" in fn
+    assert "return err" in fn
+    assert "handle->enabled = false" in fn
+    assert "i2s_del_channel" in fn
+    assert "s_ovf_armed = false" in fn
+    assert "free(handle)" in fn
+    assert fn.index("i2s_channel_disable") < fn.index("if (err != ESP_OK)")
+    assert fn.index("if (err != ESP_OK)") < fn.index(
+        "handle->enabled = false"
+    )
+    assert fn.index("handle->enabled = false") < fn.index("i2s_del_channel")
+    assert fn.index("i2s_del_channel") < fn.index("s_ovf_armed = false")
+    assert fn.index("s_ovf_armed = false") < fn.index("free(handle)")
+    # Caller surfaces deinit failure fail-loud instead of claiming success.
+    assert "pdm_capture_deinit(capture) != ESP_OK" in main
+    assert "reason: pdm deinit" in main
+
+
 def test_exact_stall_semantics():
     main = MAIN.read_text(encoding="utf-8")
     # Stall = timeout OR ESP_OK short read, only when the same read has no

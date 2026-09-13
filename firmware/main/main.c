@@ -234,7 +234,13 @@ static void recorder_capture_task(void *arg) {
             xSemaphoreGive(s_rec_lock);
         }
     }
-    pdm_capture_deinit(capture);
+    // Fail-closed deinit: on error the handle/channel/accounting are
+    // preserved inside pdm_capture_deinit (not deleted/freed/disarmed),
+    // so surface fail-loud and do not claim cleanup succeeded.
+    if (pdm_capture_deinit(capture) != ESP_OK) {
+        ESP_LOGE(TAG, "stage: record, result: error, reason: pdm deinit");
+    }
+    capture = NULL;
     recorder_request_stop();
     vTaskDelete(NULL);
 }

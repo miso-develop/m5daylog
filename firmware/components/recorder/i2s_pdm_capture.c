@@ -228,19 +228,31 @@ esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
     return ESP_OK;
 }
 
-void pdm_capture_deinit(pdm_capture_t handle) {
+esp_err_t pdm_capture_deinit(pdm_capture_t handle) {
+    esp_err_t err;
+
     if (handle == NULL) {
-        return;
+        return ESP_OK;
     }
+    // Fail-closed: never mark disabled, delete, disarm, or free after a
+    // failed disable. A failed delete likewise preserves the handle and
+    // accounting so the caller can retry/surface fail-loud.
     if (handle->enabled) {
-        i2s_channel_disable(handle->rx_chan);
+        err = i2s_channel_disable(handle->rx_chan);
+        if (err != ESP_OK) {
+            return err;
+        }
         handle->enabled = false;
     }
-    i2s_del_channel(handle->rx_chan);
+    err = i2s_del_channel(handle->rx_chan);
+    if (err != ESP_OK) {
+        return err;
+    }
     portENTER_CRITICAL(&s_ovf_mux);
     s_ovf_armed = false;
     portEXIT_CRITICAL(&s_ovf_mux);
     free(handle);
+    return ESP_OK;
 }
 
 #else  // !ESP_PLATFORM — host/test build: linkable stubs, never recording.
@@ -280,8 +292,9 @@ esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
     return ESP_ERR_NOT_SUPPORTED;
 }
 
-void pdm_capture_deinit(pdm_capture_t handle) {
+esp_err_t pdm_capture_deinit(pdm_capture_t handle) {
     (void)handle;
+    return ESP_OK;
 }
 
 #endif  // ESP_PLATFORM
