@@ -207,16 +207,28 @@ static void recorder_capture_task(void *arg) {
     // Quiescent teardown: disable the RX channel first so no further
     // on_recv_q_ovf callback can fire after the final drain, then account
     // the final snapshot, then delete the channel. This closes the
-    // drain-while-running race (drain -> disable inside deinit).
+    // drain-while-running race (drain -> disable inside deinit). A failed
+    // disable is fail-loud: the zeroed snapshot is NOT a quiescent final
+    // drain, RX remains active (retryable), and only interim evidence
+    // drained below is accounted before deinit retries disable.
     {
         pdm_overflow_snapshot_t snap = { 0, 0 };
         esp_err_t stop_err =
             pdm_capture_stop_and_drain_final(capture, &snap);
         if (stop_err != ESP_OK) {
-            ESP_LOGW(TAG, "stage: record, result: error, reason: i2s stop");
-        }
-        if ((snap.events != 0 || snap.drop_bytes != 0) &&
-            xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
+            pdm_overflow_snapshot_t interim = { 0, 0 };
+            ESP_LOGE(TAG, "stage: record, result: error, reason: i2s stop");
+            // Interim (non-final) drain while RX remains active: preserve
+            // what has arrived so far without claiming quiescence.
+            pdm_capture_drain_overflow(capture, &interim);
+            if ((interim.events != 0 || interim.drop_bytes != 0) &&
+                xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
+                pcm_pipeline_note_driver_overflow(
+                    &s_pipeline, interim.events, interim.drop_bytes);
+                xSemaphoreGive(s_rec_lock);
+            }
+        } else if ((snap.events != 0 || snap.drop_bytes != 0) &&
+                   xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
             pcm_pipeline_note_driver_overflow(
                 &s_pipeline, snap.events, snap.drop_bytes);
             xSemaphoreGive(s_rec_lock);

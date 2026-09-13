@@ -214,11 +214,18 @@ esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
     }
     // Quiescent boundary first: stop the RX channel so no further
     // on_recv_q_ovf callback can fire, then drain what fired before
-    // disable completed. Nothing is discarded.
+    // disable completed. A failed disable is NEVER treated as quiescent:
+    // enabled stays true, nothing is drained as final, and the caller must
+    // treat the failure as fail-loud/retryable (see main.c teardown).
     err = i2s_channel_disable(handle->rx_chan);
+    if (err != ESP_OK) {
+        out->events = 0;
+        out->drop_bytes = 0;
+        return err;
+    }
     handle->enabled = false;
     pdm_capture_drain_overflow(handle, out);
-    return err;
+    return ESP_OK;
 }
 
 void pdm_capture_deinit(pdm_capture_t handle) {

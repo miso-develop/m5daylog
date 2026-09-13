@@ -78,7 +78,9 @@ components/recorder/
   `dma_drop_samples`) via a drain that runs on EVERY read — including
   timeouts, zero-byte reads, STOP, and fatal reads — plus a quiescent
   stop-then-final-drain (`pdm_capture_stop_and_drain_final` disables the
-  RX channel before the final drain so no callback can fire afterwards);
+  RX channel before the final drain so no callback can fire afterwards;
+  a failed disable keeps `enabled`, zeroes the snapshot, and stays
+  fail-loud/retryable instead of claiming quiescence);
   never collapsed into a single flag, never inferred from a short read.
   A stall (`dma_read_stalls`) is a timeout OR ESP_OK short read with NO
   driver overflow on that same read (!snap_pending); overflow and stall

@@ -213,6 +213,31 @@ def test_quiescent_teardown_ordering():
     )
 
 
+def test_disable_failure_never_quiescent():
+    src = (COMP / "i2s_pdm_capture.c").read_text(encoding="utf-8")
+    main = MAIN.read_text(encoding="utf-8")
+    fn = src[src.index("pdm_capture_stop_and_drain_final") :]
+    fn = fn[: fn.index("\n}\n") + 3]
+    # Failed disable returns early: enabled stays true and no final drain
+    # is claimed as quiescent.
+    assert "if (err != ESP_OK)" in fn
+    assert "return err" in fn
+    assert "handle->enabled = false" in fn
+    assert fn.index("if (err != ESP_OK)") < fn.index(
+        "handle->enabled = false"
+    )
+    assert fn.index("if (err != ESP_OK)") < fn.index(
+        "pdm_capture_drain_overflow"
+    )
+    # Teardown surfaces disable failure fail-loud, preserves interim
+    # evidence while RX remains active, and only accounts the final
+    # snapshot on success.
+    assert "reason: i2s stop" in main
+    assert "result: error" in main
+    assert "interim" in main.lower()
+    assert "else if" in main or "else" in main
+
+
 def test_exact_stall_semantics():
     main = MAIN.read_text(encoding="utf-8")
     # Stall = timeout OR ESP_OK short read, only when the same read has no

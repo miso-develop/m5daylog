@@ -77,8 +77,11 @@ void pdm_capture_drain_overflow(pdm_capture_t handle,
 // Quiescent teardown boundary: stop/disable the RX channel first so no
 // further on_recv_q_ovf callback can fire, then drain the final overflow
 // snapshot. Must be called before pdm_capture_deinit(); deinit deletes the
-// channel without re-disabling when already stopped. Returns the disable
-// result (ESP_OK on success); `out` is always drained when non-NULL.
+// channel without re-disabling when already stopped. On disable success
+// returns ESP_OK with the final snapshot in `out`. On disable failure
+// returns the error with `out` zeroed, `enabled` left true, and ISR state
+// left intact: the failure is fail-loud and retryable, and the caller must
+// NOT treat the zeroed snapshot as a quiescent final drain.
 // ESP_ERR_NOT_SUPPORTED on non-ESP host builds.
 esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
                                            pdm_overflow_snapshot_t *out);
