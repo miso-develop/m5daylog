@@ -6,6 +6,7 @@ it against drift via source-presence assertions.
 """
 
 import struct
+import tempfile
 import wave
 from pathlib import Path
 
@@ -61,21 +62,24 @@ def test_header_vectors():
     assert struct.unpack("<I", build_header(one_hour)[40:44])[0] == one_hour
 
 
-def test_part_file_decodeable_with_stdlib_wave(tmp_path):
+def test_part_file_decodeable_with_stdlib_wave():
     # Synthetic 16-bit ramp: 1.024 s == one full 32KB pipeline slot.
+    # Stdlib only: tempfile + pathlib temporary directory (no pytest
+    # fixtures) so every host runner executes this test.
     samples = 16384
     payload = b"".join(
         struct.pack("<h", (i % 512) - 256) for i in range(samples)
     )
     assert len(payload) == 32768
-    part = tmp_path / "000000_synth.wav.part"
-    part.write_bytes(build_header(len(payload)) + payload)
-    with wave.open(str(part), "rb") as w:
-        assert w.getnchannels() == 1
-        assert w.getsampwidth() == 2
-        assert w.getframerate() == 16000
-        assert w.getnframes() == samples
-        assert len(w.readframes(samples)) == len(payload)
+    with tempfile.TemporaryDirectory() as tmp:
+        part = Path(tmp) / "000000_synth.wav.part"
+        part.write_bytes(build_header(len(payload)) + payload)
+        with wave.open(str(part), "rb") as w:
+            assert w.getnchannels() == 1
+            assert w.getsampwidth() == 2
+            assert w.getframerate() == 16000
+            assert w.getnframes() == samples
+            assert len(w.readframes(samples)) == len(payload)
 
 
 def test_sample_boundary_truncation_rule():

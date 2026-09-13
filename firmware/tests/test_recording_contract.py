@@ -263,8 +263,12 @@ def test_deinit_checks_disable_before_destroy():
     assert fn.index("handle->enabled = false") < fn.index("i2s_del_channel")
     assert fn.index("i2s_del_channel") < fn.index("s_ovf_armed = false")
     assert fn.index("s_ovf_armed = false") < fn.index("free(handle)")
-    # Caller surfaces deinit failure fail-loud instead of claiming success.
-    assert "pdm_capture_deinit(capture) != ESP_OK" in main
+    # Caller checks the stored deinit result fail-loud (owner-task retry
+    # loop) instead of claiming success: result in deinit_err, retried
+    # while failing, ownership released only after success.
+    assert "deinit_err" in main
+    assert "pdm_capture_deinit(capture)" in main
+    assert "while (deinit_err != ESP_OK)" in main
     assert "reason: pdm deinit" in main
 
 
