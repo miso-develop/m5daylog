@@ -117,3 +117,24 @@ def test_wav_open_cleanup_closes_file():
     # the FILE and clear state (open x2), plus wav_part_close (x1): no path
     # leaks an open file on failure.
     assert src.count("fclose(part->fp)") >= 3
+
+
+def test_checkpoint_durable_sync_fail_loud():
+    from pathlib import Path as _Path  # local import keeps deps explicit
+
+    repo = _Path(__file__).resolve().parents[2]
+    src = WAV_C.read_text(encoding="utf-8")
+    # ESP-IDF checkpoint path syncs in addition to fflush: durable media
+    # sync via fileno/fsync (FatFs f_sync path), not fflush alone.
+    assert "fflush" in src
+    assert "fsync" in src
+    assert "fileno" in src
+    # Sync failure propagates fail-loud (false) from both the checkpoint
+    # rewrite and the initial placeholder header paths.
+    assert src.count("return false") >= 5
+    # Bounded explicit checkpoints only: never the per-write immediate
+    # fsync shortcut (SD latency risk).
+    defaults = (repo / "firmware/sdkconfig.defaults").read_text(
+        encoding="utf-8"
+    )
+    assert "CONFIG_FATFS_IMMEDIATE_FSYNC" not in defaults

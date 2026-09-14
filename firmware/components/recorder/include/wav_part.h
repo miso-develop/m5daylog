@@ -55,8 +55,10 @@ bool wav_part_open(wav_part_t *part, const char *path,
 bool wav_part_write(wav_part_t *part, const uint8_t *pcm, size_t len);
 
 // Patch ChunkSize/Subchunk2Size in place from the payload counter and
-// flush to storage, WITHOUT closing: keeps the `.part` decodeable
-// mid-recording. Returns false when not open or on I/O failure.
+// flush to durable storage, WITHOUT closing: keeps the `.part` decodeable
+// mid-recording. On ESP-IDF the flush is followed by fsync(fileno()) so
+// the FatFs f_sync path reaches the media; any fflush/sync failure
+// returns false (fail-loud) without changing the `.wav.part` format.
 bool wav_part_flush(wav_part_t *part);
 
 // Patch sizes and close. Safe to call on a non-open handle (no-op true).

@@ -1,8 +1,19 @@
 // Portable RIFF/WAVE `.wav.part` framing — Task #44. Stdio only.
+//
+// Durability note (Human Gate zero-byte fix): stdio fflush() alone leaves
+// checkpoint bytes in FatFs/VFS caches; on ESP-IDF every explicit
+// checkpoint (flush/close) and the initial placeholder header additionally
+// issue fsync(fileno()) so the FatFs f_sync path reaches the media.
+// Sync failure is fail-loud (false) so the recorder path counts sd_err,
+// requests STOP, and never reports a successful checkpoint.
 
 #include "wav_part.h"
 
 #include <string.h>
+
+#ifdef ESP_PLATFORM
+#include <unistd.h>
+#endif
 
 static void put_u16le(uint8_t *dst, uint16_t value) {
     dst[0] = (uint8_t)(value & 0xFFu);
@@ -50,6 +61,29 @@ void wav_part_build_header(uint8_t header[RECORDER_WAV_HEADER_SIZE],
     put_u32le(header + 40, pcm_bytes);
 }
 
+static bool wav_part_sync_media(FILE *fp) {
+    if (fp == NULL) {
+        return false;
+    }
+    if (fflush(fp) != 0) {
+        return false;
+    }
+#ifdef ESP_PLATFORM
+    // Durable checkpoint: push VFS/FatFs caches to the media via the
+    // FatFs f_sync path. fileno/fsync failure is fail-loud.
+    {
+        int fd = fileno(fp);
+        if (fd < 0) {
+            return false;
+        }
+        if (fsync(fd) != 0) {
+            return false;
+        }
+    }
+#endif
+    return true;
+}
+
 static bool wav_part_rewrite_header(wav_part_t *part) {
     uint8_t header[RECORDER_WAV_HEADER_SIZE];
     long tail;
@@ -62,7 +96,7 @@ static bool wav_part_rewrite_header(wav_part_t *part) {
     if (fwrite(header, 1, sizeof(header), part->fp) != sizeof(header)) {
         return false;
     }
-    if (fflush(part->fp) != 0) {
+    if (!wav_part_sync_media(part->fp)) {
         return false;
     }
     // Return to the append position so the next write continues the payload.
@@ -105,9 +139,9 @@ bool wav_part_open(wav_part_t *part, const char *path,
         part->pcm_bytes = 0;
         return false;
     }
-    if (fflush(part->fp) != 0) {
-        // A placeholder header that never reached storage must not leave
-        // an open FILE behind: close, clear state, fail-loud.
+    if (!wav_part_sync_media(part->fp)) {
+        // A placeholder header that never reached durable storage must not
+        // leave an open FILE behind: close, clear state, fail-loud.
         fclose(part->fp);
         part->fp = NULL;
         part->open = false;
