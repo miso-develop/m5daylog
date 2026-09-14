@@ -346,8 +346,19 @@ def test_writer_stack_budget_and_high_water():
     assert "uxTaskGetStackHighWaterMark" in main
     assert "writer_hw:" in main
     assert "recorder_log_writer_stack_hw" in main
-    # Definition + mount-failure/rotate-path/mkdir/part-open/final exits.
-    assert main.count("recorder_log_writer_stack_hw(") >= 6
+    # Definition + mount-failure/rotate-path/mkdir/part-open/final exits
+    # + successful-rotation evidence while recording continues.
+    assert main.count("recorder_log_writer_stack_hw(") >= 7
+    assert 'recorder_log_writer_stack_hw("rotation")' in main
+    # Rotation success emits high-water evidence after the next segment is
+    # open and recording continues: the finalize-ok rotate log and the new
+    # segment's capturing log both precede it in the rotation branch, so
+    # the 30-minute run shows writer stack margin without terminating the
+    # writer.
+    rot_ok = main.index('recorder_log_writer_stack_hw("rotation")')
+    window = main[max(0, rot_ok - 4000) : rot_ok]
+    assert "stage: rotate, result: ok" in window
+    assert "path_suffix: .wav.part" in window
     # Rotation/finalize semantics untouched by the stack refactor.
     assert "wav_rotation_finalize_once" in main
     assert "no double close" in main.lower()

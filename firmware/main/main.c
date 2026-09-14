@@ -674,6 +674,12 @@ static void recorder_writer_task(void *arg) {
                 since_flush = 0;
                 ESP_LOGI(TAG,
                          "stage: record, result: capturing, path_suffix: .wav.part");
+                // High-water evidence for the worst-case writer call path
+                // (finalize + rename + date-dir mkdir + FATFS open above),
+                // emitted after the next segment is open and recording
+                // continues, so the 30-minute run shows stack margin
+                // without terminating the writer.
+                recorder_log_writer_stack_hw("rotation");
             }
         }
         if (recorder_stop_requested()) {

@@ -181,7 +181,8 @@ and later-task scope boundaries (no recovery/retention logic here).
   finalized `.wav` corruption 0, unintended gap <=100ms, midnight date-dir
   switch, and duplicate-stop idempotency (no double close/rename).
 - Writer stack high-water (`stage: record, result: stack, writer_hw: ...`)
-  from a normal run and from the boot-without-SD fail-loud path; no stack
+  from a normal run, from each successful rotation while recording
+  continues, and from the boot-without-SD fail-loud path; no stack
   overflow or reboot loop on SD mount failure.
 - `idf.py build` / flash / boot log tails, ESP-IDF pin `v5.5.5`.
 - Observed boot/capture log lines; any `-D` pin overrides used for the run
