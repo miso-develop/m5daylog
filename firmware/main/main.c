@@ -2,7 +2,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_chip_info.h"
 #include "esp_flash.h"
@@ -18,10 +20,12 @@
 #include "recorder_config.h"
 #include "sd_mount.h"
 #include "sd_pcm_sink.h"
+#include "wav_rotation.h"
 
 static const char *TAG = "m5daylog";
 
-// Task #44: SD mount -> PDM capture task + SD writer task -> `.wav.part`.
+// Tasks #44/#45: SD mount -> PDM capture + SD writer -> `.wav.part`
+// with Task #45 rotation/finalize to `.wav`.
 //
 // Bounded producer/consumer over the 32KB x 2 ping-pong pipeline:
 // - recorder_capture_task (priority 5) owns the PDM handle and DMA scratch.
@@ -32,17 +36,23 @@ static const char *TAG = "m5daylog";
 //   + byte sizes) on EVERY read — including timeouts, zero-byte reads,
 //   STOP, and fatal reads — plus a final drain before deinit; read timeouts
 //   count as stalls, never as fabricated drops.
-// - recorder_writer_task (priority 4) owns the `.wav.part` sink. It drains
-//   full slots; each slow SD write runs WITHOUT the pipeline lock so
-//   capture keeps filling the other slot — long SD writes are exactly what
-//   the second slot absorbs.
+// - recorder_writer_task (priority 4) owns the current segment sink. It
+//   drains full slots; each slow SD write runs WITHOUT the pipeline lock
+//   so capture keeps filling the other slot — long SD writes are exactly
+//   what the second slot absorbs. Task #45 rotation (30min / midnight)
+//   file ops (close + rename + new open) also run WITHOUT the pipeline
+//   lock and WITHOUT stopping capture, so the other slot absorbs the
+//   switch and the unintended rotation gap stays within <=100ms.
 // - Cross-task lifecycle uses ONE app-lifetime event group, never a
 //   published TaskHandle: REC_BIT_SLOT_FULL wakes the writer,
 //   REC_BIT_WRITER_READY is the startup handshake (capture never starts
 //   the mic until mount + directories + sink are ready, independent of
 //   task creation order or SMP scheduling), and sticky REC_BIT_STOP moves
-//   both tasks to ERROR teardown. No handle is ever signalled after its
-//   task is deleted, because no handle is published at all.
+//   both tasks to teardown. STOP covers every terminal finalize family:
+//   USB connection, low battery, and safe-stop request all funnel through
+//   the same idempotent finalize (no double close, no double rename).
+//   No handle is ever signalled after its task is deleted, because no
+//   handle is published at all.
 // - s_rec_lock guards the shared pipeline only. After a blocking I2S read
 //   returns, capture re-checks STOP before producing, so no audio is
 //   enqueued after the sink has failed or closed.
@@ -50,17 +60,21 @@ static const char *TAG = "m5daylog";
 // Board pins and SD bus come from recorder_config.h (M5Capsule v1.1
 // baseline: PDM CLK 40 / DAT 41, SD SPI CS 11 MOSI 12 CLK 14 MISO 39,
 // mount /sdcard). Build flags may override them; any bring-up failure
-// (events, lock, mount, mic init, `.part` open, I2S/SD I/O) enters ERROR,
-// never silent recording. Only live-recording directories are created;
-// rotation/finalize, recovery, and retention bookkeeping are later Tasks.
+// (events, lock, mount, mic init, `.part` open, I2S/SD I/O, rotation
+// path/dir/open) enters ERROR, never silent recording. Date
+// subdirectories (`recordings/YYYY-MM-DD/`) are Task #45 scope; later
+// recovery/retention bookkeeping remains out of scope.
 #ifndef RECORDER_PART_PATH
 #define RECORDER_PART_PATH \
     "/sdcard/M5DAYLOG/recordings/000000_pending.wav.part"
 #endif
 // NOTE: the default path above is a build-time fallback with the Spec #36
-// `HHMMSS_<recordingId>.wav.part` shape. Runtime naming (RTC timestamp +
-// recording id) is provided by later Tasks; this Task only guarantees the
-// `.wav.part` suffix and continuous append.
+// `HHMMSS_<recordingId>.wav.part` shape. Task #45 runtime naming builds
+// `recordings/YYYY-MM-DD/HHMMSS_<recordingId>.wav.part` from the wall
+// clock plus a per-boot segment counter (opaque recording-id placeholder;
+// full identity is a later Task). Midnight never mixes dates: the date
+// directory switches with the new file. Only the `.wav.part` suffix is
+// ever opened; PC syncs only the finalized `.wav`.
 
 // 32KB x 2 staging in DRAM. 64KB static is within ESP32-S3 SRAM; a later
 // Task may revisit placement (PSRAM) only via an explicit Spec update.
@@ -88,6 +102,73 @@ static void recorder_request_stop(void) {
 
 static bool recorder_stop_requested(void) {
     return (xEventGroupGetBits(s_rec_events) & REC_BIT_STOP) != 0;
+}
+
+// Task #45 terminal-stop entry points. USB ownership (later Task),
+// low-battery monitor (later Task), and safe-stop requests all share one
+// sticky STOP plus one idempotent finalize: simultaneous USB +
+// low-battery + stop duplicates cause a single close and a single rename
+// (no double close, no double rename). Detection itself stays in later
+// Tasks; these wrappers are the finalize contract they call.
+static void recorder_request_safe_stop(void) {
+    recorder_request_stop();
+}
+
+static void recorder_request_usb_stop(void) {
+    recorder_request_stop();
+}
+
+static void recorder_request_low_battery_stop(void) {
+    recorder_request_stop();
+}
+
+// Reference the terminal-stop wrappers so the finalize contract stays
+// wired for later USB/state tasks without unused-function warnings.
+// All three share the sticky STOP + idempotent finalize above.
+static void recorder_reference_stop_wrappers(void) {
+    (void)recorder_request_safe_stop;
+    (void)recorder_request_usb_stop;
+    (void)recorder_request_low_battery_stop;
+}
+
+// Wall-clock date/time for Task #45 segment naming. Fills
+// date_out "YYYY-MM-DD" and time_out "HHMMSS". Before the wall clock is
+// plausible (RTC not yet corrected via later USB correction), falls back
+// to a stable epoch file so recording never blocks on time: the later
+// correction changes the date and triggers a midnight rotation into the
+// correct date directory (dates are never mixed into one file).
+static void recorder_current_date_time(char date_out[RECORDER_DATE_STR_LEN],
+                                       char time_out[RECORDER_TIME_STR_LEN]) {
+    time_t now = time(NULL);
+    struct tm tm_now;
+    if (now < (time_t)1577836800L) {
+        snprintf(date_out, RECORDER_DATE_STR_LEN, "1970-01-01");
+        snprintf(time_out, RECORDER_TIME_STR_LEN, "000000");
+        return;
+    }
+    memset(&tm_now, 0, sizeof(tm_now));
+    localtime_r(&now, &tm_now);
+    snprintf(date_out, RECORDER_DATE_STR_LEN, "%04d-%02d-%02d",
+             tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday);
+    snprintf(time_out, RECORDER_TIME_STR_LEN, "%02d%02d%02d", tm_now.tm_hour,
+             tm_now.tm_min, tm_now.tm_sec);
+}
+
+static const char *recorder_rotate_reason_str(wav_rotate_reason_t reason) {
+    switch (reason) {
+        case WAV_ROTATE_TIME_30MIN:
+            return "time-30min";
+        case WAV_ROTATE_MIDNIGHT:
+            return "midnight";
+        case WAV_ROTATE_USB:
+            return "usb";
+        case WAV_ROTATE_LOW_BATTERY:
+            return "low-battery";
+        case WAV_ROTATE_STOP_REQUEST:
+            return "stop-request";
+        default:
+            return "none";
+    }
 }
 
 static void recorder_capture_task(void *arg) {
@@ -304,6 +385,20 @@ static void recorder_log_diagnostics(void) {
 static void recorder_writer_task(void *arg) {
     uint32_t since_flush = 0;
     bool running = true;
+    // Task #45 rotation segment tracking (writer-owned, no lock needed:
+    // only this task touches these locals). Capture keeps producing into
+    // the pipeline across a rotation; only terminal STOP tears capture
+    // down. seg_bytes counts payload bytes of the CURRENT segment for the
+    // 30-minute size trigger (equivalent to 1800s at 32000 B/s).
+    char seg_date[RECORDER_DATE_STR_LEN];
+    char seg_part[RECORDER_MAX_PATH_LEN];
+    char seg_wav[RECORDER_MAX_PATH_LEN];
+    char cur_time[RECORDER_TIME_STR_LEN];
+    char rec_id[16];
+    uint32_t seg_seq = 0;
+    uint32_t seg_bytes = 0;
+    TickType_t seg_start_tick = 0;
+    wav_rotation_state_t seg_state;
 
     (void)arg;
     if (sd_mount_recordings() != ESP_OK) {
@@ -312,13 +407,38 @@ static void recorder_writer_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
-    if (!sd_pcm_sink_open(&s_sink, RECORDER_PART_PATH)) {
+    // Initial segment: runtime date/time naming with the Spec #36
+    // `HHMMSS_<recordingId>.wav.part` shape inside the date directory.
+    // The recording-id field is a per-boot segment counter placeholder
+    // (opaque, no private content); full identity arrives in a later Task.
+    recorder_current_date_time(seg_date, cur_time);
+    snprintf(rec_id, sizeof(rec_id), "s%04u", (unsigned)(seg_seq & 0xFFFFu));
+    if (!wav_rotation_build_part_path(seg_part, sizeof(seg_part), seg_date,
+                                      cur_time, rec_id) ||
+        !wav_rotation_build_wav_path(seg_wav, sizeof(seg_wav), seg_date,
+                                     cur_time, rec_id)) {
+        ESP_LOGE(TAG, "stage: rotate, result: error, reason: rotate path");
+        sd_mount_unmount();
+        recorder_request_stop();
+        vTaskDelete(NULL);
+        return;
+    }
+    if (sd_mount_ensure_date_dir(seg_date) != ESP_OK) {
+        ESP_LOGE(TAG, "stage: rotate, result: error, reason: mkdir date");
+        sd_mount_unmount();
+        recorder_request_stop();
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!sd_pcm_sink_open(&s_sink, seg_part)) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: part open");
         sd_mount_unmount();
         recorder_request_stop();
         vTaskDelete(NULL);
         return;
     }
+    wav_rotation_state_init(&seg_state, seg_part, seg_wav);
+    seg_start_tick = xTaskGetTickCount();
     ESP_LOGI(TAG,
              "stage: record, result: capturing, path_suffix: .wav.part");
     // Handshake: only now may capture start the microphone.
@@ -326,7 +446,8 @@ static void recorder_writer_task(void *arg) {
 
     while (running) {
         // Wake on a new full slot; the 1s bound means a lost wakeup can
-        // never wedge the writer. STOP is sticky and checked separately so
+        // never wedge the writer and gives the 30min/midnight poll a
+        // bounded latency. STOP is sticky and checked separately so
         // it is never cleared by this wait.
         xEventGroupWaitBits(s_rec_events, REC_BIT_SLOT_FULL, pdTRUE,
                             pdFALSE, pdMS_TO_TICKS(1000));
@@ -361,12 +482,14 @@ static void recorder_writer_task(void *arg) {
                 pcm_pipeline_release_full(&s_pipeline);
                 xSemaphoreGive(s_rec_lock);
             }
+            seg_bytes += (uint32_t)full_len;
             since_flush++;
             if (since_flush >= RECORDER_FLUSH_EVERY_CHUNKS) {
                 since_flush = 0;
                 // Keep the `.wav.part` header patched so it stays
-                // decodeable. Recovery across power loss is Task #46; this
-                // only keeps the in-progress file self-describing.
+                // decodeable. Later power-loss handling rebuilds from the
+                // payload length; this only keeps the in-progress file
+                // self-describing.
                 if (!sd_pcm_sink_flush(&s_sink)) {
                     ESP_LOGE(TAG,
                              "stage: record, result: error, reason: part flush");
@@ -384,17 +507,122 @@ static void recorder_writer_task(void *arg) {
         }
         if (recorder_stop_requested()) {
             // Drain-then-exit: the inner loop above already drained every
-            // full slot observed before the stop flag.
+            // full slot observed before the stop flag. Terminal finalize
+            // below (USB / low battery / safe-stop) is idempotent.
+            running = false;
+            break;
+        }
+        // Task #45 periodic rotation poll (30min elapsed/size, midnight
+        // date change). Runs WITHOUT the pipeline lock and WITHOUT
+        // stopping capture: the other 32KB slot absorbs the file switch
+        // so the unintended gap stays <=100ms. A concurrent STOP wins:
+        // rotation is skipped and the terminal finalize path runs once.
+        {
+            char now_date[RECORDER_DATE_STR_LEN];
+            char now_time[RECORDER_TIME_STR_LEN];
+            char new_part[RECORDER_MAX_PATH_LEN];
+            char new_wav[RECORDER_MAX_PATH_LEN];
+            uint32_t elapsed_sec;
+            TickType_t now_tick;
+            bool date_changed = false;
+            wav_rotate_events_t ev = { false, false, false };
+            wav_rotate_reason_t reason = WAV_ROTATE_NONE;
+
+            recorder_current_date_time(now_date, now_time);
+            now_tick = xTaskGetTickCount();
+            elapsed_sec =
+                (uint32_t)((now_tick - seg_start_tick) / configTICK_RATE_HZ);
+            date_changed = (strcmp(now_date, seg_date) != 0);
+            reason = wav_rotation_should_rotate(elapsed_sec, seg_bytes,
+                                                date_changed, &ev);
+            if (reason == WAV_ROTATE_USB ||
+                reason == WAV_ROTATE_LOW_BATTERY ||
+                reason == WAV_ROTATE_STOP_REQUEST) {
+                // Should not happen here (STOP checked above); treat as
+                // terminal stop without opening a new file.
+                running = false;
+                break;
+            }
+            if (reason == WAV_ROTATE_TIME_30MIN ||
+                reason == WAV_ROTATE_MIDNIGHT) {
+                // Idempotent finalize of the old segment: header finalize
+                // (patch + media sync) then rename `.wav.part` -> `.wav`.
+                // First call does I/O; duplicates return cached result
+                // with no double close and no double rename.
+                if (!wav_rotation_finalize_once(&seg_state, &s_sink)) {
+                    ESP_LOGE(TAG,
+                             "stage: rotate, result: error, reason: finalize");
+                    if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) ==
+                        pdTRUE) {
+                        pcm_pipeline_note_sd_error(&s_pipeline);
+                        xSemaphoreGive(s_rec_lock);
+                    }
+                    running = false;
+                    recorder_request_stop();
+                    break;
+                }
+                ESP_LOGI(TAG, "stage: rotate, result: ok, reason: %s",
+                         recorder_rotate_reason_str(reason));
+                // Open the next segment in the (possibly new) date
+                // directory. Date directories never mix: midnight rotates
+                // into the new date dir with a fresh file.
+                seg_seq++;
+                snprintf(rec_id, sizeof(rec_id), "s%04u",
+                         (unsigned)(seg_seq & 0xFFFFu));
+                if (!wav_rotation_build_part_path(new_part, sizeof(new_part),
+                                                  now_date, now_time,
+                                                  rec_id) ||
+                    !wav_rotation_build_wav_path(new_wav, sizeof(new_wav),
+                                                 now_date, now_time,
+                                                 rec_id)) {
+                    ESP_LOGE(TAG,
+                             "stage: rotate, result: error, reason: rotate path");
+                    running = false;
+                    recorder_request_stop();
+                    break;
+                }
+                if (sd_mount_ensure_date_dir(now_date) != ESP_OK) {
+                    ESP_LOGE(TAG,
+                             "stage: rotate, result: error, reason: mkdir date");
+                    running = false;
+                    recorder_request_stop();
+                    break;
+                }
+                if (!sd_pcm_sink_open(&s_sink, new_part)) {
+                    ESP_LOGE(TAG,
+                             "stage: rotate, result: error, reason: part open");
+                    running = false;
+                    recorder_request_stop();
+                    break;
+                }
+                memcpy(seg_part, new_part, sizeof(seg_part));
+                memcpy(seg_wav, new_wav, sizeof(seg_wav));
+                memcpy(seg_date, now_date, sizeof(seg_date));
+                wav_rotation_state_init(&seg_state, seg_part, seg_wav);
+                seg_bytes = 0;
+                seg_start_tick = xTaskGetTickCount();
+                since_flush = 0;
+                ESP_LOGI(TAG,
+                         "stage: record, result: capturing, path_suffix: .wav.part");
+            }
+        }
+        if (recorder_stop_requested()) {
             running = false;
         }
     }
 
-    if (!sd_pcm_sink_close(&s_sink)) {
+    // Terminal finalize (USB connection / low battery / safe-stop request
+    // and any error teardown): header finalize then rename to `.wav`.
+    // Idempotent: simultaneous stop duplicates return the cached result
+    // with no double close and no double rename. PC syncs only `.wav`.
+    if (!wav_rotation_finalize_once(&seg_state, &s_sink)) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: part close");
         if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
             pcm_pipeline_note_sd_error(&s_pipeline);
             xSemaphoreGive(s_rec_lock);
         }
+    } else {
+        ESP_LOGI(TAG, "stage: finalize, result: ok");
     }
     sd_mount_unmount();
     ESP_LOGE(TAG, "stage: record, result: error, reason: stopped");
@@ -418,10 +646,12 @@ void app_main(void) {
     ESP_LOGI(TAG, "idf version: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "stage: scaffold, result: boot ok");
 
-    // Task #44 recording path. The event group is the only cross-task
+    // Tasks #44/#45 recording path. The event group is the only cross-task
     // channel (no published task handles); the writer-ready handshake makes
-    // creation order irrelevant. Rotation/finalize (#45), recovery (#46),
-    // manifest (#47), and state machine (#48) attach in later Tasks.
+    // creation order irrelevant. Task #45 rotation/finalize is wired into
+    // the writer task above; later recovery/retention/state tasks attach
+    // without changing the capture contract.
+    recorder_reference_stop_wrappers();
     pcm_pipeline_init(&s_pipeline, s_slot0, s_slot1);
     memset(&s_sink, 0, sizeof(s_sink));
     s_rec_events = xEventGroupCreate();
