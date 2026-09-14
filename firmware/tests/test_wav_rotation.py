@@ -16,6 +16,7 @@ source-presence assertions keeps the C implementation from drifting.
 Real files use only synthetic payloads in temporary directories.
 """
 
+import re
 import struct
 import tempfile
 import wave
@@ -33,6 +34,21 @@ MOUNT_C = COMP / "sd_mount.c"
 ROTATION_SEC = 1800
 ROTATION_BYTES = 32000 * 1800  # 57,600,000 at 16kHz/16bit/mono
 RECORDINGS = "/sdcard/M5DAYLOG/recordings"
+
+
+def _strip_c_comments(src):
+    # Remove /* block */ comments first, then // line comments, so prose
+    # mentioning a deletion call in a comment is not mistaken for real code.
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+    src = re.sub(r"//.*", "", src)
+    return src
+
+
+def _has_c_call(src, name):
+    return (
+        re.search(r"\b" + re.escape(name) + r"\s*\(", _strip_c_comments(src))
+        is not None
+    )
 
 
 # --- Python mirror of wav_rotation_should_rotate -------------------------
@@ -215,9 +231,12 @@ def test_c_source_implements_rotation_contract():
         "finalize_called",
     ):
         assert symbol in src or symbol in hdr, symbol
-    # Only rename, never deletion.
+    # Only rename, never deletion (comment prose does not count as code).
     assert "rename(" in src
-    assert "remove(" not in src
+    assert not _has_c_call(src, "remove")
+    assert not _has_c_call(src, "unlink")
+    assert not _has_c_call(hdr, "remove")
+    assert not _has_c_call(hdr, "unlink")
     # Priority + idempotency documented in code.
     assert "USB > LOW_BATTERY" in hdr or "usb" in hdr.lower()
     assert "no double close" in src.lower() or "no double rename" in src.lower()
@@ -229,7 +248,8 @@ def test_rotation_never_overwrites_or_deletes():
     src = ROT_C.read_text(encoding="utf-8")
     # Collision guard: both present fails instead of overwriting.
     assert "never overwrite" in src.lower() or "collision" in src.lower()
-    assert "remove(" not in src
+    assert not _has_c_call(src, "remove")
+    assert not _has_c_call(src, "unlink")
     # The wav path must derive from the part path (no redirection).
     assert "strcmp(expect, wav_path)" in src or "part_to_wav" in src
 
@@ -277,8 +297,9 @@ def test_mount_date_dir_wired():
     # Date validation fail-loud, never format away audio.
     assert "ESP_ERR_INVALID_ARG" in src or "ESP_ERR_INVALID_ARG" in hdr
     assert ".format_if_mount_failed = false" in src
-    assert "rename(" not in src
-    assert "remove(" not in src
+    assert not _has_c_call(src, "rename")
+    assert not _has_c_call(src, "remove")
+    assert not _has_c_call(src, "unlink")
 
 
 def test_no_deletion_or_scope_creep():
@@ -287,8 +308,8 @@ def test_no_deletion_or_scope_creep():
         for p in COMP.rglob("*")
         if p.is_file() and p.suffix in (".c", ".h")
     )
-    assert "remove(" not in blob
-    assert "unlink(" not in blob
+    assert not _has_c_call(blob, "remove")
+    assert not _has_c_call(blob, "unlink")
     for keyword in ("quarantine", "manifest", "device.json", "acks/"):
         assert keyword not in blob.lower(), keyword
 

@@ -6,6 +6,7 @@ mono contract, stays fail-loud (no silent recording state), finalizes
 power-loss recovery / retention responsibilities.
 """
 
+import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -19,6 +20,21 @@ def _sources():
         for p in COMP.rglob("*")
         if p.is_file() and p.suffix in (".c", ".h")
     }
+
+
+def _strip_c_comments(src):
+    # Remove /* block */ comments first, then // line comments, so prose
+    # mentioning `remove()` in a comment is not mistaken for a real call.
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+    src = re.sub(r"//.*", "", src)
+    return src
+
+
+def _has_c_call(src, name):
+    return (
+        re.search(r"\b" + re.escape(name) + r"\s*\(", _strip_c_comments(src))
+        is not None
+    )
 
 
 def test_format_contract_present():
@@ -37,14 +53,17 @@ def test_part_suffix_discipline():
     assert ".wav.part" in blob
     assert '#define RECORDER_PART_SUFFIX ".wav.part"' in blob
     # Task #45 finalizes to bare `.wav` via rename in the rotation module
-    # only; deletion is never allowed anywhere.
+    # only; deletion is never allowed anywhere (comment prose mentioning
+    # remove() does not count as a call).
     assert "rename(" in blob
-    assert "remove(" not in blob
+    assert not _has_c_call(blob, "remove")
+    assert not _has_c_call(blob, "unlink")
     assert '#define RECORDER_WAV_SUFFIX ".wav"' in blob
     # The rename lives in wav_rotation (finalize), never in mount/teardown.
     mount = (COMP / "sd_mount.c").read_text(encoding="utf-8")
-    assert "rename(" not in mount
-    assert "remove(" not in mount
+    assert not _has_c_call(mount, "rename")
+    assert not _has_c_call(mount, "remove")
+    assert not _has_c_call(mount, "unlink")
 
 
 def test_fail_loud_symbols():
@@ -128,9 +147,11 @@ def test_sd_mount_creates_only_recording_dirs():
     assert "YYYY-MM-DD" in hdr or "date_yyyy_mm_dd" in hdr
     for keyword in ("quarantine", "manifest", "device.json", "acks/"):
         assert keyword not in src.lower(), keyword
-    # Mount teardown never deletes or renames audio.
-    assert "rename(" not in src
-    assert "remove(" not in src
+    # Mount teardown never deletes or renames audio (comment prose
+    # mentioning remove() does not count as a call).
+    assert not _has_c_call(src, "rename")
+    assert not _has_c_call(src, "remove")
+    assert not _has_c_call(src, "unlink")
 
 
 def test_default_part_path_shape():

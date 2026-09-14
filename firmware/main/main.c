@@ -132,7 +132,10 @@ static void recorder_reference_stop_wrappers(void) {
 }
 
 // Wall-clock date/time for Task #45 segment naming. Fills
-// date_out "YYYY-MM-DD" and time_out "HHMMSS". Before the wall clock is
+// date_out "YYYY-MM-DD" (RECORDER_DATE_STR_LEN == 11) and time_out
+// "HHMMSS" (RECORDER_TIME_STR_LEN == 7). Fixed-size outputs are formatted
+// digit-by-digit with range-checked inputs so no snprintf truncation is
+// possible under -Werror=format-truncation. Before the wall clock is
 // plausible (RTC not yet corrected via later USB correction), falls back
 // to a stable epoch file so recording never blocks on time: the later
 // correction changes the date and triggers a midnight rotation into the
@@ -141,17 +144,50 @@ static void recorder_current_date_time(char date_out[RECORDER_DATE_STR_LEN],
                                        char time_out[RECORDER_TIME_STR_LEN]) {
     time_t now = time(NULL);
     struct tm tm_now;
+    int year;
+    int mon;
+    int mday;
+    int hour;
+    int min;
+    int sec;
     if (now < (time_t)1577836800L) {
-        snprintf(date_out, RECORDER_DATE_STR_LEN, "1970-01-01");
-        snprintf(time_out, RECORDER_TIME_STR_LEN, "000000");
+        memcpy(date_out, "1970-01-01", RECORDER_DATE_STR_LEN);
+        memcpy(time_out, "000000", RECORDER_TIME_STR_LEN);
         return;
     }
     memset(&tm_now, 0, sizeof(tm_now));
     localtime_r(&now, &tm_now);
-    snprintf(date_out, RECORDER_DATE_STR_LEN, "%04d-%02d-%02d",
-             tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday);
-    snprintf(time_out, RECORDER_TIME_STR_LEN, "%02d%02d%02d", tm_now.tm_hour,
-             tm_now.tm_min, tm_now.tm_sec);
+    year = tm_now.tm_year + 1900;
+    mon = tm_now.tm_mon + 1;
+    mday = tm_now.tm_mday;
+    hour = tm_now.tm_hour;
+    min = tm_now.tm_min;
+    sec = tm_now.tm_sec;
+    if (year < 2020 || year > 9999 || mon < 1 || mon > 12 || mday < 1 ||
+        mday > 31 || hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 ||
+        sec > 60) {
+        memcpy(date_out, "1970-01-01", RECORDER_DATE_STR_LEN);
+        memcpy(time_out, "000000", RECORDER_TIME_STR_LEN);
+        return;
+    }
+    date_out[0] = (char)('0' + (year / 1000) % 10);
+    date_out[1] = (char)('0' + (year / 100) % 10);
+    date_out[2] = (char)('0' + (year / 10) % 10);
+    date_out[3] = (char)('0' + year % 10);
+    date_out[4] = '-';
+    date_out[5] = (char)('0' + (mon / 10) % 10);
+    date_out[6] = (char)('0' + mon % 10);
+    date_out[7] = '-';
+    date_out[8] = (char)('0' + (mday / 10) % 10);
+    date_out[9] = (char)('0' + mday % 10);
+    date_out[10] = '\0';
+    time_out[0] = (char)('0' + (hour / 10) % 10);
+    time_out[1] = (char)('0' + hour % 10);
+    time_out[2] = (char)('0' + (min / 10) % 10);
+    time_out[3] = (char)('0' + min % 10);
+    time_out[4] = (char)('0' + (sec / 10) % 10);
+    time_out[5] = (char)('0' + sec % 10);
+    time_out[6] = '\0';
 }
 
 static const char *recorder_rotate_reason_str(wav_rotate_reason_t reason) {
