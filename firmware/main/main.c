@@ -91,9 +91,30 @@ static EventGroupHandle_t s_rec_events = NULL;
 #define REC_BIT_STOP (1u << 1)
 #define REC_BIT_WRITER_READY (1u << 2)
 
-// Flush the `.wav.part` header every N drained slots so the in-progress
+ // Flush the `.wav.part` header every N drained slots so the in-progress
 // file stays decodeable (about every 4s of audio at 32KB/s).
 #define RECORDER_FLUSH_EVERY_CHUNKS 4u
+
+// Writer stack budget (Task #45 hardware-gate fix for the boot-without-SD
+// stack overflow + reboot loop): the writer call path nests 256B path
+// snprintf builds, date-dir mkdir, FATFS f_open/f_write/f_sync across the
+// finalize/rename switch, and ESP_LOG formatting. The 4x256B segment path
+// buffers therefore live in writer-owned static .bss instead of the task
+// frame (capture never touches them; same single-owner discipline as
+// s_sink, no lock needed). The task itself runs at
+// RECORDER_WRITER_STACK_BYTES so FATFS/VFS/newlib keep headroom;
+// uxTaskGetStackHighWaterMark is logged at every writer exit
+// (stage ... result: stack) as high-water evidence for hardware
+// validation. Overflow detection stays enabled; this sizes the budget
+// instead of suppressing it.
+#define RECORDER_WRITER_STACK_BYTES 6144
+
+// Writer-owned segment path storage (see stack-budget note above).
+static char s_seg_part[RECORDER_MAX_PATH_LEN];
+static char s_seg_wav[RECORDER_MAX_PATH_LEN];
+static char s_rot_part[RECORDER_MAX_PATH_LEN];
+static char s_rot_wav[RECORDER_MAX_PATH_LEN];
+static wav_rotation_state_t s_seg_state;
 
 static void recorder_request_stop(void) {
     // STOP is sticky and also wakes the writer promptly for drain-then-exit.
@@ -414,32 +435,42 @@ static void recorder_log_diagnostics(void) {
              ", overrun: %" PRIu32
              ", stall: %" PRIu32 ", sd_err: %" PRIu32
              ", max_lat: %" PRIu32,
-             captured, written, overflow, dma_drop, buf_drop, dma_bytes,
-             buf_bytes, overrun, stalls, sd_err, max_lat);
+              captured, written, overflow, dma_drop, buf_drop, dma_bytes,
+              buf_bytes, overrun, stalls, sd_err, max_lat);
+}
+
+// Minimum-ever-free writer stack, in the same unit as the xTaskCreate
+// stack depth. Logged at every writer exit (including the SD-mount
+// failure path) so the boot-without-SD hardware scenario leaves
+// high-water evidence instead of only a reboot loop. Metadata only.
+static void recorder_log_writer_stack_hw(const char *reason) {
+    UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "stage: record, result: stack, writer_hw: %u, reason: %s",
+             (unsigned)hw, reason);
 }
 
 static void recorder_writer_task(void *arg) {
     uint32_t since_flush = 0;
     bool running = true;
-    // Task #45 rotation segment tracking (writer-owned, no lock needed:
-    // only this task touches these locals). Capture keeps producing into
-    // the pipeline across a rotation; only terminal STOP tears capture
+    // Task #45 rotation segment tracking. Small scalars stay in this frame;
+    // the 256B path buffers + finalize state live in writer-owned static
+    // storage (see stack-budget note above), so even this early
+    // mount-failure exit runs on a small frame. Capture keeps producing
+    // into the pipeline across a rotation; only terminal STOP tears capture
     // down. seg_bytes counts payload bytes of the CURRENT segment for the
     // 30-minute size trigger (equivalent to 1800s at 32000 B/s).
     char seg_date[RECORDER_DATE_STR_LEN];
-    char seg_part[RECORDER_MAX_PATH_LEN];
-    char seg_wav[RECORDER_MAX_PATH_LEN];
     char cur_time[RECORDER_TIME_STR_LEN];
     char rec_id[16];
     uint32_t seg_seq = 0;
     uint32_t seg_bytes = 0;
     TickType_t seg_start_tick = 0;
-    wav_rotation_state_t seg_state;
 
     (void)arg;
     if (sd_mount_recordings() != ESP_OK) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: sd mount");
         recorder_request_stop();
+        recorder_log_writer_stack_hw("sd mount");
         vTaskDelete(NULL);
         return;
     }
@@ -449,13 +480,14 @@ static void recorder_writer_task(void *arg) {
     // (opaque, no private content); full identity arrives in a later Task.
     recorder_current_date_time(seg_date, cur_time);
     snprintf(rec_id, sizeof(rec_id), "s%04u", (unsigned)(seg_seq & 0xFFFFu));
-    if (!wav_rotation_build_part_path(seg_part, sizeof(seg_part), seg_date,
-                                      cur_time, rec_id) ||
-        !wav_rotation_build_wav_path(seg_wav, sizeof(seg_wav), seg_date,
+    if (!wav_rotation_build_part_path(s_seg_part, sizeof(s_seg_part),
+                                      seg_date, cur_time, rec_id) ||
+        !wav_rotation_build_wav_path(s_seg_wav, sizeof(s_seg_wav), seg_date,
                                      cur_time, rec_id)) {
         ESP_LOGE(TAG, "stage: rotate, result: error, reason: rotate path");
         sd_mount_unmount();
         recorder_request_stop();
+        recorder_log_writer_stack_hw("rotate path");
         vTaskDelete(NULL);
         return;
     }
@@ -463,17 +495,19 @@ static void recorder_writer_task(void *arg) {
         ESP_LOGE(TAG, "stage: rotate, result: error, reason: mkdir date");
         sd_mount_unmount();
         recorder_request_stop();
+        recorder_log_writer_stack_hw("mkdir date");
         vTaskDelete(NULL);
         return;
     }
-    if (!sd_pcm_sink_open(&s_sink, seg_part)) {
+    if (!sd_pcm_sink_open(&s_sink, s_seg_part)) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: part open");
         sd_mount_unmount();
         recorder_request_stop();
+        recorder_log_writer_stack_hw("part open");
         vTaskDelete(NULL);
         return;
     }
-    wav_rotation_state_init(&seg_state, seg_part, seg_wav);
+    wav_rotation_state_init(&s_seg_state, s_seg_part, s_seg_wav);
     seg_start_tick = xTaskGetTickCount();
     ESP_LOGI(TAG,
              "stage: record, result: capturing, path_suffix: .wav.part");
@@ -556,8 +590,6 @@ static void recorder_writer_task(void *arg) {
         {
             char now_date[RECORDER_DATE_STR_LEN];
             char now_time[RECORDER_TIME_STR_LEN];
-            char new_part[RECORDER_MAX_PATH_LEN];
-            char new_wav[RECORDER_MAX_PATH_LEN];
             uint32_t elapsed_sec;
             TickType_t now_tick;
             bool date_changed = false;
@@ -585,7 +617,7 @@ static void recorder_writer_task(void *arg) {
                 // (patch + media sync) then rename `.wav.part` -> `.wav`.
                 // First call does I/O; duplicates return cached result
                 // with no double close and no double rename.
-                if (!wav_rotation_finalize_once(&seg_state, &s_sink)) {
+                if (!wav_rotation_finalize_once(&s_seg_state, &s_sink)) {
                     ESP_LOGE(TAG,
                              "stage: rotate, result: error, reason: finalize");
                     if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) ==
@@ -605,10 +637,12 @@ static void recorder_writer_task(void *arg) {
                 seg_seq++;
                 snprintf(rec_id, sizeof(rec_id), "s%04u",
                          (unsigned)(seg_seq & 0xFFFFu));
-                if (!wav_rotation_build_part_path(new_part, sizeof(new_part),
+                if (!wav_rotation_build_part_path(s_rot_part,
+                                                  sizeof(s_rot_part),
                                                   now_date, now_time,
                                                   rec_id) ||
-                    !wav_rotation_build_wav_path(new_wav, sizeof(new_wav),
+                    !wav_rotation_build_wav_path(s_rot_wav,
+                                                 sizeof(s_rot_wav),
                                                  now_date, now_time,
                                                  rec_id)) {
                     ESP_LOGE(TAG,
@@ -624,17 +658,17 @@ static void recorder_writer_task(void *arg) {
                     recorder_request_stop();
                     break;
                 }
-                if (!sd_pcm_sink_open(&s_sink, new_part)) {
+                if (!sd_pcm_sink_open(&s_sink, s_rot_part)) {
                     ESP_LOGE(TAG,
                              "stage: rotate, result: error, reason: part open");
                     running = false;
                     recorder_request_stop();
                     break;
                 }
-                memcpy(seg_part, new_part, sizeof(seg_part));
-                memcpy(seg_wav, new_wav, sizeof(seg_wav));
+                memcpy(s_seg_part, s_rot_part, sizeof(s_seg_part));
+                memcpy(s_seg_wav, s_rot_wav, sizeof(s_seg_wav));
                 memcpy(seg_date, now_date, sizeof(seg_date));
-                wav_rotation_state_init(&seg_state, seg_part, seg_wav);
+                wav_rotation_state_init(&s_seg_state, s_seg_part, s_seg_wav);
                 seg_bytes = 0;
                 seg_start_tick = xTaskGetTickCount();
                 since_flush = 0;
@@ -651,7 +685,7 @@ static void recorder_writer_task(void *arg) {
     // and any error teardown): header finalize then rename to `.wav`.
     // Idempotent: simultaneous stop duplicates return the cached result
     // with no double close and no double rename. PC syncs only `.wav`.
-    if (!wav_rotation_finalize_once(&seg_state, &s_sink)) {
+    if (!wav_rotation_finalize_once(&s_seg_state, &s_sink)) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: part close");
         if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
             pcm_pipeline_note_sd_error(&s_pipeline);
@@ -662,6 +696,7 @@ static void recorder_writer_task(void *arg) {
     }
     sd_mount_unmount();
     ESP_LOGE(TAG, "stage: record, result: error, reason: stopped");
+    recorder_log_writer_stack_hw("stopped");
     vTaskDelete(NULL);
 }
 
@@ -697,8 +732,9 @@ void app_main(void) {
         s_rec_lock = xSemaphoreCreateMutex();
         if (s_rec_lock == NULL) {
             ESP_LOGE(TAG, "stage: record, result: error, reason: rec lock");
-        } else if (xTaskCreate(recorder_writer_task, "rec_writer", 4096,
-                               NULL, 4, NULL) != pdPASS) {
+        } else if (xTaskCreate(recorder_writer_task, "rec_writer",
+                               RECORDER_WRITER_STACK_BYTES, NULL, 4,
+                               NULL) != pdPASS) {
             ESP_LOGE(TAG, "stage: record, result: error, reason: task spawn");
         } else if (xTaskCreate(recorder_capture_task, "rec_capture", 4096,
                                NULL, 5, NULL) != pdPASS) {

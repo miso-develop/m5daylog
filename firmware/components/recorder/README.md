@@ -163,7 +163,9 @@ and `wave`-module decodeability of synthetic payloads. `test_pcm_pipeline.py`
 locks the ping-pong / overflow-counting rules and the 32KB × 2 constants.
 `test_wav_rotation.py` locks Task #45 rotation/finalize: 30min/midnight
 decision, date-dir path building, idempotent close+rename (no double
-close/rename), and finalized-`wave` decodeability. `test_recording_contract.py`
+close/rename), finalized-`wave` decodeability, and the writer stack budget
+(static path storage, sized `RECORDER_WRITER_STACK_BYTES`, high-water log).
+`test_recording_contract.py`
 guards the 16kHz/16bit/mono format, `.wav.part` suffix discipline,
 fail-loud symbols, producer/consumer structure, overrun/drop accounting,
 and later-task scope boundaries (no recovery/retention logic here).
@@ -178,6 +180,9 @@ and later-task scope boundaries (no recovery/retention logic here).
   results plus `stage: rotate` / `stage: finalize` event logs showing
   finalized `.wav` corruption 0, unintended gap <=100ms, midnight date-dir
   switch, and duplicate-stop idempotency (no double close/rename).
+- Writer stack high-water (`stage: record, result: stack, writer_hw: ...`)
+  from a normal run and from the boot-without-SD fail-loud path; no stack
+  overflow or reboot loop on SD mount failure.
 - `idf.py build` / flash / boot log tails, ESP-IDF pin `v5.5.5`.
 - Observed boot/capture log lines; any `-D` pin overrides used for the run
   (baseline pins are committed in `recorder_config.h`).

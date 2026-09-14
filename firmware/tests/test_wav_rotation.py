@@ -314,6 +314,46 @@ def test_no_deletion_or_scope_creep():
         assert keyword not in blob.lower(), keyword
 
 
+def _writer_fn():
+    main = MAIN.read_text(encoding="utf-8")
+    start = main.index("static void recorder_writer_task(void *arg) {")
+    depth = 0
+    i = main.index("{", start)
+    for j in range(i, len(main)):
+        if main[j] == "{":
+            depth += 1
+        elif main[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return main[start : j + 1]
+    raise AssertionError("unbalanced braces in recorder_writer_task")
+
+
+def test_writer_stack_budget_and_high_water():
+    # Hardware-gate fix for the boot-without-SD stack overflow: the 256B
+    # path buffers must not live in the writer task frame, the writer runs
+    # on a sized budget (not a suppression), and every writer exit leaves
+    # high-water evidence for hardware validation.
+    main = MAIN.read_text(encoding="utf-8")
+    assert "#define RECORDER_WRITER_STACK_BYTES" in main
+    assert '"rec_writer"' in main
+    assert "RECORDER_WRITER_STACK_BYTES, NULL, 4," in main
+    assert '"rec_writer", 4096' not in main
+    for name in ("s_seg_part", "s_seg_wav", "s_rot_part", "s_rot_wav"):
+        assert ("static char %s[RECORDER_MAX_PATH_LEN]" % name) in main
+    assert "static wav_rotation_state_t s_seg_state" in main
+    assert "[RECORDER_MAX_PATH_LEN]" not in _writer_fn()
+    assert "uxTaskGetStackHighWaterMark" in main
+    assert "writer_hw:" in main
+    assert "recorder_log_writer_stack_hw" in main
+    # Definition + mount-failure/rotate-path/mkdir/part-open/final exits.
+    assert main.count("recorder_log_writer_stack_hw(") >= 6
+    # Rotation/finalize semantics untouched by the stack refactor.
+    assert "wav_rotation_finalize_once" in main
+    assert "no double close" in main.lower()
+    assert "no double rename" in main.lower()
+
+
 def test_no_credentials_or_private_data_patterns():
     blob = "\n".join(
         p.read_text(encoding="utf-8")
