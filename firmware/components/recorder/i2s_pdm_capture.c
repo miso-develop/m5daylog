@@ -1,0 +1,300 @@
+// ESP-IDF PDM RX capture — Task #44.
+//
+// Format: 16kHz / 16bit / mono PCM (recorder_config.h), M5Capsule RIGHT PDM
+// slot. Pins arrive from the caller; the Task #44 baseline defaults live in
+// recorder_config.h (see header).
+
+#include "i2s_pdm_capture.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "recorder_config.h"
+
+#ifdef ESP_PLATFORM
+
+#include "driver/i2s_pdm.h"
+#include "esp_attr.h"
+#include "esp_check.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
+
+static const char *TAG = "recorder_pdm";
+
+struct pdm_capture_handle {
+    i2s_chan_handle_t rx_chan;
+    bool enabled;
+};
+
+// Single-instance RX queue-overflow evidence. Task #44 owns exactly one
+// PDM capture channel, so file-static ISR state is explicit and safe: the
+// ISR appends under the spinlock, task context drains (copy + clear) under
+// the same spinlock. ALL shared state (armed flag + counters) uses the same
+// spinlock discipline: the ISR checks-and-updates inside
+// portENTER_CRITICAL_ISR, task context resets/arms/disarms inside
+// portENTER_CRITICAL. State is reset deterministically on every init;
+// armed by init before enable, disarmed by deinit after the channel is
+// deleted (no callback can fire afterwards).
+static portMUX_TYPE s_ovf_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_ovf_events = 0;
+static uint32_t s_ovf_drop_bytes = 0;
+static bool s_ovf_armed = false;
+
+static bool IRAM_ATTR recorder_rx_q_ovf_cb(i2s_chan_handle_t chan,
+                                           i2s_event_data_t *event,
+                                           void *user_ctx) {
+    uint32_t size;
+    (void)chan;
+    (void)user_ctx;
+    size = (event != NULL) ? (uint32_t)event->size : 0;
+    portENTER_CRITICAL_ISR(&s_ovf_mux);
+    if (s_ovf_armed) {
+        s_ovf_events++;
+        s_ovf_drop_bytes += size;
+    }
+    portEXIT_CRITICAL_ISR(&s_ovf_mux);
+    return false;
+}
+
+esp_err_t pdm_capture_init(const pdm_capture_config_t *config,
+                           pdm_capture_t *out_handle) {
+    struct pdm_capture_handle *handle = NULL;
+    i2s_chan_config_t chan_cfg;
+    i2s_pdm_rx_clk_config_t clk_cfg;
+    i2s_pdm_rx_slot_config_t slot_cfg;
+    i2s_pdm_rx_gpio_config_t gpio_cfg;
+    i2s_pdm_rx_config_t pdm_rx_cfg;
+    i2s_event_callbacks_t cbs;
+    esp_err_t err;
+
+    if (config == NULL || out_handle == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (config->pdm_clk_pin < 0 || config->pdm_data_pin < 0) {
+        ESP_LOGE(TAG,
+                 "stage: record, result: error, reason: pdm pins unset "
+                 "(board bring-up must provide verified clk/data pins)");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Deterministic reset of ALL ISR-shared overflow state under the same
+    // spinlock discipline used by the ISR and drain paths.
+    portENTER_CRITICAL(&s_ovf_mux);
+    s_ovf_events = 0;
+    s_ovf_drop_bytes = 0;
+    s_ovf_armed = false;
+    portEXIT_CRITICAL(&s_ovf_mux);
+
+    handle = (struct pdm_capture_handle *)calloc(1, sizeof(*handle));
+    if (handle == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    chan_cfg = (i2s_chan_config_t)I2S_CHANNEL_DEFAULT_CONFIG(
+        (i2s_port_t)config->i2s_port, I2S_ROLE_MASTER);
+    // DMA staging: several short descriptors keep PDM overrun visible via
+    // queue-overflow events instead of coalescing long gaps.
+    chan_cfg.dma_frame_num = 240;
+    chan_cfg.dma_desc_num = 8;
+
+    err = i2s_new_channel(&chan_cfg, NULL, &handle->rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "stage: record, result: error, reason: i2s new chan");
+        free(handle);
+        return err;
+    }
+
+    clk_cfg = (i2s_pdm_rx_clk_config_t)I2S_PDM_RX_CLK_DEFAULT_CONFIG(
+        RECORDER_SAMPLE_RATE_HZ);
+    // PCM-output slot config per the ESP-IDF v5.5 PDM RX example: 16bit
+    // samples, mono slot — then explicitly the M5Capsule RIGHT slot:
+    // M5Unified board_M5Capsule DAT=GPIO41 / CLK=GPIO40 runs
+    // input_only_right, which maps to I2S_PDM_SLOT_RIGHT. The ESP-IDF mono
+    // default would take the LEFT slot, which carries no Capsule audio.
+    slot_cfg = (i2s_pdm_rx_slot_config_t)I2S_PDM_RX_SLOT_DEFAULT_CONFIG(
+        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    slot_cfg.slot_mask = I2S_PDM_SLOT_RIGHT;
+    // Zero the GPIO struct first so every field (including invert flags) is
+    // deterministic; PDM RX uses clk + one data line.
+    memset(&gpio_cfg, 0, sizeof(gpio_cfg));
+    gpio_cfg.clk = (gpio_num_t)config->pdm_clk_pin;
+    gpio_cfg.din = (gpio_num_t)config->pdm_data_pin;
+
+    // ESP-IDF v5.5 takes a single PDM RX config bundling clk/slot/gpio.
+    memset(&pdm_rx_cfg, 0, sizeof(pdm_rx_cfg));
+    pdm_rx_cfg.clk_cfg = clk_cfg;
+    pdm_rx_cfg.slot_cfg = slot_cfg;
+    pdm_rx_cfg.gpio_cfg = gpio_cfg;
+
+    err = i2s_channel_init_pdm_rx_mode(handle->rx_chan, &pdm_rx_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "stage: record, result: error, reason: pdm rx init");
+        i2s_del_channel(handle->rx_chan);
+        free(handle);
+        return err;
+    }
+
+    // Register the RX queue-overflow callback BEFORE enabling: it is the
+    // only proven-DMA-loss evidence (i2s_event_data_t.size per event).
+    // ESP-IDF v5.5.5 requires the explicit (handle, callbacks, user_data)
+    // shape.
+    memset(&cbs, 0, sizeof(cbs));
+    cbs.on_recv_q_ovf = recorder_rx_q_ovf_cb;
+    err = i2s_channel_register_event_callback(handle->rx_chan, &cbs, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "stage: record, result: error, reason: pdm events");
+        i2s_del_channel(handle->rx_chan);
+        free(handle);
+        return err;
+    }
+    portENTER_CRITICAL(&s_ovf_mux);
+    s_ovf_armed = true;
+    portEXIT_CRITICAL(&s_ovf_mux);
+
+    err = i2s_channel_enable(handle->rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "stage: record, result: error, reason: pdm enable");
+        portENTER_CRITICAL(&s_ovf_mux);
+        s_ovf_armed = false;
+        portEXIT_CRITICAL(&s_ovf_mux);
+        i2s_del_channel(handle->rx_chan);
+        free(handle);
+        return err;
+    }
+
+    handle->enabled = true;
+    *out_handle = handle;
+    ESP_LOGI(TAG, "stage: record, result: pdm ready, rate: %u, bits: %u",
+             (unsigned)RECORDER_SAMPLE_RATE_HZ,
+             (unsigned)RECORDER_BITS_PER_SAMPLE);
+    return ESP_OK;
+}
+
+esp_err_t pdm_capture_read(pdm_capture_t handle, void *dst, size_t len,
+                           size_t *out_read) {
+    size_t bytes_read = 0;
+    esp_err_t err;
+
+    if (handle == NULL || dst == NULL || out_read == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (len == 0 || (len % RECORDER_BYTES_PER_SAMPLE) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Timeout returns ESP_ERR_TIMEOUT with whatever valid prefix arrived.
+    // That is stall evidence only — proven DMA loss arrives exclusively via
+    // pdm_capture_drain_overflow(), never inferred from a short read.
+    err = i2s_channel_read(handle->rx_chan, dst, len, &bytes_read, 1000);
+    *out_read = bytes_read;
+    return err;
+}
+
+void pdm_capture_drain_overflow(pdm_capture_t handle,
+                                pdm_overflow_snapshot_t *out) {
+    if (out == NULL) {
+        return;
+    }
+    (void)handle;
+    portENTER_CRITICAL(&s_ovf_mux);
+    out->events = s_ovf_events;
+    out->drop_bytes = s_ovf_drop_bytes;
+    s_ovf_events = 0;
+    s_ovf_drop_bytes = 0;
+    portEXIT_CRITICAL(&s_ovf_mux);
+}
+
+esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
+                                               pdm_overflow_snapshot_t *out) {
+    esp_err_t err;
+
+    if (handle == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Quiescent boundary first: stop the RX channel so no further
+    // on_recv_q_ovf callback can fire, then drain what fired before
+    // disable completed. A failed disable is NEVER treated as quiescent:
+    // enabled stays true, nothing is drained as final, and the caller must
+    // treat the failure as fail-loud/retryable (see main.c teardown).
+    err = i2s_channel_disable(handle->rx_chan);
+    if (err != ESP_OK) {
+        out->events = 0;
+        out->drop_bytes = 0;
+        return err;
+    }
+    handle->enabled = false;
+    pdm_capture_drain_overflow(handle, out);
+    return ESP_OK;
+}
+
+esp_err_t pdm_capture_deinit(pdm_capture_t handle) {
+    esp_err_t err;
+
+    if (handle == NULL) {
+        return ESP_OK;
+    }
+    // Fail-closed: never mark disabled, delete, disarm, or free after a
+    // failed disable. A failed delete likewise preserves the handle and
+    // accounting so the caller can retry/surface fail-loud.
+    if (handle->enabled) {
+        err = i2s_channel_disable(handle->rx_chan);
+        if (err != ESP_OK) {
+            return err;
+        }
+        handle->enabled = false;
+    }
+    err = i2s_del_channel(handle->rx_chan);
+    if (err != ESP_OK) {
+        return err;
+    }
+    portENTER_CRITICAL(&s_ovf_mux);
+    s_ovf_armed = false;
+    portEXIT_CRITICAL(&s_ovf_mux);
+    free(handle);
+    return ESP_OK;
+}
+
+#else  // !ESP_PLATFORM — host/test build: linkable stubs, never recording.
+
+esp_err_t pdm_capture_init(const pdm_capture_config_t *config,
+                           pdm_capture_t *out_handle) {
+    (void)config;
+    (void)out_handle;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t pdm_capture_read(pdm_capture_t handle, void *dst, size_t len,
+                           size_t *out_read) {
+    (void)handle;
+    (void)dst;
+    (void)len;
+    (void)out_read;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+void pdm_capture_drain_overflow(pdm_capture_t handle,
+                                pdm_overflow_snapshot_t *out) {
+    (void)handle;
+    if (out != NULL) {
+        out->events = 0;
+        out->drop_bytes = 0;
+    }
+}
+
+esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
+                                           pdm_overflow_snapshot_t *out) {
+    (void)handle;
+    if (out != NULL) {
+        out->events = 0;
+        out->drop_bytes = 0;
+    }
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t pdm_capture_deinit(pdm_capture_t handle) {
+    (void)handle;
+    return ESP_OK;
+}
+
+#endif  // ESP_PLATFORM
