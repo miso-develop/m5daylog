@@ -415,3 +415,25 @@ def test_esp_idf_v55_api_shape():
     blob = "\n".join(_sources().values())
     assert "sd_mmc_card_t" not in blob  # invalid type, never use
     assert "sdspi_host_t" not in blob  # nonexistent type, never use
+
+
+def test_sd_hardware_gate_config():
+    # Human Gate fixes: FAT LFN for /sdcard/M5DAYLOG/recordings, 8MB flash,
+    # protected SD data, numeric mkdir errno diagnostics. Stdlib only.
+    defaults = (REPO / "firmware/sdkconfig.defaults").read_text(
+        encoding="utf-8"
+    )
+    assert "CONFIG_FATFS_LFN_HEAP=y" in defaults
+    assert "CONFIG_FATFS_MAX_LFN=255" in defaults
+    assert "CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y" in defaults
+    assert "CONFIG_ESPTOOLPY_FLASHSIZE_2MB" not in defaults
+    cfg = (COMP / "include/recorder_config.h").read_text(encoding="utf-8")
+    assert '#define RECORDER_RECORDINGS_DIR "/sdcard/M5DAYLOG/recordings"' in cfg
+    mount = (COMP / "sd_mount.c").read_text(encoding="utf-8")
+    assert ".format_if_mount_failed = false" in mount
+    assert ".format_if_mount_failed = true" not in mount
+    # Both mkdir sites capture errno immediately and log it numerically.
+    assert mount.count("mkdir_errno") >= 4
+    assert "errno: %d" in mount
+    assert "reason: mkdir daylog" in mount
+    assert "reason: mkdir rec" in mount

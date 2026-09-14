@@ -28,13 +28,25 @@ static bool s_bus_init = false;
 static spi_host_device_t s_spi_host = SPI2_HOST;
 
 static esp_err_t ensure_recording_dirs(void) {
-    if (mkdir(RECORDER_M5DAYLOG_DIR, 0755) != 0 && errno != EEXIST) {
-        ESP_LOGE(TAG, "stage: record, result: error, reason: mkdir daylog");
-        return ESP_FAIL;
+    if (mkdir(RECORDER_M5DAYLOG_DIR, 0755) != 0) {
+        int mkdir_errno = errno;
+        if (mkdir_errno != EEXIST) {
+            ESP_LOGE(TAG,
+                     "stage: record, result: error, reason: mkdir daylog, "
+                     "errno: %d",
+                     mkdir_errno);
+            return ESP_FAIL;
+        }
     }
-    if (mkdir(RECORDER_RECORDINGS_DIR, 0755) != 0 && errno != EEXIST) {
-        ESP_LOGE(TAG, "stage: record, result: error, reason: mkdir rec");
-        return ESP_FAIL;
+    if (mkdir(RECORDER_RECORDINGS_DIR, 0755) != 0) {
+        int mkdir_errno = errno;
+        if (mkdir_errno != EEXIST) {
+            ESP_LOGE(TAG,
+                     "stage: record, result: error, reason: mkdir rec, "
+                     "errno: %d",
+                     mkdir_errno);
+            return ESP_FAIL;
+        }
     }
     return ESP_OK;
 }

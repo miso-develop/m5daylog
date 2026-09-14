@@ -10,3 +10,13 @@ CONFIG_IDF_TARGET="esp32s3"
 # Keep scaffold boot output at INFO so boot / stage / result lines are
 # visible over serial without enabling verbose subsystems.
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Human Gate fix (Task #44): FATFS must support long filenames so the
+# specified /sdcard/M5DAYLOG/recordings directory (LFN, non-8.3) creates
+# successfully. Heap-based LFN workspace with 255-char max.
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# Human Gate fix (Task #44): M5Capsule v1.1 is ESP32-S3FN8 with 8MB flash.
+# Fix the image header to 8MB; never select 2MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
