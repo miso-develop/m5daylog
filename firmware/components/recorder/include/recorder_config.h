@@ -34,6 +34,24 @@ extern "C" {
 // Spec #36 recording shape: `HHMMSS_<recordingId>.wav.part`. Only this
 // suffix is accepted for capture output — never a bare `.part`.
 #define RECORDER_PART_SUFFIX ".wav.part"
+// Finalized suffix after Task #45 rotation/finalize: `.wav.part` is
+// header-finalized, flushed, closed, then renamed to `.wav` (PC syncs
+// only `.wav`). The rename strips the trailing `.part`.
+#define RECORDER_WAV_SUFFIX ".wav"
+
+// --- WAV rotation / finalize (Task #45, IM-008) ---------------------------
+// 30-minute rotation baseline (Decision #7, Spec #36). At the fixed
+// 16kHz/16bit/mono byte rate (32000 B/s) one segment holds exactly
+// 57,600,000 payload bytes. Midnight rotation switches the date
+// directory (`recordings/YYYY-MM-DD/`) without mixing dates.
+#define RECORDER_ROTATION_INTERVAL_SEC 1800u
+#define RECORDER_ROTATION_PAYLOAD_BYTES \
+    (RECORDER_BYTE_RATE * RECORDER_ROTATION_INTERVAL_SEC)
+// Absolute path buffer for `recordings/YYYY-MM-DD/HHMMSS_<id>.wav.part`.
+// 256 bytes covers the mount prefix plus LFN date/time/id segments.
+#define RECORDER_MAX_PATH_LEN 256u
+#define RECORDER_DATE_STR_LEN 11u  // "YYYY-MM-DD" + NUL
+#define RECORDER_TIME_STR_LEN 7u   // "HHMMSS" + NUL
 
 // One full 32KB slot at 16kHz/16bit/mono holds exactly:
 //   32768 bytes / 2 bytes/sample = 16384 samples = 1.024 s of audio.
@@ -68,10 +86,11 @@ extern "C" {
 #define RECORDER_SD_MISO_PIN 39
 #endif
 
-// Filesystem scope for Task #44: only the live-recording directories are
-// created by board bring-up. Finalized-file handling and anything else
-// (rotation/finalize, recovery, retention bookkeeping) belong to later
-// Tasks and must not be created here.
+// Filesystem scope for Tasks #44/#45: board bring-up creates the
+// live-recording directories plus per-date subdirectories
+// (`recordings/YYYY-MM-DD/`) for rotation/finalize. Power-loss recovery
+// and retention bookkeeping belong to later Tasks and must not be
+// created here.
 #define RECORDER_M5DAYLOG_DIR "/sdcard/M5DAYLOG"
 #define RECORDER_RECORDINGS_DIR "/sdcard/M5DAYLOG/recordings"
 

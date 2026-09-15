@@ -1,9 +1,15 @@
-# M5Daylog recorder component (Task #44)
+# M5Daylog recorder component (Tasks #44/#45)
 
 Task #44 scope: PDM mic → I2S/DMA → 32KB × 2 double buffer → microSD
 `.wav.part` continuous PCM write. 16kHz / signed 16bit / mono PCM.
 
-Parent Map: #1. Task: #44 (`IM-007`). Related Spec: #36 (`S-003`).
+Task #45 scope (IM-008): WAV rotation / finalize — 30-minute +
+midnight rotation with header-finalize, flush/close, and idempotent
+`.wav.part` → `.wav` rename (USB / low-battery / safe-stop share the
+same idempotent finalize; no double close, no double rename).
+
+Parent Map: #1. Tasks: #44 (`IM-007`), #45 (`IM-008`).
+Related Spec: #36 (`S-003`).
 
 ## Files
 
@@ -11,16 +17,18 @@ Parent Map: #1. Task: #44 (`IM-007`). Related Spec: #36 (`S-003`).
 components/recorder/
   CMakeLists.txt
   README.md                      # this file
-  include/recorder_config.h      # sample rate / format / buffer constants
+  include/recorder_config.h      # sample rate / format / buffer + rotation constants
   include/pcm_pipeline.h         # portable ping-pong double buffer + counters
   pcm_pipeline.c                 # portable, no ESP-IDF dependency
   include/wav_part.h             # portable RIFF/WAVE `.part` framing over stdio
   wav_part.c                     # portable, no ESP-IDF dependency
+  include/wav_rotation.h         # portable rotation/finalize over stdio (#45)
+  wav_rotation.c                 # portable, no ESP-IDF dependency (#45)
   include/i2s_pdm_capture.h      # ESP-IDF PDM RX wrapper (pins from caller)
   i2s_pdm_capture.c              # ESP-IDF only (`ESP_PLATFORM`)
   include/sd_pcm_sink.h          # `.wav.part` file sink + write-latency stats
   sd_pcm_sink.c                  # stdio + `esp_timer` latency when available
-  include/sd_mount.h             # microSD SPI mount + recording-dirs API
+  include/sd_mount.h             # microSD SPI mount + recording/date-dirs API
   sd_mount.c                     # ESP-IDF only (`ESP_PLATFORM`)
 ```
 
@@ -31,12 +39,15 @@ components/recorder/
 - microSD: SPI bus CS 11 / MOSI 12 / CLK 14 / MISO 39, mounted at
   `/sdcard` via `sd_mount_recordings()`. The card is never formatted on
   mount failure — failures surface as ERROR instead.
-- Only live-recording directories are created: `/sdcard/M5DAYLOG` and
-  `/sdcard/M5DAYLOG/recordings`. Nothing else (no finalized-file,
-  recovery, or manifest/retention state — later Tasks own those).
-- Default recording path has the Spec #36 `.wav.part` shape
-  (`HHMMSS_<recordingId>.wav.part`); runtime RTC/UUID naming arrives with
-  later Tasks, so the committed default is a build-time fallback only.
+- Live-recording directories plus Task #45 date directories are created:
+  `/sdcard/M5DAYLOG`, `/sdcard/M5DAYLOG/recordings`, and
+  `recordings/YYYY-MM-DD/` via `sd_mount_ensure_date_dir()` for midnight
+  rotation. Later recovery/retention state is out of scope (#46 and later).
+- Runtime recording paths have the Spec #36 shape
+  (`recordings/YYYY-MM-DD/HHMMSS_<recordingId>.wav.part`); the
+  recording-id field is a per-boot segment counter placeholder until later
+  Tasks own full identity. The committed default path is a build-time
+  fallback only.
 - Every bring-up step is fail-loud: mount / mic-init / `.part`-open
   failures enter ERROR, never a silent "recording" state.
 
@@ -56,10 +67,16 @@ components/recorder/
   the accumulated payload length, so a `.part` is decodeable by a standard
   decoder after any flush. Odd trailing bytes are truncated to the sample
   boundary (2 bytes); only the truncated tail is discarded.
-- Rotation / rename `.wav.part → .wav` / recovery / retention bookkeeping
-  are **out of scope** (Tasks #45/#46/#47). This component never deletes or
-  renames files. `sd_pcm_sink` appends to one caller-provided `.wav.part`
-  path (suffix enforced at open, never a bare `.part`).
+- Rotation / finalize `.wav.part → .wav` is Task #45 scope
+  (`wav_rotation.h/.c` + writer wiring in `main.c`): header finalize,
+  flush/close, then rename to `.wav` on 30-minute elapsed, midnight date
+  change, USB connection, low battery, or safe-stop request. Close is
+  idempotent across simultaneous events (first call does I/O; duplicates
+  return the cached result with no double close and no double rename).
+  This component never deletes audio (only `rename()`, never `remove()`).
+  `sd_pcm_sink` appends to one caller-provided `.wav.part` path (suffix
+  enforced at open, never a bare `.part`). Later recovery/retention
+  bookkeeping stays out of scope (#46 and later).
 - microSD mount and recording directories are Task #44 bring-up
   (`sd_mount.c`: `/sdcard` + `/sdcard/M5DAYLOG/recordings`). The sink
   writes to the mounted path; open/write failures are fail-loud (`false` +
@@ -105,11 +122,16 @@ recorder_capture_task (prio 5): wait WRITER_READY handshake → re-check STOP
     → quiescent stop-and-final-drain
     (pdm_capture_stop_and_drain_final; failed disable stays retryable)
     → fail-closed deinit (checked fail-loud, never destroys after failure)
-recorder_writer_task (prio 4): mount + dirs + sink open → set WRITER_READY
-    → on SLOT_FULL: [lock] peek full slot → [unlock] → sd_pcm_sink_write_chunk
-    (slow, lock released: capture fills the other slot meanwhile) →
-    [lock] release + latency note → every 4 slots: wav_part_flush (header
-    patch) + running diagnostics → STOP: drain-then-exit, close, unmount
+recorder_writer_task (prio 4): mount + date dir + segment open →
+    set WRITER_READY → on SLOT_FULL: [lock] peek full slot → [unlock] →
+    sd_pcm_sink_write_chunk (slow, lock released: capture fills the other
+    slot meanwhile) → [lock] release + latency note → every 4 slots:
+    wav_part_flush (header patch) + running diagnostics → periodic
+    rotation poll (30min/size, midnight date change): WITHOUT lock and
+    WITHOUT stopping capture → wav_rotation_finalize_once (close+rename,
+    idempotent) → ensure new date dir → open new segment → STOP:
+    drain-then-exit, idempotent finalize (USB/low-battery/safe-stop share
+    one close+rename, no double close/rename), unmount
 ```
 
 One app-lifetime event group is the only cross-task channel (SLOT_FULL,
@@ -127,9 +149,10 @@ here); radio/LED policy is owned by Spec #36 and later Tasks.
 
 ## Host tests
 
-Portable logic (`pcm_pipeline.c`, `wav_part.c`, `recorder_config.h`) has no
-ESP-IDF dependency. Host contract tests live in `firmware/tests/` and run
-with stdlib-only pytest (no ESP-IDF, no device, no network):
+Portable logic (`pcm_pipeline.c`, `wav_part.c`, `wav_rotation.c`,
+`recorder_config.h`) has no ESP-IDF dependency. Host contract tests live
+in `firmware/tests/` and run with stdlib-only pytest (no ESP-IDF, no
+device, no network):
 
 ```sh
 python3 -m pytest firmware/tests -v
@@ -138,17 +161,29 @@ python3 -m pytest firmware/tests -v
 `test_wav_part.py` checks the 44-byte header vectors, odd-tail truncation,
 and `wave`-module decodeability of synthetic payloads. `test_pcm_pipeline.py`
 locks the ping-pong / overflow-counting rules and the 32KB × 2 constants.
-`test_recording_contract.py` guards the 16kHz/16bit/mono format, `.wav.part`
-suffix discipline, fail-loud symbols, producer/consumer structure,
-overrun/drop accounting, and #45/#46 scope boundaries (no
-rename/recovery/retention logic in this component).
+`test_wav_rotation.py` locks Task #45 rotation/finalize: 30min/midnight
+decision, date-dir path building, idempotent close+rename (no double
+close/rename), finalized-`wave` decodeability, and the writer stack budget
+(static path storage, sized `RECORDER_WRITER_STACK_BYTES`, high-water log).
+`test_recording_contract.py`
+guards the 16kHz/16bit/mono format, `.wav.part` suffix discipline,
+fail-loud symbols, producer/consumer structure, overrun/drop accounting,
+and later-task scope boundaries (no recovery/retention logic here).
 
-## Device evidence (recorded in the Task #44 PR, never in-repo)
+## Device evidence (recorded in the Task PR, never in-repo)
 
 - 1-hour run counters: `samples_captured`, driver `dma_drop_* = 0` with
   `dma_overrun_events = 0`, software `buffer_overflow = 0` with
   `buffer_drop_* = 0`, `sd_write_errors = 0`, max SD latency.
 - Generated `.wav.part` (+ flushed header) opened with a standard decoder.
+- Task #45 boundary evidence: rotation-boundary waveform/duration/decode
+  results plus `stage: rotate` / `stage: finalize` event logs showing
+  finalized `.wav` corruption 0, unintended gap <=100ms, midnight date-dir
+  switch, and duplicate-stop idempotency (no double close/rename).
+- Writer stack high-water (`stage: record, result: stack, writer_hw: ...`)
+  from a normal run, from each successful rotation while recording
+  continues, and from the boot-without-SD fail-loud path; no stack
+  overflow or reboot loop on SD mount failure.
 - `idf.py build` / flash / boot log tails, ESP-IDF pin `v5.5.5`.
 - Observed boot/capture log lines; any `-D` pin overrides used for the run
   (baseline pins are committed in `recorder_config.h`).

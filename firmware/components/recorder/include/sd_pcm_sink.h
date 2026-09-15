@@ -1,6 +1,6 @@
 #pragma once
 
-// microSD `.wav.part` file sink + write-latency diagnostics — Task #44.
+// microSD `.wav.part` file sink + write-latency diagnostics — Tasks #44/#45.
 //
 // Owns one open `.wav.part` file (see wav_part.h). Each drained 32KB slot
 // from the double buffer is appended via sd_pcm_sink_write_chunk(), which
@@ -46,7 +46,8 @@ bool sd_pcm_sink_write_chunk(sd_pcm_sink_t *sink, const uint8_t *data,
 bool sd_pcm_sink_flush(sd_pcm_sink_t *sink);
 
 // Patch header sizes and close. Safe on non-open handles (no-op true).
-// Never deletes or renames: finalize/rotation is Task #45.
+// Never deletes or renames: Task #45 finalize/rotation lives in
+// wav_rotation.h (close here, then idempotent rename there).
 bool sd_pcm_sink_close(sd_pcm_sink_t *sink);
 
 #ifdef __cplusplus

@@ -1,15 +1,19 @@
-// microSD SPI mount + Task #44 directory bring-up.
+// microSD SPI mount + Tasks #44/#45 directory bring-up.
 //
 // M5Capsule v1.1: SD over SPI (CS 11 / MOSI 12 / CLK 14 / MISO 39),
-// mounted at /sdcard. Only live-recording directories are created.
+// mounted at /sdcard. Live-recording directories plus Task #45 per-date
+// subdirectories (`recordings/YYYY-MM-DD/`) are created. No other state.
 
 #include "sd_mount.h"
 
 #include "recorder_config.h"
 
+#include <string.h>
+
 #ifdef ESP_PLATFORM
 
 #include <errno.h>
+#include <stdio.h>
 #include <sys/stat.h>
 
 #include "driver/sdspi_host.h"
@@ -111,6 +115,45 @@ esp_err_t sd_mount_recordings(void) {
     return ESP_OK;
 }
 
+esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd) {
+    char dir[RECORDER_MAX_PATH_LEN];
+    int needed;
+    size_t i;
+
+    if (!s_mounted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (date_yyyy_mm_dd == NULL || strlen(date_yyyy_mm_dd) != 10u) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (i = 0; i < 10u; i++) {
+        char c = date_yyyy_mm_dd[i];
+        if (i == 4u || i == 7u) {
+            if (c != '-') {
+                return ESP_ERR_INVALID_ARG;
+            }
+        } else if (c < '0' || c > '9') {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    needed = snprintf(dir, sizeof(dir), "%s/%s", RECORDER_RECORDINGS_DIR,
+                      date_yyyy_mm_dd);
+    if (needed < 0 || (size_t)needed >= sizeof(dir)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (mkdir(dir, 0755) != 0) {
+        int mkdir_errno = errno;
+        if (mkdir_errno != EEXIST) {
+            ESP_LOGE(TAG,
+                     "stage: rotate, result: error, reason: mkdir date, "
+                     "errno: %d",
+                     mkdir_errno);
+            return ESP_FAIL;
+        }
+    }
+    return ESP_OK;
+}
+
 bool sd_mount_is_mounted(void) {
     return s_mounted;
 }
@@ -131,6 +174,11 @@ void sd_mount_unmount(void) {
 #else  // !ESP_PLATFORM — host/test build: linkable stubs, never mounted.
 
 esp_err_t sd_mount_recordings(void) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd) {
+    (void)date_yyyy_mm_dd;
     return ESP_ERR_NOT_SUPPORTED;
 }
 

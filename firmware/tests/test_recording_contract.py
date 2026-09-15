@@ -1,11 +1,12 @@
-"""Task #44 scope-boundary tests: format, fail-loud, and out-of-scope guards.
+"""Tasks #44/#45 scope-boundary tests: format, fail-loud, rotation guards.
 
-Stdlib only. Ensures the #44 implementation keeps the fixed 16kHz/16bit/
-mono contract, stays fail-loud (no silent recording state), writes only
-`.part` files, and does NOT absorb Task #45/#46/#47 responsibilities
-(rotation+finalize, power-loss recovery/quarantine, manifest/retention).
+Stdlib only. Ensures the implementation keeps the fixed 16kHz/16bit/
+mono contract, stays fail-loud (no silent recording state), finalizes
+`.wav.part` -> `.wav` via Task #45 rotation, and does NOT absorb later
+power-loss recovery / retention responsibilities.
 """
 
+import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -19,6 +20,21 @@ def _sources():
         for p in COMP.rglob("*")
         if p.is_file() and p.suffix in (".c", ".h")
     }
+
+
+def _strip_c_comments(src):
+    # Remove /* block */ comments first, then // line comments, so prose
+    # mentioning `remove()` in a comment is not mistaken for a real call.
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+    src = re.sub(r"//.*", "", src)
+    return src
+
+
+def _has_c_call(src, name):
+    return (
+        re.search(r"\b" + re.escape(name) + r"\s*\(", _strip_c_comments(src))
+        is not None
+    )
 
 
 def test_format_contract_present():
@@ -36,9 +52,18 @@ def test_part_suffix_discipline():
     # Only `.wav.part` is accepted for capture output, never bare `.part`.
     assert ".wav.part" in blob
     assert '#define RECORDER_PART_SUFFIX ".wav.part"' in blob
-    # #44 never finalizes to bare `.wav`: no rename/remove in the component.
-    assert "rename(" not in blob
-    assert "remove(" not in blob
+    # Task #45 finalizes to bare `.wav` via rename in the rotation module
+    # only; deletion is never allowed anywhere (comment prose mentioning
+    # remove() does not count as a call).
+    assert "rename(" in blob
+    assert not _has_c_call(blob, "remove")
+    assert not _has_c_call(blob, "unlink")
+    assert '#define RECORDER_WAV_SUFFIX ".wav"' in blob
+    # The rename lives in wav_rotation (finalize), never in mount/teardown.
+    mount = (COMP / "sd_mount.c").read_text(encoding="utf-8")
+    assert not _has_c_call(mount, "rename")
+    assert not _has_c_call(mount, "remove")
+    assert not _has_c_call(mount, "unlink")
 
 
 def test_fail_loud_symbols():
@@ -62,13 +87,15 @@ def test_fail_loud_symbols():
 def test_no_scope_creep_into_later_tasks():
     srcs = _sources()
     blob = "\n".join(srcs.values()).lower()
-    # Rotation / finalize (#45) policy keywords must not be implemented here.
+    # Later recovery/retention keywords must not be implemented here
+    # (rotation/finalize #45 is now in scope).
     for keyword in ("quarantine", "manifest", "device.json", "acks/"):
         assert keyword not in blob, keyword
-    # This component documents that mount/rotation/recovery are out of scope.
+    # Rotation is implemented; later recovery/retention stays out of scope.
     readme = (COMP / "README.md").read_text(encoding="utf-8").lower()
-    for marker in ("out of scope", "#45", "#46", "never deletes"):
+    for marker in ("#45", "#46", "never deletes"):
         assert marker in readme, marker
+    assert "rotation" in readme
 
 
 def test_no_credentials_or_private_data_patterns():
@@ -99,6 +126,7 @@ def test_sd_mount_creates_only_recording_dirs():
     hdr = (COMP / "include/sd_mount.h").read_text(encoding="utf-8")
     for symbol in (
         "sd_mount_recordings",
+        "sd_mount_ensure_date_dir",
         "sd_mount_is_mounted",
         "sd_mount_unmount",
     ):
@@ -112,21 +140,29 @@ def test_sd_mount_creates_only_recording_dirs():
         "RECORDER_SD_MOUNT_POINT",
     ):
         assert token in src, token
-    # Only live-recording directories are created; later-Task state is not.
+    # Live-recording plus Task #45 date directories; later-Task state is not.
     assert "RECORDER_RECORDINGS_DIR" in src
     assert "mkdir" in src
     assert "format_if_mount_failed" in src  # never format away audio
+    assert "YYYY-MM-DD" in hdr or "date_yyyy_mm_dd" in hdr
     for keyword in ("quarantine", "manifest", "device.json", "acks/"):
         assert keyword not in src.lower(), keyword
-    # Mount teardown never deletes or renames audio.
-    assert "rename(" not in src
-    assert "remove(" not in src
+    # Mount teardown never deletes or renames audio (comment prose
+    # mentioning remove() does not count as a call).
+    assert not _has_c_call(src, "rename")
+    assert not _has_c_call(src, "remove")
+    assert not _has_c_call(src, "unlink")
 
 
 def test_default_part_path_shape():
     main = MAIN.read_text(encoding="utf-8")
     assert ".wav.part" in main
     assert "/sdcard/M5DAYLOG/recordings/" in main
+    # Task #45 runtime naming: date directory + HHMMSS id + finalize.
+    assert "wav_rotation_build_part_path" in main
+    assert "wav_rotation_build_wav_path" in main
+    assert "sd_mount_ensure_date_dir" in main
+    assert "wav_rotation_finalize_once" in main
 
 
 def test_producer_consumer_structure():

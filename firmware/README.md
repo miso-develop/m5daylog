@@ -85,12 +85,16 @@ M5Capsule v1.1 bring-up with PDM CLK40/DAT41 and SD SPI mount at `/sdcard`,
 `.wav.part` continuous write with flush-patched headers, fail-loud mic/SD
 errors) wired into `main/` as capture + writer FreeRTOS tasks, plus
 stdlib-only host contract tests in `firmware/tests/`
-(`python3 -m pytest firmware/tests -v`). Rotation/finalize (#45),
-recovery (#46), manifest (#47), and state machine (#48) remain out
-of scope.
+(`python3 -m pytest firmware/tests -v`).
 
-Out of scope: WAV rotation (#45), recovery (#46),
-manifest (#47), state machine (#48), USB MSC/CDC (#49/#50), `pc/`,
+Task #45 (IM-008) adds WAV rotation / finalize in the same component
+(`wav_rotation.h/.c`: 30-minute + midnight rotation, date directories
+`recordings/YYYY-MM-DD/`, header-finalize + flush/close + idempotent
+`.wav.part` → `.wav` rename shared by USB / low-battery / safe-stop,
+no double close/rename, rotation gap <=100ms without stopping capture).
+
+Out of scope: recovery (#46), retention/identity (#47 and later),
+state machine (#48), USB MSC/CDC (#49/#50), `pc/`,
 `contracts/`, `fixtures/`, `.github/`, and security-rule changes.
 
 ## Evidence
