@@ -308,11 +308,19 @@ def test_no_deletion_or_scope_creep():
         for p in COMP.rglob("*")
         if p.is_file() and p.suffix in (".c", ".h")
     )
-    assert not _has_c_call(blob, "remove")
+    # Audio is never deleted: no unlink() anywhere; remove() only in
+    # device_manifest.c for tmp/destination metadata replace.
     assert not _has_c_call(blob, "unlink")
-    # Task #46 recovery/quarantine is now in scope (own module + wiring);
-    # later manifest/identity retention stays out of scope.
-    for keyword in ("manifest", "device.json", "acks/"):
+    for p in COMP.rglob("*"):
+        if p.is_file() and p.suffix in (".c", ".h") and \
+                p.name != "device_manifest.c":
+            assert not _has_c_call(
+                p.read_text(encoding="utf-8"), "remove"), p.name
+    # Task #46 recovery/quarantine and Task #47 identity/manifest are now
+    # in scope (own modules + wiring); processed-ACK retention stays out.
+    assert "manifest" in blob.lower()
+    assert "device.json" in blob.lower() or "device_json" in blob.lower()
+    for keyword in ("acks/",):
         assert keyword not in blob.lower(), keyword
 
 

@@ -101,9 +101,19 @@ rename() only and never auto-deleted, results to `events.jsonl` plus
 `stage: recover` counts), plus stdlib-only host contract tests
 (`python3 -m pytest firmware/tests -v`).
 
-Out of scope: retention/identity (#47 and later),
+Out of scope: processed-ACK retention (later Task),
 state machine (#48), USB MSC/CDC (#49/#50), `pc/`,
 `contracts/`, `fixtures/`, `.github/`, and security-rule changes.
+
+Task #47 (IM-010) adds device identity + manifest/integrity in
+`components/recorder/` (`sha256.h/.c`, `device_identity.h/.c`,
+`device_manifest.h/.c`: NVS-stable UUIDv4 `deviceId`, `device.json`,
+per-segment UUIDv4 `recordingId`, incremental SHA-256 over the WAV file
+bytes entire, `manifest.json` via `manifest.tmp` + atomic rename with
+CONFLICT protection) wired into `main/` (boot identity/manifest ensure,
+rotation/terminal manifest records, recovered-`.wav` sync), plus
+stdlib-only host contract tests in `firmware/tests/`
+(`python3 -m pytest firmware/tests -v`).
 
 ## Evidence
 

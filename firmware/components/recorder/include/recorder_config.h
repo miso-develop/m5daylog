@@ -90,7 +90,8 @@ extern "C" {
 // Filesystem scope for Tasks #44/#45/#46: board bring-up creates the
 // live-recording directories, per-date subdirectories
 // (`recordings/YYYY-MM-DD/`) for rotation/finalize, and the quarantine
-// directory for Task #46 power-loss recovery. Later retention bookkeeping
+// directory for Task #46 power-loss recovery. Task #47 metadata files
+// below live in the same M5DAYLOG root; later retention/ACK handling
 // belongs to later Tasks and must not be created here.
 #define RECORDER_M5DAYLOG_DIR "/sdcard/M5DAYLOG"
 #define RECORDER_RECORDINGS_DIR "/sdcard/M5DAYLOG/recordings"
@@ -100,6 +101,33 @@ extern "C" {
 // Task #46 (IM-009): boot recovery summary + per-file results are
 // appended here as JSON lines (counts / sizes / result classes only).
 #define RECORDER_EVENTS_PATH "/sdcard/M5DAYLOG/events.jsonl"
+
+// --- Device metadata / manifest (Task #47, IM-010) ------------------------
+// Spec #35 (S-002) identity + integrity contract: first-boot `deviceId`
+// (UUIDv4, NVS-persisted) surfaces in `device.json`; every
+// finalized/recovered `.wav` (WAV file bytes entire, incremental SHA-256,
+// lowercase hex 64 chars) is reflected in `manifest.json` via
+// `manifest.tmp` full-write + flush + atomic rename. PoC
+// `schemaVersion=1`; unknown majors fail closed without writing.
+// Timestamps are offset ISO-8601 (`YYYY-MM-DDTHH:MM:SS+00:00`, UTC).
+#define RECORDER_METADATA_SCHEMA_VERSION 1u
+#define RECORDER_MODEL "M5Capsule v1.1"
+#define RECORDER_FIRMWARE_VERSION "0.1.0"
+#define RECORDER_DEVICE_JSON_PATH "/sdcard/M5DAYLOG/device.json"
+#define RECORDER_MANIFEST_PATH "/sdcard/M5DAYLOG/manifest.json"
+#define RECORDER_MANIFEST_TMP_PATH "/sdcard/M5DAYLOG/manifest.tmp"
+// UUIDv4 canonical string: 8-4-4-4-12 lowercase hex (36 chars + NUL).
+#define RECORDER_UUID_STR_LEN 37u
+// SHA-256 of the WAV file bytes entire: 64 lowercase hex chars + NUL.
+#define RECORDER_SHA256_HEX_LEN 65u
+// Offset ISO-8601 `YYYY-MM-DDTHH:MM:SS+HH:MM`: 25 chars + NUL.
+#define RECORDER_ISO8601_STR_LEN 32u
+// Single recording entry JSON bound (relative filename + UUIDs + hex).
+#define RECORDER_MANIFEST_ENTRY_MAX 1024u
+// Manifest file rewrite bound: 32 finalized/recovered segments per 16h
+// day (~350 bytes each) fit comfortably; fail-loud above this bound
+// rather than truncating integrity data.
+#define RECORDER_MANIFEST_MAX_BYTES 131072u
 
 // Sanity: slots must hold whole samples (even byte count for 16bit PCM).
 _Static_assert((RECORDER_BUFFER_BYTES % RECORDER_BYTES_PER_SAMPLE) == 0,
