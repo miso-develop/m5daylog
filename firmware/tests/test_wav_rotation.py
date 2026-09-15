@@ -361,14 +361,33 @@ def test_writer_stack_budget_and_high_water():
     assert main.count("recorder_log_writer_stack_hw(") >= 7
     assert 'recorder_log_writer_stack_hw("rotation")' in main
     # Rotation success emits high-water evidence after the next segment is
-    # open and recording continues: the finalize-ok rotate log and the new
-    # segment's capturing log both precede it in the rotation branch, so
-    # the 30-minute run shows writer stack margin without terminating the
-    # writer.
-    rot_ok = main.index('recorder_log_writer_stack_hw("rotation")')
-    window = main[max(0, rot_ok - 4000) : rot_ok]
-    assert "stage: rotate, result: ok" in window
-    assert "path_suffix: .wav.part" in window
+    # open and recording continues: the finalize-ok rotate log, then the
+    # new segment's capturing log, then the rotation high-water call, in
+    # that structural order inside the rotation branch — verified by
+    # anchor ordering (not a fixed character window) so later Tasks may
+    # add bounded processing (Task #47 manifest record + fresh UUIDv4)
+    # between the anchors without breaking this gate. The 30-minute run
+    # therefore shows writer stack margin without terminating the writer.
+    rot_ok_at = main.index("stage: rotate, result: ok")
+    hw_at = main.index('recorder_log_writer_stack_hw("rotation")')
+    assert rot_ok_at < hw_at
+    capturing_at = [
+        m.start()
+        for m in re.finditer(
+            r"stage: record, result: capturing, path_suffix: \.wav\.part",
+            main,
+        )
+    ]
+    assert len(capturing_at) >= 2  # initial segment + rotation segment
+    between = [c for c in capturing_at if rot_ok_at < c < hw_at]
+    assert between, (
+        "rotation must log the next segment capturing between the "
+        "rotate-ok log and the rotation high-water evidence"
+    )
+    # Task #47 manifest + identity work stays between the same anchors.
+    between_src = main[rot_ok_at:hw_at]
+    assert "recorder_manifest_record_wav" in between_src
+    assert "recorder_new_recording_id" in between_src
     # Rotation/finalize semantics untouched by the stack refactor.
     assert "wav_rotation_finalize_once" in main
     assert "no double close" in main.lower()
