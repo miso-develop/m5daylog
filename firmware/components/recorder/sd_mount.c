@@ -1,8 +1,9 @@
-// microSD SPI mount + Tasks #44/#45 directory bring-up.
+// microSD SPI mount + Tasks #44/#45/#46 directory bring-up.
 //
 // M5Capsule v1.1: SD over SPI (CS 11 / MOSI 12 / CLK 14 / MISO 39),
-// mounted at /sdcard. Live-recording directories plus Task #45 per-date
-// subdirectories (`recordings/YYYY-MM-DD/`) are created. No other state.
+// mounted at /sdcard. Live-recording directories, Task #45 per-date
+// subdirectories (`recordings/YYYY-MM-DD/`), and the Task #46 quarantine
+// directory are created. No other state.
 
 #include "sd_mount.h"
 
@@ -47,6 +48,18 @@ static esp_err_t ensure_recording_dirs(void) {
         if (mkdir_errno != EEXIST) {
             ESP_LOGE(TAG,
                      "stage: record, result: error, reason: mkdir rec, "
+                     "errno: %d",
+                     mkdir_errno);
+            return ESP_FAIL;
+        }
+    }
+    // Task #46: quarantine isolation directory. Never auto-deleted;
+    // recovery moves unrecoverable `.wav.part` files here with rename().
+    if (mkdir(RECORDER_QUARANTINE_DIR, 0755) != 0) {
+        int mkdir_errno = errno;
+        if (mkdir_errno != EEXIST) {
+            ESP_LOGE(TAG,
+                     "stage: recover, result: error, reason: mkdir quarantine, "
                      "errno: %d",
                      mkdir_errno);
             return ESP_FAIL;
@@ -154,6 +167,23 @@ esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd) {
     return ESP_OK;
 }
 
+esp_err_t sd_mount_ensure_quarantine_dir(void) {
+    if (!s_mounted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (mkdir(RECORDER_QUARANTINE_DIR, 0755) != 0) {
+        int mkdir_errno = errno;
+        if (mkdir_errno != EEXIST) {
+            ESP_LOGE(TAG,
+                     "stage: recover, result: error, reason: mkdir quarantine, "
+                     "errno: %d",
+                     mkdir_errno);
+            return ESP_FAIL;
+        }
+    }
+    return ESP_OK;
+}
+
 bool sd_mount_is_mounted(void) {
     return s_mounted;
 }
@@ -179,6 +209,10 @@ esp_err_t sd_mount_recordings(void) {
 
 esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd) {
     (void)date_yyyy_mm_dd;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t sd_mount_ensure_quarantine_dir(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
 

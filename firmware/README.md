@@ -93,7 +93,15 @@ Task #45 (IM-008) adds WAV rotation / finalize in the same component
 `.wav.part` → `.wav` rename shared by USB / low-battery / safe-stop,
 no double close/rename, rotation gap <=100ms without stopping capture).
 
-Out of scope: recovery (#46), retention/identity (#47 and later),
+Task #46 (IM-009) adds boot power-loss recovery / quarantine in the same
+component (`wav_recovery.h/.c`: residual `.wav.part` scan after mount,
+header rebuild from payload length with tail-only truncation, recovered
+`.wav` finalize, unrecoverable files moved to `quarantine/` with
+rename() only and never auto-deleted, results to `events.jsonl` plus
+`stage: recover` counts), plus stdlib-only host contract tests
+(`python3 -m pytest firmware/tests -v`).
+
+Out of scope: retention/identity (#47 and later),
 state machine (#48), USB MSC/CDC (#49/#50), `pc/`,
 `contracts/`, `fixtures/`, `.github/`, and security-rule changes.
 

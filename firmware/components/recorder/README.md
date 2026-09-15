@@ -1,4 +1,4 @@
-# M5Daylog recorder component (Tasks #44/#45)
+# M5Daylog recorder component (Tasks #44/#45/#46)
 
 Task #44 scope: PDM mic → I2S/DMA → 32KB × 2 double buffer → microSD
 `.wav.part` continuous PCM write. 16kHz / signed 16bit / mono PCM.
@@ -8,7 +8,13 @@ midnight rotation with header-finalize, flush/close, and idempotent
 `.wav.part` → `.wav` rename (USB / low-battery / safe-stop share the
 same idempotent finalize; no double close, no double rename).
 
-Parent Map: #1. Tasks: #44 (`IM-007`), #45 (`IM-008`).
+Task #46 scope (IM-009): boot power-loss recovery / quarantine —
+residual `.wav.part` scan, WAV header rebuild from the written PCM
+payload length with tail-only sample truncation, recovered `.wav`
+finalize, unrecoverable files moved to `quarantine/` with rename() only
+(never auto-deleted), results appended to `events.jsonl` as counts.
+
+Parent Map: #1. Tasks: #44 (`IM-007`), #45 (`IM-008`), #46 (`IM-009`).
 Related Spec: #36 (`S-003`).
 
 ## Files
@@ -17,18 +23,20 @@ Related Spec: #36 (`S-003`).
 components/recorder/
   CMakeLists.txt
   README.md                      # this file
-  include/recorder_config.h      # sample rate / format / buffer + rotation constants
+  include/recorder_config.h      # sample rate / format / buffer + rotation + recovery paths
   include/pcm_pipeline.h         # portable ping-pong double buffer + counters
   pcm_pipeline.c                 # portable, no ESP-IDF dependency
   include/wav_part.h             # portable RIFF/WAVE `.part` framing over stdio
   wav_part.c                     # portable, no ESP-IDF dependency
   include/wav_rotation.h         # portable rotation/finalize over stdio (#45)
   wav_rotation.c                 # portable, no ESP-IDF dependency (#45)
+  include/wav_recovery.h         # portable boot recovery/quarantine over stdio (#46)
+  wav_recovery.c                 # portable, no ESP-IDF dependency (#46)
   include/i2s_pdm_capture.h      # ESP-IDF PDM RX wrapper (pins from caller)
   i2s_pdm_capture.c              # ESP-IDF only (`ESP_PLATFORM`)
   include/sd_pcm_sink.h          # `.wav.part` file sink + write-latency stats
   sd_pcm_sink.c                  # stdio + `esp_timer` latency when available
-  include/sd_mount.h             # microSD SPI mount + recording/date-dirs API
+  include/sd_mount.h             # microSD SPI mount + recording/date/quarantine-dirs API
   sd_mount.c                     # ESP-IDF only (`ESP_PLATFORM`)
 ```
 
@@ -39,10 +47,12 @@ components/recorder/
 - microSD: SPI bus CS 11 / MOSI 12 / CLK 14 / MISO 39, mounted at
   `/sdcard` via `sd_mount_recordings()`. The card is never formatted on
   mount failure — failures surface as ERROR instead.
-- Live-recording directories plus Task #45 date directories are created:
-  `/sdcard/M5DAYLOG`, `/sdcard/M5DAYLOG/recordings`, and
+- Live-recording directories plus Task #45 date directories plus Task #46
+  quarantine are created: `/sdcard/M5DAYLOG`, `/sdcard/M5DAYLOG/recordings`,
   `recordings/YYYY-MM-DD/` via `sd_mount_ensure_date_dir()` for midnight
-  rotation. Later recovery/retention state is out of scope (#46 and later).
+  rotation, and `/sdcard/M5DAYLOG/quarantine/` via
+  `sd_mount_ensure_quarantine_dir()` for power-loss isolation (never
+  auto-deleted). Later retention/manifest state is out of scope (#47+).
 - Runtime recording paths have the Spec #36 shape
   (`recordings/YYYY-MM-DD/HHMMSS_<recordingId>.wav.part`); the
   recording-id field is a per-boot segment counter placeholder until later
@@ -75,10 +85,24 @@ components/recorder/
   return the cached result with no double close and no double rename).
   This component never deletes audio (only `rename()`, never `remove()`).
   `sd_pcm_sink` appends to one caller-provided `.wav.part` path (suffix
-  enforced at open, never a bare `.part`). Later recovery/retention
-  bookkeeping stays out of scope (#46 and later).
+  enforced at open, never a bare `.part`).
+- Power-loss recovery / quarantine is Task #46 scope
+  (`wav_recovery.h/.c` + RECOVER step in `main.c` writer bring-up after
+  mount, before the new segment opens): residual `.wav.part` files under
+  `recordings/` (top level plus one-level date subdirectories) are
+  recovered by rebuilding the 44-byte header from `file_size - 44` with
+  the fixed 16kHz/16bit/mono format; an odd trailing byte is truncated to
+  the sample boundary only. Files too small for a header, with an invalid
+  RIFF/WAVE/PCM header or format mismatch, or colliding with an existing
+  `.wav` are moved to `quarantine/` with `rename()` (numeric uniqueness on
+  collision) and never auto-deleted. A summary plus per-file JSON lines
+  (basename + `pcm_bytes` + result, sanitized to filename-safe chars) are
+  appended to `events.jsonl`; fatal scan/dir failures enter ERROR, never
+  silent recording. Later retention/manifest bookkeeping stays out of
+  scope (#47 and later).
 - microSD mount and recording directories are Task #44 bring-up
-  (`sd_mount.c`: `/sdcard` + `/sdcard/M5DAYLOG/recordings`). The sink
+  (`sd_mount.c`: `/sdcard` + `/sdcard/M5DAYLOG/recordings` + Task #46
+  `/sdcard/M5DAYLOG/quarantine`). The sink
   writes to the mounted path; open/write failures are fail-loud (`false` +
   counter increment + caller logs ERROR); the caller must not report a
   recording state while the sink is failed.
@@ -122,7 +146,10 @@ recorder_capture_task (prio 5): wait WRITER_READY handshake → re-check STOP
     → quiescent stop-and-final-drain
     (pdm_capture_stop_and_drain_final; failed disable stays retryable)
     → fail-closed deinit (checked fail-loud, never destroys after failure)
-recorder_writer_task (prio 4): mount + date dir + segment open →
+recorder_writer_task (prio 4): mount + quarantine ensure + RECOVER scan
+    (residual `.wav.part` → recovered `.wav` / `quarantine/`, counts to
+    `events.jsonl` + `stage: recover` log; fatal scan enters ERROR) +
+    date dir + segment open →
     set WRITER_READY → on SLOT_FULL: [lock] peek full slot → [unlock] →
     sd_pcm_sink_write_chunk (slow, lock released: capture fills the other
     slot meanwhile) → [lock] release + latency note → every 4 slots:
@@ -150,9 +177,9 @@ here); radio/LED policy is owned by Spec #36 and later Tasks.
 ## Host tests
 
 Portable logic (`pcm_pipeline.c`, `wav_part.c`, `wav_rotation.c`,
-`recorder_config.h`) has no ESP-IDF dependency. Host contract tests live
-in `firmware/tests/` and run with stdlib-only pytest (no ESP-IDF, no
-device, no network):
+`wav_recovery.c`, `recorder_config.h`) has no ESP-IDF dependency. Host
+contract tests live in `firmware/tests/` and run with stdlib-only pytest
+(no ESP-IDF, no device, no network):
 
 ```sh
 python3 -m pytest firmware/tests -v
@@ -168,7 +195,14 @@ close/rename), finalized-`wave` decodeability, and the writer stack budget
 `test_recording_contract.py`
 guards the 16kHz/16bit/mono format, `.wav.part` suffix discipline,
 fail-loud symbols, producer/consumer structure, overrun/drop accounting,
-and later-task scope boundaries (no recovery/retention logic here).
+and later-task scope boundaries (retention/manifest stay out; #45
+rotation and #46 recovery/quarantine are in scope).
+`test_wav_recovery.py` locks Task #46 recovery/quarantine: header
+rebuild from payload length, odd-tail-only truncation, quarantine
+isolation without deletion, collision handling (never overwrite),
+date-dir scan, `events.jsonl` results, boot wiring (`stage: recover`,
+quarantine ensure, fail-loud scan), and `wave`-module decodeability of
+recovered files with synthetic payloads.
 
 ## Device evidence (recorded in the Task PR, never in-repo)
 
@@ -180,6 +214,11 @@ and later-task scope boundaries (no recovery/retention logic here).
   results plus `stage: rotate` / `stage: finalize` event logs showing
   finalized `.wav` corruption 0, unintended gap <=100ms, midnight date-dir
   switch, and duplicate-stop idempotency (no double close/rename).
+- Task #46 recovery evidence (synthetic power-cut runs, never real audio):
+  residual `.wav.part` sizes, `stage: recover` counts
+  (`scanned/recovered/quarantined/errors`), `events.jsonl` recovery lines,
+  `wave`-module decodeability of every recovered `.wav` (corruption 0),
+  and quarantine isolation of the unrecoverable cases with no auto-delete.
 - Writer stack high-water (`stage: record, result: stack, writer_hw: ...`)
   from a normal run, from each successful rotation while recording
   continues, and from the boot-without-SD fail-loud path; no stack

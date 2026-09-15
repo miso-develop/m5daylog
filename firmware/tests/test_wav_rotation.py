@@ -310,7 +310,9 @@ def test_no_deletion_or_scope_creep():
     )
     assert not _has_c_call(blob, "remove")
     assert not _has_c_call(blob, "unlink")
-    for keyword in ("quarantine", "manifest", "device.json", "acks/"):
+    # Task #46 recovery/quarantine is now in scope (own module + wiring);
+    # later manifest/identity retention stays out of scope.
+    for keyword in ("manifest", "device.json", "acks/"):
         assert keyword not in blob.lower(), keyword
 
 
