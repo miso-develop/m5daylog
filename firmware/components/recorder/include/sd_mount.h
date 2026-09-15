@@ -1,14 +1,16 @@
 #pragma once
 
-// microSD SPI mount + Tasks #44/#45 directory bring-up.
+// microSD SPI mount + Tasks #44/#45/#46 directory bring-up.
 //
 // Mounts the microSD at RECORDER_SD_MOUNT_POINT ("/sdcard") over the
 // M5Capsule v1.1 SPI bus (CS 11 / MOSI 12 / CLK 14 / MISO 39, see
 // recorder_config.h) and creates the directories required for live
 // recording (`/sdcard/M5DAYLOG` + `/sdcard/M5DAYLOG/recordings`) plus,
 // via sd_mount_ensure_date_dir(), per-date subdirectories
-// (`recordings/YYYY-MM-DD/`) for Task #45 midnight rotation. Later
-// recovery/retention state is never created here.
+// (`recordings/YYYY-MM-DD/`) for Task #45 midnight rotation, and the
+// Task #46 quarantine directory (`/sdcard/M5DAYLOG/quarantine/`) for
+// power-loss recovery isolation. Later retention state is never
+// created here.
 //
 // Fail-loud: every failure returns non-ESP_OK so the caller enters ERROR
 // instead of a silent "recording" state (Spec #36). The card is never
@@ -32,8 +34,9 @@ typedef int esp_err_t;
 extern "C" {
 #endif
 
-// Mount the card and ensure the Tasks #44/#45 recording directories exist.
-// Safe to call when already mounted (verifies directories, returns ESP_OK).
+// Mount the card and ensure the Tasks #44/#45/#46 directories exist
+// (recordings + quarantine). Safe to call when already mounted
+// (verifies directories, returns ESP_OK).
 esp_err_t sd_mount_recordings(void);
 
 // Ensure the per-date subdirectory `recordings/YYYY-MM-DD/` exists for
@@ -43,6 +46,13 @@ esp_err_t sd_mount_recordings(void);
 // Fail-loud: mkdir errors (other than EEXIST) return ESP_FAIL so the
 // caller enters ERROR instead of recording without a directory.
 esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd);
+
+// Ensure the Task #46 quarantine directory
+// (`/sdcard/M5DAYLOG/quarantine/`) exists for power-loss recovery
+// isolation. Requires a prior successful sd_mount_recordings();
+// otherwise ESP_ERR_INVALID_STATE. Quarantine files are never
+// auto-deleted. Fail-loud like the date-dir helper.
+esp_err_t sd_mount_ensure_quarantine_dir(void);
 
 // True after a successful sd_mount_recordings() until unmount.
 bool sd_mount_is_mounted(void);

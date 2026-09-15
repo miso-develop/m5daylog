@@ -87,15 +87,18 @@ def test_fail_loud_symbols():
 def test_no_scope_creep_into_later_tasks():
     srcs = _sources()
     blob = "\n".join(srcs.values()).lower()
-    # Later recovery/retention keywords must not be implemented here
-    # (rotation/finalize #45 is now in scope).
-    for keyword in ("quarantine", "manifest", "device.json", "acks/"):
+    # Later retention keywords must not be implemented here
+    # (rotation/finalize #45 and recovery/quarantine #46 are now in scope).
+    for keyword in ("manifest", "device.json", "acks/"):
         assert keyword not in blob, keyword
-    # Rotation is implemented; later recovery/retention stays out of scope.
+    # Rotation + recovery are implemented; later retention stays out.
+    assert "quarantine" in blob
+    assert "wav_recovery" in blob
     readme = (COMP / "README.md").read_text(encoding="utf-8").lower()
     for marker in ("#45", "#46", "never deletes"):
         assert marker in readme, marker
     assert "rotation" in readme
+    assert "recovery" in readme or "quarantine" in readme
 
 
 def test_no_credentials_or_private_data_patterns():
@@ -127,6 +130,7 @@ def test_sd_mount_creates_only_recording_dirs():
     for symbol in (
         "sd_mount_recordings",
         "sd_mount_ensure_date_dir",
+        "sd_mount_ensure_quarantine_dir",
         "sd_mount_is_mounted",
         "sd_mount_unmount",
     ):
@@ -140,13 +144,16 @@ def test_sd_mount_creates_only_recording_dirs():
         "RECORDER_SD_MOUNT_POINT",
     ):
         assert token in src, token
-    # Live-recording plus Task #45 date directories; later-Task state is not.
+    # Live-recording plus Task #45 date directories plus Task #46
+    # quarantine; later-Task manifest/retention state is not.
     assert "RECORDER_RECORDINGS_DIR" in src
+    assert "RECORDER_QUARANTINE_DIR" in src
     assert "mkdir" in src
     assert "format_if_mount_failed" in src  # never format away audio
     assert "YYYY-MM-DD" in hdr or "date_yyyy_mm_dd" in hdr
-    for keyword in ("quarantine", "manifest", "device.json", "acks/"):
+    for keyword in ("manifest", "device.json", "acks/"):
         assert keyword not in src.lower(), keyword
+    assert "quarantine" in src.lower()
     # Mount teardown never deletes or renames audio (comment prose
     # mentioning remove() does not count as a call).
     assert not _has_c_call(src, "rename")

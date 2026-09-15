@@ -20,12 +20,15 @@
 #include "recorder_config.h"
 #include "sd_mount.h"
 #include "sd_pcm_sink.h"
+#include "wav_recovery.h"
 #include "wav_rotation.h"
 
 static const char *TAG = "m5daylog";
 
-// Tasks #44/#45: SD mount -> PDM capture + SD writer -> `.wav.part`
-// with Task #45 rotation/finalize to `.wav`.
+// Tasks #44/#45/#46: SD mount -> RECOVER -> PDM capture + SD writer ->
+// `.wav.part` with Task #45 rotation/finalize to `.wav` and Task #46
+// boot power-loss recovery (residual `.wav.part` -> recovered `.wav` or
+// `quarantine/`, results to `events.jsonl`).
 //
 // Bounded producer/consumer over the 32KB x 2 ping-pong pipeline:
 // - recorder_capture_task (priority 5) owns the PDM handle and DMA scratch.
@@ -60,10 +63,13 @@ static const char *TAG = "m5daylog";
 // Board pins and SD bus come from recorder_config.h (M5Capsule v1.1
 // baseline: PDM CLK 40 / DAT 41, SD SPI CS 11 MOSI 12 CLK 14 MISO 39,
 // mount /sdcard). Build flags may override them; any bring-up failure
-// (events, lock, mount, mic init, `.part` open, I2S/SD I/O, rotation
-// path/dir/open) enters ERROR, never silent recording. Date
-// subdirectories (`recordings/YYYY-MM-DD/`) are Task #45 scope; later
-// recovery/retention bookkeeping remains out of scope.
+// (events, lock, mount, recovery, mic init, `.part` open, I2S/SD I/O,
+// rotation path/dir/open) enters ERROR, never silent recording. Date
+// subdirectories (`recordings/YYYY-MM-DD/`) are Task #45 scope; Task #46
+// owns the boot RECOVER step (scan residual `.wav.part`, rebuild headers
+// from payload length with tail-only truncation, quarantine unrecoverable
+// files without auto-delete, log counts to `events.jsonl`). Retention /
+// manifest bookkeeping remains out of scope.
 #ifndef RECORDER_PART_PATH
 #define RECORDER_PART_PATH \
     "/sdcard/M5DAYLOG/recordings/000000_pending.wav.part"
@@ -474,6 +480,50 @@ static void recorder_writer_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
+    // Task #46 RECOVER (Spec #36 BOOT -> HW_INIT -> SD_MOUNT -> RECOVER ->
+    // RTC_CHECK -> RECORDING): scan residual `.wav.part` files left by a
+    // power loss, rebuild each WAV header from the written PCM payload
+    // length (odd tail truncated to the sample boundary only), rename
+    // recovered files `.wav.part` -> `.wav`, and isolate unrecoverable
+    // files into `quarantine/` with rename() only (never auto-deleted).
+    // Results (counts/sizes only, no audio or credential content) are
+    // appended to `events.jsonl` by the scan itself; the serial log below
+    // carries the same counts for hardware evidence. A fatal scan failure
+    // (recordings unreadable / quarantine uncreatable) enters ERROR and
+    // never starts recording, so a silent unrecovered state is impossible.
+    // Recovery runs before the new segment opens so the fresh capture
+    // never collides with a residual file.
+    {
+        wav_recovery_stats_t rec_stats;
+        memset(&rec_stats, 0, sizeof(rec_stats));
+        if (sd_mount_ensure_quarantine_dir() != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "stage: recover, result: error, reason: mkdir quarantine");
+            sd_mount_unmount();
+            recorder_request_stop();
+            recorder_log_writer_stack_hw("mkdir quarantine");
+            vTaskDelete(NULL);
+            return;
+        }
+        if (!wav_recovery_scan_recordings(RECORDER_RECORDINGS_DIR,
+                                          RECORDER_QUARANTINE_DIR,
+                                          RECORDER_EVENTS_PATH, &rec_stats)) {
+            ESP_LOGE(TAG,
+                     "stage: recover, result: error, reason: scan");
+            sd_mount_unmount();
+            recorder_request_stop();
+            recorder_log_writer_stack_hw("recover scan");
+            vTaskDelete(NULL);
+            return;
+        }
+        ESP_LOGI(TAG,
+                 "stage: recover, result: ok, scanned: %" PRIu32
+                 ", recovered: %" PRIu32 ", quarantined: %" PRIu32
+                 ", errors: %" PRIu32 ", pcm_bytes: %" PRIu32,
+                 rec_stats.scanned, rec_stats.recovered,
+                 rec_stats.quarantined, rec_stats.errors,
+                 rec_stats.recovered_pcm_bytes);
+    }
     // Initial segment: runtime date/time naming with the Spec #36
     // `HHMMSS_<recordingId>.wav.part` shape inside the date directory.
     // The recording-id field is a per-boot segment counter placeholder
@@ -723,11 +773,12 @@ void app_main(void) {
     ESP_LOGI(TAG, "idf version: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "stage: scaffold, result: boot ok");
 
-    // Tasks #44/#45 recording path. The event group is the only cross-task
-    // channel (no published task handles); the writer-ready handshake makes
-    // creation order irrelevant. Task #45 rotation/finalize is wired into
-    // the writer task above; later recovery/retention/state tasks attach
-    // without changing the capture contract.
+    // Tasks #44/#45/#46 recording path. The event group is the only
+    // cross-task channel (no published task handles); the writer-ready
+    // handshake makes creation order irrelevant. Task #45
+    // rotation/finalize and Task #46 boot RECOVER are wired into the
+    // writer task above; later retention/state tasks attach without
+    // changing the capture contract.
     recorder_reference_stop_wrappers();
     pcm_pipeline_init(&s_pipeline, s_slot0, s_slot1);
     memset(&s_sink, 0, sizeof(s_sink));

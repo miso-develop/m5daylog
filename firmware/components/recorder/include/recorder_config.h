@@ -1,6 +1,7 @@
 #pragma once
 
-// M5Daylog recorder fixed audio contract — Task #44 (IM-007).
+// M5Daylog recorder fixed audio contract — Tasks #44 (IM-007) / #45
+// (IM-008) / #46 (IM-009).
 //
 // 16kHz / signed 16bit little-endian / mono PCM from the PDM mic via
 // I2S/DMA, staged through a 32KB x 2 double buffer into a `.wav.part`
@@ -86,13 +87,19 @@ extern "C" {
 #define RECORDER_SD_MISO_PIN 39
 #endif
 
-// Filesystem scope for Tasks #44/#45: board bring-up creates the
-// live-recording directories plus per-date subdirectories
-// (`recordings/YYYY-MM-DD/`) for rotation/finalize. Power-loss recovery
-// and retention bookkeeping belong to later Tasks and must not be
-// created here.
+// Filesystem scope for Tasks #44/#45/#46: board bring-up creates the
+// live-recording directories, per-date subdirectories
+// (`recordings/YYYY-MM-DD/`) for rotation/finalize, and the quarantine
+// directory for Task #46 power-loss recovery. Later retention bookkeeping
+// belongs to later Tasks and must not be created here.
 #define RECORDER_M5DAYLOG_DIR "/sdcard/M5DAYLOG"
 #define RECORDER_RECORDINGS_DIR "/sdcard/M5DAYLOG/recordings"
+// Task #46 (IM-009): unrecoverable `.wav.part` files are isolated here
+// with rename() only and never auto-deleted.
+#define RECORDER_QUARANTINE_DIR "/sdcard/M5DAYLOG/quarantine"
+// Task #46 (IM-009): boot recovery summary + per-file results are
+// appended here as JSON lines (counts / sizes / result classes only).
+#define RECORDER_EVENTS_PATH "/sdcard/M5DAYLOG/events.jsonl"
 
 // Sanity: slots must hold whole samples (even byte count for 16bit PCM).
 _Static_assert((RECORDER_BUFFER_BYTES % RECORDER_BYTES_PER_SAMPLE) == 0,
