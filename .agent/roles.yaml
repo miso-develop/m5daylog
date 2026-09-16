@@ -1,14 +1,28 @@
-version: 2
+version: 3
 
 policy:
   exactly_one_active_role_per_chat: true
   repository_is_durable_source_of_truth: true
+  repository_visibility_must_be_checked_before_write: true
+  public_repository_private_source_metadata_allowed: false
+  private_source_metadata_disclosure_requires_explicit_human_approval: true
   silent_cross_role_work: false
   implementation_self_merge: false
+  handoff_is_transition_only: true
+  material_handoff_only_information_allowed: false
+  handoff_protocol: .agent/HANDOFF_PROTOCOL.md
   domain_modes:
     - required
     - optional
     - forbidden
+
+handoff:
+  protocol_version: 3
+  contract: .agent/HANDOFF_PROTOCOL.md
+  durable_first: true
+  durable_first_respects_repository_visibility: true
+  chat_and_github_use_same_schema: true
+  pr_head_required_for_revision_bound_transition: true
 
 roles:
   general:
@@ -106,7 +120,11 @@ notes:
   - DOMAIN identifies the primary technical or functional area and never expands Role permissions.
   - required means DOMAIN must be declared; optional means DOMAIN may be used as a specialist focus; forbidden means DOMAIN must not be declared.
   - For optional-Domain Roles, omission means cross-domain operation within the same Role.
+  - Before repository writes, Agents must determine repository visibility and must not disclose private-source metadata into a public repository without explicit human approval.
+  - Public durable records should contain public-safe resulting state; private-source provenance/traceability belongs in an approved private durable location.
+  - Handoffs are structural workflow transitions; all material context/evidence must be persisted to durable state appropriate for its visibility/sensitivity before handoff.
+  - The receiving Agent reconstructs current context from GitHub during Bootstrap and treats mismatched PR HEAD values as stale handoffs requiring reevaluation.
   - These values are machine-readable policy metadata, not by themselves GitHub permission enforcement.
   - Important restrictions should also be enforced with branch protection, required checks, scoped credentials, or a Control Plane.
-  - Integration source/commit permission marked 'limited' means integration-only mechanical changes may be permitted by its role contract; functional implementation must be handed back to Implementation.
-  - Cross-agent runtime supervision, scheduling, stall detection, and automatic recovery are intentionally outside this ChatGPT role catalog and belong to an external Control Plane when present.
+  - Integration source/commit permission marked 'limited' means integration-only mechanical changes may be permitted by its Role Contract; functional implementation must be handed back to Implementation.
+  - Cross-agent runtime supervision, scheduling, stall detection, and automatic recovery are intentionally outside this ChatGPT Role catalog and belong to an external Control Plane when present.
