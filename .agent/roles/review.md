@@ -69,4 +69,4 @@ The Review Agent should identify the defect, not prescribe unnecessary implement
 - `READY_FOR_INTEGRATION` -> Integration
 - security concern -> Security
 - specification ambiguity -> Specification
-- physical/manual validation -> Human Gate through Integration/Supervisor as appropriate
+- physical/manual validation -> Human Gate through Integration
