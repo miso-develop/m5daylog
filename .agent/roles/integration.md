@@ -59,7 +59,7 @@ Use one of:
 - implementation defect -> Implementation
 - specification ambiguity/change -> Specification
 - security concern -> Security
-- workflow/ownership stall -> Supervisor
+- workflow/ownership stall -> Human or external Control Plane
 - manual/physical verification -> Human Gate
 
 A merge is the result of satisfied evidence, not a substitute for missing evidence.
