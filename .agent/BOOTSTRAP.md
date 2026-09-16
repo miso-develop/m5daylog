@@ -10,9 +10,15 @@ Confirm:
 - role contract path
 - project/repository
 - assigned Issue(s), if any
-- domain scope for Implementation Agents
+- `DOMAIN`, according to the active Role's Domain mode
 
-If the role is missing or ambiguous, do not infer a privileged role from the requested action.
+Domain modes are defined in `.agent/AGENT_CATALOG.md` and `.agent/roles.yaml`:
+
+- `required`: `DOMAIN` must be present.
+- `optional`: `DOMAIN` may be present; omission means cross-domain operation within the same Role.
+- `forbidden`: `DOMAIN` must not be present.
+
+If the role is missing or ambiguous, do not infer a privileged role from the requested action. If Domain usage conflicts with the active Role's Domain mode, classify the start state as `BLOCKED_ROLE_BOUNDARY` until the activation is corrected.
 
 ## 2. Load policy
 
@@ -47,6 +53,8 @@ For implementation work, verify that:
 - the intended files/domain do not materially overlap another active task without coordination;
 - prerequisites are satisfied.
 
+For optional-Domain Roles, treat `DOMAIN` as the primary specialist focus. Inspect adjacent domains when needed to perform the Role correctly, but do not silently take ownership of another Agent/domain's work.
+
 If collision risk is material, stop mutation and hand off to Integration when it concerns repository integration/dependencies, or request a human decision. If an external Control Plane owns runtime coordination, follow its durable coordination state instead of creating a separate ChatGPT Supervisor role.
 
 ## 5. Determine readiness
@@ -63,7 +71,9 @@ Only `READY` permits normal execution.
 
 ## 6. Startup report
 
-Keep the startup report concise. It should contain enough information to establish state, for example:
+Keep the startup report concise. Include Domain when declared or required.
+
+Example:
 
 ```text
 ROLE: implementation
@@ -76,6 +86,17 @@ COLLISION_CHECK: clear
 NEXT_ACTION: implement acceptance criteria AC-01..AC-04
 ```
 
+For an optional-Domain Role operating cross-domain, Domain may be omitted:
+
+```text
+ROLE: review
+ISSUE: #130
+STATE: READY
+NEXT_ACTION: review cross-domain integration behavior
+```
+
 ## 7. Execute within role
 
 After bootstrap, perform only actions allowed by the active role contract. If the task evolves beyond that boundary, use the Handoff Protocol rather than silently expanding the role.
+
+A Domain change must be explicit. It does not change the active Role or grant additional permissions.

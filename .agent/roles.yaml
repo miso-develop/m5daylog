@@ -1,14 +1,19 @@
-version: 1
+version: 2
 
 policy:
   exactly_one_active_role_per_chat: true
   repository_is_durable_source_of_truth: true
   silent_cross_role_work: false
   implementation_self_merge: false
+  domain_modes:
+    - required
+    - optional
+    - forbidden
 
 roles:
   general:
     contract: .agent/roles/general.md
+    domain_mode: forbidden
     source_modify: false
     commit: false
     push: false
@@ -22,6 +27,7 @@ roles:
 
   specification:
     contract: .agent/roles/specification.md
+    domain_mode: optional
     source_modify: false
     specification_modify: true
     issue_modify: true
@@ -39,8 +45,8 @@ roles:
 
   implementation:
     contract: .agent/roles/implementation.md
+    domain_mode: required
     multiple_instances_allowed: true
-    domain_scope_required: true
     source_modify: true
     commit: true
     push: true
@@ -56,6 +62,7 @@ roles:
 
   review:
     contract: .agent/roles/review.md
+    domain_mode: optional
     source_modify: false
     commit: false
     push: false
@@ -67,20 +74,9 @@ roles:
       - ready_for_integration
       - rework_required
 
-  integration:
-    contract: .agent/roles/integration.md
-    source_modify: limited
-    commit: limited
-    push: limited
-    pr_review: true
-    merge: true
-    primary_outputs:
-      - integration_verdict
-      - merge
-      - follow_up_handoff
-
   security:
     contract: .agent/roles/security.md
+    domain_mode: optional
     source_modify: false
     commit: false
     push: false
@@ -93,7 +89,23 @@ roles:
       - security_issue
       - risk_assessment
 
+  integration:
+    contract: .agent/roles/integration.md
+    domain_mode: forbidden
+    source_modify: limited
+    commit: limited
+    push: limited
+    pr_review: true
+    merge: true
+    primary_outputs:
+      - integration_verdict
+      - merge
+      - follow_up_handoff
+
 notes:
+  - DOMAIN identifies the primary technical or functional area and never expands Role permissions.
+  - required means DOMAIN must be declared; optional means DOMAIN may be used as a specialist focus; forbidden means DOMAIN must not be declared.
+  - For optional-Domain Roles, omission means cross-domain operation within the same Role.
   - These values are machine-readable policy metadata, not by themselves GitHub permission enforcement.
   - Important restrictions should also be enforced with branch protection, required checks, scoped credentials, or a Control Plane.
   - Integration source/commit permission marked 'limited' means integration-only mechanical changes may be permitted by its role contract; functional implementation must be handed back to Implementation.
