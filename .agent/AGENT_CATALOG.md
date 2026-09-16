@@ -31,29 +31,49 @@ A higher-priority source may clarify or supersede a lower-priority source, but i
 - Material uncertainty, unresolved conflicts, secret exposure, destructive changes, or required product decisions must be escalated.
 - A role declaration is a policy boundary, not merely a descriptive label.
 
+## Domain model
+
+`DOMAIN` identifies the primary technical or functional area owned or emphasized by a chat. Examples include `device`, `web`, `pc`, `backend`, `infra`, `protocol`, or another project-defined identifier.
+
+`DOMAIN` does **not** grant additional Role permissions. The active Role Contract remains authoritative.
+
+Each Role defines one of three Domain modes:
+
+- `required`: the chat must declare a `DOMAIN` before substantive work.
+- `optional`: the chat may declare a `DOMAIN` to preserve specialist context and primary focus; omission means the Role may operate cross-domain.
+- `forbidden`: the Role is intentionally project-wide/cross-domain and must not declare a `DOMAIN`.
+
+For Roles with optional Domain, `DOMAIN` is a primary-focus label rather than an absolute visibility boundary. The Agent may inspect adjacent domains when necessary to perform its Role correctly, but should not silently take ownership of work assigned to another Agent/domain.
+
 ## Roles
 
-| Role | Primary responsibility | Typical durable output | May modify product source? | May merge? |
-|---|---|---|---:|---:|
-| `general` | Project-wide consultation, triage, routing | clarified request, routing decision, issue proposal | No | No |
-| `specification` | Requirements, architecture, Map / Decision / Spec / Task | approved specification artifacts | No | No |
-| `implementation` | Implement assigned work, usually within one domain | branch, commits, PR, implementation evidence | Yes | No |
-| `review` | Independent code/spec review | review findings, READY/REWORK recommendation | No | No |
-| `integration` | Integration readiness, dependency coordination, merge decision | integration verdict, merge, follow-up work | Limited | Yes |
-| `security` | Threat modeling and security assessment | security findings, risk decisions, security issues | No | No |
+| Role | Domain mode | Primary responsibility | Typical durable output | May modify product source? | May merge? |
+|---|---|---|---|---:|---:|
+| `general` | `forbidden` | Project-wide consultation, triage, routing | clarified request, routing decision, issue proposal | No | No |
+| `specification` | `optional` | Requirements, architecture, Map / Decision / Spec / Task | approved specification artifacts | No | No |
+| `implementation` | `required` | Implement assigned work within an explicit domain | branch, commits, PR, implementation evidence | Yes | No |
+| `review` | `optional` | Independent code/spec review | review findings, READY/REWORK recommendation | No | No |
+| `security` | `optional` | Threat modeling and security assessment | security findings, risk decisions, security issues | No | No |
+| `integration` | `forbidden` | Cross-domain integration readiness, dependency coordination, merge decision | integration verdict, merge, follow-up work | Limited | Yes |
 
-## Implementation Agent instances
+## Domain-scoped Agent instances
 
-`implementation` is intentionally one role contract rather than separate role definitions for Device, Web, PC, Backend, Infrastructure, and similar domains.
+Projects may create separate long-lived chats for Roles whose Domain mode is `required` or `optional`.
 
-In normal operation, separate chats or workers may instantiate the same Implementation Agent role with different explicit domain scopes, for example:
+Typical examples:
 
+- `specification / device`
+- `specification / web`
 - `implementation / device`
 - `implementation / web`
-- `implementation / pc`
-- `implementation / backend`
+- `review / device`
+- `review / web`
+- `security / device`
+- `security / protocol`
 
-Each instance must declare its domain and assigned Issue(s). Domain separation is intended to reduce conflicting context and parallel-write collisions without duplicating the implementation policy itself.
+Implementation always requires a Domain because it is an execution/ownership boundary. Specification, Review, and Security may omit Domain when the task is intentionally cross-domain.
+
+General and Integration do not use Domain: General is project-wide by design, while Integration must remain able to evaluate dependencies and readiness across multiple domains.
 
 ## External orchestration
 
@@ -70,16 +90,28 @@ ACTIVE_ROLE = review
 ROLE_CONTRACT = .agent/roles/review.md
 ```
 
-For Implementation Agents, also declare:
+When Domain is used:
 
 ```text
+ACTIVE_ROLE = review
+DOMAIN = device
+ROLE_CONTRACT = .agent/roles/review.md
+```
+
+For Implementation Agents, Domain is mandatory:
+
+```text
+ACTIVE_ROLE = implementation
 DOMAIN = device
 ASSIGNED_ISSUE = #123
+ROLE_CONTRACT = .agent/roles/implementation.md
 ```
 
 ## Role change
 
 A role does not change implicitly because the conversation topic changes. A role change should be explicit and should cause the new role contract to be read before further work.
+
+A Domain change also should be explicit. For optional-Domain Roles, removing Domain means switching back to cross-domain operation within the same Role; it does not change the Role itself.
 
 ## Enforcement note
 

@@ -19,12 +19,23 @@ Use a handoff when:
 
 Do not silently perform cross-role work merely because it is small.
 
+## Domain-aware routing
+
+When the target Role has `domain_mode: required`, the handoff must identify the target `DOMAIN`.
+
+When the target Role has `domain_mode: optional`, include `DOMAIN` when a specialist owner/focus is known and useful. Omit it when the target work is intentionally cross-domain.
+
+When the target Role has `domain_mode: forbidden`, do not assign a `DOMAIN`.
+
+A Domain declaration does not grant permissions beyond the target Role Contract.
+
 ## Required handoff content
 
 A durable handoff should identify:
 
 - source role
 - target role
+- target Domain when required or useful under the target Role's Domain mode
 - Issue / PR
 - current state
 - concise finding or reason
@@ -33,13 +44,14 @@ A durable handoff should identify:
 - blocking/non-blocking status
 - relevant acceptance criteria or specification references
 
-Recommended format:
+Recommended format for a domain-targeted handoff:
 
 ```markdown
 ## HANDOFF
 
 FROM: review
 TO: implementation
+DOMAIN: device
 ISSUE: #123
 PR: #130
 STATE: REWORK_REQUIRED
@@ -57,6 +69,8 @@ BLOCKING: yes
 ### Completion condition
 <observable condition for handing back>
 ```
+
+For optional-Domain Roles, omit `DOMAIN` when the work is deliberately cross-domain.
 
 ## Standard handoff routes
 
