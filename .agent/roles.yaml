@@ -15,6 +15,8 @@ policy:
     - required
     - optional
     - forbidden
+  domain_identifier_is_self_defining_scope: false
+  unresolved_domain_scope_requires_human_decision: true
 
 handoff:
   protocol_version: 3
@@ -118,6 +120,9 @@ roles:
 
 notes:
   - DOMAIN identifies the primary technical or functional area and never expands Role permissions.
+  - A DOMAIN identifier is a label, not a self-defining file, component, or ownership boundary.
+  - Agents resolve effective Domain scope from authoritative project state during Bootstrap; a central Domain registry is not required when scope is unambiguous.
+  - If Domain scope has multiple material interpretations or a safe ownership/file boundary cannot be established, Agents must use NEEDS_HUMAN_DECISION and avoid repository-changing work until clarified.
   - required means DOMAIN must be declared; optional means DOMAIN may be used as a specialist focus; forbidden means DOMAIN must not be declared.
   - For optional-Domain Roles, omission means cross-domain operation within the same Role.
   - Before repository writes, Agents must determine repository visibility and must not disclose private-source metadata into a public repository without explicit human approval.
