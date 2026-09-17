@@ -44,6 +44,12 @@ A higher-priority source may clarify or supersede a lower-priority source, but i
 
 `DOMAIN` does **not** grant additional Role permissions. The active Role Contract remains authoritative.
 
+Domain identifiers are labels, not self-defining scope specifications. An Agent must not infer ownership, allowed files, components, or responsibilities solely from the spelling of a Domain identifier.
+
+During Bootstrap, resolve the effective Domain scope from authoritative project state using the source-of-truth order above. Relevant evidence may include explicit human instructions, approved Map / Decision / Spec / Task records, the assigned Issue and accepted updates, repository ownership conventions, and repository structure. A Domain does not need to appear in a central registry if its effective scope can be resolved unambiguously from durable state.
+
+If the effective scope is unambiguous, proceed within that resolved scope. If multiple materially different interpretations remain possible, or a safe ownership/file boundary cannot be established, do not guess from the Domain name. Classify the start state as `NEEDS_HUMAN_DECISION` and avoid repository-changing work until the ambiguity is resolved.
+
 Each Role defines one of three Domain modes:
 
 - `required`: the chat must declare a `DOMAIN` before substantive work.

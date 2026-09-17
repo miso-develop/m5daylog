@@ -22,6 +22,18 @@ Domain modes are defined in `.agent/AGENT_CATALOG.md` and `.agent/roles.yaml`:
 - `optional`: `DOMAIN` may be present; omission means cross-domain operation within the same Role.
 - `forbidden`: `DOMAIN` must not be present.
 
+When `DOMAIN` is present, resolve its effective technical/functional scope before substantive work. The Domain identifier is a label, not a self-defining file or ownership boundary. Do not infer scope solely from the Domain name.
+
+Resolve Domain scope from authoritative project state in priority order, including as relevant:
+
+1. explicit human instruction;
+2. repository Agent Contract;
+3. approved Map / Decision / Spec / Task records;
+4. assigned Issue and accepted updates;
+5. repository ownership conventions and current repository structure.
+
+A Domain does not need to be pre-registered if these sources establish one unambiguous effective scope. If multiple materially different interpretations remain possible, or a safe ownership/file boundary cannot be established, classify the start state as `NEEDS_HUMAN_DECISION` and do not perform repository-changing work until the Domain scope is clarified.
+
 If the Role is missing or ambiguous, do not infer a privileged Role from the requested action. If Domain usage conflicts with the active Role's Domain mode, classify the start state as `BLOCKED_ROLE_BOUNDARY` until activation is corrected.
 
 ## 2. Load policy
@@ -81,6 +93,8 @@ For implementation work, verify that:
 - there is no conflicting PR implementing the same task;
 - the intended files/domain do not materially overlap another active task without coordination;
 - prerequisites are satisfied.
+
+Use the resolved Domain scope from Bootstrap as an ownership aid; never treat the Domain identifier itself as a filename pattern, directory prefix, or sufficient proof of ownership.
 
 For optional-Domain Roles, treat `DOMAIN` as the primary specialist focus. Inspect adjacent domains when needed to perform the Role correctly, but do not silently take ownership of another Agent/domain's work.
 
