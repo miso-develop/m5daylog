@@ -1,4 +1,4 @@
-version: 3
+version: 4
 
 policy:
   exactly_one_active_role_per_chat: true
@@ -28,6 +28,7 @@ handoff:
 
 roles:
   general:
+    short_name: gen
     contract: .agent/roles/general.md
     domain_mode: forbidden
     source_modify: false
@@ -42,6 +43,7 @@ roles:
       - issue_proposal
 
   specification:
+    short_name: spec
     contract: .agent/roles/specification.md
     domain_mode: optional
     source_modify: false
@@ -60,6 +62,7 @@ roles:
       - acceptance_criteria
 
   implementation:
+    short_name: impl
     contract: .agent/roles/implementation.md
     domain_mode: required
     multiple_instances_allowed: true
@@ -77,6 +80,7 @@ roles:
       - pull_request
 
   review:
+    short_name: rev
     contract: .agent/roles/review.md
     domain_mode: optional
     source_modify: false
@@ -91,6 +95,7 @@ roles:
       - rework_required
 
   security:
+    short_name: sec
     contract: .agent/roles/security.md
     domain_mode: optional
     source_modify: false
@@ -106,6 +111,7 @@ roles:
       - risk_assessment
 
   integration:
+    short_name: intg
     contract: .agent/roles/integration.md
     domain_mode: forbidden
     source_modify: limited
@@ -119,6 +125,7 @@ roles:
       - follow_up_handoff
 
 notes:
+  - short_name is the canonical CLI-style Role alias accepted by /bootstrap.
   - DOMAIN identifies the primary technical or functional area and never expands Role permissions.
   - A DOMAIN identifier is a label, not a self-defining file, component, or ownership boundary.
   - Agents resolve effective Domain scope from authoritative project state during Bootstrap; a central Domain registry is not required when scope is unambiguous.

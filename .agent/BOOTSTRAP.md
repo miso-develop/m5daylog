@@ -1,8 +1,10 @@
 # Agent Bootstrap Protocol
 
-version: 3
+version: 4
 
 Every Agent chat must perform this bootstrap before substantive repository work.
+
+The canonical activation entrypoint is `/bootstrap <role> [options]` (or `/b`). Argument parsing and automatic-start behavior are defined by `.agent/commands/bootstrap.md`. Calling `/bootstrap` without a Role preserves the current activation and re-runs this protocol.
 
 ## 1. Identify execution context
 
@@ -10,9 +12,11 @@ Confirm:
 
 - `ACTIVE_ROLE`
 - Role Contract path
+- `CHAT_GENERATION` (positive integer; use `1` when an existing chat has no value)
 - project/repository
 - target repository visibility (`public` / `private`) before any write
 - assigned Issue(s), if any
+- `OBJECTIVE`, if any
 - referenced PR / handoff, if any
 - `DOMAIN`, according to the active Role's Domain mode
 
@@ -29,7 +33,7 @@ Resolve Domain scope from authoritative project state in priority order, includi
 1. explicit human instruction;
 2. repository Agent Contract;
 3. approved Map / Decision / Spec / Task records;
-4. assigned Issue and accepted updates;
+4. assigned Issue / PR and accepted durable updates;
 5. repository ownership conventions and current repository structure.
 
 A Domain does not need to be pre-registered if these sources establish one unambiguous effective scope. If multiple materially different interpretations remain possible, or a safe ownership/file boundary cannot be established, classify the start state as `NEEDS_HUMAN_DECISION` and do not perform repository-changing work until the Domain scope is clarified.
@@ -115,13 +119,20 @@ Only `READY` permits normal execution. `STALE_HANDOFF` requires reevaluation fro
 
 ## 7. Startup report
 
-Keep the startup report concise. Include Domain when declared or required.
+Start with the activation heading:
+
+```text
+# Chat Opening — <Role Display Name>[-<domain>]#<generation>
+```
+
+Then emit a concise startup report. Include Domain when declared or required, and include Objective only when it materially helps identify the current work.
 
 Example:
 
 ```text
 ROLE: implementation
 DOMAIN: device
+GENERATION: 3
 ISSUE: #123
 STATE: READY
 RELATED_PR: none
@@ -130,19 +141,12 @@ COLLISION_CHECK: clear
 NEXT_ACTION: implement acceptance criteria AC-01..AC-04
 ```
 
-For an optional-Domain Role operating cross-domain, Domain may be omitted:
-
-```text
-ROLE: review
-ISSUE: #130
-PR: #135
-STATE: READY
-HANDOFF_HEAD_MATCH: yes
-NEXT_ACTION: independently review current PR against durable requirements/evidence
-```
+For an optional-Domain Role operating cross-domain, Domain may be omitted.
 
 ## 8. Execute within Role
 
-After Bootstrap, perform only actions allowed by the active Role Contract. If the task evolves beyond that boundary, persist the material state and use the Handoff Protocol rather than silently expanding the Role.
+After Bootstrap, perform only actions allowed by the active Role Contract. Automatic execution after `/bootstrap` is governed by `.agent/commands/bootstrap.md`; `--no-start` stops after the startup report.
 
-A Domain change must be explicit. It does not change the active Role or grant additional permissions.
+If the task evolves beyond the Role boundary, persist the material state and use the Handoff Protocol rather than silently expanding the Role.
+
+A Role or Domain change must be explicit. Explicit `/bootstrap <role> ...` activation is such a change; topic drift is not. Changing Role or Domain does not grant additional permissions beyond the activated Role Contract.

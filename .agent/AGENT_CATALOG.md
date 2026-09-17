@@ -60,14 +60,16 @@ For Roles with optional Domain, `DOMAIN` is a primary-focus label rather than an
 
 ## Roles
 
-| Role | Domain mode | Primary responsibility | Typical durable output | May modify product source? | May merge? |
-|---|---|---|---|---:|---:|
-| `general` | `forbidden` | Project-wide consultation, triage, routing | clarified request, routing decision, issue proposal | No | No |
-| `specification` | `optional` | Requirements, architecture, Map / Decision / Spec / Task | approved specification artifacts | No | No |
-| `implementation` | `required` | Implement assigned work within an explicit domain | branch, commits, PR, implementation evidence | Yes | No |
-| `review` | `optional` | Independent code/spec review | review findings, READY/REWORK recommendation | No | No |
-| `security` | `optional` | Threat modeling and security assessment | security findings, risk decisions, security issues | No | No |
-| `integration` | `forbidden` | Cross-domain integration readiness, dependency coordination, merge decision | integration verdict, merge, follow-up work | Limited | Yes |
+| Role | Short | Domain mode | Primary responsibility | Typical durable output | May modify product source? | May merge? |
+|---|---|---|---|---|---:|---:|
+| `general` | `gen` | `forbidden` | Project-wide consultation, triage, routing | clarified request, routing decision, issue proposal | No | No |
+| `specification` | `spec` | `optional` | Requirements, architecture, Map / Decision / Spec / Task | approved specification artifacts | No | No |
+| `implementation` | `impl` | `required` | Implement assigned work within an explicit domain | branch, commits, PR, implementation evidence | Yes | No |
+| `review` | `rev` | `optional` | Independent code/spec review | review findings, READY/REWORK recommendation | No | No |
+| `security` | `sec` | `optional` | Threat modeling and security assessment | security findings, risk decisions, security issues | No | No |
+| `integration` | `intg` | `forbidden` | Cross-domain integration readiness, dependency coordination, merge decision | integration verdict, merge, follow-up work | Limited | Yes |
+
+Role ids, aliases, contracts, and Domain modes are machine-readable in `.agent/roles.yaml`.
 
 ## Domain-scoped Agent instances
 
@@ -96,35 +98,25 @@ Responsibilities such as agent scheduling, ownership arbitration, stall detectio
 
 ## Role activation
 
-A chat should activate a role with at least:
+The canonical Chat activation entrypoint is `/bootstrap <role> [options]` or its alias `/b`. Full Role ids and `short_name` values are accepted. The command contract in `.agent/commands/bootstrap.md` defines Domain, Issue, Objective, Generation, `--no-start`, usage errors, and automatic-start behavior.
+
+Examples:
 
 ```text
-ACTIVE_ROLE = review
-ROLE_CONTRACT = .agent/roles/review.md
+/b impl -d web -i 123 -g 4
+/b rev -d device -i 123 --no-start
+/b spec -p "Define the next device task"
 ```
 
-When Domain is used:
+An invocation with an explicit Role is a direct human activation request and may replace the current Role / Domain. Calling `/bootstrap` without a Role preserves the current activation and re-runs Bootstrap.
 
-```text
-ACTIVE_ROLE = review
-DOMAIN = device
-ROLE_CONTRACT = .agent/roles/review.md
-```
-
-For Implementation Agents, Domain is mandatory:
-
-```text
-ACTIVE_ROLE = implementation
-DOMAIN = device
-ASSIGNED_ISSUE = #123
-ROLE_CONTRACT = .agent/roles/implementation.md
-```
+Activation does not grant permissions beyond the selected Role Contract.
 
 ## Role change
 
-A role does not change implicitly because the conversation topic changes. A role change should be explicit and should cause the new role contract to be read before further work.
+A role does not change implicitly because the conversation topic changes. An explicit `/bootstrap <role> ...` activation is a valid Role change and causes the selected Role Contract to be loaded before further work.
 
-A Domain change also should be explicit. For optional-Domain Roles, removing Domain means switching back to cross-domain operation within the same Role; it does not change the Role itself.
+A Domain change also must be explicit. For optional-Domain Roles, activating without Domain means cross-domain operation within that Role.
 
 ## Enforcement note
 

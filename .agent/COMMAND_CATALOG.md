@@ -11,9 +11,9 @@ Canonical commands and their short aliases resolve to the same contract.
 | `/continue` | `/c` | `.agent/commands/continue.md` | Recover the immediately preceding interrupted ChatGPT task and continue it |
 | `/resume` | `/r` | `.agent/commands/resume.md` | Refresh durable project state and resume actionable work for the current Role / Domain |
 | `/status` | `/s` | `.agent/commands/status.md` | Refresh authoritative state and report current work status without advancing it |
-| `/bootstrap` | `/b` | `.agent/commands/bootstrap.md` | Re-run the Agent bootstrap for the current Role and Domain |
+| `/bootstrap` | `/b` | `.agent/commands/bootstrap.md` | Activate a Role from explicit arguments or re-run Bootstrap for the current activation |
 | `/handoff` | `/h` | `.agent/commands/handoff.md` | Prepare the appropriate cross-role handoff |
 
 Short aliases are exact aliases of their canonical commands; they do not define separate behavior.
 
-Pseudo commands do not grant permissions. The current explicit human instruction, active Role Contract, Domain policy, approved specification, and repository safety rules remain authoritative.
+Pseudo commands do not grant permissions. Explicit activation arguments to `/bootstrap` may change Role / Domain because they are direct human instructions, but they do not expand the permissions of the activated Role. The current explicit human instruction, active Role Contract, Domain policy, approved specification, and repository safety rules remain authoritative.
