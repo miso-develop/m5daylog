@@ -207,10 +207,13 @@ def test_writer_ready_handshake():
     assert "REC_BIT_STOP" in main
     assert "handshake" in main.lower()
     # STOP is sticky: after the READY/STOP wait the capture task must
-    # re-check STOP before pdm_capture_init, so a late STOP never starts
-    # the mic even when READY is also set.
-    assert "(bits & REC_BIT_STOP) != 0" in main
-    assert main.index("(bits & REC_BIT_STOP)") < main.index("pdm_capture_init")
+    # re-check STOP before the actual pdm_capture_init call, so a late STOP
+    # never starts the mic even when READY is also set. Scope the ordering
+    # check to the capture task so comments elsewhere cannot satisfy it.
+    capture_task_at = main.index("static void recorder_capture_task")
+    stop_at = main.index("(bits & REC_BIT_STOP) != 0", capture_task_at)
+    init_at = main.index("pdm_capture_init(&cfg, &capture)", capture_task_at)
+    assert stop_at < init_at
 
 
 def test_safe_stop_lifecycle():

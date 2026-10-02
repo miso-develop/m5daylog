@@ -1,7 +1,7 @@
 #pragma once
 
 // M5Daylog recorder fixed audio contract — Tasks #44 (IM-007) / #45
-// (IM-008) / #46 (IM-009).
+// (IM-008) / #46 (IM-009) / #47 (IM-010) / #48 (IM-011).
 //
 // 16kHz / signed 16bit little-endian / mono PCM from the PDM mic via
 // I2S/DMA, staged through a 32KB x 2 double buffer into a `.wav.part`
@@ -59,12 +59,17 @@ extern "C" {
 #define RECORDER_SAMPLES_PER_SLOT \
     (RECORDER_BUFFER_BYTES / RECORDER_BYTES_PER_SAMPLE)
 
-// --- M5Capsule v1.1 board baseline (Task #44 hardware revision) ---------
+// --- M5Capsule v1.1 board baseline (Tasks #44 / #48) --------------------
 // PDM microphone data lines and microSD SPI bus pins below are the verified
-// M5Capsule v1.1 bring-up values. Each is guarded so build flags
-// (`-DRECORDER_...=...`) can override without editing source. Invalid pins
-// fail init fail-loud; the firmware never reports recording while bring-up
-// has failed (Spec #36 silent-state prohibition).
+// M5Capsule v1.1 bring-up values. Task #48 additionally owns the v1.1
+// battery/power/status baseline: HOLD=GPIO46 must stay high after wake,
+// VBAT is sensed on GPIO6 through a 2:1 divider, and RGB uses GPIO21 with
+// its v1.1 power gate on GPIO38. Each pin is guarded so build flags
+// (`-DRECORDER_...=...`) can override without editing source. Invalid
+// hardware init fails loud; firmware never reports recording after failure.
+#ifndef RECORDER_POWER_HOLD_PIN
+#define RECORDER_POWER_HOLD_PIN 46
+#endif
 #ifndef RECORDER_PDM_CLK_PIN
 #define RECORDER_PDM_CLK_PIN 40
 #endif
@@ -86,20 +91,46 @@ extern "C" {
 #ifndef RECORDER_SD_MISO_PIN
 #define RECORDER_SD_MISO_PIN 39
 #endif
+#ifndef RECORDER_BATTERY_ADC_PIN
+#define RECORDER_BATTERY_ADC_PIN 6
+#endif
+#ifndef RECORDER_STATUS_LED_DATA_PIN
+#define RECORDER_STATUS_LED_DATA_PIN 21
+#endif
+#ifndef RECORDER_STATUS_LED_POWER_PIN
+#define RECORDER_STATUS_LED_POWER_PIN 38
+#endif
 
-// Filesystem scope for Tasks #44/#45/#46: board bring-up creates the
+// --- State / low-battery policy (Task #48, IM-011) -----------------------
+// Decision #30 starts around 10% but explicitly requires recalibration after
+// the measured PoC discharge curve is available. Use an overridable voltage
+// threshold rather than presenting raw ADC conversion as an accurate SOC
+// percentage. Three consecutive low readings reject transient load sag before
+// the recorder transitions to LOW_BATTERY_STOP and finalizes the current WAV.
+#ifndef RECORDER_LOW_BATTERY_MV
+#define RECORDER_LOW_BATTERY_MV 3600
+#endif
+#ifndef RECORDER_BATTERY_POLL_MS
+#define RECORDER_BATTERY_POLL_MS 5000u
+#endif
+#ifndef RECORDER_LOW_BATTERY_CONFIRM_SAMPLES
+#define RECORDER_LOW_BATTERY_CONFIRM_SAMPLES 3u
+#endif
+
+// Filesystem scope for Tasks #44/#45/#46/#48: board bring-up creates the
 // live-recording directories, per-date subdirectories
 // (`recordings/YYYY-MM-DD/`) for rotation/finalize, and the quarantine
 // directory for Task #46 power-loss recovery. Task #47 metadata files
-// below live in the same M5DAYLOG root; later retention/ACK handling
+// below live in the same M5DAYLOG root; Task #48 appends lifecycle/failure
+// events to the existing events.jsonl. Later retention/ACK handling
 // belongs to later Tasks and must not be created here.
 #define RECORDER_M5DAYLOG_DIR "/sdcard/M5DAYLOG"
 #define RECORDER_RECORDINGS_DIR "/sdcard/M5DAYLOG/recordings"
 // Task #46 (IM-009): unrecoverable `.wav.part` files are isolated here
 // with rename() only and never auto-deleted.
 #define RECORDER_QUARANTINE_DIR "/sdcard/M5DAYLOG/quarantine"
-// Task #46 (IM-009): boot recovery summary + per-file results are
-// appended here as JSON lines (counts / sizes / result classes only).
+// Tasks #46/#48: boot recovery summary + lifecycle/failure results are
+// appended here as JSON lines (metadata only; existing data is not truncated).
 #define RECORDER_EVENTS_PATH "/sdcard/M5DAYLOG/events.jsonl"
 
 // --- Device metadata / manifest (Task #47, IM-010) ------------------------
@@ -132,6 +163,8 @@ extern "C" {
 // Sanity: slots must hold whole samples (even byte count for 16bit PCM).
 _Static_assert((RECORDER_BUFFER_BYTES % RECORDER_BYTES_PER_SAMPLE) == 0,
                "recorder buffer must hold whole 16bit samples");
+_Static_assert(RECORDER_LOW_BATTERY_CONFIRM_SAMPLES > 0,
+               "low-battery confirmation must require at least one sample");
 
 #ifdef __cplusplus
 }
