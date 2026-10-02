@@ -101,8 +101,6 @@ const char *recorder_reason_str(recorder_reason_t reason) {
             return "recovery";
         case RECORDER_REASON_SD_MOUNT:
             return "sd-mount";
-        case RECORDER_REASON_SD_FULL:
-            return "sd-full";
         case RECORDER_REASON_SD_WRITE:
             return "sd-write";
         case RECORDER_REASON_SD_FLUSH:
