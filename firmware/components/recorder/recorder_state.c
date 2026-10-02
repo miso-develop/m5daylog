@@ -10,6 +10,11 @@ static bool recorder_state_is_terminal(recorder_state_t state) {
 
 static bool recorder_state_transition_allowed(recorder_state_t from,
                                               recorder_state_t to) {
+    // ERROR is terminal and the first recorded terminal cause is immutable.
+    // Re-entering ERROR must not be accepted as a same-state reason update.
+    if (from == RECORDER_STATE_ERROR) {
+        return false;
+    }
     if (from == to) {
         return true;
     }
@@ -17,7 +22,7 @@ static bool recorder_state_transition_allowed(recorder_state_t from,
     // previously selected LOW_BATTERY_STOP (for example finalize failure)
     // must supersede the safe-stop state instead of falsely reporting that
     // the WAV was closed safely.
-    if (to == RECORDER_STATE_ERROR && from != RECORDER_STATE_ERROR) {
+    if (to == RECORDER_STATE_ERROR) {
         return true;
     }
     if (recorder_state_is_terminal(from)) {
