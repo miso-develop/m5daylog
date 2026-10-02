@@ -32,6 +32,7 @@ typedef enum {
     RECORDER_REASON_BOOT,
     RECORDER_REASON_RECOVERY,
     RECORDER_REASON_SD_MOUNT,
+    RECORDER_REASON_SD_FULL,
     RECORDER_REASON_SD_WRITE,
     RECORDER_REASON_SD_FLUSH,
     RECORDER_REASON_MIC_INIT,
@@ -54,8 +55,9 @@ typedef struct {
 void recorder_state_machine_init(recorder_state_machine_t *machine);
 
 // Apply one legal lifecycle transition. ERROR is terminal and may be entered
-// from any non-terminal state. LOW_BATTERY_STOP is terminal and may be
-// entered from RECORDING. Illegal transitions leave the machine untouched.
+// from any state except ERROR itself; this allows a finalize failure to
+// supersede a previously selected LOW_BATTERY_STOP. Illegal transitions
+// leave the machine untouched.
 bool recorder_state_transition(recorder_state_machine_t *machine,
                                recorder_state_t next,
                                recorder_reason_t reason);
