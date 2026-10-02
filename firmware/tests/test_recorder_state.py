@@ -6,8 +6,6 @@ SD/mic/DMA failures from being mistaken for RECORDING. Physical LED/battery
 behavior remains in the consolidated Device milestone gate after #50.
 """
 
-import json
-import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -52,9 +50,10 @@ def mirror_transition(state, next_state):
 
 def test_state_set_matches_spec_36():
     hdr = STATE_H.read_text(encoding="utf-8")
+    src = STATE_C.read_text(encoding="utf-8")
     for state in STATES:
         assert f"RECORDER_STATE_{state}" in hdr
-        assert f'"{state}"' in STATE_C.read_text(encoding="utf-8")
+        assert f'"{state}"' in src
 
 
 def test_state_transition_contract():
@@ -74,7 +73,10 @@ def test_state_transition_contract():
 
 def test_state_event_is_jsonl_and_cause_traceable():
     src = STATE_C.read_text(encoding="utf-8")
-    for key in ('"event"', '"timestamp"', '"from"', '"to"', '"reason"', '"batteryMv"'):
+    for key in (
+        '"event"', '"timestamp"', '"from"', '"to"', '"reason"',
+        '"batteryMv"',
+    ):
         assert key.replace('"', '\\"') in src or key in src
     for reason in (
         "sd-mount",
@@ -94,9 +96,17 @@ def test_state_event_is_jsonl_and_cause_traceable():
     assert '"}\\n"' in src or "}\\n" in src
 
 
-def test_battery_monitor_uses_capsule_adc_and_calibrated_voltage():
+def test_capsule_power_hold_and_battery_monitor_use_verified_board_mapping():
     cfg = CFG.read_text(encoding="utf-8")
     src = POWER_C.read_text(encoding="utf-8")
+    main = MAIN.read_text(encoding="utf-8")
+    assert "#define RECORDER_POWER_HOLD_PIN 46" in cfg
+    assert "recorder_power_enable_hold" in src
+    assert "gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, 1)" in src
+    # HOLD must be asserted from app_main before recorder tasks are started.
+    assert main.index("recorder_power_enable_hold()") < main.index(
+        'xTaskCreate(recorder_writer_task, "rec_writer"'
+    )
     assert "#define RECORDER_BATTERY_ADC_PIN 6" in cfg
     assert "ADC_UNIT_1" in src
     assert "ADC_CHANNEL_5" in src
@@ -117,6 +127,10 @@ def test_status_led_is_dark_normally_and_distinguishes_terminal_states():
     assert "recorder_status_led_write(32, 0, 0, true)" in src
     assert "recorder_status_led_write(24, 8, 0, true)" in src
     assert "recorder_status_led_write(0, 0, 0, false)" in src
+    # Terminal indication is monotonic: delayed work cannot hide ERROR or
+    # turn a completed LOW_BATTERY_STOP back to the normal-dark state.
+    assert "s_led_state == RECORDER_STATE_ERROR" in src
+    assert "s_led_state == RECORDER_STATE_LOW_BATTERY_STOP" in src
 
 
 def test_task_48_sources_are_in_component_build():
@@ -158,7 +172,7 @@ def test_main_wires_state_failures_and_low_battery_monitor():
         assert reason in main, reason
     # Final status must not collapse every stop into ERROR/stopped.
     assert "LOW_BATTERY_STOP" in main
-    assert 'reason: stopped' not in main
+    assert "reason: stopped" not in main
 
 
 def test_low_battery_policy_is_voltage_based_not_fake_soc_percentage():
