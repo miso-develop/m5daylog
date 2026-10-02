@@ -41,8 +41,9 @@ static const char *TAG = "m5daylog";
 // ERROR and LOW_BATTERY_STOP visibly distinct.
 //
 // Regression contract notes retained for the older source-contract tests:
-// - WRITER_READY is the startup handshake; capture re-checks sticky STOP
-//   after waking and before pdm_capture_init.
+// - WRITER_READY is the storage/sink startup handshake; capture re-checks
+//   sticky STOP after waking and before pdm_capture_init. RECORDING_READY is
+//   published only after mic init and the RECOVER -> RECORDING transition.
 // - Slow SD and rotation file I/O run WITHOUT the pipeline lock so capture
 //   keeps filling the other slot; the intended rotation-gap bound is <=100ms.
 // - Always preserve driver overflow evidence on every read. The producer
@@ -68,17 +69,17 @@ static const char *TAG = "m5daylog";
 //   file ops (close + rename + new open) also run WITHOUT the pipeline
 //   lock and WITHOUT stopping capture, so the other slot absorbs the
 //   switch and the unintended rotation gap stays within <=100ms.
-// - recorder_battery_task (priority 3) starts only after WRITER_READY. It
+// - recorder_battery_task (priority 3) starts only after RECORDING_READY. It
 //   samples the calibrated M5Capsule VBAT ADC every configured interval;
 //   consecutive low readings transition RECORDING -> LOW_BATTERY_STOP and
 //   set the same sticky STOP used by the idempotent finalize path.
 // - Cross-task lifecycle uses ONE app-lifetime event group, never a
 //   published TaskHandle: REC_BIT_SLOT_FULL wakes the writer,
-//   REC_BIT_WRITER_READY is the startup handshake (capture never starts
-//   the mic until mount + directories + sink are ready, independent of
-//   task creation order or SMP scheduling), and sticky REC_BIT_STOP moves
-//   tasks to teardown. No handle is ever signalled after its task is
-//   deleted, because no task handle is published at all.
+//   REC_BIT_WRITER_READY means mount + directories + sink are ready so
+//   capture may initialize the mic, REC_BIT_RECORDING_READY means mic init
+//   succeeded and RECOVER -> RECORDING was published, and sticky
+//   REC_BIT_STOP moves tasks to teardown. No handle is ever signalled after
+//   its task is deleted, because no task handle is published at all.
 // - s_rec_lock guards the shared pipeline only. s_state_lock separately
 //   serializes the explicit lifecycle plus state-event JSONL appends.
 #ifndef RECORDER_PART_PATH
@@ -103,6 +104,7 @@ static int s_last_battery_mv = 0;
 #define REC_BIT_SLOT_FULL (1u << 0)
 #define REC_BIT_STOP (1u << 1)
 #define REC_BIT_WRITER_READY (1u << 2)
+#define REC_BIT_RECORDING_READY (1u << 3)
 
 // Flush the `.wav.part` header every N drained slots so the in-progress
 // file stays decodeable (about every 4s of audio at 32KB/s).
@@ -485,10 +487,10 @@ static void recorder_battery_task(void *arg) {
     uint32_t low_samples = 0;
     (void)arg;
     bits = xEventGroupWaitBits(s_rec_events,
-                               REC_BIT_WRITER_READY | REC_BIT_STOP,
+                               REC_BIT_RECORDING_READY | REC_BIT_STOP,
                                pdFALSE, pdFALSE, portMAX_DELAY);
     if ((bits & REC_BIT_STOP) != 0 ||
-        (bits & REC_BIT_WRITER_READY) == 0) {
+        (bits & REC_BIT_RECORDING_READY) == 0) {
         vTaskDelete(NULL);
         return;
     }
@@ -555,6 +557,14 @@ static void recorder_capture_task(void *arg) {
         recorder_enter_error(RECORDER_REASON_MIC_INIT);
         vTaskDelete(NULL);
         return;
+    }
+    if (!recorder_transition_state(RECORDER_STATE_RECORDING,
+                                   RECORDER_REASON_NONE, 0)) {
+        recorder_enter_error(RECORDER_REASON_INTERNAL);
+    } else {
+        ESP_LOGI(TAG,
+                 "stage: record, result: capturing, path_suffix: .wav.part");
+        xEventGroupSetBits(s_rec_events, REC_BIT_RECORDING_READY);
     }
 
     while (!recorder_stop_requested()) {
@@ -900,18 +910,6 @@ static void recorder_writer_task(void *arg) {
     }
     wav_rotation_state_init(&s_seg_state, s_seg_part, s_seg_wav);
     seg_start_tick = xTaskGetTickCount();
-    if (!recorder_transition_state(RECORDER_STATE_RECORDING,
-                                   RECORDER_REASON_NONE, 0)) {
-        recorder_enter_error(RECORDER_REASON_INTERNAL);
-        (void)wav_rotation_finalize_once(&s_seg_state, &s_sink);
-        recorder_set_events_ready(false);
-        sd_mount_unmount();
-        recorder_log_writer_stack_hw("state recording");
-        vTaskDelete(NULL);
-        return;
-    }
-    ESP_LOGI(TAG,
-             "stage: record, result: capturing, path_suffix: .wav.part");
     xEventGroupSetBits(s_rec_events, REC_BIT_WRITER_READY);
 
     while (running) {
