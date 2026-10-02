@@ -358,9 +358,7 @@ static bool recorder_transition_state(recorder_state_t next,
 }
 
 static void recorder_enter_error(recorder_reason_t reason) {
-    if (recorder_current_state() != RECORDER_STATE_ERROR) {
-        (void)recorder_transition_state(RECORDER_STATE_ERROR, reason, 0);
-    }
+    (void)recorder_transition_state(RECORDER_STATE_ERROR, reason, 0);
     recorder_request_stop();
 }
 
