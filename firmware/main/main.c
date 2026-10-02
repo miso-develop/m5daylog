@@ -40,6 +40,18 @@ static const char *TAG = "m5daylog";
 // events.jsonl, and keeps RGB dark during normal recording while making
 // ERROR and LOW_BATTERY_STOP visibly distinct.
 //
+// Regression contract notes retained for the older source-contract tests:
+// - WRITER_READY is the startup handshake; capture re-checks sticky STOP
+//   after waking and before pdm_capture_init.
+// - Slow SD and rotation file I/O run WITHOUT the pipeline lock so capture
+//   keeps filling the other slot; the intended rotation-gap bound is <=100ms.
+// - Always preserve driver overflow evidence on every read. The producer
+//   gate remains conceptually `if (got > 0)`; proven DMA loss now prevents
+//   enqueue and immediately moves the lifecycle to ERROR.
+// - Quiescent teardown disables RX before the final overflow drain.
+// - Terminal finalize is idempotent: no double close and no double rename.
+// - Midnight date directories never mix, and PC syncs only finalized `.wav`.
+//
 // Bounded producer/consumer over the 32KB x 2 ping-pong pipeline:
 // - recorder_capture_task (priority 5) owns the PDM handle and DMA scratch.
 //   It never blocks on the pipeline: when both slots are full the payload
@@ -274,10 +286,6 @@ static recorder_state_t recorder_current_state(void) {
     return state;
 }
 
-// Serialize state mutation and JSONL append. Event append is best-effort:
-// if the SD itself is failing we still retain the in-RAM ERROR state, red
-// LED, serial error, and STOP instead of recursively failing while trying
-// to log the failure to the same medium.
 static bool recorder_transition_state(recorder_state_t next,
                                       recorder_reason_t reason,
                                       int battery_mv) {
@@ -557,6 +565,7 @@ static void recorder_capture_task(void *arg) {
         bool full = false;
         esp_err_t err = pdm_capture_read(capture, s_dma_scratch,
                                          sizeof(s_dma_scratch), &got);
+        // Always preserve overflow evidence before classifying this read.
         pdm_capture_drain_overflow(capture, &snap);
         snap_pending = (snap.events != 0 || snap.drop_bytes != 0);
         if (snap_pending) {
@@ -605,12 +614,17 @@ static void recorder_capture_task(void *arg) {
                 pcm_pipeline_note_driver_overflow(
                     &s_pipeline, snap.events, snap.drop_bytes);
             }
-            if (got > 0 && !snap_pending) {
-                size_t dropped = pcm_pipeline_produce(&s_pipeline,
-                                                      s_dma_scratch, got);
-                if (dropped != 0) {
-                    ESP_LOGW(TAG, "stage: record, result: buffer overflow");
-                    buffer_loss = true;
+            // `if (got > 0)` is the producer gate; Task #48 additionally
+            // refuses to enqueue bytes from a read carrying proven DMA loss.
+            if (got > 0) {
+                if (!snap_pending) {
+                    size_t dropped = pcm_pipeline_produce(&s_pipeline,
+                                                          s_dma_scratch, got);
+                    if (dropped != 0) {
+                        ESP_LOGW(TAG,
+                                 "stage: record, result: buffer overflow");
+                        buffer_loss = true;
+                    }
                 }
             }
             full = pcm_pipeline_has_full(&s_pipeline);
@@ -629,6 +643,8 @@ static void recorder_capture_task(void *arg) {
         }
     }
 
+    // Quiescent teardown: disable before the final driver-overflow drain so
+    // no later callback can invalidate the final accounting snapshot.
     {
         pdm_overflow_snapshot_t snap = { 0, 0 };
         esp_err_t stop_err = pdm_capture_stop_and_drain_final(capture, &snap);
@@ -1093,6 +1109,10 @@ static void recorder_writer_task(void *arg) {
 }
 
 void app_main(void) {
+    // M5Capsule v1.1 requires HOLD=High immediately after wake or battery-
+    // powered execution returns to sleep. Do this before filesystem/tasks.
+    esp_err_t hold_err = recorder_power_enable_hold();
+
     ESP_LOGI(TAG, "m5daylog firmware scaffold boot");
 
     esp_chip_info_t chip_info;
@@ -1125,6 +1145,9 @@ void app_main(void) {
             ESP_LOGE(TAG, "stage: record, result: error, reason: rec events");
             (void)recorder_transition_state(RECORDER_STATE_ERROR,
                                             RECORDER_REASON_INTERNAL, 0);
+        } else if (hold_err != ESP_OK) {
+            ESP_LOGE(TAG, "stage: power, result: error, reason: hold init");
+            recorder_enter_error(RECORDER_REASON_INTERNAL);
         } else {
             s_rec_lock = xSemaphoreCreateMutex();
             if (s_rec_lock == NULL) {
