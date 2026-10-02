@@ -18,6 +18,7 @@
 static rmt_channel_handle_t s_led_channel = NULL;
 static rmt_encoder_handle_t s_led_encoder = NULL;
 static bool s_led_ready = false;
+static recorder_state_t s_led_state = RECORDER_STATE_BOOT;
 
 static void recorder_status_led_cleanup(void) {
     if (s_led_channel != NULL) {
@@ -33,6 +34,7 @@ static void recorder_status_led_cleanup(void) {
     }
     (void)gpio_set_level((gpio_num_t)RECORDER_STATUS_LED_POWER_PIN, 0);
     s_led_ready = false;
+    s_led_state = RECORDER_STATE_BOOT;
 }
 
 static esp_err_t recorder_status_led_write(uint8_t red, uint8_t green,
@@ -127,6 +129,7 @@ esp_err_t recorder_status_led_init(void) {
         return err;
     }
     s_led_ready = true;
+    s_led_state = RECORDER_STATE_BOOT;
     err = recorder_status_led_write(0, 0, 0, false);
     if (err != ESP_OK) {
         recorder_status_led_cleanup();
@@ -136,14 +139,34 @@ esp_err_t recorder_status_led_init(void) {
 }
 
 esp_err_t recorder_status_led_set_state(recorder_state_t state) {
+    esp_err_t err;
+    // Terminal indications are monotonic: ERROR supersedes low-battery,
+    // and a delayed lower-priority task can never overwrite red with amber
+    // or switch a terminal indication back off.
+    if (s_led_state == RECORDER_STATE_ERROR &&
+        state != RECORDER_STATE_ERROR) {
+        return ESP_OK;
+    }
+    if (s_led_state == RECORDER_STATE_LOW_BATTERY_STOP &&
+        state != RECORDER_STATE_ERROR &&
+        state != RECORDER_STATE_LOW_BATTERY_STOP) {
+        return ESP_OK;
+    }
     switch (state) {
         case RECORDER_STATE_ERROR:
-            return recorder_status_led_write(32, 0, 0, true);
+            err = recorder_status_led_write(32, 0, 0, true);
+            break;
         case RECORDER_STATE_LOW_BATTERY_STOP:
-            return recorder_status_led_write(24, 8, 0, true);
+            err = recorder_status_led_write(24, 8, 0, true);
+            break;
         default:
-            return recorder_status_led_write(0, 0, 0, false);
+            err = recorder_status_led_write(0, 0, 0, false);
+            break;
     }
+    if (err == ESP_OK) {
+        s_led_state = state;
+    }
+    return err;
 }
 
 void recorder_status_led_deinit(void) {
