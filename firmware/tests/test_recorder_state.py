@@ -182,3 +182,24 @@ def test_low_battery_policy_is_voltage_based_not_fake_soc_percentage():
     assert "recalibr" in cfg
     assert "battery_mv" in main or "battery mv" in main
     assert "battery_percent" not in main
+
+
+def test_recording_is_published_only_after_mic_init_succeeds():
+    main = MAIN.read_text(encoding="utf-8")
+    capture_at = main.index("static void recorder_capture_task")
+    writer_at = main.index("static void recorder_writer_task", capture_at)
+    app_main_at = main.index("void app_main", writer_at)
+    capture = main[capture_at:writer_at]
+    writer = main[writer_at:app_main_at]
+
+    # Writer readiness proves storage/sink readiness only. Publishing the
+    # RECORDING lifecycle belongs after successful mic initialization.
+    assert "recorder_transition_state(RECORDER_STATE_RECORDING" not in writer
+    init_at = capture.find("pdm_capture_init(&cfg, &capture)")
+    mic_error_at = capture.find("recorder_enter_error(RECORDER_REASON_MIC_INIT)")
+    recording_at = capture.find(
+        "recorder_transition_state(RECORDER_STATE_RECORDING"
+    )
+    assert init_at >= 0
+    assert mic_error_at > init_at
+    assert recording_at > mic_error_at
