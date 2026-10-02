@@ -13,11 +13,15 @@ static bool recorder_state_transition_allowed(recorder_state_t from,
     if (from == to) {
         return true;
     }
+    // ERROR is the absolute terminal state. A failure while completing a
+    // previously selected LOW_BATTERY_STOP (for example finalize failure)
+    // must supersede the safe-stop state instead of falsely reporting that
+    // the WAV was closed safely.
+    if (to == RECORDER_STATE_ERROR && from != RECORDER_STATE_ERROR) {
+        return true;
+    }
     if (recorder_state_is_terminal(from)) {
         return false;
-    }
-    if (to == RECORDER_STATE_ERROR) {
-        return true;
     }
     switch (from) {
         case RECORDER_STATE_BOOT:
