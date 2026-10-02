@@ -27,6 +27,7 @@ idf_component_register(
     REQUIRES
         driver
         esp_adc
+        esp_driver_rmt
         esp_timer
         fatfs
         sdmmc
