@@ -292,7 +292,9 @@ static bool recorder_transition_state(recorder_state_t next,
                                       recorder_reason_t reason,
                                       int battery_mv) {
     recorder_state_t from;
+    recorder_state_machine_t candidate;
     bool changed;
+    bool event_write_failed = false;
     bool ok;
     char timestamp[RECORDER_ISO8601_STR_LEN];
     if (s_state_lock == NULL ||
@@ -300,8 +302,9 @@ static bool recorder_transition_state(recorder_state_t next,
         return false;
     }
     from = s_rec_state.state;
+    candidate = s_rec_state;
     changed = from != next;
-    ok = recorder_state_transition(&s_rec_state, next, reason);
+    ok = recorder_state_transition(&candidate, next, reason);
     if (battery_mv > 0) {
         s_last_battery_mv = battery_mv;
     }
@@ -312,11 +315,28 @@ static bool recorder_transition_state(recorder_state_t next,
                                          from, next, reason,
                                          battery_mv > 0 ? battery_mv :
                                                           s_last_battery_mv)) {
-            ESP_LOGW(TAG,
-                     "stage: state, result: warning, reason: event append");
+            event_write_failed = true;
+            (void)recorder_state_transition(&s_rec_state,
+                                            RECORDER_STATE_ERROR,
+                                            RECORDER_REASON_SD_WRITE);
+        } else {
+            s_rec_state = candidate;
         }
+    } else if (ok) {
+        s_rec_state = candidate;
     }
     xSemaphoreGive(s_state_lock);
+    if (event_write_failed) {
+        ESP_LOGE(TAG,
+                 "stage: state, result: error, reason: event append sd-write");
+        recorder_request_stop();
+        if (s_status_led_ready &&
+            recorder_status_led_set_state(RECORDER_STATE_ERROR) != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "stage: state, result: error, reason: status led");
+        }
+        return false;
+    }
     if (!ok) {
         ESP_LOGE(TAG,
                  "stage: state, result: error, reason: illegal transition, from: %s, to: %s",
@@ -338,7 +358,9 @@ static bool recorder_transition_state(recorder_state_t next,
 }
 
 static void recorder_enter_error(recorder_reason_t reason) {
-    (void)recorder_transition_state(RECORDER_STATE_ERROR, reason, 0);
+    if (recorder_current_state() != RECORDER_STATE_ERROR) {
+        (void)recorder_transition_state(RECORDER_STATE_ERROR, reason, 0);
+    }
     recorder_request_stop();
 }
 
