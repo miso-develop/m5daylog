@@ -80,6 +80,7 @@ def test_state_event_is_jsonl_and_cause_traceable():
         assert key.replace('"', '\\"') in src or key in src
     for reason in (
         "sd-mount",
+        "sd-full",
         "sd-write",
         "sd-flush",
         "mic-init",
@@ -142,6 +143,7 @@ def test_task_48_sources_are_in_component_build():
     ):
         assert source in cmake
     assert "esp_adc" in cmake
+    assert "esp_driver_rmt" in cmake
 
 
 def test_main_wires_state_failures_and_low_battery_monitor():
@@ -170,6 +172,9 @@ def test_main_wires_state_failures_and_low_battery_monitor():
         "RECORDER_REASON_BUFFER_OVERFLOW",
     ):
         assert reason in main, reason
+    # SD-full has its own durable reason symbol even when lower-level I/O
+    # code is the component that ultimately reports ENOSPC at runtime.
+    assert "RECORDER_REASON_SD_FULL" in STATE_H.read_text(encoding="utf-8")
     # Final status must not collapse every stop into ERROR/stopped.
     assert "LOW_BATTERY_STOP" in main
     assert "reason: stopped" not in main
