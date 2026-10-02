@@ -9,6 +9,7 @@
 #include "driver/rmt_encoder.h"
 #include "driver/rmt_tx.h"
 #include "esp_rom_sys.h"
+#include "freertos/FreeRTOS.h"
 #include "recorder_config.h"
 
 #define RECORDER_LED_RMT_RESOLUTION_HZ 10000000u
@@ -37,7 +38,6 @@ static void recorder_status_led_cleanup(void) {
 static esp_err_t recorder_status_led_write(uint8_t red, uint8_t green,
                                            uint8_t blue,
                                            bool keep_powered) {
-    // WS2812 wire order is G,R,B and the byte encoder is MSB-first.
     uint8_t grb[3] = { green, red, blue };
     rmt_transmit_config_t tx_cfg = {
         .loop_count = 0,
@@ -50,7 +50,6 @@ static esp_err_t recorder_status_led_write(uint8_t red, uint8_t green,
     if (err != ESP_OK) {
         return err;
     }
-    // Allow the v1.1 RGB rail to settle before sending the first pixel.
     esp_rom_delay_us(1000);
     err = rmt_transmit(s_led_channel, s_led_encoder, grb, sizeof(grb),
                        &tx_cfg);
@@ -86,15 +85,15 @@ esp_err_t recorder_status_led_init(void) {
     rmt_bytes_encoder_config_t encoder_cfg = {
         .bit0 = {
             .level0 = 1,
-            .duration0 = 3,  // 0.3us @ 10MHz
+            .duration0 = 3,
             .level1 = 0,
-            .duration1 = 9,  // 0.9us
+            .duration1 = 9,
         },
         .bit1 = {
             .level0 = 1,
-            .duration0 = 9,  // 0.9us
+            .duration0 = 9,
             .level1 = 0,
-            .duration1 = 3,  // 0.3us
+            .duration1 = 3,
         },
         .flags.msb_first = 1,
     };
@@ -128,7 +127,6 @@ esp_err_t recorder_status_led_init(void) {
         return err;
     }
     s_led_ready = true;
-    // Decision #9: normal boot/recording indication is LED fully off.
     err = recorder_status_led_write(0, 0, 0, false);
     if (err != ESP_OK) {
         recorder_status_led_cleanup();
@@ -140,13 +138,10 @@ esp_err_t recorder_status_led_init(void) {
 esp_err_t recorder_status_led_set_state(recorder_state_t state) {
     switch (state) {
         case RECORDER_STATE_ERROR:
-            // Solid red: fatal/fail-loud state.
             return recorder_status_led_write(32, 0, 0, true);
         case RECORDER_STATE_LOW_BATTERY_STOP:
-            // Solid amber: safe low-battery stop; visually distinct from red.
             return recorder_status_led_write(24, 8, 0, true);
         default:
-            // Normal recording and transitional USB states remain dark.
             return recorder_status_led_write(0, 0, 0, false);
     }
 }
