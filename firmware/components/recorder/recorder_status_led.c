@@ -9,7 +9,6 @@
 #include "driver/rmt_encoder.h"
 #include "driver/rmt_tx.h"
 #include "esp_rom_sys.h"
-#include "freertos/FreeRTOS.h"
 #include "recorder_config.h"
 
 #define RECORDER_LED_RMT_RESOLUTION_HZ 10000000u
@@ -58,7 +57,8 @@ static esp_err_t recorder_status_led_write(uint8_t red, uint8_t green,
     if (err != ESP_OK) {
         return err;
     }
-    err = rmt_tx_wait_all_done(s_led_channel, pdMS_TO_TICKS(20));
+    // IDF rmt_tx_wait_all_done() takes milliseconds, not RTOS ticks.
+    err = rmt_tx_wait_all_done(s_led_channel, 20);
     if (err != ESP_OK) {
         return err;
     }
