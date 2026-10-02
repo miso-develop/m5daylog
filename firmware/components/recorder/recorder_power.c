@@ -3,14 +3,13 @@
 #ifdef ESP_PLATFORM
 
 #include <stdbool.h>
-#include <string.h>
 
+#include "driver/gpio.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "recorder_config.h"
 
-// M5Capsule / Capsule v1.1 board mapping used by M5Unified:
-// GPIO6 -> ADC1 channel 5, VBAT divider ratio 2.0.
 #define RECORDER_BATTERY_ADC_UNIT ADC_UNIT_1
 #define RECORDER_BATTERY_ADC_CHANNEL ADC_CHANNEL_5
 #define RECORDER_BATTERY_ADC_ATTEN ADC_ATTEN_DB_12
@@ -32,6 +31,21 @@ static void recorder_power_cleanup(void) {
     s_power_ready = false;
 }
 
+esp_err_t recorder_power_enable_hold(void) {
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << RECORDER_POWER_HOLD_PIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, 1);
+}
+
 esp_err_t recorder_power_init(void) {
     adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = RECORDER_BATTERY_ADC_UNIT,
@@ -49,6 +63,10 @@ esp_err_t recorder_power_init(void) {
     };
     esp_err_t err;
 
+    err = recorder_power_enable_hold();
+    if (err != ESP_OK) {
+        return err;
+    }
     if (s_power_ready) {
         return ESP_OK;
     }
@@ -65,9 +83,9 @@ esp_err_t recorder_power_init(void) {
         recorder_power_cleanup();
         return err;
     }
-    // ESP32-S3 supports curve-fitting calibration. Treat missing calibration
-    // as a fail-loud monitor-init failure rather than applying an unverified
-    // raw-count threshold to a safety stop.
+    // ESP32-S3 curve-fitting converts the divided ADC reading to mV.
+    // Failing calibration is safer than comparing unverified raw counts to
+    // a voltage threshold that controls recording shutdown.
     err = adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_adc_cali);
     if (err != ESP_OK) {
         recorder_power_cleanup();
