@@ -1,7 +1,7 @@
 #pragma once
 
 // M5Daylog recorder fixed audio contract — Tasks #44 (IM-007) / #45
-// (IM-008) / #46 (IM-009).
+// (IM-008) / #46 (IM-009) / #47 (IM-010) / #48 (IM-011).
 //
 // 16kHz / signed 16bit little-endian / mono PCM from the PDM mic via
 // I2S/DMA, staged through a 32KB x 2 double buffer into a `.wav.part`
@@ -59,12 +59,12 @@ extern "C" {
 #define RECORDER_SAMPLES_PER_SLOT \
     (RECORDER_BUFFER_BYTES / RECORDER_BYTES_PER_SAMPLE)
 
-// --- M5Capsule v1.1 board baseline (Task #44 hardware revision) ---------
+// --- M5Capsule v1.1 board baseline (Tasks #44 / #48) --------------------
 // PDM microphone data lines and microSD SPI bus pins below are the verified
-// M5Capsule v1.1 bring-up values. Each is guarded so build flags
-// (`-DRECORDER_...=...`) can override without editing source. Invalid pins
-// fail init fail-loud; the firmware never reports recording while bring-up
-// has failed (Spec #36 silent-state prohibition).
+// M5Capsule v1.1 bring-up values. Task #48 additionally uses the board's
+// VBAT divider on GPIO6/ADC1 and the Stamp-S3A RGB pixel on GPIO21; v1.1
+// gates RGB power with GPIO38. Each is guarded so build flags can override
+// without editing source. Invalid hardware init fails loud.
 #ifndef RECORDER_PDM_CLK_PIN
 #define RECORDER_PDM_CLK_PIN 40
 #endif
@@ -86,20 +86,45 @@ extern "C" {
 #ifndef RECORDER_SD_MISO_PIN
 #define RECORDER_SD_MISO_PIN 39
 #endif
+#ifndef RECORDER_BATTERY_ADC_PIN
+#define RECORDER_BATTERY_ADC_PIN 6
+#endif
+#ifndef RECORDER_STATUS_LED_DATA_PIN
+#define RECORDER_STATUS_LED_DATA_PIN 21
+#endif
+#ifndef RECORDER_STATUS_LED_POWER_PIN
+#define RECORDER_STATUS_LED_POWER_PIN 38
+#endif
 
-// Filesystem scope for Tasks #44/#45/#46: board bring-up creates the
+// Decision #30 calls for an initial ~10% low-battery safe-close threshold,
+// then recalibration after measuring the actual discharge curve. Voltage is
+// therefore the explicit configurable PoC boundary instead of pretending a
+// raw ADC estimate is a precise state-of-charge percentage. Three
+// consecutive low readings suppress transient load sag before safe stop.
+#ifndef RECORDER_LOW_BATTERY_MV
+#define RECORDER_LOW_BATTERY_MV 3600
+#endif
+#ifndef RECORDER_BATTERY_POLL_MS
+#define RECORDER_BATTERY_POLL_MS 5000u
+#endif
+#ifndef RECORDER_LOW_BATTERY_CONFIRM_SAMPLES
+#define RECORDER_LOW_BATTERY_CONFIRM_SAMPLES 3u
+#endif
+
+// Filesystem scope for Tasks #44/#45/#46/#48: board bring-up creates the
 // live-recording directories, per-date subdirectories
 // (`recordings/YYYY-MM-DD/`) for rotation/finalize, and the quarantine
 // directory for Task #46 power-loss recovery. Task #47 metadata files
-// below live in the same M5DAYLOG root; later retention/ACK handling
+// below live in the same M5DAYLOG root. Task #48 appends state/failure/
+// low-battery diagnostics to events.jsonl; later retention/ACK handling
 // belongs to later Tasks and must not be created here.
 #define RECORDER_M5DAYLOG_DIR "/sdcard/M5DAYLOG"
 #define RECORDER_RECORDINGS_DIR "/sdcard/M5DAYLOG/recordings"
 // Task #46 (IM-009): unrecoverable `.wav.part` files are isolated here
 // with rename() only and never auto-deleted.
 #define RECORDER_QUARANTINE_DIR "/sdcard/M5DAYLOG/quarantine"
-// Task #46 (IM-009): boot recovery summary + per-file results are
-// appended here as JSON lines (counts / sizes / result classes only).
+// Tasks #46/#48: boot recovery plus lifecycle/failure diagnostics are
+// appended here as JSON lines; existing diagnostics are never truncated.
 #define RECORDER_EVENTS_PATH "/sdcard/M5DAYLOG/events.jsonl"
 
 // --- Device metadata / manifest (Task #47, IM-010) ------------------------
@@ -132,6 +157,8 @@ extern "C" {
 // Sanity: slots must hold whole samples (even byte count for 16bit PCM).
 _Static_assert((RECORDER_BUFFER_BYTES % RECORDER_BYTES_PER_SAMPLE) == 0,
                "recorder buffer must hold whole 16bit samples");
+_Static_assert(RECORDER_LOW_BATTERY_CONFIRM_SAMPLES > 0,
+               "low-battery confirmation must require at least one sample");
 
 #ifdef __cplusplus
 }
