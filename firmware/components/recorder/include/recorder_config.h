@@ -102,11 +102,11 @@ extern "C" {
 #endif
 
 // --- State / low-battery policy (Task #48, IM-011) -----------------------
-// Decision #30 starts around 10% but explicitly requires calibration from
-// the measured PoC discharge curve. Use an overridable voltage threshold
-// rather than presenting raw ADC conversion as an accurate SOC percentage.
-// Three consecutive low readings reject transient load sag before the
-// recorder transitions to LOW_BATTERY_STOP and finalizes the current WAV.
+// Decision #30 starts around 10% but explicitly requires recalibration after
+// the measured PoC discharge curve is available. Use an overridable voltage
+// threshold rather than presenting raw ADC conversion as an accurate SOC
+// percentage. Three consecutive low readings reject transient load sag before
+// the recorder transitions to LOW_BATTERY_STOP and finalizes the current WAV.
 #ifndef RECORDER_LOW_BATTERY_MV
 #define RECORDER_LOW_BATTERY_MV 3600
 #endif
