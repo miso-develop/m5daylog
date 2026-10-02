@@ -1,0 +1,129 @@
+name: Firmware CI
+
+on:
+  pull_request:
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: firmware:host-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify exact tested revision
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          if [[ "$actual_head" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "Expected HEAD $EXPECTED_HEAD_SHA but checked out $actual_head" >&2
+            exit 1
+          fi
+          printf 'Exact tested HEAD: `%s`\n' "$actual_head" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install host-test dependency
+        run: python3 -m pip install --disable-pip-version-check --no-input pytest==8.4.2
+
+      - name: Run firmware host contract tests
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/firmware-pytest.xml"
+          pytest_status=0
+          python3 -m pytest firmware/tests -v --junitxml="$report" || pytest_status=$?
+
+          python3 - "$report" "$pytest_status" <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          report_path = sys.argv[1]
+          pytest_status = int(sys.argv[2])
+          root = ET.parse(report_path).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+
+          tests = sum(int(suite.attrib.get("tests", 0)) for suite in suites)
+          failures = sum(int(suite.attrib.get("failures", 0)) for suite in suites)
+          errors = sum(int(suite.attrib.get("errors", 0)) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
+          failed = failures + errors
+
+          summary = (
+              f"Host tests: TESTS={tests} FAILED={failed} SKIPPED={skipped} "
+              f"PYTEST_EXIT={pytest_status}\n"
+          )
+          print(summary, end="")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(summary)
+
+          if pytest_status != 0 or failed != 0 or skipped != 0:
+              raise SystemExit("host-test gate failed")
+          PY
+
+  esp-idf-build:
+    name: firmware:esp-idf-v5.5.5-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify exact tested revision
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          if [[ "$actual_head" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "Expected HEAD $EXPECTED_HEAD_SHA but checked out $actual_head" >&2
+            exit 1
+          fi
+          printf 'Exact tested HEAD: `%s`\n' "$actual_head" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run ESP-IDF v5.5.5 clean build
+        env:
+          IDF_IMAGE: espressif/idf@sha256:6e2800a69f1c6521a5651da524f811e237d13e34cad369687916d0ad0bc4ef89
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace/firmware \
+            "$IDF_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              idf_version="$(idf.py --version)"
+              echo "$idf_version"
+              case "$idf_version" in
+                *"v5.5.5"*) ;;
+                *) echo "Expected ESP-IDF v5.5.5, got: $idf_version" >&2; exit 1 ;;
+              esac
+              idf.py fullclean
+              idf.py set-target esp32s3
+              idf.py build
+            '
+          printf 'ESP-IDF: `v5.5.5`\nClean build: `PASS`\n' >> "$GITHUB_STEP_SUMMARY"
