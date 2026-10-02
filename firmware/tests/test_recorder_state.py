@@ -133,6 +133,31 @@ def test_status_led_is_dark_normally_and_distinguishes_terminal_states():
     assert "s_led_state == RECORDER_STATE_LOW_BATTERY_STOP" in src
 
 
+def test_status_led_serializes_shared_rmt_access_across_recorder_tasks():
+    src = LED_C.read_text(encoding="utf-8")
+    assert '#include "freertos/semphr.h"' in src
+    assert "static SemaphoreHandle_t s_led_lock" in src
+
+    set_at = src.index("esp_err_t recorder_status_led_set_state")
+    deinit_at = src.index("void recorder_status_led_deinit", set_at)
+    set_src = src[set_at:deinit_at]
+
+    take = "xSemaphoreTake(s_led_lock, portMAX_DELAY)"
+    give = "xSemaphoreGive(s_led_lock)"
+    assert take in set_src
+    assert give in set_src
+    # The terminal-precedence guards and RMT write must all execute only
+    # after acquiring the same component-local mutex.
+    assert set_src.index(take) < set_src.index(
+        "s_led_state == RECORDER_STATE_ERROR"
+    )
+    assert set_src.index(take) < set_src.index(
+        "s_led_state == RECORDER_STATE_LOW_BATTERY_STOP"
+    )
+    assert set_src.index(take) < set_src.index("recorder_status_led_write")
+    assert set_src.rindex(give) > set_src.index("recorder_status_led_write")
+
+
 def test_task_48_sources_are_in_component_build():
     cmake = CMAKE.read_text(encoding="utf-8")
     for source in (
