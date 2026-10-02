@@ -1,4 +1,4 @@
-# M5Daylog recorder component (Tasks #44/#45/#46)
+# M5Daylog recorder component (Tasks #44/#45/#46/#47)
 
 Task #44 scope: PDM mic → I2S/DMA → 32KB × 2 double buffer → microSD
 `.wav.part` continuous PCM write. 16kHz / signed 16bit / mono PCM.
@@ -14,6 +14,16 @@ payload length with tail-only sample truncation, recovered `.wav`
 finalize, unrecoverable files moved to `quarantine/` with rename() only
 (never auto-deleted), results appended to `events.jsonl` as counts.
 
+Task #47 scope (IM-010): device identity + manifest/integrity —
+first-boot UUIDv4 `deviceId` (NVS `m5daylog/device_id`, stable across
+boots), `device.json` generation (Spec #35 S-002, mismatch/unknown
+schema never auto-overwritten), per-segment UUIDv4 `recordingId`,
+incremental SHA-256 over the WAV file bytes entire (lowercase hex 64,
+must match PC recomputation), finalized/recovered entries in
+`manifest.json` via `manifest.tmp` full-write + flush + atomic rename
+(power-loss preserves the old manifest; same recordingId with a
+different hash reports CONFLICT and never overwrites).
+
 Parent Map: #1. Tasks: #44 (`IM-007`), #45 (`IM-008`), #46 (`IM-009`).
 Related Spec: #36 (`S-003`).
 
@@ -23,7 +33,7 @@ Related Spec: #36 (`S-003`).
 components/recorder/
   CMakeLists.txt
   README.md                      # this file
-  include/recorder_config.h      # sample rate / format / buffer + rotation + recovery paths
+  include/recorder_config.h      # sample rate / format / buffer + rotation + recovery + metadata paths
   include/pcm_pipeline.h         # portable ping-pong double buffer + counters
   pcm_pipeline.c                 # portable, no ESP-IDF dependency
   include/wav_part.h             # portable RIFF/WAVE `.part` framing over stdio
@@ -32,6 +42,12 @@ components/recorder/
   wav_rotation.c                 # portable, no ESP-IDF dependency (#45)
   include/wav_recovery.h         # portable boot recovery/quarantine over stdio (#46)
   wav_recovery.c                 # portable, no ESP-IDF dependency (#46)
+  include/sha256.h               # portable incremental SHA-256 over stdio (#47)
+  sha256.c                       # portable, no ESP-IDF dependency (#47)
+  include/device_identity.h      # portable UUID/device.json + ESP NVS ensure (#47)
+  device_identity.c              # portable subset + ESP_PLATFORM NVS only (#47)
+  include/device_manifest.h      # portable manifest/integrity over stdio (#47)
+  device_manifest.c              # portable, no ESP-IDF dependency (#47)
   include/i2s_pdm_capture.h      # ESP-IDF PDM RX wrapper (pins from caller)
   i2s_pdm_capture.c              # ESP-IDF only (`ESP_PLATFORM`)
   include/sd_pcm_sink.h          # `.wav.part` file sink + write-latency stats
@@ -52,12 +68,16 @@ components/recorder/
   `recordings/YYYY-MM-DD/` via `sd_mount_ensure_date_dir()` for midnight
   rotation, and `/sdcard/M5DAYLOG/quarantine/` via
   `sd_mount_ensure_quarantine_dir()` for power-loss isolation (never
-  auto-deleted). Later retention/manifest state is out of scope (#47+).
+  auto-deleted). Task #47 metadata files (`device.json`, `manifest.json`
+  via `manifest.tmp`) live in the same root and are owned by
+  `device_identity`/`device_manifest` + the writer task, not the mount
+  module. Processed-ACK retention stays out of scope (later Task).
 - Runtime recording paths have the Spec #36 shape
-  (`recordings/YYYY-MM-DD/HHMMSS_<recordingId>.wav.part`); the
-  recording-id field is a per-boot segment counter placeholder until later
-  Tasks own full identity. The committed default path is a build-time
-  fallback only.
+  (`recordings/YYYY-MM-DD/HHMMSS_<recordingId>.wav.part`); Task #47 fills
+  the recording-id field with a fresh UUIDv4 per segment (122 hardware-RNG
+  bits; the stable NVS `deviceId` is the device identity, the per-segment
+  UUID is the cross-system primary key). The committed default path is a
+  build-time fallback only.
 - Every bring-up step is fail-loud: mount / mic-init / `.part`-open
   failures enter ERROR, never a silent "recording" state.
 
@@ -82,10 +102,25 @@ components/recorder/
   flush/close, then rename to `.wav` on 30-minute elapsed, midnight date
   change, USB connection, low battery, or safe-stop request. Close is
   idempotent across simultaneous events (first call does I/O; duplicates
-  return the cached result with no double close and no double rename).
-  This component never deletes audio (only `rename()`, never `remove()`).
-  `sd_pcm_sink` appends to one caller-provided `.wav.part` path (suffix
-  enforced at open, never a bare `.part`).
+   return the cached result with no double close and no double rename).
+   Audio is never deleted (only `rename()` moves `.wav`/`.wav.part`;
+   the sole `remove()` uses in `device_manifest.c` are tmp/destination
+   replace for the metadata atomic rename plus best-effort stale-tmp
+   cleanup — never audio deletion, never auto-delete of unacknowledged
+   recordings).
+   `sd_pcm_sink` appends to one caller-provided `.wav.part` path (suffix
+   enforced at open, never a bare `.part`).
+- Device identity / manifest / integrity is Task #47 scope
+  (`sha256.h/.c` + `device_identity.h/.c` + `device_manifest.h/.c` +
+  writer wiring in `main.c`): NVS-stable UUIDv4 `deviceId`, `device.json`
+  per Spec #35 (mismatch/unknown schema never auto-overwritten,
+  fail-closed), fresh UUIDv4 `recordingId` per segment (the cross-system
+  primary key), incremental SHA-256 over the WAV file bytes entire
+  (lowercase hex, PC-recomputable), and `manifest.json` entries for every
+  finalized/recovered `.wav` via `manifest.tmp` full-write + flush +
+  atomic rename (crash preserves the old manifest; same recordingId with
+  a different hash reports CONFLICT and never overwrites). Timestamps are
+  UTC offset ISO-8601; only `.wav` (never `.wav.part`) is entered.
 - Power-loss recovery / quarantine is Task #46 scope
   (`wav_recovery.h/.c` + RECOVER step in `main.c` writer bring-up after
   mount, before the new segment opens): residual `.wav.part` files under
@@ -97,9 +132,11 @@ components/recorder/
   `.wav` are moved to `quarantine/` with `rename()` (numeric uniqueness on
   collision) and never auto-deleted. A summary plus per-file JSON lines
   (basename + `pcm_bytes` + result, sanitized to filename-safe chars) are
-  appended to `events.jsonl`; fatal scan/dir failures enter ERROR, never
-  silent recording. Later retention/manifest bookkeeping stays out of
-  scope (#47 and later).
+   appended to `events.jsonl`; fatal scan/dir failures enter ERROR, never
+   silent recording. Task #47 syncs each recovered `.wav` into the
+   manifest with state=recovered (unparseable names skipped, manifest I/O
+   failure enters ERROR). Processed-ACK retention stays out of scope
+   (later Task).
 - microSD mount and recording directories are Task #44 bring-up
   (`sd_mount.c`: `/sdcard` + `/sdcard/M5DAYLOG/recordings` + Task #46
   `/sdcard/M5DAYLOG/quarantine`). The sink
@@ -146,19 +183,26 @@ recorder_capture_task (prio 5): wait WRITER_READY handshake → re-check STOP
     → quiescent stop-and-final-drain
     (pdm_capture_stop_and_drain_final; failed disable stays retryable)
     → fail-closed deinit (checked fail-loud, never destroys after failure)
-recorder_writer_task (prio 4): mount + quarantine ensure + RECOVER scan
-    (residual `.wav.part` → recovered `.wav` / `quarantine/`, counts to
-    `events.jsonl` + `stage: recover` log; fatal scan enters ERROR) +
-    date dir + segment open →
+recorder_writer_task (prio 4): mount + NVS deviceId + device.json ensure
+    (mismatch/unknown schema enters ERROR, never auto-overwrites) +
+    manifest shell (promote valid manifest.tmp / create empty on first
+    boot) + quarantine ensure + RECOVER scan (residual `.wav.part` →
+    recovered `.wav` / `quarantine/`, counts to `events.jsonl` +
+    `stage: recover` log; fatal scan enters ERROR) + recovered-`.wav`
+    manifest sync (state=recovered, `stage: manifest` counts; manifest I/O
+    failure enters ERROR) + date dir + segment open (fresh UUIDv4
+    recordingId + UTC startedAt per segment) →
     set WRITER_READY → on SLOT_FULL: [lock] peek full slot → [unlock] →
     sd_pcm_sink_write_chunk (slow, lock released: capture fills the other
     slot meanwhile) → [lock] release + latency note → every 4 slots:
     wav_part_flush (header patch) + running diagnostics → periodic
     rotation poll (30min/size, midnight date change): WITHOUT lock and
     WITHOUT stopping capture → wav_rotation_finalize_once (close+rename,
-    idempotent) → ensure new date dir → open new segment → STOP:
-    drain-then-exit, idempotent finalize (USB/low-battery/safe-stop share
-    one close+rename, no double close/rename), unmount
+    idempotent) → manifest record (SHA-256 file hash + tmp/rename upsert,
+    state=finalized; failure stops fail-loud) → ensure new date dir →
+    open new segment (fresh UUIDv4) → STOP: drain-then-exit, idempotent
+    finalize (USB/low-battery/safe-stop share one close+rename, no double
+    close/rename) + terminal manifest record (state=finalized), unmount
 ```
 
 One app-lifetime event group is the only cross-task channel (SLOT_FULL,
@@ -177,7 +221,8 @@ here); radio/LED policy is owned by Spec #36 and later Tasks.
 ## Host tests
 
 Portable logic (`pcm_pipeline.c`, `wav_part.c`, `wav_rotation.c`,
-`wav_recovery.c`, `recorder_config.h`) has no ESP-IDF dependency. Host
+`wav_recovery.c`, `sha256.c`, `device_identity.c` portable subset,
+`device_manifest.c`, `recorder_config.h`) has no ESP-IDF dependency. Host
 contract tests live in `firmware/tests/` and run with stdlib-only pytest
 (no ESP-IDF, no device, no network):
 
@@ -195,8 +240,18 @@ close/rename), finalized-`wave` decodeability, and the writer stack budget
 `test_recording_contract.py`
 guards the 16kHz/16bit/mono format, `.wav.part` suffix discipline,
 fail-loud symbols, producer/consumer structure, overrun/drop accounting,
-and later-task scope boundaries (retention/manifest stay out; #45
-rotation and #46 recovery/quarantine are in scope).
+and later-task scope boundaries (processed-ACK retention stays out; #45
+rotation, #46 recovery/quarantine, and #47 identity/manifest are in
+scope).
+`test_device_manifest.py` locks Task #47 identity/manifest/integrity:
+SHA-256 vectors (incremental, lowercase hex, file-hash matches PC
+recomputation), UUIDv4 shape, `device.json`/manifest schema shape
+(Spec #35 required fields, `schemaVersion=1`, unknown-major fail-closed,
+deviceId-mismatch preservation), tmp+rename atomicity (crash preserves
+the old manifest), CONFLICT on same recordingId with a different hash
+(never overwrites), idempotent duplicate upserts, and writer wiring
+(NVS ensure, `device.json` ensure, per-segment UUIDv4, rotation/terminal
+`stage: manifest` records, recovered sync, metadata-only logging).
 `test_wav_recovery.py` locks Task #46 recovery/quarantine: header
 rebuild from payload length, odd-tail-only truncation, quarantine
 isolation without deletion, collision handling (never overwrite),
@@ -219,6 +274,13 @@ recovered files with synthetic payloads.
   (`scanned/recovered/quarantined/errors`), `events.jsonl` recovery lines,
   `wave`-module decodeability of every recovered `.wav` (corruption 0),
   and quarantine isolation of the unrecoverable cases with no auto-delete.
+- Task #47 metadata evidence (synthetic payloads only, never real audio):
+  `device.json` / `manifest.json` schema validation against the Spec #35
+  required fields, hash comparison (`device SHA-256 == PC recomputation`)
+  for finalized/recovered files, manifest power-loss test (kill during
+  `manifest.tmp` write, old manifest intact; missing manifest + valid tmp
+  promotes), no recordingId collisions across segments, and
+  `stage: manifest` log lines (ok/error/conflict counts only).
 - Writer stack high-water (`stage: record, result: stack, writer_hw: ...`)
   from a normal run, from each successful rotation while recording
   continues, and from the boot-without-SD fail-loud path; no stack

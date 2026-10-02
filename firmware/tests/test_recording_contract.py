@@ -52,12 +52,18 @@ def test_part_suffix_discipline():
     # Only `.wav.part` is accepted for capture output, never bare `.part`.
     assert ".wav.part" in blob
     assert '#define RECORDER_PART_SUFFIX ".wav.part"' in blob
-    # Task #45 finalizes to bare `.wav` via rename in the rotation module
-    # only; deletion is never allowed anywhere (comment prose mentioning
-    # remove() does not count as a call).
+    # Task #45 finalizes to bare `.wav` via rename in the rotation module;
+    # Task #47 publishes `manifest.json` via tmp + atomic rename in the
+    # manifest module. Audio is never deleted: the only `remove()` uses
+    # live in device_manifest.c (tmp/destination metadata replace +
+    # stale-tmp cleanup), and `unlink()` appears nowhere (comment prose
+    # mentioning remove() does not count as a call).
     assert "rename(" in blob
-    assert not _has_c_call(blob, "remove")
     assert not _has_c_call(blob, "unlink")
+    for path, src in srcs.items():
+        if path.endswith("device_manifest.c"):
+            continue
+        assert not _has_c_call(src, "remove"), path
     assert '#define RECORDER_WAV_SUFFIX ".wav"' in blob
     # The rename lives in wav_rotation (finalize), never in mount/teardown.
     mount = (COMP / "sd_mount.c").read_text(encoding="utf-8")
@@ -88,17 +94,23 @@ def test_no_scope_creep_into_later_tasks():
     srcs = _sources()
     blob = "\n".join(srcs.values()).lower()
     # Later retention keywords must not be implemented here
-    # (rotation/finalize #45 and recovery/quarantine #46 are now in scope).
-    for keyword in ("manifest", "device.json", "acks/"):
+    # (rotation/finalize #45, recovery/quarantine #46, and
+    # identity/manifest #47 are now in scope; processed-ACK retention
+    # stays out).
+    for keyword in ("acks/",):
         assert keyword not in blob, keyword
-    # Rotation + recovery are implemented; later retention stays out.
+    # Rotation + recovery + identity/manifest are implemented; later
+    # retention stays out.
     assert "quarantine" in blob
     assert "wav_recovery" in blob
+    assert "manifest" in blob
+    assert "device_identity" in blob or "device.json" in blob
     readme = (COMP / "README.md").read_text(encoding="utf-8").lower()
-    for marker in ("#45", "#46", "never deletes"):
+    for marker in ("#45", "#46", "#47"):
         assert marker in readme, marker
     assert "rotation" in readme
     assert "recovery" in readme or "quarantine" in readme
+    assert "manifest" in readme
 
 
 def test_no_credentials_or_private_data_patterns():

@@ -369,13 +369,21 @@ def test_c_recovery_never_deletes():
         for p in COMP.rglob("*")
         if p.is_file() and p.suffix in (".c", ".h")
     )
-    assert not _has_c_call(blob, "remove")
+    # Recovery never deletes audio: no unlink() anywhere; remove() only
+    # in device_manifest.c for tmp/destination metadata replace.
     assert not _has_c_call(blob, "unlink")
-    # Recovery/quarantine are now in scope; later manifest/identity stay out.
+    for p in COMP.rglob("*"):
+        if p.is_file() and p.suffix in (".c", ".h") and \
+                p.name != "device_manifest.c":
+            assert not _has_c_call(
+                p.read_text(encoding="utf-8"), "remove"), p.name
+    # Recovery/quarantine and Task #47 identity/manifest are now in
+    # scope; processed-ACK retention stays out.
     lowered = blob.lower()
     assert "quarantine" in lowered
     assert "wav_recovery" in lowered or "wav_recovery" in lowered
-    for keyword in ("manifest", "device.json", "acks/"):
+    assert "manifest" in lowered
+    for keyword in ("acks/",):
         assert keyword not in lowered, keyword
 
 

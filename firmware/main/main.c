@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "esp_chip_info.h"
 #include "esp_flash.h"
@@ -15,6 +16,9 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "device_identity.h"
+#include "device_manifest.h"
+#include "esp_random.h"
 #include "i2s_pdm_capture.h"
 #include "pcm_pipeline.h"
 #include "recorder_config.h"
@@ -25,10 +29,13 @@
 
 static const char *TAG = "m5daylog";
 
-// Tasks #44/#45/#46: SD mount -> RECOVER -> PDM capture + SD writer ->
-// `.wav.part` with Task #45 rotation/finalize to `.wav` and Task #46
-// boot power-loss recovery (residual `.wav.part` -> recovered `.wav` or
-// `quarantine/`, results to `events.jsonl`).
+// Tasks #44/#45/#46/#47: SD mount -> RECOVER -> PDM capture + SD writer ->
+// `.wav.part` with Task #45 rotation/finalize to `.wav`, Task #46 boot
+// power-loss recovery (residual `.wav.part` -> recovered `.wav` or
+// `quarantine/`, results to `events.jsonl`), and Task #47 device
+// identity + manifest/integrity (NVS `deviceId`, `device.json`,
+// per-segment UUIDv4 `recordingId`, incremental SHA-256 over the WAV
+// file bytes entire, `manifest.json` via `manifest.tmp` atomic rename).
 //
 // Bounded producer/consumer over the 32KB x 2 ping-pong pipeline:
 // - recorder_capture_task (priority 5) owns the PDM handle and DMA scratch.
@@ -64,12 +71,15 @@ static const char *TAG = "m5daylog";
 // baseline: PDM CLK 40 / DAT 41, SD SPI CS 11 MOSI 12 CLK 14 MISO 39,
 // mount /sdcard). Build flags may override them; any bring-up failure
 // (events, lock, mount, recovery, mic init, `.part` open, I2S/SD I/O,
-// rotation path/dir/open) enters ERROR, never silent recording. Date
-// subdirectories (`recordings/YYYY-MM-DD/`) are Task #45 scope; Task #46
-// owns the boot RECOVER step (scan residual `.wav.part`, rebuild headers
-// from payload length with tail-only truncation, quarantine unrecoverable
-// files without auto-delete, log counts to `events.jsonl`). Retention /
-// manifest bookkeeping remains out of scope.
+// rotation path/dir/open, device identity, manifest) enters ERROR, never
+// silent recording. Date subdirectories (`recordings/YYYY-MM-DD/`) are
+// Task #45 scope; Task #46 owns the boot RECOVER step (scan residual
+// `.wav.part`, rebuild headers from payload length with tail-only
+// truncation, quarantine unrecoverable files without auto-delete, log
+// counts to `events.jsonl`); Task #47 owns NVS `deviceId`,
+// `device.json`, per-segment UUIDv4 `recordingId`, incremental SHA-256,
+// and `manifest.json` (tmp + atomic rename, CONFLICT never overwrites).
+// Processed-ACK retention stays out of scope (later Task).
 #ifndef RECORDER_PART_PATH
 #define RECORDER_PART_PATH \
     "/sdcard/M5DAYLOG/recordings/000000_pending.wav.part"
@@ -77,10 +87,11 @@ static const char *TAG = "m5daylog";
 // NOTE: the default path above is a build-time fallback with the Spec #36
 // `HHMMSS_<recordingId>.wav.part` shape. Task #45 runtime naming builds
 // `recordings/YYYY-MM-DD/HHMMSS_<recordingId>.wav.part` from the wall
-// clock plus a per-boot segment counter (opaque recording-id placeholder;
-// full identity is a later Task). Midnight never mixes dates: the date
-// directory switches with the new file. Only the `.wav.part` suffix is
-// ever opened; PC syncs only the finalized `.wav`.
+// clock; Task #47 fills `<recordingId>` with a fresh UUIDv4 per segment
+// (122 hardware-RNG bits, NVS device identity is separate and stable).
+// Midnight never mixes dates: the date directory switches with the new
+// file. Only the `.wav.part` suffix is ever opened; PC syncs only the
+// finalized `.wav` listed in `manifest.json`.
 
 // 32KB x 2 staging in DRAM. 64KB static is within ESP32-S3 SRAM; a later
 // Task may revisit placement (PSRAM) only via an explicit Spec update.
@@ -121,6 +132,19 @@ static char s_seg_wav[RECORDER_MAX_PATH_LEN];
 static char s_rot_part[RECORDER_MAX_PATH_LEN];
 static char s_rot_wav[RECORDER_MAX_PATH_LEN];
 static wav_rotation_state_t s_seg_state;
+
+// Task #47 writer-owned metadata storage (same stack-budget discipline:
+// the 1KB manifest entry plus identity/ISO buffers live in .bss, never
+// in the writer task frame; the writer is the single owner, no lock).
+static char s_device_id[RECORDER_UUID_STR_LEN];
+static char s_manifest_entry[RECORDER_MANIFEST_ENTRY_MAX];
+static char s_manifest_now[RECORDER_ISO8601_STR_LEN];
+static char s_seg_rec_id[RECORDER_UUID_STR_LEN];
+static char s_seg_started[RECORDER_ISO8601_STR_LEN];
+
+// M5DAYLOG-relative prefix stripped when recording manifest filenames
+// (`/sdcard/M5DAYLOG/recordings/...` -> `recordings/...`).
+static const char *const k_m5daylog_prefix = "/sdcard/M5DAYLOG/";
 
 static void recorder_request_stop(void) {
     // STOP is sticky and also wakes the writer promptly for drain-then-exit.
@@ -231,6 +255,207 @@ static const char *recorder_rotate_reason_str(wav_rotate_reason_t reason) {
             return "stop-request";
         default:
             return "none";
+    }
+}
+
+// Task #47: fresh UUIDv4 recordingId per segment from the hardware RNG
+// (122 random bits). Fail-loud false on any formatting failure so the
+// caller never reuses a stale id (recordingId collisions are forbidden).
+static bool recorder_new_recording_id(char out[RECORDER_UUID_STR_LEN]) {
+    uint8_t rand16[16];
+    uint32_t w;
+    int i;
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, RECORDER_UUID_STR_LEN);
+    for (i = 0; i < 4; ++i) {
+        w = esp_random();
+        rand16[i * 4 + 0] = (uint8_t)(w >> 24);
+        rand16[i * 4 + 1] = (uint8_t)(w >> 16);
+        rand16[i * 4 + 2] = (uint8_t)(w >> 8);
+        rand16[i * 4 + 3] = (uint8_t)(w);
+    }
+    if (!device_identity_format_uuid_v4(rand16, out)) {
+        memset(out, 0, RECORDER_UUID_STR_LEN);
+        return false;
+    }
+    memset(rand16, 0, sizeof(rand16));
+    return true;
+}
+
+// Task #47: current UTC offset ISO-8601 (`YYYY-MM-DDTHH:MM:SS+00:00`)
+// for manifest `updatedAt`/`startedAt`. Falls back to the stable epoch
+// when the wall clock is not yet plausible (same rule as segment naming;
+// never fabricates a local offset the device does not know).
+static bool recorder_current_iso8601(char out[RECORDER_ISO8601_STR_LEN]) {
+    char date[RECORDER_DATE_STR_LEN];
+    char time6[RECORDER_TIME_STR_LEN];
+    int n;
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, RECORDER_ISO8601_STR_LEN);
+    recorder_current_date_time(date, time6);
+    n = snprintf(out, RECORDER_ISO8601_STR_LEN, "%.4s-%.2s-%.2sT%.2s:%.2s:%.2s+00:00",
+                 date, date + 5, date + 8, time6, time6 + 2, time6 + 4);
+    if (n < 0 || (size_t)n >= RECORDER_ISO8601_STR_LEN ||
+        !device_manifest_is_valid_iso8601_offset(out)) {
+        memset(out, 0, RECORDER_ISO8601_STR_LEN);
+        return false;
+    }
+    return true;
+}
+
+// Task #47: hash one finalized `.wav` and upsert its manifest entry.
+// `wav_path` is the absolute finalized path, `rec_id`/`started_at` are the
+// segment-start values, `state` is finalized/recovered. Uses the
+// writer-owned static entry/ISO buffers (no task-frame growth). Returns
+// true only on DEVICE_MANIFEST_OK (idempotent duplicates count as ok).
+// Logs carry only stage/result metadata, never filenames, ids, or hashes.
+static bool recorder_manifest_record_wav(const char *wav_path,
+                                         const char *rec_id,
+                                         const char *started_at,
+                                         const char *state) {
+    char sha[RECORDER_SHA256_HEX_LEN];
+    uint32_t size_bytes = 0;
+    uint32_t pcm_bytes = 0;
+    uint32_t duration_ms = 0;
+    const char *rel;
+    size_t prefix_len;
+    memset(s_manifest_entry, 0, sizeof(s_manifest_entry));
+    memset(s_manifest_now, 0, sizeof(s_manifest_now));
+    memset(sha, 0, sizeof(sha));
+    if (wav_path == NULL || rec_id == NULL || started_at == NULL ||
+        state == NULL) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest arg");
+        return false;
+    }
+    prefix_len = strlen(k_m5daylog_prefix);
+    if (strncmp(wav_path, k_m5daylog_prefix, prefix_len) != 0) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest path");
+        return false;
+    }
+    rel = wav_path + prefix_len;
+    if (!recorder_current_iso8601(s_manifest_now)) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest time");
+        return false;
+    }
+    if (!device_manifest_hash_wav_file(wav_path, sha, &size_bytes)) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest hash");
+        return false;
+    }
+    if (size_bytes < RECORDER_WAV_HEADER_SIZE) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest size");
+        return false;
+    }
+    pcm_bytes = size_bytes - RECORDER_WAV_HEADER_SIZE;
+    pcm_bytes -= (pcm_bytes % RECORDER_BYTES_PER_SAMPLE);
+    duration_ms = device_manifest_duration_ms(pcm_bytes);
+    if (!device_manifest_build_entry(rec_id, rel, started_at, duration_ms,
+                                     size_bytes, sha, RECORDER_SAMPLE_RATE_HZ,
+                                     RECORDER_BITS_PER_SAMPLE,
+                                     RECORDER_CHANNELS, state, NULL,
+                                     s_manifest_entry,
+                                     sizeof(s_manifest_entry))) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest entry");
+        return false;
+    }
+    {
+        device_manifest_result_t r = device_manifest_upsert_file(
+            RECORDER_MANIFEST_PATH, RECORDER_MANIFEST_TMP_PATH, s_device_id,
+            s_manifest_now, s_manifest_entry);
+        if (r == DEVICE_MANIFEST_OK) {
+            ESP_LOGI(TAG, "stage: manifest, result: ok");
+            return true;
+        }
+        if (r == DEVICE_MANIFEST_CONFLICT) {
+            ESP_LOGE(TAG,
+                     "stage: manifest, result: error, reason: manifest conflict");
+        } else {
+            ESP_LOGE(TAG,
+                     "stage: manifest, result: error, reason: manifest write");
+        }
+        return false;
+    }
+}
+
+// Task #47: ensure an empty manifest exists when neither the manifest nor
+// its tmp exists (first boot). A present manifest is left untouched; a
+// leftover tmp with a missing destination is promoted when valid.
+static bool recorder_ensure_manifest_exists(void) {
+    FILE *probe = NULL;
+    if (!recorder_current_iso8601(s_manifest_now)) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest time");
+        return false;
+    }
+    probe = fopen(RECORDER_MANIFEST_PATH, "rb");
+    if (probe != NULL) {
+        fclose(probe);
+        return true;
+    }
+    if (!device_manifest_recover_tmp(RECORDER_MANIFEST_PATH,
+                                     RECORDER_MANIFEST_TMP_PATH,
+                                     s_device_id)) {
+        // No promotable tmp: distinguish first boot (neither file) from a
+        // corrupt tmp alongside a missing destination (fail-closed).
+        FILE *tmp_probe = fopen(RECORDER_MANIFEST_TMP_PATH, "rb");
+        if (tmp_probe != NULL) {
+            fclose(tmp_probe);
+            ESP_LOGE(TAG,
+                     "stage: manifest, result: error, reason: manifest tmp");
+            return false;
+        }
+    } else {
+        probe = fopen(RECORDER_MANIFEST_PATH, "rb");
+        if (probe != NULL) {
+            fclose(probe);
+            return true;
+        }
+    }
+    // First boot: write the canonical empty document via tmp + rename.
+    {
+        char empty[256];
+        FILE *out = NULL;
+        size_t len;
+        memset(empty, 0, sizeof(empty));
+        if (!device_manifest_build_empty(s_device_id, s_manifest_now, empty,
+                                         sizeof(empty))) {
+            ESP_LOGE(TAG,
+                     "stage: manifest, result: error, reason: manifest empty");
+            return false;
+        }
+        len = strlen(empty);
+        out = fopen(RECORDER_MANIFEST_TMP_PATH, "wb");
+        if (out == NULL) {
+            ESP_LOGE(TAG,
+                     "stage: manifest, result: error, reason: manifest tmp open");
+            return false;
+        }
+        if (fwrite(empty, 1, len, out) != len || fflush(out) != 0) {
+            fclose(out);
+            ESP_LOGE(TAG,
+                     "stage: manifest, result: error, reason: manifest tmp write");
+            return false;
+        }
+        {
+            int fd = fileno(out);
+            if (fd >= 0) {
+                (void)fsync(fd);
+            }
+        }
+        if (fclose(out) != 0) {
+            ESP_LOGE(TAG,
+                     "stage: manifest, result: error, reason: manifest tmp close");
+            return false;
+        }
+        if (rename(RECORDER_MANIFEST_TMP_PATH, RECORDER_MANIFEST_PATH) != 0) {
+            ESP_LOGE(TAG,
+                     "stage: manifest, result: error, reason: manifest rename");
+            return false;
+        }
+        ESP_LOGI(TAG, "stage: manifest, result: ok");
+        return true;
     }
 }
 
@@ -467,8 +692,7 @@ static void recorder_writer_task(void *arg) {
     // 30-minute size trigger (equivalent to 1800s at 32000 B/s).
     char seg_date[RECORDER_DATE_STR_LEN];
     char cur_time[RECORDER_TIME_STR_LEN];
-    char rec_id[16];
-    uint32_t seg_seq = 0;
+    char rec_id[RECORDER_UUID_STR_LEN];
     uint32_t seg_bytes = 0;
     TickType_t seg_start_tick = 0;
 
@@ -477,6 +701,40 @@ static void recorder_writer_task(void *arg) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: sd mount");
         recorder_request_stop();
         recorder_log_writer_stack_hw("sd mount");
+        vTaskDelete(NULL);
+        return;
+    }
+    // Task #47 identity (Spec #35 S-002): stable NVS `deviceId` (first
+    // boot generates a UUIDv4, later boots reuse it), `device.json`
+    // present and matching (mismatch or unknown schema never
+    // auto-overwritten, fail-closed), and a manifest shell (promote a
+    // valid `manifest.tmp` when the destination is missing, else create
+    // the canonical empty document on first boot). Any failure enters
+    // ERROR before recovery or capture so the device never records under
+    // a forked or unlisted identity.
+    memset(s_device_id, 0, sizeof(s_device_id));
+    if (device_identity_ensure_device_id(s_device_id) != ESP_OK) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: device id");
+        sd_mount_unmount();
+        recorder_request_stop();
+        recorder_log_writer_stack_hw("device id");
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!device_identity_ensure_device_json(RECORDER_DEVICE_JSON_PATH,
+                                            s_device_id, NULL, NULL)) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: device json");
+        sd_mount_unmount();
+        recorder_request_stop();
+        recorder_log_writer_stack_hw("device json");
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!recorder_ensure_manifest_exists()) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest init");
+        sd_mount_unmount();
+        recorder_request_stop();
+        recorder_log_writer_stack_hw("manifest init");
         vTaskDelete(NULL);
         return;
     }
@@ -523,13 +781,60 @@ static void recorder_writer_task(void *arg) {
                  rec_stats.scanned, rec_stats.recovered,
                  rec_stats.quarantined, rec_stats.errors,
                  rec_stats.recovered_pcm_bytes);
+        // Task #47: recovered `.wav` files enter the manifest with
+        // state=recovered (recordingId from the filename, startedAt from
+        // the date directory + HHMMSS prefix, incremental file hash).
+        // Unparseable names are skipped without failing the boot; a
+        // manifest I/O failure enters ERROR so recovered audio is never
+        // left unlisted.
+        if (recorder_current_iso8601(s_manifest_now)) {
+            uint32_t added = 0;
+            uint32_t skipped = 0;
+            if (!device_manifest_sync_wav_dir(
+                    RECORDER_RECORDINGS_DIR, RECORDER_MANIFEST_PATH,
+                    RECORDER_MANIFEST_TMP_PATH, s_device_id, s_manifest_now,
+                    DEVICE_MANIFEST_STATE_RECOVERED, &added, &skipped)) {
+                ESP_LOGE(TAG,
+                         "stage: manifest, result: error, reason: manifest sync");
+                sd_mount_unmount();
+                recorder_request_stop();
+                recorder_log_writer_stack_hw("manifest sync");
+                vTaskDelete(NULL);
+                return;
+            }
+            ESP_LOGI(TAG,
+                     "stage: manifest, result: ok, added: %" PRIu32
+                     ", skipped: %" PRIu32,
+                     added, skipped);
+        } else {
+            ESP_LOGE(TAG,
+                     "stage: manifest, result: error, reason: manifest time");
+            sd_mount_unmount();
+            recorder_request_stop();
+            recorder_log_writer_stack_hw("manifest time");
+            vTaskDelete(NULL);
+            return;
+        }
     }
     // Initial segment: runtime date/time naming with the Spec #36
     // `HHMMSS_<recordingId>.wav.part` shape inside the date directory.
-    // The recording-id field is a per-boot segment counter placeholder
-    // (opaque, no private content); full identity arrives in a later Task.
+    // Task #47 fills `<recordingId>` with a fresh UUIDv4 (opaque random
+    // identifier, no private content) and records its UTC startedAt for
+    // the manifest entry written at finalize.
     recorder_current_date_time(seg_date, cur_time);
-    snprintf(rec_id, sizeof(rec_id), "s%04u", (unsigned)(seg_seq & 0xFFFFu));
+    memset(rec_id, 0, sizeof(rec_id));
+    memset(s_seg_rec_id, 0, sizeof(s_seg_rec_id));
+    memset(s_seg_started, 0, sizeof(s_seg_started));
+    if (!recorder_new_recording_id(rec_id) ||
+        !recorder_current_iso8601(s_seg_started)) {
+        ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest id");
+        sd_mount_unmount();
+        recorder_request_stop();
+        recorder_log_writer_stack_hw("manifest id");
+        vTaskDelete(NULL);
+        return;
+    }
+    memcpy(s_seg_rec_id, rec_id, sizeof(s_seg_rec_id));
     if (!wav_rotation_build_part_path(s_seg_part, sizeof(s_seg_part),
                                       seg_date, cur_time, rec_id) ||
         !wav_rotation_build_wav_path(s_seg_wav, sizeof(s_seg_wav), seg_date,
@@ -681,12 +986,37 @@ static void recorder_writer_task(void *arg) {
                 }
                 ESP_LOGI(TAG, "stage: rotate, result: ok, reason: %s",
                          recorder_rotate_reason_str(reason));
+                // Task #47: the just-finalized segment enters the manifest
+                // (incremental SHA-256 over the `.wav` bytes entire, tmp +
+                // atomic rename, CONFLICT never overwrites). A manifest
+                // failure stops rotation fail-loud like a finalize
+                // failure, so finalized audio is never left unlisted.
+                if (!recorder_manifest_record_wav(
+                        s_seg_wav, s_seg_rec_id, s_seg_started,
+                        DEVICE_MANIFEST_STATE_FINALIZED)) {
+                    if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) ==
+                        pdTRUE) {
+                        pcm_pipeline_note_sd_error(&s_pipeline);
+                        xSemaphoreGive(s_rec_lock);
+                    }
+                    running = false;
+                    recorder_request_stop();
+                    break;
+                }
                 // Open the next segment in the (possibly new) date
                 // directory. Date directories never mix: midnight rotates
-                // into the new date dir with a fresh file.
-                seg_seq++;
-                snprintf(rec_id, sizeof(rec_id), "s%04u",
-                         (unsigned)(seg_seq & 0xFFFFu));
+                // into the new date dir with a fresh file and a fresh
+                // UUIDv4 recordingId (collisions forbidden).
+                memset(rec_id, 0, sizeof(rec_id));
+                if (!recorder_new_recording_id(rec_id) ||
+                    !recorder_current_iso8601(s_seg_started)) {
+                    ESP_LOGE(TAG,
+                             "stage: manifest, result: error, reason: manifest id");
+                    running = false;
+                    recorder_request_stop();
+                    break;
+                }
+                memcpy(s_seg_rec_id, rec_id, sizeof(s_seg_rec_id));
                 if (!wav_rotation_build_part_path(s_rot_part,
                                                   sizeof(s_rot_part),
                                                   now_date, now_time,
@@ -740,7 +1070,10 @@ static void recorder_writer_task(void *arg) {
     // Terminal finalize (USB connection / low battery / safe-stop request
     // and any error teardown): header finalize then rename to `.wav`.
     // Idempotent: simultaneous stop duplicates return the cached result
-    // with no double close and no double rename. PC syncs only `.wav`.
+    // with no double close and no double rename. PC syncs only `.wav`
+    // entries listed in `manifest.json` (Task #47 records the finalized
+    // segment the same way as rotation; a manifest failure is fail-loud
+    // like a close failure).
     if (!wav_rotation_finalize_once(&s_seg_state, &s_sink)) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: part close");
         if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
@@ -749,6 +1082,14 @@ static void recorder_writer_task(void *arg) {
         }
     } else {
         ESP_LOGI(TAG, "stage: finalize, result: ok");
+        if (!recorder_manifest_record_wav(s_seg_wav, s_seg_rec_id,
+                                          s_seg_started,
+                                          DEVICE_MANIFEST_STATE_FINALIZED)) {
+            if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
+                pcm_pipeline_note_sd_error(&s_pipeline);
+                xSemaphoreGive(s_rec_lock);
+            }
+        }
     }
     sd_mount_unmount();
     ESP_LOGE(TAG, "stage: record, result: error, reason: stopped");
@@ -773,10 +1114,12 @@ void app_main(void) {
     ESP_LOGI(TAG, "idf version: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "stage: scaffold, result: boot ok");
 
-    // Tasks #44/#45/#46 recording path. The event group is the only
+    // Tasks #44/#45/#46/#47 recording path. The event group is the only
     // cross-task channel (no published task handles); the writer-ready
     // handshake makes creation order irrelevant. Task #45
-    // rotation/finalize and Task #46 boot RECOVER are wired into the
+    // rotation/finalize, Task #46 boot RECOVER, and Task #47
+    // identity/manifest (NVS deviceId, device.json, per-segment UUIDv4,
+    // SHA-256, manifest.json via tmp + atomic rename) are wired into the
     // writer task above; later retention/state tasks attach without
     // changing the capture contract.
     recorder_reference_stop_wrappers();
