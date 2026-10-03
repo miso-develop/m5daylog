@@ -140,6 +140,60 @@ class LibraryContainmentTests(unittest.TestCase):
                 self.run_sync(mount, library, db_path)
             self.assertEqual(before, snapshot(external))
 
+    def test_partial_symlink_inside_library_is_replaced_without_target_write(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mount = root / "drive"
+            library = root / "library"
+            db_path = root / "state.db"
+            protected = library / "protected.bin"
+            protected.parent.mkdir(parents=True)
+            protected.write_bytes(b"library-protected-must-remain-unchanged")
+            write_device(mount)
+
+            raw = library / "2026" / "10" / "03" / "raw"
+            raw.mkdir(parents=True)
+            partial = raw / f"{RECORDING_ID}.wav.partial"
+            try:
+                partial.symlink_to(protected)
+            except OSError as exc:
+                self.skipTest(type(exc).__name__)
+
+            protected_before = protected.read_bytes()
+            summary = self.run_sync(mount, library, db_path)
+
+            self.assertEqual(protected_before, protected.read_bytes())
+            self.assertEqual(1, summary.copied)
+            self.assertFalse(partial.exists())
+            self.assertEqual(PAYLOAD, raw.joinpath(f"{RECORDING_ID}.wav").read_bytes())
+
+    def test_partial_hardlink_inside_library_is_replaced_without_target_write(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mount = root / "drive"
+            library = root / "library"
+            db_path = root / "state.db"
+            protected = library / "protected.bin"
+            protected.parent.mkdir(parents=True)
+            protected.write_bytes(b"library-hardlink-must-remain-unchanged")
+            write_device(mount)
+
+            raw = library / "2026" / "10" / "03" / "raw"
+            raw.mkdir(parents=True)
+            partial = raw / f"{RECORDING_ID}.wav.partial"
+            try:
+                os.link(protected, partial)
+            except OSError as exc:
+                self.skipTest(type(exc).__name__)
+
+            protected_before = protected.read_bytes()
+            summary = self.run_sync(mount, library, db_path)
+
+            self.assertEqual(protected_before, protected.read_bytes())
+            self.assertEqual(1, summary.copied)
+            self.assertFalse(partial.exists())
+            self.assertEqual(PAYLOAD, raw.joinpath(f"{RECORDING_ID}.wav").read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()
