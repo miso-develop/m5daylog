@@ -32,13 +32,12 @@ typedef struct {
     _Atomic uint32_t generation;
     _Atomic uint32_t active_commands;
     _Atomic uint32_t phase;
-    // Serializes the CDC-ready publication decision with RX classification.
-    // Without this boundary, an RX callback can observe CLOSED immediately
-    // before lifecycle OPEN and publish a stale-discard epoch afterward.
-    _Atomic bool rx_phase_lock;
-    // RX arriving while admission is closed/resetting is stale with respect to
-    // the next lifecycle-owned CDC-ready point. The worker drains through an
-    // empty TinyUSB read before clearing the corresponding epoch.
+    // Lock-free RX admission word. The high bits encode whether RX belongs to
+    // the published session and whether stale RX still needs a drain-to-empty;
+    // the low bits count callbacks that have atomically joined stale-RX
+    // classification. This lets lifecycle OPEN race callbacks without making a
+    // TinyUSB callback wait on another task.
+    _Atomic uint32_t rx_state;
     _Atomic uint32_t rx_discard_epoch;
     _Atomic uint32_t rx_drained_epoch;
 } usb_cdc_session_gate_t;
@@ -48,10 +47,9 @@ uint32_t usb_cdc_session_gate_generation(const usb_cdc_session_gate_t *gate);
 bool usb_cdc_session_gate_is_open(const usb_cdc_session_gate_t *gate);
 
 // Open command admission only from the recorder lifecycle's CDC-ready point.
-// Returns false while RESETTING, while the gate is not stably CLOSED, or while
-// stale RX still requires a drain-to-empty pass. RX classification is
-// serialized with the CLOSED -> OPEN publication so a callback cannot create a
-// stale discard epoch after this function successfully publishes CDC-ready.
+// Returns false while RESETTING or while stale RX still requires a
+// drain-to-empty pass. RX callbacks and OPEN compete on one atomic admission
+// word, so a callback is classified wholly before or wholly after CDC-ready.
 bool usb_cdc_session_gate_open(usb_cdc_session_gate_t *gate);
 
 // Non-blocking close for callback context. Already running commands may finish,
