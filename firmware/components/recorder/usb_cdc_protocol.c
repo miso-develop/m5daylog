@@ -151,7 +151,9 @@ static int cdc_protocol_process_line(const uint8_t *line, size_t len,
                                   USB_CDC_ERROR_INVALID_JSON);
     }
 
-    root = cJSON_Parse((const char *)line);
+    // Require the entire framed line to be one JSON value; do not accept a
+    // valid prefix followed by trailing non-whitespace bytes.
+    root = cJSON_ParseWithOpts((const char *)line, NULL, true);
     if (root == NULL) {
         return cdc_error_response(out, out_size, NULL,
                                   USB_CDC_ERROR_INVALID_JSON);
@@ -265,11 +267,13 @@ static int cdc_protocol_process_line(const uint8_t *line, size_t len,
     }
 
 done:
-    cJSON_Delete(root);
+    // `id` points into root, so perform any overflow fallback while root is
+    // still alive. This keeps the error path free of use-after-free reads.
     if (n < 0 || (size_t)n >= out_size) {
-        return cdc_error_response(out, out_size, id,
-                                  USB_CDC_ERROR_INTERNAL_ERROR);
+        n = cdc_error_response(out, out_size, id,
+                               USB_CDC_ERROR_INTERNAL_ERROR);
     }
+    cJSON_Delete(root);
     return n;
 }
 
