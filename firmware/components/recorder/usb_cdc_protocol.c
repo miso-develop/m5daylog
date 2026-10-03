@@ -32,13 +32,31 @@ static volatile bool s_reset_line = false;
 static bool s_initialized = false;
 static bool s_started = false;
 
-static bool cdc_write_response(const char *response, size_t len) {
+static bool usb_cdc_session_gate_tx_is_current(
+    const usb_cdc_session_gate_t *gate, uint32_t response_generation) {
+    usb_cdc_session_snapshot_t response_snapshot = {
+        .generation = response_generation,
+        .admitted = true,
+    };
+    return usb_cdc_session_gate_snapshot_is_current(gate, response_snapshot);
+}
+
+static bool cdc_write_response(const char *response, size_t len,
+                               uint32_t response_generation) {
     size_t sent = 0;
     while (sent < len) {
-        size_t queued = tinyusb_cdcacm_write_queue(
+        size_t queued;
+        if (!s_connected ||
+            !usb_cdc_session_gate_tx_is_current(&s_session_gate,
+                                                response_generation)) {
+            return false;
+        }
+        queued = tinyusb_cdcacm_write_queue(
             TINYUSB_CDC_ACM_0, (const uint8_t *)response + sent, len - sent);
         if (queued == 0u) {
-            if (!s_connected) {
+            if (!s_connected ||
+                !usb_cdc_session_gate_tx_is_current(&s_session_gate,
+                                                    response_generation)) {
                 return false;
             }
             if (tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
@@ -49,16 +67,31 @@ static bool cdc_write_response(const char *response, size_t len) {
         }
         sent += queued;
     }
-    while (tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, '\n') == 0u) {
-        if (!s_connected) {
+    for (;;) {
+        if (!s_connected ||
+            !usb_cdc_session_gate_tx_is_current(&s_session_gate,
+                                                response_generation)) {
             return false;
+        }
+        if (tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, '\n') != 0u) {
+            break;
         }
         (void)tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
                                          pdMS_TO_TICKS(20));
         vTaskDelay(1);
     }
-    return tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
-                                      CDC_TX_FLUSH_TICKS) == ESP_OK;
+    if (!s_connected ||
+        !usb_cdc_session_gate_tx_is_current(&s_session_gate,
+                                            response_generation)) {
+        return false;
+    }
+    if (tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
+                                   CDC_TX_FLUSH_TICKS) != ESP_OK) {
+        return false;
+    }
+    return s_connected &&
+           usb_cdc_session_gate_tx_is_current(&s_session_gate,
+                                              response_generation);
 }
 
 static void usb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
@@ -182,10 +215,12 @@ static void usb_cdc_worker_task(void *arg) {
                     response_len = usb_cdc_protocol_process_line(
                         frame_line, frame_len, response, sizeof(response),
                         &s_config, rtc_correction_apply);
+                    if (response_len > 0 && s_connected) {
+                        (void)cdc_write_response(response,
+                                                 (size_t)response_len,
+                                                 frame_generation);
+                    }
                     usb_cdc_session_gate_command_end(&s_session_gate);
-                }
-                if (response_len > 0 && s_connected) {
-                    (void)cdc_write_response(response, (size_t)response_len);
                 }
             }
         } while (got != 0u);
