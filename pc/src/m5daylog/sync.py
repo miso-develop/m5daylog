@@ -482,6 +482,25 @@ def _mark_conflict(
     connection.commit()
 
 
+def _reject_device_local_targets(
+    mount: Path,
+    library_root: Path,
+    db_path: Path,
+) -> None:
+    """Prevent caller-supplied local output paths from writing into Device media."""
+    try:
+        device_root = mount.resolve(strict=True)
+        candidates = (library_root.resolve(strict=False), db_path.resolve(strict=False))
+    except OSError:
+        raise SyncValidationError("unable to resolve sync target paths") from None
+    for candidate in candidates:
+        try:
+            candidate.relative_to(device_root)
+        except ValueError:
+            continue
+        raise SyncValidationError("local sync target must be outside Device mount")
+
+
 def sync_device(
     mount_root: str | Path,
     *,
@@ -498,7 +517,9 @@ def sync_device(
     manifest = _load_manifest(mount, contracts)
     prepared = _preflight(mount, device, manifest)
 
-    db_file = init_db(Path(db_path).expanduser())
+    db_target = Path(db_path).expanduser()
+    _reject_device_local_targets(mount, library, db_target)
+    db_file = init_db(db_target)
     connection = sqlite3.connect(str(db_file))
     copied = reused = conflicts = 0
     try:
