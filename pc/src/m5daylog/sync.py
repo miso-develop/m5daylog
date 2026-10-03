@@ -358,6 +358,27 @@ def _file_matches(path: Path, expected_size: int, expected_sha256: str) -> bool:
     return size == expected_size and actual_sha == expected_sha256
 
 
+def _open_fresh_partial(partial: Path) -> BinaryIO:
+    """Replace a stale partial entry without following symlink or hard-link aliases."""
+    try:
+        partial.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise SyncValidationError("unable to replace stale partial") from None
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(partial, flags, 0o600)
+    except OSError:
+        raise SyncValidationError("unable to create fresh partial") from None
+    return os.fdopen(descriptor, "wb")
+
+
 def copy_verified_stream(
     reader: BinaryIO,
     partial_path: str | Path,
@@ -366,14 +387,14 @@ def copy_verified_stream(
     expected_sha256: str,
     chunk_size: int = 1024 * 1024,
 ) -> None:
-    """Copy from byte zero into a truncating partial and verify before return."""
+    """Copy from byte zero into a fresh partial and verify before return."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
     partial = Path(partial_path)
     partial.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
     total = 0
-    with partial.open("wb") as output:
+    with _open_fresh_partial(partial) as output:
         while True:
             chunk = reader.read(chunk_size)
             if not chunk:
