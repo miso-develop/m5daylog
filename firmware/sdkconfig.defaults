@@ -20,3 +20,9 @@ CONFIG_FATFS_MAX_LFN=255
 # Human Gate fix (Task #44): M5Capsule v1.1 is ESP32-S3FN8 with 8MB flash.
 # Fix the image header to 8MB; never select 2MB.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# Task #49: expose the finalized recording volume as USB Mass Storage only.
+# CDC is intentionally deferred to Task #50. The SD/VFS ownership gate lives
+# in usb_msc_ownership.c and never formats media on mount failure.
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=4096

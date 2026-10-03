@@ -461,14 +461,18 @@ def test_esp_idf_v55_api_shape():
     )
     # GPIO struct is zeroed before use: no uninitialized fields.
     assert "memset(&gpio_cfg, 0, sizeof(gpio_cfg))" in capture
-    # ESP-IDF v5.5 mount order: base_path, host, slot, mount, card.
     mount = (COMP / "sd_mount.c").read_text(encoding="utf-8")
     assert "esp_vfs_fat_mount_config_t" in mount
-    assert "&slot_config, &mount_config, &s_card" in mount
-    # Real v5.5.5 SDSPI types: declaration-initialized host, direct slot id,
-    # sdmmc_card_t handle shared between mount and unmount.
+    # Task #49 must retain the raw SDSPI/card lifetime across APP -> USB ->
+    # APP ownership changes. Validate the ESP-IDF v5.5 raw-SDSPI API shape
+    # instead of the pre-MSC convenience esp_vfs_fat_sdspi_mount call.
     assert "sdmmc_host_t host = SDSPI_HOST_DEFAULT()" in mount
-    assert "slot_config.host_id = host.slot" in mount
+    assert "dev.host_id = host.slot" in mount
+    assert "sdspi_host_init_device(&dev, &s_sdspi)" in mount
+    assert "host.slot = s_sdspi" in mount
+    assert "sdmmc_card_init(&host, &s_card)" in mount
+    assert "tinyusb_msc_new_storage_sdmmc(&storage_cfg, &s_storage)" in mount
+    assert "sdspi_dev_handle_t" in mount
     assert "sdmmc_card_t" in mount
     blob = "\n".join(_sources().values())
     assert "sd_mmc_card_t" not in blob  # invalid type, never use
