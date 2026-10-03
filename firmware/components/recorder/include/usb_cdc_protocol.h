@@ -4,10 +4,9 @@
 //
 // Requests are UTF-8 JSON objects framed by LF (CRLF accepted on RX), with a
 // maximum payload of 1024 bytes excluding the terminator. Processing is
-// sequential and responses preserve request order. CDC_EVENT_LINE_STATE_CHANGED
-// (DTR/RTS) and the recorder's actual MSC USB session boundaries both reset
-// partial framing. A physical reset is also a command-execution barrier: when
-// it returns, no command admitted by the prior session is still executing.
+// sequential and responses preserve request order. CDC transport callbacks
+// report connectivity/RX only; command admission is opened explicitly by the
+// recorder lifecycle after MSC ownership reaches USB_SYNC/CDC-ready.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -64,10 +63,16 @@ typedef struct {
 // unchanged.
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config);
 
-// Close command admission, wait for any command already executing to finish,
-// and discard partial RX framing at a real USB session boundary. This is the
-// teardown barrier required before remount/RTC-event flush/restart.
+// Close command admission, invalidate old RX identity, wait for any command
+// already executing to finish, and force stale RX to be drained before a later
+// lifecycle-owned reopen. This is the teardown barrier required before
+// remount/RTC-event flush/restart.
 void usb_cdc_protocol_reset_session(void);
+
+// Open command admission at the accepted CDC-ready lifecycle point. This is
+// intentionally separate from RX/DTR transport callbacks; only the recorder
+// ownership lifecycle may make commands executable.
+void usb_cdc_protocol_open_session(void);
 
 // Initialize CDC-ACM interface 0 and its dedicated sequential worker after
 // the common TinyUSB driver has been installed by the MSC owner.
