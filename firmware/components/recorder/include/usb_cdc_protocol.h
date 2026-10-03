@@ -4,8 +4,9 @@
 //
 // Requests are UTF-8 JSON objects framed by LF (CRLF accepted on RX), with a
 // maximum payload of 1024 bytes excluding the terminator. Processing is
-// sequential and responses preserve request order. DTR/RTS changes and the
-// recorder's actual MSC USB session boundaries both reset partial framing.
+// sequential and responses preserve request order. CDC_EVENT_LINE_STATE_CHANGED
+// (DTR/RTS) and the recorder's actual MSC USB session boundaries both reset
+// partial framing.
 
 #include <stdbool.h>
 #include <stddef.h>

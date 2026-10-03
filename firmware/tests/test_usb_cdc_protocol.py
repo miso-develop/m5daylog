@@ -242,7 +242,9 @@ def test_set_time_accepts_offset_and_z_and_rejects_invalid_without_mutation():
 
 def test_rtc_parser_classifies_valid_shape_calendar_range_as_range_error():
     src = RTC_C.read_text(encoding="utf-8")
-    range_check = src[src.index("if (month < 1"):src.index("pos = 19u;")]
+    parser_at = src.index("static rtc_correction_result_t rtc_parse_iso8601")
+    range_at = src.index("if (month < 1", parser_at)
+    range_check = src[range_at:src.index("pos = 19u;", range_at)]
     assert "RTC_CORRECTION_RANGE_ERROR" in range_check
     assert "RTC_CORRECTION_INVALID_ARGS" not in range_check
 
