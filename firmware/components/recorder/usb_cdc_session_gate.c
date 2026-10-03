@@ -11,6 +11,20 @@ static bool gate_has_pending_rx_discard(const usb_cdc_session_gate_t *gate) {
                                 memory_order_seq_cst);
 }
 
+static void gate_rx_phase_lock(usb_cdc_session_gate_t *gate) {
+    bool expected = false;
+
+    while (!atomic_compare_exchange_weak_explicit(
+        &gate->rx_phase_lock, &expected, true,
+        memory_order_acquire, memory_order_relaxed)) {
+        expected = false;
+    }
+}
+
+static void gate_rx_phase_unlock(usb_cdc_session_gate_t *gate) {
+    atomic_store_explicit(&gate->rx_phase_lock, false, memory_order_release);
+}
+
 void usb_cdc_session_gate_init(usb_cdc_session_gate_t *gate) {
     if (gate == NULL) {
         return;
@@ -18,6 +32,7 @@ void usb_cdc_session_gate_init(usb_cdc_session_gate_t *gate) {
     atomic_init(&gate->generation, 1u);
     atomic_init(&gate->active_commands, 0u);
     atomic_init(&gate->phase, USB_CDC_SESSION_GATE_CLOSED);
+    atomic_init(&gate->rx_phase_lock, false);
     atomic_init(&gate->rx_discard_epoch, 0u);
     atomic_init(&gate->rx_drained_epoch, 0u);
 }
@@ -37,19 +52,32 @@ bool usb_cdc_session_gate_is_open(const usb_cdc_session_gate_t *gate) {
            USB_CDC_SESSION_GATE_OPEN;
 }
 
-void usb_cdc_session_gate_open(usb_cdc_session_gate_t *gate) {
+bool usb_cdc_session_gate_open(usb_cdc_session_gate_t *gate) {
     uint32_t expected;
+    bool opened = false;
+
     if (gate == NULL) {
-        return;
+        return false;
     }
 
-    // Only the stable CLOSED phase is eligible for a lifecycle-owned reopen.
-    // In particular RESETTING is not reopenable while teardown is waiting for
-    // an already admitted command to leave the active set.
-    expected = USB_CDC_SESSION_GATE_CLOSED;
-    (void)atomic_compare_exchange_strong_explicit(
-        &gate->phase, &expected, USB_CDC_SESSION_GATE_OPEN,
-        memory_order_seq_cst, memory_order_seq_cst);
+    // Linearize CLOSED/OPEN RX classification with CDC-ready publication.
+    // If RX was classified as stale first, its discard epoch is visible here
+    // and OPEN is refused until the worker drains through an empty read. If
+    // OPEN wins first, the callback observes OPEN and classifies its bytes as
+    // the first valid request of the new lifecycle-owned session.
+    gate_rx_phase_lock(gate);
+    if (!gate_has_pending_rx_discard(gate)) {
+        expected = USB_CDC_SESSION_GATE_CLOSED;
+        if (atomic_compare_exchange_strong_explicit(
+                &gate->phase, &expected, USB_CDC_SESSION_GATE_OPEN,
+                memory_order_seq_cst, memory_order_seq_cst)) {
+            opened = true;
+        } else if (expected == USB_CDC_SESSION_GATE_OPEN) {
+            opened = true;
+        }
+    }
+    gate_rx_phase_unlock(gate);
+    return opened;
 }
 
 void usb_cdc_session_gate_close(usb_cdc_session_gate_t *gate) {
@@ -116,11 +144,17 @@ void usb_cdc_session_gate_note_rx(usb_cdc_session_gate_t *gate) {
     if (gate == NULL) {
         return;
     }
+
+    // This critical section is paired with gate_open(). It prevents a callback
+    // that observed CLOSED from publishing a stale epoch after CDC-ready has
+    // already been made visible to the lifecycle.
+    gate_rx_phase_lock(gate);
     if (atomic_load_explicit(&gate->phase, memory_order_seq_cst) !=
         USB_CDC_SESSION_GATE_OPEN) {
         (void)atomic_fetch_add_explicit(&gate->rx_discard_epoch, 1u,
                                         memory_order_seq_cst);
     }
+    gate_rx_phase_unlock(gate);
 }
 
 uint32_t usb_cdc_session_gate_rx_discard_epoch(
