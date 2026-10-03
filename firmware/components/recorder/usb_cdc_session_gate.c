@@ -263,8 +263,10 @@ bool usb_cdc_session_gate_should_discard_rx(
     if (gate == NULL) {
         return true;
     }
-    return !gate_rx_admission_is_open(gate) ||
-           gate_has_pending_rx_discard(gate);
+    // Preserve the public meaning of this predicate: it reports an unresolved
+    // stale-RX epoch, not whether lifecycle command admission is currently
+    // closed. Snapshot/current checks independently enforce admission.
+    return gate_has_pending_rx_discard(gate);
 }
 
 void usb_cdc_session_gate_mark_rx_drained(usb_cdc_session_gate_t *gate,
