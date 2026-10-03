@@ -1,13 +1,11 @@
-// microSD SPI ownership + Tasks #44/#45/#46 directory bring-up.
+// microSD SPI ownership + recorder directory bring-up.
 //
-// Task #49 initializes SDSPI once and uses esp_tinyusb as the FAT/VFS owner
-// switch. Task #87 disables automatic USB mount switching: APP -> USB happens
-// only after recorder finalize/release, while USB -> APP happens only after the
-// USB device stack is quiesced and the old USB-owned storage proves that no
-// deferred host write is still pending.
+// Task #49 publishes the medium to USB only after recorder finalization.
+// Task #87 Strategy 2 never remounts APP storage after host release: explicit
+// eject is followed by USB teardown and deletion of the USB storage object,
+// then the powered session ends in SHUTDOWN_ARMED.
 
 #include "sd_mount.h"
-
 #include "recorder_config.h"
 
 #include <string.h>
@@ -164,8 +162,6 @@ esp_err_t sd_mount_recordings(void) {
         return ensure_recording_dirs();
     }
     if (s_storage != NULL) {
-        // USB owns the medium. A recorder session may only restart after the
-        // explicit Task #87 barrier has rebuilt APP ownership.
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -228,7 +224,6 @@ esp_err_t sd_mount_recordings(void) {
         sd_mount_unmount();
         return err;
     }
-
     ESP_LOGI(TAG, "stage: record, result: sd ready, mount: %s",
              RECORDER_SD_MOUNT_POINT);
     return ESP_OK;
@@ -245,7 +240,7 @@ esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd) {
     if (date_yyyy_mm_dd == NULL || strlen(date_yyyy_mm_dd) != 10u) {
         return ESP_ERR_INVALID_ARG;
     }
-    for (i = 0; i < 10u; i++) {
+    for (i = 0; i < 10u; ++i) {
         char c = date_yyyy_mm_dd[i];
         if (i == 4u || i == 7u) {
             if (c != '-') {
@@ -328,22 +323,18 @@ esp_err_t sd_mount_transfer_to_usb(void) {
     if (!release_ready || s_storage == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-
     err = tinyusb_msc_set_storage_mount_point(
         s_storage, TINYUSB_MSC_STORAGE_MOUNT_USB);
     if (err != ESP_OK) {
         return err;
     }
-    // esp_tinyusb's setter does not propagate internal mount helper failures.
-    // The storage callback is authoritative: USB ownership must have completed
-    // synchronously and therefore Device VFS must now be unavailable.
     if (sd_mount_is_mounted()) {
         return ESP_FAIL;
     }
     return ESP_OK;
 }
 
-esp_err_t sd_mount_transfer_to_app(void) {
+esp_err_t sd_mount_release_usb_storage(void) {
     bool release_ready;
     esp_err_t err;
 
@@ -355,9 +346,9 @@ esp_err_t sd_mount_transfer_to_app(void) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // This deletion is a second proof after USB-stack teardown. esp_tinyusb
-    // rejects deletion while deferred host writes remain, so failure here is
-    // fail-closed and the Device filesystem stays unmounted.
+    // tinyusb_msc_delete_storage() refuses deletion while deferred host writes
+    // remain. Success both destroys the USB LUN/backend and proves the pending
+    // write count is zero. Strategy 2 deliberately does not create APP storage.
     err = tinyusb_msc_delete_storage(s_storage);
     if (err != ESP_OK) {
         ESP_LOGE(TAG,
@@ -366,17 +357,15 @@ esp_err_t sd_mount_transfer_to_app(void) {
     }
     s_storage = NULL;
 
-    // Re-open the same initialized SD card as a fresh APP-owned MSC storage.
-    // No stale USB LUN/storage object survives into Device ownership.
-    err = sd_mount_create_storage(TINYUSB_MSC_STORAGE_MOUNT_APP);
+    err = tinyusb_msc_uninstall_driver();
     if (err != ESP_OK) {
         ESP_LOGE(TAG,
-                 "stage: usb, result: error, reason: app storage rebuild");
+                 "stage: usb, result: error, reason: msc driver release");
         return err;
     }
-    if (!sd_mount_is_mounted()) {
-        return ESP_FAIL;
-    }
+    s_msc_driver_init = false;
+    ESP_LOGI(TAG,
+             "stage: usb, result: storage-released, owner: none, mount: none");
     return ESP_OK;
 }
 
@@ -388,25 +377,6 @@ void sd_mount_note_usb_owned(void) {
     portEXIT_CRITICAL(&s_owner_lock);
 }
 
-void sd_mount_note_app_owned(void) {
-    portENTER_CRITICAL(&s_owner_lock);
-    s_mounted = true;
-    s_usb_release_requested = false;
-    s_device_fs_released = false;
-    portEXIT_CRITICAL(&s_owner_lock);
-}
-
-esp_err_t sd_mount_remount_after_usb(void) {
-    if (!sd_mount_is_mounted() || s_storage == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    portENTER_CRITICAL(&s_owner_lock);
-    s_usb_release_requested = false;
-    s_device_fs_released = false;
-    portEXIT_CRITICAL(&s_owner_lock);
-    return ensure_recording_dirs();
-}
-
 void sd_mount_unmount(void) {
     bool usb_release;
     esp_err_t err;
@@ -414,9 +384,6 @@ void sd_mount_unmount(void) {
     portENTER_CRITICAL(&s_owner_lock);
     usb_release = s_usb_release_requested;
     if (usb_release) {
-        // The writer reaches this only after closing/finalizing its segment and
-        // committing metadata. Task #87 keeps APP mounted until the explicit
-        // transfer called by the USB attach gate.
         s_device_fs_released = true;
     }
     portEXIT_CRITICAL(&s_owner_lock);
@@ -427,9 +394,6 @@ void sd_mount_unmount(void) {
     }
 
     if (s_storage != NULL) {
-        // Terminal low-battery/error shutdown is not a USB handoff. Replace
-        // the ownership callback before deleting storage so no lifecycle event
-        // can accidentally restart the recorder.
         (void)tinyusb_msc_set_storage_callback(sd_mount_terminal_storage_event,
                                                NULL);
         err = tinyusb_msc_delete_storage(s_storage);
@@ -458,50 +422,18 @@ void sd_mount_unmount(void) {
 
 #else
 
-esp_err_t sd_mount_recordings(void) {
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
+esp_err_t sd_mount_recordings(void) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd) {
     (void)date_yyyy_mm_dd;
     return ESP_ERR_NOT_SUPPORTED;
 }
-
-esp_err_t sd_mount_ensure_quarantine_dir(void) {
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-bool sd_mount_is_mounted(void) {
-    return false;
-}
-
-esp_err_t sd_mount_release_for_usb(void) {
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-bool sd_mount_device_fs_released(void) {
-    return false;
-}
-
-esp_err_t sd_mount_transfer_to_usb(void) {
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-esp_err_t sd_mount_transfer_to_app(void) {
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-void sd_mount_note_usb_owned(void) {
-}
-
-void sd_mount_note_app_owned(void) {
-}
-
-esp_err_t sd_mount_remount_after_usb(void) {
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-void sd_mount_unmount(void) {
-}
+esp_err_t sd_mount_ensure_quarantine_dir(void) { return ESP_ERR_NOT_SUPPORTED; }
+bool sd_mount_is_mounted(void) { return false; }
+esp_err_t sd_mount_release_for_usb(void) { return ESP_ERR_NOT_SUPPORTED; }
+bool sd_mount_device_fs_released(void) { return false; }
+esp_err_t sd_mount_transfer_to_usb(void) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t sd_mount_release_usb_storage(void) { return ESP_ERR_NOT_SUPPORTED; }
+void sd_mount_note_usb_owned(void) {}
+void sd_mount_unmount(void) {}
 
 #endif

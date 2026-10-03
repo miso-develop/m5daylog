@@ -2,10 +2,11 @@
 
 // Tasks #49/#87: fail-closed USB MSC ownership handoff.
 //
-// Initial APP -> USB publication still requires WAV finalize + manifest commit
-// + Device filesystem release. Task #87 adds a second barrier in the reverse
-// direction: ambiguous suspend/bus-loss may only request explicit USB teardown;
-// Device remount is allowed only after teardown and deferred-write proof.
+// APP -> USB publication requires finalized WAV + durable manifest + Device
+// filesystem release. The reverse direction is not an ownership return:
+// Strategy 2 accepts only an explicit MSC eject, quiesces host I/O, releases
+// the USB-owned storage object, and leaves the Device filesystem unmounted for
+// persistent shutdown.
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -29,40 +30,24 @@ typedef enum {
     USB_MSC_EVENT_NONE = 0,
     USB_MSC_EVENT_ATTACH,
     USB_MSC_EVENT_HOST_OWNED,
-    USB_MSC_EVENT_BARRIER_REQUIRED,
-    USB_MSC_EVENT_DETACH,
+    USB_MSC_EVENT_RELEASE_REQUESTED,
+    USB_MSC_EVENT_RELEASE_QUIESCED,
     USB_MSC_EVENT_FAILED,
 } usb_msc_ownership_event_t;
 
-// Bind the ownership callbacks to the MSC storage created by sd_mount. The USB
-// device stack is intentionally started separately so boot can reach RECORDING
-// before an already-connected host can request ownership.
 esp_err_t usb_msc_ownership_init(void);
 esp_err_t usb_msc_ownership_start(void);
-
-// Wait for one ownership event. timeout_ms == UINT32_MAX waits indefinitely.
 usb_msc_ownership_event_t usb_msc_ownership_wait_event(uint32_t timeout_ms);
 
-// Complete the fail-closed pre-publish gate. All three proofs are mandatory;
-// false never transfers storage from APP to USB.
 esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
                                                    bool manifest_committed,
                                                    bool device_fs_released);
 
-// Task #87 reverse barrier. May be called only after BARRIER_REQUIRED while USB
-// owns the storage. It tears down the TinyUSB device stack first, then asks the
-// SD layer to prove no deferred host write remains and rebuild APP ownership.
-// Any failure leaves Device filesystem access disabled.
-esp_err_t usb_msc_ownership_complete_disconnect_barrier(void);
-
-// Record the fresh-session recovery proof after Device remount and the new
-// recorder session has observably reached RECORDING. This proof is accepted
-// only after a successful reverse barrier and is consumed by rearm.
-esp_err_t usb_msc_ownership_note_recording_recovered(void);
-
-// Start a fresh USB publication session only after Device remount and recording
-// recovery have completed. Stale event bits/proofs do not cross sessions.
-esp_err_t usb_msc_ownership_rearm(void);
+// Valid only after the explicit START STOP UNIT(load_eject=1,start=0) wrapper
+// has logically disconnected the device and emitted RELEASE_REQUESTED. Stops
+// TinyUSB first, then destroys the USB storage object; the latter is the
+// esp_tinyusb deferred-write-zero proof. It never builds APP storage.
+esp_err_t usb_msc_ownership_complete_release_quiesce(void);
 
 bool usb_msc_ownership_is_host_owned(void);
 
