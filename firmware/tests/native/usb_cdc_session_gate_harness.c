@@ -185,13 +185,15 @@ static void test_acquired_batch_snapshot_is_invalid_after_reset_and_reopen(void)
     }
 }
 
-static void test_rx_before_lifecycle_open_stays_discardable_until_drained(void) {
+static void test_lifecycle_open_waits_for_stale_rx_drain_before_new_request(void) {
     uint32_t discard_epoch;
+    uint32_t current_generation;
+    usb_cdc_session_snapshot_t snapshot;
 
     usb_cdc_session_gate_init(&s_gate);
 
-    /* RX arriving during RECORDING/USB_PREPARE is noted while admission is
-       closed. Reaching USB_SYNC must not make those already queued bytes live. */
+    /* Model queued stale bytes left by the previous physical session. CDC-ready
+       must not become visible while that old queue still needs drain-to-empty. */
     usb_cdc_session_gate_note_rx(&s_gate);
     discard_epoch = usb_cdc_session_gate_rx_discard_epoch(&s_gate);
     if (!usb_cdc_session_gate_should_discard_rx(&s_gate)) {
@@ -199,15 +201,34 @@ static void test_rx_before_lifecycle_open_stays_discardable_until_drained(void) 
     }
 
     usb_cdc_session_gate_open(&s_gate);
-    if (!usb_cdc_session_gate_should_discard_rx(&s_gate)) {
-        fail("lifecycle reopen revived RX queued before CDC-ready");
+    if (usb_cdc_session_gate_is_open(&s_gate)) {
+        fail("CDC-ready opened before stale RX drain completed");
     }
 
-    /* The worker marks only the epoch it observed before an empty read. */
+    /* The worker reaches an empty read and clears exactly the observed stale
+       epoch. Only then may lifecycle publication make later RX executable. */
     usb_cdc_session_gate_mark_rx_drained(&s_gate, discard_epoch);
     if (usb_cdc_session_gate_should_discard_rx(&s_gate)) {
         fail("drained pre-ready RX remained permanently blocked");
     }
+
+    usb_cdc_session_gate_open(&s_gate);
+    if (!usb_cdc_session_gate_is_open(&s_gate)) {
+        fail("CDC-ready did not open after stale RX drain completed");
+    }
+
+    /* This models the first complete post-ready request. It must be admitted
+       normally rather than consumed by the older discard epoch. */
+    snapshot = usb_cdc_session_gate_snapshot(&s_gate);
+    if (!usb_cdc_session_gate_snapshot_is_current(&s_gate, snapshot)) {
+        fail("first post-ready RX batch was not admitted");
+    }
+    current_generation = usb_cdc_session_gate_generation(&s_gate);
+    if (snapshot.generation != current_generation ||
+        !usb_cdc_session_gate_command_begin(&s_gate, snapshot.generation)) {
+        fail("first post-ready request was silently discarded");
+    }
+    usb_cdc_session_gate_command_end(&s_gate);
 }
 
 int main(void) {
@@ -215,7 +236,7 @@ int main(void) {
     test_reset_cannot_be_reopened_while_cutoff_is_in_progress();
     test_pre_reset_frame_cannot_execute_after_new_session_opens();
     test_acquired_batch_snapshot_is_invalid_after_reset_and_reopen();
-    test_rx_before_lifecycle_open_stays_discardable_until_drained();
+    test_lifecycle_open_waits_for_stale_rx_drain_before_new_request();
     puts("production session gate lifecycle overlap: PASS");
     return 0;
 }
