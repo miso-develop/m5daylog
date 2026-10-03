@@ -199,10 +199,12 @@ void usb_cdc_protocol_reset_session(void) {
     s_connected = false;
     s_reset_line = true;
     usb_cdc_session_gate_reset(&s_session_gate, cdc_session_gate_wait, NULL);
+
+    // TinyUSB RX queued before the physical boundary is transport state rather
+    // than generic command-gate state. Mark it stale only here; the worker will
+    // drain through an empty read before such bytes can become executable.
+    usb_cdc_session_gate_note_rx(&s_session_gate);
     if (s_worker != NULL) {
-        // Reset marks the prior RX epoch stale. Wake the worker after that mark
-        // exists so it drains TinyUSB to an empty read before stale RX can ever
-        // become command input in a later lifecycle-owned open session.
         xTaskNotifyGive(s_worker);
     }
 }
