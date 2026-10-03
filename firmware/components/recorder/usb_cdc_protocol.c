@@ -20,7 +20,6 @@
 #include "rtc_correction.h"
 #include "tinyusb_cdc_acm.h"
 
-#define CDC_RX_UNREAD_BYTES 2048u
 #define CDC_RX_CHUNK_BYTES 256u
 #define CDC_RESPONSE_BYTES 768u
 #define CDC_TX_FLUSH_TICKS pdMS_TO_TICKS(250)
@@ -414,7 +413,6 @@ esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
 esp_err_t usb_cdc_protocol_start(void) {
     tinyusb_config_cdcacm_t acm_cfg = {
         .cdc_port = TINYUSB_CDC_ACM_0,
-        .rx_unread_buf_sz = CDC_RX_UNREAD_BYTES,
         .callback_rx = usb_cdc_rx_callback,
         .callback_rx_wanted_char = NULL,
         .callback_line_state_changed = usb_cdc_line_state_callback,
