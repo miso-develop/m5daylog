@@ -1,9 +1,8 @@
-"""Task #87 behavioral host tests for the USB ownership state machine.
+"""Task #87 behavioral host tests for USB/SD ownership transitions.
 
-Unlike the source-contract tests, this suite compiles and executes the production
-usb_msc_ownership.c and sd_mount.c against deterministic host stubs.  The stubs
-model only ESP-IDF/TinyUSB primitives; ownership state and failure handling stay
-inside the production sources under test.
+These tests compile and execute the production C sources against deterministic
+host stubs. Source-text tests remain supplemental; this file drives the actual
+state transitions and injected failure returns required by AC-10.
 """
 
 from pathlib import Path
@@ -32,8 +31,12 @@ STUB_HEADERS = {
     """,
     "esp_log.h": r"""
         #pragma once
-        #define ESP_LOGI(tag, fmt, ...) do { (void)(tag); (void)sizeof(fmt); } while (0)
-        #define ESP_LOGE(tag, fmt, ...) do { (void)(tag); (void)sizeof(fmt); } while (0)
+        static inline void test_esp_log(const char *tag, const char *fmt, ...) {
+            (void)tag;
+            (void)fmt;
+        }
+        #define ESP_LOGI(...) test_esp_log(__VA_ARGS__)
+        #define ESP_LOGE(...) test_esp_log(__VA_ARGS__)
     """,
     "freertos/FreeRTOS.h": r"""
         #pragma once
@@ -73,9 +76,7 @@ STUB_HEADERS = {
             TINYUSB_EVENT_DETACHED = 2,
             TINYUSB_EVENT_SUSPENDED = 3,
         } tinyusb_event_id_t;
-        typedef struct {
-            tinyusb_event_id_t id;
-        } tinyusb_event_t;
+        typedef struct { tinyusb_event_id_t id; } tinyusb_event_t;
         typedef void (*tinyusb_event_cb_t)(tinyusb_event_t *event, void *arg);
         typedef struct {
             tinyusb_event_cb_t event_cb;
@@ -97,7 +98,6 @@ STUB_HEADERS = {
     "tinyusb_msc.h": r"""
         #pragma once
         #include <stdbool.h>
-        #include <stddef.h>
         #include "esp_err.h"
 
         typedef void *tinyusb_msc_storage_handle_t;
@@ -163,10 +163,7 @@ STUB_HEADERS = {
         #include "esp_err.h"
         #include "sdmmc_cmd.h"
         typedef int sdspi_dev_handle_t;
-        typedef struct {
-            int host_id;
-            int gpio_cs;
-        } sdspi_device_config_t;
+        typedef struct { int host_id; int gpio_cs; } sdspi_device_config_t;
         #define SDSPI_DEFAULT_HOST 0
         #define SDSPI_HOST_DEFAULT() ((sdmmc_host_t){ .slot = 2 })
         #define SDSPI_DEVICE_CONFIG_DEFAULT() ((sdspi_device_config_t){0})
@@ -210,16 +207,12 @@ STUB_HEADERS = {
 }
 
 
-HARNESS = r"""
-    #include <pthread.h>
-    #include <sched.h>
-    #include <stdatomic.h>
+OWNERSHIP_HARNESS = r"""
     #include <stdbool.h>
     #include <stdint.h>
     #include <stdio.h>
     #include <stdlib.h>
     #include <string.h>
-    #include <time.h>
 
     #include "freertos/FreeRTOS.h"
     #include "freertos/event_groups.h"
@@ -230,110 +223,218 @@ HARNESS = r"""
 
     #define CHECK(expr) do { \
         if (!(expr)) { \
-            fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+            fprintf(stderr, "CHECK failed %s:%d: %s\n", __FILE__, __LINE__, #expr); \
             exit(2); \
         } \
     } while (0)
 
-    struct event_group {
-        pthread_mutex_t mutex;
-        pthread_cond_t cond;
-        EventBits_t bits;
-    };
-
+    struct event_group { EventBits_t bits; };
     static tinyusb_event_cb_t g_device_cb;
     static void *g_device_arg;
     static tinyusb_msc_storage_callback_t g_storage_cb;
     static void *g_storage_arg;
-    static int g_storage_token;
+    static bool g_mounted = true;
+    static bool g_release_requested;
+    static bool g_device_fs_released;
+    static bool g_auto_prepare = true;
+    static int g_prepare_bit_was_set = -1;
     static esp_err_t g_uninstall_result = ESP_OK;
-    static esp_err_t g_delete_result = ESP_OK;
-    static esp_err_t g_new_storage_result = ESP_OK;
-    static bool g_disconnect_result = true;
-    static int g_driver_install_calls;
-    static int g_driver_uninstall_calls;
-    static int g_delete_calls;
-    static int g_new_storage_calls;
+    static esp_err_t g_transfer_app_result = ESP_OK;
+    static int g_uninstall_calls;
+    static int g_transfer_app_calls;
     static int g_disconnect_calls;
-    static int g_sequence[16];
-    static int g_sequence_len;
-    static atomic_int g_attach_done;
-
-    enum {
-        STEP_UNINSTALL = 1,
-        STEP_DELETE_STORAGE = 2,
-        STEP_NEW_STORAGE = 3,
-    };
-
-    static void record_step(int step) {
-        CHECK(g_sequence_len < (int)(sizeof(g_sequence) / sizeof(g_sequence[0])));
-        g_sequence[g_sequence_len++] = step;
-    }
-
-    static void sleep_ms(long ms) {
-        struct timespec ts = {
-            .tv_sec = ms / 1000,
-            .tv_nsec = (ms % 1000) * 1000000L,
-        };
-        (void)nanosleep(&ts, NULL);
-    }
 
     EventGroupHandle_t xEventGroupCreate(void) {
-        struct event_group *group = calloc(1, sizeof(*group));
-        CHECK(group != NULL);
-        CHECK(pthread_mutex_init(&group->mutex, NULL) == 0);
-        CHECK(pthread_cond_init(&group->cond, NULL) == 0);
-        return group;
+        return calloc(1, sizeof(struct event_group));
     }
-
-    void vEventGroupDelete(EventGroupHandle_t group) {
-        if (group == NULL) return;
-        (void)pthread_cond_destroy(&group->cond);
-        (void)pthread_mutex_destroy(&group->mutex);
-        free(group);
-    }
-
+    void vEventGroupDelete(EventGroupHandle_t group) { free(group); }
     EventBits_t xEventGroupSetBits(EventGroupHandle_t group, EventBits_t bits) {
-        EventBits_t result;
-        CHECK(group != NULL);
-        CHECK(pthread_mutex_lock(&group->mutex) == 0);
         group->bits |= bits;
-        result = group->bits;
-        CHECK(pthread_cond_broadcast(&group->cond) == 0);
-        CHECK(pthread_mutex_unlock(&group->mutex) == 0);
-        return result;
+        return group->bits;
     }
-
     EventBits_t xEventGroupClearBits(EventGroupHandle_t group, EventBits_t bits) {
-        EventBits_t previous;
-        CHECK(group != NULL);
-        CHECK(pthread_mutex_lock(&group->mutex) == 0);
-        previous = group->bits;
+        EventBits_t previous = group->bits;
         group->bits &= ~bits;
-        CHECK(pthread_mutex_unlock(&group->mutex) == 0);
         return previous;
     }
-
     EventBits_t xEventGroupWaitBits(EventGroupHandle_t group,
                                     EventBits_t bits,
                                     BaseType_t clear_on_exit,
                                     BaseType_t wait_for_all,
                                     TickType_t ticks) {
-        EventBits_t result;
-        bool ready;
-        CHECK(group != NULL);
-        CHECK(pthread_mutex_lock(&group->mutex) == 0);
-        for (;;) {
-            EventBits_t matched = group->bits & bits;
-            ready = wait_for_all ? matched == bits : matched != 0;
-            if (ready || ticks != portMAX_DELAY) break;
-            CHECK(pthread_cond_wait(&group->cond, &group->mutex) == 0);
+        (void)wait_for_all;
+        (void)ticks;
+        if (bits == (1u << 1)) {
+            g_prepare_bit_was_set = (group->bits & bits) != 0;
+            if (g_auto_prepare && !g_prepare_bit_was_set) {
+                g_release_requested = true;
+                g_device_fs_released = true;
+                CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
+            }
         }
-        result = group->bits;
-        if (ready && clear_on_exit) group->bits &= ~bits;
-        CHECK(pthread_mutex_unlock(&group->mutex) == 0);
+        EventBits_t result = group->bits;
+        if (clear_on_exit && (result & bits) != 0) group->bits &= ~bits;
         return result;
     }
+
+    bool sd_mount_is_mounted(void) { return g_mounted; }
+    esp_err_t sd_mount_transfer_to_usb(void) {
+        tinyusb_msc_event_t event = {
+            .id = TINYUSB_MSC_EVENT_MOUNT_COMPLETE,
+            .mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB,
+        };
+        if (!g_release_requested || !g_device_fs_released || !g_mounted) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        CHECK(g_storage_cb != NULL);
+        g_storage_cb((void *)1, &event, g_storage_arg);
+        return ESP_OK;
+    }
+    esp_err_t sd_mount_transfer_to_app(void) {
+        tinyusb_msc_event_t event = {
+            .id = TINYUSB_MSC_EVENT_MOUNT_COMPLETE,
+            .mount_point = TINYUSB_MSC_STORAGE_MOUNT_APP,
+        };
+        g_transfer_app_calls++;
+        if (g_transfer_app_result != ESP_OK) return g_transfer_app_result;
+        CHECK(g_storage_cb != NULL);
+        g_storage_cb((void *)1, &event, g_storage_arg);
+        return ESP_OK;
+    }
+    void sd_mount_note_usb_owned(void) { g_mounted = false; }
+    void sd_mount_note_app_owned(void) {
+        g_mounted = true;
+        g_release_requested = false;
+        g_device_fs_released = false;
+    }
+
+    esp_err_t tinyusb_msc_set_storage_callback(tinyusb_msc_storage_callback_t cb,
+                                                void *arg) {
+        g_storage_cb = cb;
+        g_storage_arg = arg;
+        return ESP_OK;
+    }
+    esp_err_t tinyusb_driver_install(const tinyusb_config_t *config) {
+        g_device_cb = config->event_cb;
+        g_device_arg = config->event_arg;
+        return ESP_OK;
+    }
+    esp_err_t tinyusb_driver_uninstall(void) {
+        g_uninstall_calls++;
+        return g_uninstall_result;
+    }
+    bool tud_disconnect(void) {
+        g_disconnect_calls++;
+        return true;
+    }
+
+    static usb_msc_ownership_event_t next_event(void) {
+        return usb_msc_ownership_wait_event(0);
+    }
+    static void enter_host_owned(void) {
+        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+        CHECK(usb_msc_ownership_init() == ESP_OK);
+        CHECK(usb_msc_ownership_start() == ESP_OK);
+        CHECK(g_device_cb != NULL);
+        g_prepare_bit_was_set = -1;
+        g_device_cb(&attached, g_device_arg);
+        CHECK(g_prepare_bit_was_set == 0);
+        CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+        CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
+        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(!g_mounted);
+    }
+    static void start_barrier(void) {
+        tinyusb_event_t suspended = { .id = TINYUSB_EVENT_SUSPENDED };
+        g_device_cb(&suspended, g_device_arg);
+        CHECK(g_disconnect_calls == 1);
+        CHECK(next_event() == USB_MSC_EVENT_BARRIER_REQUIRED);
+        CHECK(usb_msc_ownership_rearm() == ESP_ERR_INVALID_STATE);
+    }
+    static void assert_failed_closed(void) {
+        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(!g_mounted);
+        CHECK(next_event() == USB_MSC_EVENT_FAILED);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(usb_msc_ownership_rearm() == ESP_ERR_INVALID_STATE);
+    }
+
+    static void run_success(void) {
+        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+        enter_host_owned();
+        start_barrier();
+        CHECK(usb_msc_ownership_complete_disconnect_barrier() == ESP_OK);
+        CHECK(g_uninstall_calls == 1);
+        CHECK(g_transfer_app_calls == 1);
+        CHECK(!usb_msc_ownership_is_host_owned());
+        CHECK(g_mounted);
+        CHECK(next_event() == USB_MSC_EVENT_DETACH);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(usb_msc_ownership_rearm() == ESP_ERR_INVALID_STATE);
+        CHECK(usb_msc_ownership_note_recording_recovered() == ESP_OK);
+        CHECK(usb_msc_ownership_rearm() == ESP_OK);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        g_prepare_bit_was_set = -1;
+        g_device_cb(&attached, g_device_arg);
+        CHECK(g_prepare_bit_was_set == 0);
+        CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+        CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
+    }
+    static void run_teardown_failure(void) {
+        enter_host_owned();
+        start_barrier();
+        g_uninstall_result = ESP_FAIL;
+        CHECK(usb_msc_ownership_complete_disconnect_barrier() == ESP_FAIL);
+        CHECK(g_uninstall_calls == 1);
+        CHECK(g_transfer_app_calls == 0);
+        assert_failed_closed();
+    }
+    static void run_app_transfer_failure(void) {
+        enter_host_owned();
+        start_barrier();
+        g_transfer_app_result = ESP_FAIL;
+        CHECK(usb_msc_ownership_complete_disconnect_barrier() == ESP_FAIL);
+        CHECK(g_uninstall_calls == 1);
+        CHECK(g_transfer_app_calls == 1);
+        assert_failed_closed();
+    }
+
+    int main(int argc, char **argv) {
+        CHECK(argc == 2);
+        if (strcmp(argv[1], "success") == 0) run_success();
+        else if (strcmp(argv[1], "teardown") == 0) run_teardown_failure();
+        else if (strcmp(argv[1], "app-transfer") == 0) run_app_transfer_failure();
+        else CHECK(false);
+        return 0;
+    }
+"""
+
+
+SD_HARNESS = r"""
+    #include <stdbool.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+
+    #include "driver/sdspi_host.h"
+    #include "driver/spi_common.h"
+    #include "sd_mount.h"
+    #include "sdmmc_cmd.h"
+    #include "tinyusb_msc.h"
+
+    #define CHECK(expr) do { \
+        if (!(expr)) { \
+            fprintf(stderr, "CHECK failed %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+            exit(2); \
+        } \
+    } while (0)
+
+    static int g_storage_token;
+    static int g_new_storage_calls;
+    static int g_delete_calls;
+    static bool g_delete_fail;
+    static bool g_rebuild_fail;
 
     esp_err_t spi_bus_initialize(spi_host_device_t host,
                                  const spi_bus_config_t *config,
@@ -355,217 +456,68 @@ HARNESS = r"""
     }
 
     esp_err_t tinyusb_msc_install_driver(const tinyusb_msc_driver_config_t *config) {
-        g_storage_cb = config->callback;
-        g_storage_arg = config->callback_arg;
-        return ESP_OK;
+        (void)config; return ESP_OK;
     }
     esp_err_t tinyusb_msc_uninstall_driver(void) { return ESP_OK; }
-    esp_err_t tinyusb_msc_set_storage_callback(tinyusb_msc_storage_callback_t callback,
+    esp_err_t tinyusb_msc_set_storage_callback(tinyusb_msc_storage_callback_t cb,
                                                 void *arg) {
-        g_storage_cb = callback;
-        g_storage_arg = arg;
-        return ESP_OK;
+        (void)cb; (void)arg; return ESP_OK;
     }
     esp_err_t tinyusb_msc_new_storage_sdmmc(const tinyusb_msc_storage_config_t *config,
                                             tinyusb_msc_storage_handle_t *handle) {
-        tinyusb_msc_event_t event;
+        (void)config;
         g_new_storage_calls++;
-        record_step(STEP_NEW_STORAGE);
-        if (g_new_storage_result != ESP_OK) return g_new_storage_result;
+        if (g_rebuild_fail && g_new_storage_calls >= 2) return ESP_FAIL;
         *handle = &g_storage_token;
-        if (g_storage_cb != NULL) {
-            event.id = TINYUSB_MSC_EVENT_MOUNT_COMPLETE;
-            event.mount_point = config->mount_point;
-            g_storage_cb(*handle, &event, g_storage_arg);
-        }
+        if (g_new_storage_calls >= 2) sd_mount_note_app_owned();
         return ESP_OK;
     }
     esp_err_t tinyusb_msc_delete_storage(tinyusb_msc_storage_handle_t handle) {
         (void)handle;
         g_delete_calls++;
-        record_step(STEP_DELETE_STORAGE);
-        return g_delete_result;
+        return g_delete_fail ? ESP_FAIL : ESP_OK;
     }
     esp_err_t tinyusb_msc_set_storage_mount_point(tinyusb_msc_storage_handle_t handle,
-                                                   tinyusb_msc_mount_point_t mount_point) {
-        tinyusb_msc_event_t event;
-        CHECK(handle != NULL);
-        CHECK(g_storage_cb != NULL);
-        event.id = TINYUSB_MSC_EVENT_MOUNT_START;
-        event.mount_point = mount_point;
-        g_storage_cb(handle, &event, g_storage_arg);
-        event.id = TINYUSB_MSC_EVENT_MOUNT_COMPLETE;
-        g_storage_cb(handle, &event, g_storage_arg);
-        return ESP_OK;
+                                                   tinyusb_msc_mount_point_t point) {
+        (void)handle; (void)point; return ESP_OK;
     }
 
-    esp_err_t tinyusb_driver_install(const tinyusb_config_t *config) {
-        g_driver_install_calls++;
-        g_device_cb = config->event_cb;
-        g_device_arg = config->event_arg;
-        return ESP_OK;
-    }
-    esp_err_t tinyusb_driver_uninstall(void) {
-        g_driver_uninstall_calls++;
-        record_step(STEP_UNINSTALL);
-        return g_uninstall_result;
-    }
-    bool tud_disconnect(void) {
-        g_disconnect_calls++;
-        return g_disconnect_result;
-    }
-
-    static usb_msc_ownership_event_t wait_expected(usb_msc_ownership_event_t expected) {
-        for (int i = 0; i < 1000; ++i) {
-            usb_msc_ownership_event_t event = usb_msc_ownership_wait_event(0);
-            if (event == expected) return event;
-            if (event != USB_MSC_EVENT_NONE) {
-                fprintf(stderr, "unexpected USB event %d while waiting for %d\n",
-                        (int)event, (int)expected);
-                exit(2);
-            }
-            sleep_ms(1);
-        }
-        fprintf(stderr, "timeout waiting for USB event %d\n", (int)expected);
-        exit(2);
-    }
-
-    static void *attach_thread(void *arg) {
-        tinyusb_event_t event = { .id = TINYUSB_EVENT_ATTACHED };
-        (void)arg;
-        CHECK(g_device_cb != NULL);
-        g_device_cb(&event, g_device_arg);
-        atomic_store(&g_attach_done, 1);
-        return NULL;
-    }
-
-    static void enter_host_owned(void) {
-        pthread_t thread;
+    static void enter_usb_owned(void) {
         CHECK(sd_mount_recordings() == ESP_OK);
         CHECK(sd_mount_is_mounted());
-        CHECK(usb_msc_ownership_init() == ESP_OK);
-        CHECK(usb_msc_ownership_start() == ESP_OK);
-        CHECK(g_driver_install_calls == 1);
-
-        atomic_store(&g_attach_done, 0);
-        CHECK(pthread_create(&thread, NULL, attach_thread, NULL) == 0);
-        (void)wait_expected(USB_MSC_EVENT_ATTACH);
-        CHECK(atomic_load(&g_attach_done) == 0);
-
         CHECK(sd_mount_release_for_usb() == ESP_OK);
         sd_mount_unmount();
         CHECK(sd_mount_device_fs_released());
-        CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
-        CHECK(pthread_join(thread, NULL) == 0);
-        CHECK(atomic_load(&g_attach_done) == 1);
-        CHECK(usb_msc_ownership_is_host_owned());
+        sd_mount_note_usb_owned();
         CHECK(!sd_mount_is_mounted());
-        (void)wait_expected(USB_MSC_EVENT_HOST_OWNED);
     }
-
-    static void trigger_suspend_barrier(void) {
-        tinyusb_event_t event = { .id = TINYUSB_EVENT_SUSPENDED };
-        CHECK(g_device_cb != NULL);
-        g_device_cb(&event, g_device_arg);
-        CHECK(g_disconnect_calls == 1);
-        (void)wait_expected(USB_MSC_EVENT_BARRIER_REQUIRED);
-        CHECK(usb_msc_ownership_is_host_owned());
-        CHECK(!sd_mount_is_mounted());
-        CHECK(usb_msc_ownership_rearm() == ESP_ERR_INVALID_STATE);
-    }
-
-    static void reset_sequence(void) { g_sequence_len = 0; }
-
-    static void assert_failed_closed(void) {
-        CHECK(!sd_mount_is_mounted());
-        CHECK(usb_msc_ownership_is_host_owned());
-        CHECK(usb_msc_ownership_rearm() == ESP_ERR_INVALID_STATE);
-        (void)wait_expected(USB_MSC_EVENT_FAILED);
-        CHECK(usb_msc_ownership_wait_event(0) == USB_MSC_EVENT_NONE);
-    }
-
     static void run_success(void) {
-        pthread_t thread;
-        int installs_before_rearm;
-
-        enter_host_owned();
-        trigger_suspend_barrier();
-        reset_sequence();
-        CHECK(usb_msc_ownership_complete_disconnect_barrier() == ESP_OK);
-        CHECK(g_sequence_len == 3);
-        CHECK(g_sequence[0] == STEP_UNINSTALL);
-        CHECK(g_sequence[1] == STEP_DELETE_STORAGE);
-        CHECK(g_sequence[2] == STEP_NEW_STORAGE);
-        CHECK(g_driver_uninstall_calls == 1);
+        enter_usb_owned();
+        CHECK(sd_mount_transfer_to_app() == ESP_OK);
         CHECK(g_delete_calls == 1);
+        CHECK(g_new_storage_calls == 2);
         CHECK(sd_mount_is_mounted());
-        CHECK(!usb_msc_ownership_is_host_owned());
-        (void)wait_expected(USB_MSC_EVENT_DETACH);
-        CHECK(usb_msc_ownership_wait_event(0) == USB_MSC_EVENT_NONE);
-        CHECK(sd_mount_remount_after_usb() == ESP_OK);
-
-        /* Barrier completion alone is not permission to publish a new USB session. */
-        CHECK(usb_msc_ownership_rearm() == ESP_ERR_INVALID_STATE);
-        CHECK(usb_msc_ownership_note_recording_recovered() == ESP_OK);
-        installs_before_rearm = g_driver_install_calls;
-        CHECK(usb_msc_ownership_rearm() == ESP_OK);
-        CHECK(g_driver_install_calls == installs_before_rearm + 1);
-        CHECK(usb_msc_ownership_wait_event(0) == USB_MSC_EVENT_NONE);
-
-        /* Fresh rearm must not reuse the prior session's PREPARE_OK proof. */
-        atomic_store(&g_attach_done, 0);
-        CHECK(pthread_create(&thread, NULL, attach_thread, NULL) == 0);
-        (void)wait_expected(USB_MSC_EVENT_ATTACH);
-        sleep_ms(20);
-        CHECK(atomic_load(&g_attach_done) == 0);
-        CHECK(sd_mount_release_for_usb() == ESP_OK);
-        sd_mount_unmount();
-        CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
-        CHECK(pthread_join(thread, NULL) == 0);
-        CHECK(usb_msc_ownership_is_host_owned());
     }
-
-    static void run_teardown_failure(void) {
-        enter_host_owned();
-        trigger_suspend_barrier();
-        reset_sequence();
-        g_uninstall_result = ESP_FAIL;
-        CHECK(usb_msc_ownership_complete_disconnect_barrier() == ESP_FAIL);
-        CHECK(g_sequence_len == 1);
-        CHECK(g_sequence[0] == STEP_UNINSTALL);
-        CHECK(g_delete_calls == 0);
-        assert_failed_closed();
-    }
-
     static void run_deferred_write_failure(void) {
-        enter_host_owned();
-        trigger_suspend_barrier();
-        reset_sequence();
-        g_delete_result = ESP_FAIL;
-        CHECK(usb_msc_ownership_complete_disconnect_barrier() == ESP_FAIL);
-        CHECK(g_sequence_len == 2);
-        CHECK(g_sequence[0] == STEP_UNINSTALL);
-        CHECK(g_sequence[1] == STEP_DELETE_STORAGE);
-        assert_failed_closed();
+        enter_usb_owned();
+        g_delete_fail = true;
+        CHECK(sd_mount_transfer_to_app() == ESP_FAIL);
+        CHECK(g_delete_calls == 1);
+        CHECK(g_new_storage_calls == 1);
+        CHECK(!sd_mount_is_mounted());
     }
-
     static void run_app_rebuild_failure(void) {
-        enter_host_owned();
-        trigger_suspend_barrier();
-        reset_sequence();
-        g_new_storage_result = ESP_FAIL;
-        CHECK(usb_msc_ownership_complete_disconnect_barrier() == ESP_FAIL);
-        CHECK(g_sequence_len == 3);
-        CHECK(g_sequence[0] == STEP_UNINSTALL);
-        CHECK(g_sequence[1] == STEP_DELETE_STORAGE);
-        CHECK(g_sequence[2] == STEP_NEW_STORAGE);
-        assert_failed_closed();
+        enter_usb_owned();
+        g_rebuild_fail = true;
+        CHECK(sd_mount_transfer_to_app() == ESP_FAIL);
+        CHECK(g_delete_calls == 1);
+        CHECK(g_new_storage_calls == 2);
+        CHECK(!sd_mount_is_mounted());
     }
 
     int main(int argc, char **argv) {
         CHECK(argc == 2);
         if (strcmp(argv[1], "success") == 0) run_success();
-        else if (strcmp(argv[1], "teardown") == 0) run_teardown_failure();
         else if (strcmp(argv[1], "deferred-write") == 0) run_deferred_write_failure();
         else if (strcmp(argv[1], "app-rebuild") == 0) run_app_rebuild_failure();
         else CHECK(false);
@@ -581,57 +533,81 @@ def _write_stubs(root: Path) -> None:
         path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
 
 
-@pytest.fixture(scope="module")
-def ownership_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    build = tmp_path_factory.mktemp("usb-ownership-behavior")
-    stubs = build / "stubs"
-    _write_stubs(stubs)
-    harness = build / "harness.c"
-    harness.write_text(textwrap.dedent(HARNESS).lstrip(), encoding="utf-8")
-    output = build / "usb_ownership_harness"
-    compiler = shutil.which("cc") or shutil.which("gcc")
-    assert compiler is not None, "Firmware host behavioral tests require a C compiler"
+def _compile(compiler: str, stubs: Path, source: Path, harness: Path, output: Path, *defines: str) -> None:
     command = [
         compiler,
         "-std=c11",
         "-Wall",
         "-Wextra",
         "-Werror",
-        "-pthread",
-        "-DESP_PLATFORM=1",
-        "-DCONFIG_TINYUSB_SUSPEND_CALLBACK=1",
+        *defines,
         "-I",
         str(stubs),
         "-I",
         str(INCLUDE),
-        str(RECORDER / "usb_msc_ownership.c"),
-        str(RECORDER / "sd_mount.c"),
+        str(source),
         str(harness),
         "-o",
         str(output),
     ]
     result = subprocess.run(command, text=True, capture_output=True, check=False)
     assert result.returncode == 0, (
-        "behavioral harness compile failed\n"
-        f"stdout:\n{result.stdout}\n"
-        f"stderr:\n{result.stderr}"
+        f"compile failed: {' '.join(command)}\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    return output
 
 
-@pytest.mark.parametrize(
-    "scenario",
-    ["success", "teardown", "deferred-write", "app-rebuild"],
-)
-def test_usb_disconnect_barrier_executes_production_state_machine(
-    ownership_harness: Path, scenario: str
-) -> None:
-    result = subprocess.run(
-        [str(ownership_harness), scenario],
-        text=True,
-        capture_output=True,
-        check=False,
+@pytest.fixture(scope="module")
+def behavioral_harnesses(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
+    build = tmp_path_factory.mktemp("usb-barrier-behavior")
+    stubs = build / "stubs"
+    _write_stubs(stubs)
+    compiler = shutil.which("cc") or shutil.which("gcc")
+    assert compiler is not None, "Firmware behavioral tests require a C compiler"
+
+    ownership_c = build / "ownership_harness.c"
+    ownership_c.write_text(textwrap.dedent(OWNERSHIP_HARNESS).lstrip(), encoding="utf-8")
+    ownership_bin = build / "ownership_harness"
+    _compile(
+        compiler,
+        stubs,
+        RECORDER / "usb_msc_ownership.c",
+        ownership_c,
+        ownership_bin,
+        "-DESP_PLATFORM=1",
+        "-DCONFIG_TINYUSB_SUSPEND_CALLBACK=1",
     )
+
+    sd_c = build / "sd_harness.c"
+    sd_c.write_text(textwrap.dedent(SD_HARNESS).lstrip(), encoding="utf-8")
+    sd_bin = build / "sd_harness"
+    _compile(
+        compiler,
+        stubs,
+        RECORDER / "sd_mount.c",
+        sd_c,
+        sd_bin,
+        "-DESP_PLATFORM=1",
+    )
+    return {"ownership": ownership_bin, "sd": sd_bin}
+
+
+def _run(binary: Path, scenario: str) -> None:
+    result = subprocess.run([str(binary), scenario], text=True, capture_output=True, check=False)
     assert result.returncode == 0, (
         f"scenario={scenario}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+@pytest.mark.parametrize("scenario", ["success", "teardown", "app-transfer"])
+def test_usb_ownership_state_machine_executes_barrier_paths(
+    behavioral_harnesses: dict[str, Path], scenario: str
+) -> None:
+    _run(behavioral_harnesses["ownership"], scenario)
+
+
+@pytest.mark.parametrize("scenario", ["success", "deferred-write", "app-rebuild"])
+def test_sd_transfer_to_app_executes_deferred_write_and_rebuild_paths(
+    behavioral_harnesses: dict[str, Path], scenario: str
+) -> None:
+    _run(behavioral_harnesses["sd"], scenario)
