@@ -1,12 +1,11 @@
 #pragma once
 
-// Task #49: fail-closed USB MSC ownership handoff.
+// Tasks #49/#87: fail-closed USB MSC ownership handoff.
 //
-// The TinyUSB storage callback reports an ATTACH before the SD card is
-// transferred from the application to the USB host. The callback blocks
-// until the recorder confirms WAV finalize + manifest commit + Device-side
-// filesystem release. A normal detach is reported only after TinyUSB has
-// mounted the filesystem back to the application.
+// Initial APP -> USB publication still requires WAV finalize + manifest commit
+// + Device filesystem release. Task #87 adds a second barrier in the reverse
+// direction: ambiguous suspend/bus-loss may only request explicit USB teardown;
+// Device remount is allowed only after teardown and deferred-write proof.
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -30,13 +29,14 @@ typedef enum {
     USB_MSC_EVENT_NONE = 0,
     USB_MSC_EVENT_ATTACH,
     USB_MSC_EVENT_HOST_OWNED,
+    USB_MSC_EVENT_BARRIER_REQUIRED,
     USB_MSC_EVENT_DETACH,
     USB_MSC_EVENT_FAILED,
 } usb_msc_ownership_event_t;
 
-// Bind the Task #49 callback to the MSC storage created by sd_mount.
-// The USB device stack is intentionally started separately so boot can reach
-// RECORDING before an already-connected host can request ownership.
+// Bind the ownership callbacks to the MSC storage created by sd_mount. The USB
+// device stack is intentionally started separately so boot can reach RECORDING
+// before an already-connected host can request ownership.
 esp_err_t usb_msc_ownership_init(void);
 esp_err_t usb_msc_ownership_start(void);
 
@@ -44,10 +44,20 @@ esp_err_t usb_msc_ownership_start(void);
 usb_msc_ownership_event_t usb_msc_ownership_wait_event(uint32_t timeout_ms);
 
 // Complete the fail-closed pre-publish gate. All three proofs are mandatory;
-// false never releases the blocked TinyUSB mount callback.
+// false never transfers storage from APP to USB.
 esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
                                                    bool manifest_committed,
                                                    bool device_fs_released);
+
+// Task #87 reverse barrier. May be called only after BARRIER_REQUIRED while USB
+// owns the storage. It tears down the TinyUSB device stack first, then asks the
+// SD layer to prove no deferred host write remains and rebuild APP ownership.
+// Any failure leaves Device filesystem access disabled.
+esp_err_t usb_msc_ownership_complete_disconnect_barrier(void);
+
+// Start a fresh USB publication session only after Device remount and recording
+// recovery have completed. Stale event bits/proofs do not cross sessions.
+esp_err_t usb_msc_ownership_rearm(void);
 
 bool usb_msc_ownership_is_host_owned(void);
 
