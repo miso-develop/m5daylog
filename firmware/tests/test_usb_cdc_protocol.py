@@ -1,9 +1,4 @@
-"""Task #50 host contract tests: USB CDC JSON protocol and RTC correction.
-
-The production implementation is C/ESP-IDF, while these host tests use a
-faithful Python mirror for protocol vectors plus source-contract assertions.
-Only synthetic IDs/timestamps are used.
-"""
+"""Task #50 host contract tests: USB CDC JSON protocol and RTC correction."""
 
 from __future__ import annotations
 
@@ -44,17 +39,12 @@ def _error(request_id, code):
 
 
 def _normalize_time(value):
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not TIME_RE.fullmatch(value):
         raise ValueError("INVALID_ARGS")
-    m = TIME_RE.fullmatch(value)
-    if not m:
-        raise ValueError("INVALID_ARGS")
-    # Python validates leap years, impossible dates, hours and minutes.
     parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     offset = parsed.utcoffset()
     if offset is None:
         raise ValueError("INVALID_ARGS")
-    # BM8563-backed PoC range. Normalization is UTC, second precision.
     utc = parsed.astimezone(dt.timezone.utc).replace(microsecond=0)
     if not 2000 <= utc.year <= 2099:
         raise OverflowError("RANGE_ERROR")
@@ -133,8 +123,6 @@ def mirror_handle(raw, state):
             return _error(request_id, "RANGE_ERROR")
         except (TypeError, ValueError):
             return _error(request_id, "INVALID_ARGS")
-        # Mirror the specified mutation order: validate fully, apply RTC,
-        # then persist one pending correction before reporting success.
         state.rtc = normalized
         state.pending = {"before": before, "after": normalized, "source": "pc"}
         return {
@@ -148,8 +136,11 @@ def mirror_handle(raw, state):
 
 def test_protocol_vectors_cover_read_only_commands_and_stable_errors():
     state = MirrorState()
-    ping = mirror_handle('{"id":"p1","cmd":"PING","args":{}}', state)
-    assert ping == {"id": "p1", "ok": True, "result": {"pong": True}}
+    assert mirror_handle('{"id":"p1","cmd":"PING","args":{}}', state) == {
+        "id": "p1",
+        "ok": True,
+        "result": {"pong": True},
+    }
     info = mirror_handle('{"id":"i1","cmd":"GET_INFO","args":{}}', state)
     assert info["result"]["protocolMajor"] == 1
     assert info["result"]["audioCapabilities"] == {
@@ -162,7 +153,6 @@ def test_protocol_vectors_cover_read_only_commands_and_stable_errors():
     assert status["result"]["state"] == "USB_SYNC"
     assert state.pending is None
     assert state.rtc == "2026-10-03T00:00:00+00:00"
-
     assert mirror_handle("{", state)["error"]["code"] == "INVALID_JSON"
     assert mirror_handle("[]", state)["error"]["code"] == "INVALID_REQUEST"
     assert mirror_handle('{"id":"bad id","cmd":"PING","args":{}}', state)["id"] is None
@@ -187,9 +177,6 @@ def test_set_time_accepts_offset_and_z_and_rejects_invalid_without_mutation():
         "after": "2026-10-03T01:30:00+00:00",
         "source": "pc",
     }
-
-    # One pending correction is the idempotency barrier for an indeterminate
-    # PC timeout/retry.
     busy = mirror_handle(
         '{"id":"t2","cmd":"SET_TIME","args":{"time":"2026-10-03T02:00:00Z"}}',
         state,
@@ -227,7 +214,6 @@ def test_framing_contract_crlf_size_and_disconnect_reset_are_encoded_in_source()
         "tinyusb_cdcacm_write_flush",
     ):
         assert marker in hdr or marker in src, marker
-    # Processing/synchronous flushing must not run in the TinyUSB RX callback.
     callback_at = src.index("static void usb_cdc_rx_callback")
     worker_at = src.index("static void usb_cdc_worker_task")
     callback = src[callback_at:worker_at]
@@ -240,7 +226,6 @@ def test_cdc_composite_and_runtime_wiring_preserve_task49_ownership():
     comp_cmake = COMP_CMAKE.read_text(encoding="utf-8")
     main_cmake = MAIN_CMAKE.read_text(encoding="utf-8")
     runtime = RUNTIME.read_text(encoding="utf-8")
-
     assert "CONFIG_TINYUSB_MSC_ENABLED=y" in sdk
     assert "CONFIG_TINYUSB_CDC_ENABLED=y" in sdk
     assert "CONFIG_TINYUSB_CDC_COUNT=1" in sdk
@@ -265,7 +250,6 @@ def test_set_time_pending_store_is_nvs_only_during_usb_sync():
         "BM8563",
     ):
         assert marker in src, marker
-
     apply_at = src.index("rtc_correction_apply")
     flush_at = src.index("rtc_correction_flush_pending_event", apply_at)
     apply_region = src[apply_at:flush_at]
@@ -282,28 +266,24 @@ def test_pending_event_flush_is_after_remount_before_recording_and_exactly_once_
     recover_at = runtime.index("RECORDER_STATE_RECOVER", flush_at)
     restart_at = runtime.index("recorder_start_session", recover_at)
     assert remount_at < flush_at < recover_at < restart_at
-
-    # A crash after append but before NVS clear must not duplicate the event.
-    for marker in ("correctionId", "rtc_correction_event_already_recorded", "fsync", "nvs_erase_key"):
+    for marker in (
+        "correctionId",
+        "rtc_correction_event_already_recorded",
+        "fsync",
+        "nvs_erase_key",
+    ):
         assert marker in rtc, marker
     assert rtc.index("fsync") < rtc.index("nvs_erase_key")
 
 
-def test_protocol_responses_do_not_log_request_payload_or_private_data():
-    src = PROTO_C.read_text(encoding="utf-8").lower()
-    for forbidden in (
-        "request payload",
-        "raw audio",
-        "transcript",
-        "authorization",
-        "password",
-    ):
-        assert forbidden not in src
+def test_protocol_has_no_application_logging_surface_for_command_data():
+    src = PROTO_C.read_text(encoding="utf-8")
+    # Protocol handling intentionally contains no application logging API;
+    # therefore command bodies/metadata cannot accidentally be emitted here.
+    assert "ESP_LOG" not in src
 
 
 def test_oversized_line_is_recoverable_at_next_line_in_reference_framer():
-    # Mirror the externally visible framing rule: overlong input is discarded
-    # until LF and the next bounded line remains processable.
     state = MirrorState()
     oversized = "x" * 1025
     assert mirror_handle(oversized, state)["error"]["code"] == "REQUEST_TOO_LARGE"
