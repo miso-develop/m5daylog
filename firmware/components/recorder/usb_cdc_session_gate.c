@@ -211,8 +211,6 @@ void usb_cdc_session_gate_reset(usb_cdc_session_gate_t *gate,
                           memory_order_seq_cst);
     (void)atomic_fetch_add_explicit(&gate->generation, 1u,
                                     memory_order_seq_cst);
-    (void)atomic_fetch_add_explicit(&gate->rx_discard_epoch, 1u,
-                                    memory_order_seq_cst);
 
     while (atomic_load_explicit(&gate->active_commands,
                                 memory_order_acquire) != 0u) {
