@@ -149,7 +149,7 @@ def _validate_format(value: str, format_name: str, path: str) -> None:
             raise _contract_error(path, "format")
         return
     if format_name == "date-time":
-        match = _RFC3339_DATETIME.fullmatch(value.upper())
+        match = _RFC3339_DATETIME.match(value.upper())
         if match is None:
             raise _contract_error(path, "format")
         year, month, day = map(int, match.groups())
