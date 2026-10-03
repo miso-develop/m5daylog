@@ -26,3 +26,8 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 # in usb_msc_ownership.c and never formats media on mount failure.
 CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=4096
+
+# Task #87: stock self-powered hardware has no dedicated firmware-readable
+# VBUS sense. Suspend/bus-loss is therefore only an ambiguous trigger for the
+# explicit logical-disconnect/quiescence barrier; it never authorizes remount.
+CONFIG_TINYUSB_SUSPEND_CALLBACK=y
