@@ -205,12 +205,18 @@ static void recorder_handle_usb_host_owned(void) {
     if (!recorder_transition_state(RECORDER_STATE_USB_SYNC,
                                    RECORDER_REASON_USB, 0)) {
         recorder_enter_error(RECORDER_REASON_USB);
+        return;
     }
+
+    // #37 connect ordering makes CDC ready only after finalize/manifest/unmount
+    // and MSC publication. Transport RX/DTR callbacks cannot open this gate.
+    usb_cdc_protocol_open_session();
 }
 
 static void recorder_handle_usb_detach(void) {
     // MSC remount-to-app completion is the actual detach boundary. Reset the
-    // CDC framer before SD remount/recovery so no line spans USB sessions.
+    // CDC framer and close command admission before SD remount/recovery so no
+    // line or mutating command can span USB ownership sessions.
     usb_cdc_protocol_reset_session();
 
     if (recorder_current_state() != RECORDER_STATE_USB_SYNC) {
