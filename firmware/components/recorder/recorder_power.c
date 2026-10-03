@@ -35,7 +35,7 @@ static void recorder_power_cleanup(void) {
     s_power_ready = false;
 }
 
-static esp_err_t recorder_power_config_hold(int level) {
+static esp_err_t recorder_power_config_hold_output(void) {
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << RECORDER_POWER_HOLD_PIN,
         .mode = GPIO_MODE_OUTPUT,
@@ -43,21 +43,26 @@ static esp_err_t recorder_power_config_hold(int level) {
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    esp_err_t err = gpio_config(&cfg);
-    if (err != ESP_OK) {
-        return err;
-    }
-    return gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, level);
+    return gpio_config(&cfg);
 }
 
 esp_err_t recorder_power_enable_hold(void) {
+    esp_err_t err;
     gpio_deep_sleep_hold_dis();
     (void)gpio_hold_dis((gpio_num_t)RECORDER_POWER_HOLD_PIN);
-    return recorder_power_config_hold(1);
+    err = recorder_power_config_hold_output();
+    if (err != ESP_OK) {
+        return err;
+    }
+    return gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, 1);
 }
 
 esp_err_t recorder_power_release_hold(void) {
-    esp_err_t err = recorder_power_config_hold(0);
+    esp_err_t err = recorder_power_config_hold_output();
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, 0);
     if (err != ESP_OK) {
         return err;
     }

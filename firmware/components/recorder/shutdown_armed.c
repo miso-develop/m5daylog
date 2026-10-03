@@ -2,6 +2,7 @@
 
 #ifdef ESP_PLATFORM
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "nvs.h"

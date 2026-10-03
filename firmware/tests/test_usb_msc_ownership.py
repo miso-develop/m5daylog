@@ -91,10 +91,12 @@ def test_ambiguous_suspend_and_detach_never_authorize_release():
     sdkconfig = SDKCONFIG.read_text(encoding="utf-8")
 
     assert "CONFIG_TINYUSB_SUSPEND_CALLBACK=y" in sdkconfig
-    suspend_at = src.index("TINYUSB_EVENT_SUSPENDED")
-    detach_at = src.index("TINYUSB_EVENT_DETACHED", suspend_at)
-    ambiguous_region = src[suspend_at:src.index("usb_msc_ownership_init", detach_at)]
-    assert "tud_disconnect" not in ambiguous_region
+    callback_at = src.index("static void usb_device_event_cb")
+    wrapper_at = src.index("// GNU ld --wrap", callback_at)
+    ambiguous_region = src[callback_at:wrapper_at]
+    assert "TINYUSB_EVENT_SUSPENDED" in ambiguous_region
+    assert "TINYUSB_EVENT_DETACHED" in ambiguous_region
+    assert "tud_disconnect" not in ambiguous_region[ambiguous_region.index("TINYUSB_EVENT_SUSPENDED"):]
     assert "USB_BIT_RELEASE_REQUESTED" not in ambiguous_region
     assert "sd_mount_release_usb_storage" not in ambiguous_region
     assert "ambiguous" in ambiguous_region.lower()
