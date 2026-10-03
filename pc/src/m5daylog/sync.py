@@ -7,6 +7,7 @@ their field set.
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import os
@@ -40,6 +41,16 @@ _SCHEMA_VALIDATION_KEYS = {
     "items",
 }
 _SCHEMA_KEYS = _SCHEMA_META_KEYS | _SCHEMA_VALIDATION_KEYS
+
+# Match the RFC3339 validator used by jsonschema[format]==4.26.0 for the
+# canonical Draft 2020-12 ``date-time`` format checker. jsonschema uppercases
+# the candidate before validation, so lowercase ``t`` / ``z`` remain valid.
+_RFC3339_DATETIME = re.compile(
+    r"^(\d{4})-(0[1-9]|1[0-2])-(\d{2})T"
+    r"(?:[01]\d|2[0-3]):(?:[0-5]\d):(?:[0-5]\d)"
+    r"(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$",
+    re.ASCII,
+)
 
 
 class ContractValidationError(ValueError):
@@ -116,7 +127,14 @@ def _resolve_ref(root_schema: dict[str, Any], ref: str) -> dict[str, Any]:
 
 
 def _is_integer(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+    # JSON Schema integers are mathematical integers, so JSON ``1.0`` is an
+    # integer while booleans are not. This mirrors jsonschema's type checker
+    # for values produced by json.loads().
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and value.is_integer()
 
 
 def _validate_format(value: str, format_name: str, path: str) -> None:
@@ -125,16 +143,17 @@ def _validate_format(value: str, format_name: str, path: str) -> None:
             uuid.UUID(value)
         except (ValueError, AttributeError):
             raise _contract_error(path, "format") from None
+        # jsonschema 4.26.0's Draft 2020-12 UUID checker accepts UUID strings
+        # only when the RFC 4122 hyphens occur at these exact positions.
+        if not all(value[position] == "-" for position in (8, 13, 18, 23)):
+            raise _contract_error(path, "format")
         return
     if format_name == "date-time":
-        if "T" not in value:
+        match = _RFC3339_DATETIME.fullmatch(value.upper())
+        if match is None:
             raise _contract_error(path, "format")
-        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            raise _contract_error(path, "format") from None
-        if parsed.tzinfo is None:
+        year, month, day = map(int, match.groups())
+        if year == 0 or not 1 <= day <= calendar.monthrange(year, month)[1]:
             raise _contract_error(path, "format")
         return
     raise _contract_error(path, "unsupported-format")
@@ -482,23 +501,54 @@ def _mark_conflict(
     connection.commit()
 
 
-def _reject_device_local_targets(
-    mount: Path,
-    library_root: Path,
-    db_path: Path,
-) -> None:
-    """Prevent caller-supplied local output paths from writing into Device media."""
+def _device_root(mount: Path) -> Path:
     try:
-        device_root = mount.resolve(strict=True)
-        candidates = (library_root.resolve(strict=False), db_path.resolve(strict=False))
+        return mount.resolve(strict=True)
     except OSError:
-        raise SyncValidationError("unable to resolve sync target paths") from None
-    for candidate in candidates:
+        raise SyncValidationError("unable to resolve Device mount") from None
+
+
+def _reject_paths_inside_device(device_root: Path, *paths: Path) -> None:
+    """Reject paths whose current resolved target is on the Device mount.
+
+    ``Path.resolve(strict=False)`` follows existing symlink/reparse components
+    while allowing not-yet-created suffixes. This catches a local library root
+    that is safe itself but contains a nested junction/symlink into the Device,
+    as well as a pre-existing partial/final symlink that targets Device media.
+    """
+    for path in paths:
+        try:
+            candidate = path.resolve(strict=False)
+        except OSError:
+            raise SyncValidationError("unable to resolve sync target paths") from None
         try:
             candidate.relative_to(device_root)
         except ValueError:
             continue
         raise SyncValidationError("local sync target must be outside Device mount")
+
+
+def _reject_device_local_targets(
+    mount: Path,
+    library_root: Path,
+    db_path: Path,
+) -> Path:
+    """Prevent caller-supplied local output paths from writing into Device media."""
+    device_root = _device_root(mount)
+    _reject_paths_inside_device(device_root, library_root, db_path)
+    return device_root
+
+
+def _reject_derived_recording_targets(
+    device_root: Path,
+    library_root: Path,
+    prepared: list[tuple[dict[str, Any], Path]],
+) -> None:
+    """Preflight every final/partial path before any local sync state is written."""
+    for recording, _source in prepared:
+        final_path = _target_path(library_root, recording)
+        partial_path = Path(str(final_path) + ".partial")
+        _reject_paths_inside_device(device_root, final_path, partial_path)
 
 
 def sync_device(
@@ -518,7 +568,9 @@ def sync_device(
     prepared = _preflight(mount, device, manifest)
 
     db_target = Path(db_path).expanduser()
-    _reject_device_local_targets(mount, library, db_target)
+    device_root = _reject_device_local_targets(mount, library, db_target)
+    _reject_derived_recording_targets(device_root, library, prepared)
+
     db_file = init_db(db_target)
     connection = sqlite3.connect(str(db_file))
     copied = reused = conflicts = 0
@@ -526,6 +578,9 @@ def sync_device(
         _upsert_device(connection, device, manifest)
         for recording, source in prepared:
             final_path = _target_path(library, recording)
+            partial_path = Path(str(final_path) + ".partial")
+            _reject_paths_inside_device(device_root, final_path, partial_path)
+
             expected_size = recording["sizeBytes"]
             expected_sha = recording["sha256"]
             existing = _existing_recording(connection, recording["recordingId"])
@@ -539,7 +594,6 @@ def sync_device(
                 conflicts += 1
                 continue
 
-            partial_path = Path(str(final_path) + ".partial")
             if final_path.exists():
                 if _file_matches(final_path, expected_size, expected_sha):
                     _write_recording(
@@ -556,6 +610,9 @@ def sync_device(
                 continue
 
             final_path.parent.mkdir(parents=True, exist_ok=True)
+            # Re-resolve after directory creation so an existing nested reparse
+            # point cannot be followed by the subsequent partial-file open.
+            _reject_paths_inside_device(device_root, final_path, partial_path)
             with source.open("rb") as reader:
                 copy_verified_stream(
                     reader,
@@ -564,9 +621,14 @@ def sync_device(
                     expected_sha256=expected_sha,
                 )
 
+            # Re-check immediately before publication as well. This protects the
+            # no-clobber step from a pre-existing or newly surfaced final reparse
+            # target without changing the normal stale-partial recovery path.
+            _reject_paths_inside_device(device_root, final_path, partial_path)
             try:
                 publish_no_clobber(partial_path, final_path)
             except FileExistsError:
+                _reject_paths_inside_device(device_root, final_path, partial_path)
                 if _file_matches(final_path, expected_size, expected_sha):
                     if partial_path.exists():
                         partial_path.unlink()
