@@ -20,6 +20,7 @@ idf_component_register(
         "usb_msc_ownership.c"
         "usb_cdc_protocol_core.c"
         "usb_cdc_session_gate.c"
+        "usb_cdc_tx.c"
         "usb_cdc_protocol.c"
         "rtc_correction.c"
     INCLUDE_DIRS
