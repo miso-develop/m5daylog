@@ -1,0 +1,41 @@
+name: Contract Schemas
+
+on:
+  pull_request:
+    paths:
+      - 'contracts/**'
+      - 'fixtures/**'
+      - 'tests/test_contracts.py'
+      - '.github/workflows/contracts.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'contracts/**'
+      - 'fixtures/**'
+      - 'tests/test_contracts.py'
+      - '.github/workflows/contracts.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  contract-validation:
+    name: contracts:validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show Python runtime
+        run: python3 --version
+
+      - name: Install JSON Schema validator
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir 'jsonschema[format]==4.26.0'
+
+      - name: Validate canonical schemas and fixtures
+        run: python3 -m unittest discover -s tests -p 'test_contracts.py' -v

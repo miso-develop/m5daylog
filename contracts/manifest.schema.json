@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "M5Daylog recording manifest",
+  "$defs": {
+    "offsetDateTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "recording": {
+      "type": "object",
+      "required": [
+        "recordingId",
+        "filename",
+        "startedAt",
+        "durationMs",
+        "sizeBytes",
+        "sha256",
+        "sampleRate",
+        "bitDepth",
+        "channels",
+        "state",
+        "firmwareVersion"
+      ],
+      "properties": {
+        "recordingId": {"type": "string", "format": "uuid"},
+        "filename": {"type": "string", "pattern": "^.+\\.wav$"},
+        "startedAt": {"$ref": "#/$defs/offsetDateTime"},
+        "durationMs": {"type": "integer", "minimum": 0},
+        "sizeBytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "sampleRate": {"type": "integer", "minimum": 1},
+        "bitDepth": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1},
+        "state": {"type": "string", "enum": ["finalized", "recovered"]},
+        "firmwareVersion": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "type": "object",
+  "required": ["schemaVersion", "deviceId", "updatedAt", "recordings"],
+  "properties": {
+    "schemaVersion": {"type": "integer", "const": 1},
+    "deviceId": {"type": "string", "format": "uuid"},
+    "updatedAt": {"$ref": "#/$defs/offsetDateTime"},
+    "recordings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/recording"}
+    }
+  }
+}

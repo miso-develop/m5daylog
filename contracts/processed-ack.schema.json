@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "M5Daylog processed recording acknowledgement",
+  "$defs": {
+    "offsetDateTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    }
+  },
+  "type": "object",
+  "required": ["schemaVersion", "deviceId", "processedAt", "recordingIds"],
+  "properties": {
+    "schemaVersion": {"type": "integer", "const": 1},
+    "deviceId": {"type": "string", "format": "uuid"},
+    "processedAt": {"$ref": "#/$defs/offsetDateTime"},
+    "recordingIds": {
+      "type": "array",
+      "items": {"type": "string", "format": "uuid"}
+    }
+  }
+}

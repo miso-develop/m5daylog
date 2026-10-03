@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "deviceId": "not-a-uuid",
+  "model": "M5Capsule v1.1",
+  "firmwareVersion": "0.1.0",
+  "audioCapabilities": {}
+}
