@@ -12,6 +12,8 @@
 
 #ifdef ESP_PLATFORM
 
+#include <stddef.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "esp_log.h"
