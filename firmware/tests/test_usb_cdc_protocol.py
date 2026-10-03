@@ -34,14 +34,54 @@ class MirrorState:
         self.rtc = "2026-10-03T00:00:00+00:00"
 
 
+class ReferenceLineFramer:
+    """Minimal behavioral model for the session-reset framing contract."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+
+    def feed(self, data: bytes):
+        lines = []
+        for byte in data:
+            if byte == ord("\n"):
+                line = bytes(self.buffer)
+                if line.endswith(b"\r"):
+                    line = line[:-1]
+                lines.append(line)
+                self.buffer.clear()
+            else:
+                self.buffer.append(byte)
+        return lines
+
+    def reset_session(self):
+        self.buffer.clear()
+
+
 def _error(request_id, code):
     return {"id": request_id, "ok": False, "error": {"code": code, "message": code}}
 
 
 def _normalize_time(value):
-    if not isinstance(value, str) or not TIME_RE.fullmatch(value):
+    if not isinstance(value, str):
         raise ValueError("INVALID_ARGS")
-    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    match = TIME_RE.fullmatch(value)
+    if match is None:
+        raise ValueError("INVALID_ARGS")
+
+    year, month, day = (int(part) for part in match.group("date").split("-"))
+    hour, minute, second = (int(part) for part in match.group("time").split(":"))
+    offset_text = match.group("offset")
+    if offset_text != "Z":
+        off_hour, off_minute = (int(part) for part in offset_text[1:].split(":"))
+        if off_hour > 14 or off_minute > 59 or (off_hour == 14 and off_minute != 0):
+            raise ValueError("INVALID_ARGS")
+
+    try:
+        dt.datetime(year, month, day, hour, minute, second)
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise OverflowError("RANGE_ERROR") from exc
+
     offset = parsed.utcoffset()
     if offset is None:
         raise ValueError("INVALID_ARGS")
@@ -186,7 +226,7 @@ def test_set_time_accepts_offset_and_z_and_rejects_invalid_without_mutation():
 
     for bad, code in (
         ("2026-10-03T10:30:00", "INVALID_ARGS"),
-        ("2026-02-30T10:30:00+09:00", "INVALID_ARGS"),
+        ("2026-02-30T10:30:00+09:00", "RANGE_ERROR"),
         ("1999-12-31T23:59:59Z", "RANGE_ERROR"),
     ):
         fresh = MirrorState()
@@ -198,6 +238,13 @@ def test_set_time_accepts_offset_and_z_and_rejects_invalid_without_mutation():
         assert res["error"]["code"] == code
         assert fresh.rtc == before
         assert fresh.pending is None
+
+
+def test_rtc_parser_classifies_valid_shape_calendar_range_as_range_error():
+    src = RTC_C.read_text(encoding="utf-8")
+    range_check = src[src.index("if (month < 1"):src.index("pos = 19u;")]
+    assert "RTC_CORRECTION_RANGE_ERROR" in range_check
+    assert "RTC_CORRECTION_INVALID_ARGS" not in range_check
 
 
 def test_framing_contract_crlf_size_and_disconnect_reset_are_encoded_in_source():
@@ -219,6 +266,51 @@ def test_framing_contract_crlf_size_and_disconnect_reset_are_encoded_in_source()
     callback = src[callback_at:worker_at]
     assert "tinyusb_cdcacm_write_flush" not in callback
     assert "cdc_protocol_process_line" not in callback
+
+
+def test_physical_session_boundary_discards_partial_line_before_reconnect():
+    full = b'{"id":"stale","cmd":"SET_TIME","args":{"time":"2026-10-03T10:30:00Z"}}'
+    split = full.index(b"2026") + 4
+    framer = ReferenceLineFramer()
+    state = MirrorState()
+    before = state.rtc
+
+    assert framer.feed(full[:split]) == []
+    framer.reset_session()
+    stale_tail = framer.feed(full[split:] + b"\n")
+    assert len(stale_tail) == 1
+    stale_response = mirror_handle(stale_tail[0].decode("utf-8"), state)
+    assert stale_response["error"]["code"] == "INVALID_JSON"
+    assert state.rtc == before
+    assert state.pending is None
+
+    next_line = framer.feed(b'{"id":"next","cmd":"PING","args":{}}\n')
+    assert len(next_line) == 1
+    next_response = mirror_handle(next_line[0].decode("utf-8"), state)
+    assert next_response["ok"] is True
+    assert next_response["id"] == "next"
+
+    hdr = PROTO_H.read_text(encoding="utf-8")
+    src = PROTO_C.read_text(encoding="utf-8")
+    runtime = RUNTIME.read_text(encoding="utf-8")
+    assert "usb_cdc_protocol_reset_session" in hdr
+    reset_at = src.index("usb_cdc_protocol_reset_session")
+    reset_region = src[reset_at:src.index("}\n", reset_at) + 2]
+    assert "s_connected = false" in reset_region
+    assert "s_reset_line = true" in reset_region
+    assert "xTaskNotifyGive" in reset_region
+
+    attach_at = runtime.index("static void recorder_handle_usb_attach")
+    host_at = runtime.index("static void recorder_handle_usb_host_owned", attach_at)
+    attach_region = runtime[attach_at:host_at]
+    detach_at = runtime.index("static void recorder_handle_usb_detach")
+    app_main_at = runtime.index("void app_main", detach_at)
+    detach_region = runtime[detach_at:app_main_at]
+    assert "usb_cdc_protocol_reset_session();" in attach_region
+    assert "usb_cdc_protocol_reset_session();" in detach_region
+    assert detach_region.index("usb_cdc_protocol_reset_session();") < detach_region.index(
+        "sd_mount_remount_after_usb"
+    )
 
 
 def test_cdc_composite_and_runtime_wiring_preserve_task49_ownership():
