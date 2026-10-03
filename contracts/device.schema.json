@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "M5Daylog device metadata",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "deviceId",
+    "model",
+    "firmwareVersion",
+    "audioCapabilities"
+  ],
+  "properties": {
+    "schemaVersion": {"type": "integer", "const": 1},
+    "deviceId": {"type": "string", "format": "uuid"},
+    "model": {"type": "string", "minLength": 1},
+    "firmwareVersion": {"type": "string", "minLength": 1},
+    "audioCapabilities": {"type": "object"}
+  }
+}

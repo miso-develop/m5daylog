@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "deviceId": "11111111-2222-4333-8444-555555555555",
+  "processedAt": "2026-10-03T11:30:00+09:00",
+  "recordingIds": [
+    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "01234567-89ab-4def-8123-456789abcdef"
+  ]
+}
