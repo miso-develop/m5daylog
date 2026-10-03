@@ -8,6 +8,9 @@
 
 #include "usb_cdc_session_gate.h"
 
+#define TEST_RX_STATE_OPEN (1u << 31)
+#define TEST_RX_STATE_OPENING (1u << 29)
+
 static usb_cdc_session_gate_t s_gate;
 static atomic_bool s_command_entered;
 static atomic_bool s_release_command;
@@ -145,6 +148,34 @@ static void test_reset_cannot_be_reopened_while_cutoff_is_in_progress(void) {
     usb_cdc_session_gate_command_end(&s_gate);
 }
 
+static void test_reset_cancels_an_open_publication_reserved_before_cutoff(void) {
+    uint32_t delayed_expected;
+    uint32_t discard_before;
+
+    usb_cdc_session_gate_init(&s_gate);
+
+    /* White-box the exact race boundary: an opener has reserved the clean RX
+       admission word but has not yet published CDC-ready. Reset must cancel
+       that reservation so a delayed final CAS cannot reopen transport after
+       the physical-session cutoff. */
+    atomic_store(&s_gate.rx_state, TEST_RX_STATE_OPENING);
+    usb_cdc_session_gate_reset(&s_gate, NULL, NULL);
+
+    delayed_expected = TEST_RX_STATE_OPENING;
+    if (atomic_compare_exchange_strong(&s_gate.rx_state, &delayed_expected,
+                                       TEST_RX_STATE_OPEN)) {
+        fail("delayed opener published CDC-ready after reset cutoff");
+    }
+
+    /* The transport's mandatory post-reset queue note must still classify RX
+       as stale rather than observing a resurrected OPEN admission word. */
+    discard_before = usb_cdc_session_gate_rx_discard_epoch(&s_gate);
+    usb_cdc_session_gate_note_rx(&s_gate);
+    if (usb_cdc_session_gate_rx_discard_epoch(&s_gate) == discard_before) {
+        fail("post-reset RX was not classified stale after opening race");
+    }
+}
+
 static void test_pre_reset_frame_cannot_execute_after_new_session_opens(void) {
     uint32_t stale_generation;
 
@@ -234,6 +265,7 @@ static void test_lifecycle_open_waits_for_stale_rx_drain_before_new_request(void
 int main(void) {
     test_inflight_command_completes_before_reset_returns();
     test_reset_cannot_be_reopened_while_cutoff_is_in_progress();
+    test_reset_cancels_an_open_publication_reserved_before_cutoff();
     test_pre_reset_frame_cannot_execute_after_new_session_opens();
     test_acquired_batch_snapshot_is_invalid_after_reset_and_reopen();
     test_lifecycle_open_waits_for_stale_rx_drain_before_new_request();
