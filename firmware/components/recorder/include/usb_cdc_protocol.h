@@ -4,7 +4,8 @@
 //
 // Requests are UTF-8 JSON objects framed by LF (CRLF accepted on RX), with a
 // maximum payload of 1024 bytes excluding the terminator. Processing is
-// sequential and responses preserve request order.
+// sequential and responses preserve request order. TinyUSB
+// CDC_EVENT_LINE_STATE_CHANGED resets partial framing on disconnect/reconnect.
 
 #include <stdbool.h>
 #include <stddef.h>
