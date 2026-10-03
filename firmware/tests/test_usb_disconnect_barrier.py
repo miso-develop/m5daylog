@@ -55,7 +55,7 @@ def test_runtime_arms_before_hold_release_and_never_restarts_recording():
 
 def test_manual_wake_recovery_wrapper_orders_pending_rtc_before_armed_clear():
     runtime = RUNTIME.read_text(encoding="utf-8")
-    fn_at = runtime.index("static bool recorder_task87_manifest_sync_wav_dir")
+    fn_at = runtime.index("bool recorder_task87_manifest_sync_wav_dir")
     base_call_at = runtime.index("device_manifest_sync_wav_dir(", fn_at)
     rtc_at = runtime.index("recorder_flush_pending_rtc_after_mount", base_call_at)
     clear_at = runtime.index("shutdown_armed_clear", rtc_at)
