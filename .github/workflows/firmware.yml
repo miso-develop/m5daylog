@@ -118,7 +118,11 @@ jobs:
               set -euo pipefail
               cjson_dir="$IDF_PATH/components/json/cJSON"
               test -f "$cjson_dir/cJSON.c"
-              cc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror \
+              cjson_limit="$(sed -n "s/^set(M5DAYLOG_CJSON_NESTING_LIMIT \([0-9][0-9]*\))$/\1/p" /workspace/firmware/CMakeLists.txt)"
+              test "$cjson_limit" = "4"
+              cc -std=c11 -D_POSIX_C_SOURCE=200809L \
+                -DCJSON_NESTING_LIMIT="$cjson_limit" \
+                -Wall -Wextra -Werror \
                 -I /workspace/firmware/components/recorder/include \
                 -I "$cjson_dir" \
                 /workspace/firmware/components/recorder/usb_cdc_protocol_core.c \
