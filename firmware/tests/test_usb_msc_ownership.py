@@ -192,10 +192,14 @@ def test_task87_barrier_failure_is_fail_closed_without_remount():
     assert uninstall_at < fail_return_at < app_mount_at
 
     handler_at = runtime.index("static void recorder_handle_usb_barrier")
-    complete_at = runtime.index("usb_msc_ownership_complete_disconnect_barrier", handler_at)
-    detach_at = runtime.index("recorder_handle_usb_detach", complete_at)
-    error_at = runtime.index("recorder_enter_error", complete_at)
-    assert complete_at < error_at < detach_at
+    app_main_at = runtime.index("void app_main", handler_at)
+    handler_region = runtime[handler_at:app_main_at]
+    complete_at = handler_region.index("usb_msc_ownership_complete_disconnect_barrier")
+    error_at = handler_region.index("recorder_enter_error", complete_at)
+    assert complete_at < error_at
+    # Success is consumed exactly once by the event loop's DETACH case.
+    assert "recorder_handle_usb_detach" not in handler_region
+    assert "case USB_MSC_EVENT_DETACH" in runtime[app_main_at:]
 
 
 def test_task87_fresh_usb_session_is_rearmed_only_after_recording_restart():
