@@ -1,8 +1,8 @@
-"""Task #49 host contract tests: USB MSC ownership handoff.
+"""Tasks #49/#87 host contract tests: USB MSC ownership handoff.
 
 Stdlib-only source/contract tests. Physical enumeration, repeated cable cycling,
-and filesystem integrity remain Device Human-Gate evidence after the Device task
-chain reaches #50; these tests lock the fail-closed software ordering.
+and filesystem integrity remain Device Human-Gate evidence; these tests lock the
+fail-closed software ordering and Task #87 software-only disconnect barrier.
 """
 
 from pathlib import Path
@@ -14,6 +14,7 @@ RUNTIME = REPO / "firmware/main/task49_runtime.c"
 MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
 USB_H = COMP / "include/usb_msc_ownership.h"
 USB_C = COMP / "usb_msc_ownership.c"
+SD_H = COMP / "include/sd_mount.h"
 SD_C = COMP / "sd_mount.c"
 CMAKE = COMP / "CMakeLists.txt"
 MANIFEST = COMP / "idf_component.yml"
@@ -132,3 +133,78 @@ def test_usb_ownership_logs_metadata_only():
         assert forbidden not in src
     for marker in ("attach", "detach", "owner", "mount"):
         assert marker in src, marker
+
+
+def test_task87_suspend_is_only_a_trigger_for_explicit_disconnect_barrier():
+    hdr = USB_H.read_text(encoding="utf-8")
+    src = USB_C.read_text(encoding="utf-8")
+    sdkconfig = SDKCONFIG.read_text(encoding="utf-8")
+
+    assert "CONFIG_TINYUSB_SUSPEND_CALLBACK=y" in sdkconfig
+    assert "USB_MSC_EVENT_BARRIER_REQUIRED" in hdr
+    assert "TINYUSB_EVENT_SUSPENDED" in src
+    suspend_at = src.index("TINYUSB_EVENT_SUSPENDED")
+    barrier_at = src.index("USB_BIT_BARRIER_REQUIRED", suspend_at)
+    assert "tud_disconnect()" in src[suspend_at:barrier_at]
+    # An ambiguous suspend/bus-loss observation cannot directly authorize APP mount.
+    assert "sd_mount_transfer_to_app" not in src[suspend_at:barrier_at]
+
+
+def test_task87_barrier_stops_usb_stack_before_app_mount():
+    hdr = USB_H.read_text(encoding="utf-8")
+    src = USB_C.read_text(encoding="utf-8")
+
+    assert "usb_msc_ownership_complete_disconnect_barrier" in hdr
+    fn_at = src.index("usb_msc_ownership_complete_disconnect_barrier")
+    uninstall_at = src.index("tinyusb_driver_uninstall", fn_at)
+    quiesced_at = src.index("host-io-quiesced", uninstall_at)
+    app_mount_at = src.index("sd_mount_transfer_to_app", quiesced_at)
+    proof_at = src.index("s_barrier_app_mounted", app_mount_at)
+    detach_at = src.index("USB_BIT_DETACH", proof_at)
+    assert uninstall_at < quiesced_at < app_mount_at < proof_at < detach_at
+
+
+def test_task87_msc_auto_mount_is_disabled_and_attach_gate_remains_blocking():
+    sd = SD_C.read_text(encoding="utf-8")
+    src = USB_C.read_text(encoding="utf-8")
+
+    assert "tinyusb_msc_install_driver" in sd
+    assert ".auto_mount_off = 1" in sd
+    for marker in ("sd_mount_transfer_to_usb", "sd_mount_transfer_to_app"):
+        assert marker in SD_H.read_text(encoding="utf-8")
+        assert marker in sd
+
+    attached_at = src.index("TINYUSB_EVENT_ATTACHED")
+    wait_at = src.index("USB_BIT_PREPARE_OK", attached_at)
+    to_usb_at = src.index("sd_mount_transfer_to_usb", wait_at)
+    host_owned_at = src.index("s_host_owned", to_usb_at)
+    assert attached_at < wait_at < to_usb_at < host_owned_at
+
+
+def test_task87_barrier_failure_is_fail_closed_without_remount():
+    src = USB_C.read_text(encoding="utf-8")
+    runtime = RUNTIME.read_text(encoding="utf-8")
+
+    fn_at = src.index("usb_msc_ownership_complete_disconnect_barrier")
+    uninstall_at = src.index("tinyusb_driver_uninstall", fn_at)
+    fail_return_at = src.index("return", uninstall_at)
+    app_mount_at = src.index("sd_mount_transfer_to_app", uninstall_at)
+    assert uninstall_at < fail_return_at < app_mount_at
+
+    handler_at = runtime.index("static void recorder_handle_usb_barrier")
+    complete_at = runtime.index("usb_msc_ownership_complete_disconnect_barrier", handler_at)
+    detach_at = runtime.index("recorder_handle_usb_detach", complete_at)
+    error_at = runtime.index("recorder_enter_error", complete_at)
+    assert complete_at < error_at < detach_at
+
+
+def test_task87_fresh_usb_session_is_rearmed_only_after_recording_restart():
+    hdr = USB_H.read_text(encoding="utf-8")
+    runtime = RUNTIME.read_text(encoding="utf-8")
+
+    assert "usb_msc_ownership_rearm" in hdr
+    fn_at = runtime.index("static void recorder_handle_usb_detach")
+    restart_at = runtime.index("recorder_start_session", fn_at)
+    ready_at = runtime.index("recorder_wait_initial_recording", restart_at)
+    rearm_at = runtime.index("usb_msc_ownership_rearm", ready_at)
+    assert restart_at < ready_at < rearm_at
