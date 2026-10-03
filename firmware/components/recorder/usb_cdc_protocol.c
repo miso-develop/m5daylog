@@ -211,12 +211,18 @@ void usb_cdc_protocol_reset_session(void) {
 
 void usb_cdc_protocol_open_session(void) {
     // Only task50's accepted USB_SYNC/CDC-ready transition calls this API.
-    // Pending stale RX, if any, remains non-executable until the worker has
-    // drained it to an empty read; snapshot/command admission checks enforce it.
+    // CDC-ready is not published until every stale RX epoch from the previous
+    // physical session has reached a TinyUSB drain-to-empty boundary. While the
+    // gate remains CLOSED, newly arriving bytes are classified into the stale
+    // epoch and drained too; after OPEN wins, later RX is the new session.
     s_reset_line = true;
-    usb_cdc_session_gate_open(&s_session_gate);
-    if (s_worker != NULL) {
+    if (s_worker == NULL) {
+        return;
+    }
+    xTaskNotifyGive(s_worker);
+    while (!usb_cdc_session_gate_open(&s_session_gate)) {
         xTaskNotifyGive(s_worker);
+        vTaskDelay(1);
     }
 }
 
