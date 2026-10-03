@@ -1,6 +1,4 @@
-# M5Daylog recorder component — Tasks #44 (IM-007) through #49 (IM-012).
-# Portable recorder sources remain stdlib-testable; ESP-IDF wrappers add
-# PDM/SD/power/RGB and Task #49 USB MSC ownership.
+# M5Daylog recorder component — Tasks #44 (IM-007) through #49/#87.
 
 idf_component_register(
     SRCS
@@ -18,6 +16,7 @@ idf_component_register(
         "sd_pcm_sink.c"
         "sd_mount.c"
         "usb_msc_ownership.c"
+        "shutdown_armed.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

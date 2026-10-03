@@ -8,12 +8,16 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_sleep.h"
 #include "recorder_config.h"
 
 #define RECORDER_BATTERY_ADC_UNIT ADC_UNIT_1
 #define RECORDER_BATTERY_ADC_CHANNEL ADC_CHANNEL_5
 #define RECORDER_BATTERY_ADC_ATTEN ADC_ATTEN_DB_12
 #define RECORDER_BATTERY_DIVIDER_NUM 2
+#ifndef RECORDER_WAKE_BUTTON_PIN
+#define RECORDER_WAKE_BUTTON_PIN 42
+#endif
 
 static adc_oneshot_unit_handle_t s_adc_unit = NULL;
 static adc_cali_handle_t s_adc_cali = NULL;
@@ -31,7 +35,7 @@ static void recorder_power_cleanup(void) {
     s_power_ready = false;
 }
 
-esp_err_t recorder_power_enable_hold(void) {
+static esp_err_t recorder_power_config_hold_output(void) {
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << RECORDER_POWER_HOLD_PIN,
         .mode = GPIO_MODE_OUTPUT,
@@ -39,11 +43,57 @@ esp_err_t recorder_power_enable_hold(void) {
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    esp_err_t err = gpio_config(&cfg);
+    return gpio_config(&cfg);
+}
+
+esp_err_t recorder_power_enable_hold(void) {
+    esp_err_t err;
+    gpio_deep_sleep_hold_dis();
+    (void)gpio_hold_dis((gpio_num_t)RECORDER_POWER_HOLD_PIN);
+    err = recorder_power_config_hold_output();
     if (err != ESP_OK) {
         return err;
     }
     return gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, 1);
+}
+
+esp_err_t recorder_power_release_hold(void) {
+    esp_err_t err = recorder_power_config_hold_output();
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, 0);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = gpio_hold_en((gpio_num_t)RECORDER_POWER_HOLD_PIN);
+    if (err != ESP_OK) {
+        return err;
+    }
+    gpio_deep_sleep_hold_en();
+    return ESP_OK;
+}
+
+esp_err_t recorder_power_manual_wake_asserted(bool *asserted) {
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << RECORDER_WAKE_BUTTON_PIN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err;
+
+    if (asserted == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *asserted = false;
+    err = gpio_config(&cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+    *asserted = gpio_get_level((gpio_num_t)RECORDER_WAKE_BUTTON_PIN) == 0;
+    return ESP_OK;
 }
 
 esp_err_t recorder_power_init(void) {
@@ -76,6 +126,7 @@ esp_err_t recorder_power_init(void) {
         recorder_power_cleanup();
         return err;
     }
+    s_power_ready = true;
     err = adc_oneshot_config_channel(s_adc_unit,
                                      RECORDER_BATTERY_ADC_CHANNEL,
                                      &chan_cfg);
@@ -83,15 +134,11 @@ esp_err_t recorder_power_init(void) {
         recorder_power_cleanup();
         return err;
     }
-    // ESP32-S3 curve-fitting converts the divided ADC reading to mV.
-    // Failing calibration is safer than comparing unverified raw counts to
-    // a voltage threshold that controls recording shutdown.
     err = adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_adc_cali);
     if (err != ESP_OK) {
         recorder_power_cleanup();
         return err;
     }
-    s_power_ready = true;
     return ESP_OK;
 }
 
@@ -123,6 +170,14 @@ esp_err_t recorder_power_read_battery_mv(int *battery_mv) {
 
 void recorder_power_deinit(void) {
     recorder_power_cleanup();
+}
+
+void recorder_power_enter_shutdown_sleep(void) {
+    recorder_power_cleanup();
+    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_deep_sleep_start();
+    for (;;) {
+    }
 }
 
 #endif  // ESP_PLATFORM
