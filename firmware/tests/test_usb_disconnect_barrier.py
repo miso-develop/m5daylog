@@ -10,7 +10,6 @@ REPO = Path(__file__).resolve().parents[2]
 USB_C = REPO / "firmware/components/recorder/usb_msc_ownership.c"
 SD_C = REPO / "firmware/components/recorder/sd_mount.c"
 RUNTIME = REPO / "firmware/main/task49_runtime.c"
-BASE_MAIN = REPO / "firmware/main/main.c"
 MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
 
 
@@ -54,16 +53,11 @@ def test_runtime_arms_before_hold_release_and_never_restarts_recording():
     assert "usb_msc_ownership_rearm" not in runtime
 
 
-def test_manual_wake_resume_hook_runs_after_recovery_before_new_recording_id():
+def test_manual_wake_recovery_wrapper_orders_pending_rtc_before_armed_clear():
     runtime = RUNTIME.read_text(encoding="utf-8")
-    base = BASE_MAIN.read_text(encoding="utf-8")
-
-    hook_at = runtime.index("static bool recorder_before_fresh_recording")
-    rtc_at = runtime.index("recorder_flush_pending_rtc_after_mount", hook_at)
+    fn_at = runtime.index("static bool recorder_task87_manifest_sync_wav_dir")
+    base_call_at = runtime.index("device_manifest_sync_wav_dir(", fn_at)
+    rtc_at = runtime.index("recorder_flush_pending_rtc_after_mount", base_call_at)
     clear_at = runtime.index("shutdown_armed_clear", rtc_at)
-    assert rtc_at < clear_at
-
-    recovery_at = base.index("device_manifest_recover_pending")
-    hook_call_at = base.index("RECORDER_BEFORE_FRESH_RECORDING()", recovery_at)
-    fresh_id_at = base.index("recorder_new_recording_id", hook_call_at)
-    assert recovery_at < hook_call_at < fresh_id_at
+    assert base_call_at < rtc_at < clear_at
+    assert "#define device_manifest_sync_wav_dir recorder_task87_manifest_sync_wav_dir" in runtime
