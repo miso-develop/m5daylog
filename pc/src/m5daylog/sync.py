@@ -321,19 +321,17 @@ def _preflight(
 
 def _target_path(library_root: Path, recording: dict[str, Any]) -> Path:
     value = recording["startedAt"]
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-    try:
-        started = datetime.fromisoformat(normalized)
-    except ValueError:
-        raise SyncValidationError("invalid recording timestamp") from None
-    if started.tzinfo is None:
+    match = _RFC3339_DATETIME.match(value.upper())
+    if match is None:
         raise SyncValidationError("invalid recording timestamp")
-    date = started.date()
+    year, month, day = map(int, match.groups())
+    if year == 0 or not 1 <= day <= calendar.monthrange(year, month)[1]:
+        raise SyncValidationError("invalid recording timestamp")
     return (
         library_root
-        / f"{date.year:04d}"
-        / f"{date.month:02d}"
-        / f"{date.day:02d}"
+        / f"{year:04d}"
+        / f"{month:02d}"
+        / f"{day:02d}"
         / "raw"
         / f"{recording['recordingId']}.wav"
     )
