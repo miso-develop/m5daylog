@@ -19,10 +19,10 @@
 #include "tinyusb_cdc_acm.h"
 #include "usb_cdc_protocol_core.h"
 #include "usb_cdc_session_gate.h"
+#include "usb_cdc_tx.h"
 
 #define CDC_RX_CHUNK_BYTES 256u
 #define CDC_RESPONSE_BYTES 768u
-#define CDC_TX_FLUSH_TICKS pdMS_TO_TICKS(250)
 
 static usb_cdc_protocol_config_t s_config;
 static TaskHandle_t s_worker = NULL;
@@ -32,8 +32,14 @@ static volatile bool s_reset_line = false;
 static bool s_initialized = false;
 static bool s_started = false;
 
-static bool usb_cdc_session_gate_tx_is_current(
-    const usb_cdc_session_gate_t *gate, uint32_t response_generation) {
+static bool cdc_tx_is_connected(void *ctx) {
+    (void)ctx;
+    return s_connected;
+}
+
+static bool cdc_tx_session_is_current(void *ctx,
+                                      uint32_t response_generation) {
+    usb_cdc_session_gate_t *gate = ctx;
     usb_cdc_session_snapshot_t response_snapshot = {
         .generation = response_generation,
         .admitted = true,
@@ -41,57 +47,42 @@ static bool usb_cdc_session_gate_tx_is_current(
     return usb_cdc_session_gate_snapshot_is_current(gate, response_snapshot);
 }
 
+static size_t cdc_tx_queue(void *ctx, const uint8_t *data, size_t len) {
+    (void)ctx;
+    return tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, data, len);
+}
+
+static size_t cdc_tx_queue_char(void *ctx, uint8_t value) {
+    (void)ctx;
+    return tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, (char)value);
+}
+
+static bool cdc_tx_flush(void *ctx, uint32_t timeout_ms) {
+    (void)ctx;
+    return tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
+                                      pdMS_TO_TICKS(timeout_ms)) == ESP_OK;
+}
+
+static void cdc_tx_wait(void *ctx) {
+    (void)ctx;
+    vTaskDelay(1);
+}
+
 static bool cdc_write_response(const char *response, size_t len,
                                uint32_t response_generation) {
-    size_t sent = 0;
-    while (sent < len) {
-        size_t queued;
-        if (!s_connected ||
-            !usb_cdc_session_gate_tx_is_current(&s_session_gate,
-                                                response_generation)) {
-            return false;
-        }
-        queued = tinyusb_cdcacm_write_queue(
-            TINYUSB_CDC_ACM_0, (const uint8_t *)response + sent, len - sent);
-        if (queued == 0u) {
-            if (!s_connected ||
-                !usb_cdc_session_gate_tx_is_current(&s_session_gate,
-                                                    response_generation)) {
-                return false;
-            }
-            if (tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
-                                           pdMS_TO_TICKS(20)) != ESP_OK) {
-                vTaskDelay(1);
-            }
-            continue;
-        }
-        sent += queued;
-    }
-    for (;;) {
-        if (!s_connected ||
-            !usb_cdc_session_gate_tx_is_current(&s_session_gate,
-                                                response_generation)) {
-            return false;
-        }
-        if (tinyusb_cdcacm_write_queue_char(TINYUSB_CDC_ACM_0, '\n') != 0u) {
-            break;
-        }
-        (void)tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
-                                         pdMS_TO_TICKS(20));
-        vTaskDelay(1);
-    }
-    if (!s_connected ||
-        !usb_cdc_session_gate_tx_is_current(&s_session_gate,
-                                            response_generation)) {
-        return false;
-    }
-    if (tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
-                                   CDC_TX_FLUSH_TICKS) != ESP_OK) {
-        return false;
-    }
-    return s_connected &&
-           usb_cdc_session_gate_tx_is_current(&s_session_gate,
-                                              response_generation);
+    usb_cdc_tx_ops_t ops = {
+        .transport_ctx = NULL,
+        .session_ctx = &s_session_gate,
+        .is_connected = cdc_tx_is_connected,
+        .session_is_current = cdc_tx_session_is_current,
+        .queue = cdc_tx_queue,
+        .queue_char = cdc_tx_queue_char,
+        .flush = cdc_tx_flush,
+        .wait = cdc_tx_wait,
+        .retry_flush_timeout_ms = 20u,
+        .final_flush_timeout_ms = 250u,
+    };
+    return usb_cdc_tx_write_response(&ops, response, len, response_generation);
 }
 
 static void usb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
