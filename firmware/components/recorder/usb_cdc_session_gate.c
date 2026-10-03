@@ -66,21 +66,40 @@ static void gate_cancel_rx_opening(usb_cdc_session_gate_t *gate) {
 
 static void gate_mark_rx_boundary_stale(usb_cdc_session_gate_t *gate) {
     uint32_t state;
-
-    // Publish the boundary epoch before removing OPEN/OPENING. If the worker
-    // reaches an empty read in between, that read is already after the cutoff
-    // and may legitimately satisfy this epoch.
-    (void)atomic_fetch_add_explicit(&gate->rx_discard_epoch, 1u,
-                                    memory_order_seq_cst);
+    bool boundary_registered = false;
 
     state = atomic_load_explicit(&gate->rx_state, memory_order_seq_cst);
     for (;;) {
-        uint32_t desired = (state & RX_STATE_COUNT_MASK) | RX_STATE_DIRTY;
+        uint32_t count = state & RX_STATE_COUNT_MASK;
+        uint32_t desired;
+
+        if (count == RX_STATE_COUNT_MASK) {
+            // Fail closed if the classifier count is saturated. Clearing the
+            // OPEN/OPENING flags is still mandatory; the saturated count then
+            // intentionally prevents any later publication.
+            desired = count | RX_STATE_DIRTY;
+        } else {
+            // Register one synthetic classifier while atomically removing both
+            // OPEN and OPENING. This prevents the worker from clearing DIRTY
+            // before the boundary epoch below has been published, while every
+            // callback after this CAS observes closed admission and classifies
+            // itself as stale without waiting.
+            desired = (count + 1u) | RX_STATE_DIRTY;
+        }
+
         if (atomic_compare_exchange_weak_explicit(
                 &gate->rx_state, &state, desired,
                 memory_order_seq_cst, memory_order_seq_cst)) {
+            boundary_registered = count != RX_STATE_COUNT_MASK;
             break;
         }
+    }
+
+    (void)atomic_fetch_add_explicit(&gate->rx_discard_epoch, 1u,
+                                    memory_order_seq_cst);
+    if (boundary_registered) {
+        (void)atomic_fetch_sub_explicit(&gate->rx_state, 1u,
+                                        memory_order_seq_cst);
     }
     gate_try_clear_rx_dirty(gate);
 }
