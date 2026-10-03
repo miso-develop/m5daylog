@@ -1,8 +1,8 @@
 """Task #87 Strategy 2 behavioral tests for explicit-eject USB quiescence.
 
 The production C ownership coordinator is compiled against deterministic host
-stubs. These tests intentionally exercise the release signal and state
-transitions rather than accepting source-text markers as the primary proof.
+stubs. These tests exercise the linker-wrapped START STOP UNIT callback used by
+esp_tinyusb 2.2.1, rather than inventing a duplicate TinyUSB callback symbol.
 """
 
 from pathlib import Path
@@ -87,11 +87,16 @@ STUB_HEADERS = {
     "tusb.h": r"""
         #pragma once
         #include <stdbool.h>
+        #include <stdint.h>
         bool tud_disconnect(void);
-        bool tud_msc_start_stop_cb(unsigned char lun,
-                                   unsigned char power_condition,
-                                   bool start,
-                                   bool load_eject);
+        bool __real_tud_msc_start_stop_cb(uint8_t lun,
+                                          uint8_t power_condition,
+                                          bool start,
+                                          bool load_eject);
+        bool __wrap_tud_msc_start_stop_cb(uint8_t lun,
+                                          uint8_t power_condition,
+                                          bool start,
+                                          bool load_eject);
     """,
     "tinyusb_msc.h": r"""
         #pragma once
@@ -161,6 +166,7 @@ HARNESS = r"""
     static bool g_release_requested;
     static bool g_device_fs_released;
     static int g_disconnect_calls;
+    static int g_real_start_stop_calls;
     static int g_uninstall_calls;
     static int g_release_storage_calls;
     static esp_err_t g_uninstall_result = ESP_OK;
@@ -226,6 +232,14 @@ HARNESS = r"""
     bool tud_disconnect(void) {
         g_disconnect_calls++; return true;
     }
+    bool __real_tud_msc_start_stop_cb(uint8_t lun,
+                                      uint8_t power_condition,
+                                      bool start,
+                                      bool load_eject) {
+        (void)lun; (void)power_condition; (void)start; (void)load_eject;
+        g_real_start_stop_calls++;
+        return true;
+    }
 
     static usb_msc_ownership_event_t next_event(void) {
         return usb_msc_ownership_wait_event(0);
@@ -257,7 +271,8 @@ HARNESS = r"""
     }
 
     static void request_explicit_eject(void) {
-        CHECK(tud_msc_start_stop_cb(0, 0, false, true));
+        CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, true));
+        CHECK(g_real_start_stop_calls == 0);
         CHECK(g_disconnect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_REQUESTED);
         CHECK(usb_msc_ownership_is_host_owned());
@@ -279,8 +294,9 @@ HARNESS = r"""
 
     static void run_non_eject_start_stop(void) {
         enter_host_owned();
-        CHECK(tud_msc_start_stop_cb(0, 0, true, true));
-        CHECK(tud_msc_start_stop_cb(0, 0, false, false));
+        CHECK(__wrap_tud_msc_start_stop_cb(0, 0, true, true));
+        CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, false));
+        CHECK(g_real_start_stop_calls == 2);
         CHECK(g_disconnect_calls == 0);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         CHECK(usb_msc_ownership_is_host_owned());

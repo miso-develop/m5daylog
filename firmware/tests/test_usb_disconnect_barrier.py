@@ -1,8 +1,7 @@
 """Task #87 Strategy 2 source-order contracts.
 
-Behavioral host tests are the primary proof. These assertions additionally
-lock the release ordering and prevent a regression back to same-session APP
-remount/rearm.
+Behavioral host tests are the primary proof. These assertions lock the linker
+seam, release ordering, and the absence of same-session APP remount/rearm.
 """
 
 from pathlib import Path
@@ -11,6 +10,16 @@ REPO = Path(__file__).resolve().parents[2]
 USB_C = REPO / "firmware/components/recorder/usb_msc_ownership.c"
 SD_C = REPO / "firmware/components/recorder/sd_mount.c"
 RUNTIME = REPO / "firmware/main/task49_runtime.c"
+BASE_MAIN = REPO / "firmware/main/main.c"
+MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
+
+
+def test_start_stop_unit_has_one_to_one_linker_wrap_seam():
+    usb = USB_C.read_text(encoding="utf-8")
+    cmake = MAIN_CMAKE.read_text(encoding="utf-8")
+    assert "__wrap_tud_msc_start_stop_cb" in usb
+    assert "__real_tud_msc_start_stop_cb" in usb
+    assert "--wrap=tud_msc_start_stop_cb" in cmake
 
 
 def test_release_quiesce_tears_down_usb_before_deferred_write_proof():
@@ -45,10 +54,16 @@ def test_runtime_arms_before_hold_release_and_never_restarts_recording():
     assert "usb_msc_ownership_rearm" not in runtime
 
 
-def test_manual_wake_resume_hook_orders_pending_rtc_before_clear_and_session():
+def test_manual_wake_resume_hook_runs_after_recovery_before_new_recording_id():
     runtime = RUNTIME.read_text(encoding="utf-8")
-    fn_at = runtime.index("static bool recorder_manual_wake_resume")
-    rtc_at = runtime.index("recorder_flush_pending_rtc_after_mount", fn_at)
+    base = BASE_MAIN.read_text(encoding="utf-8")
+
+    hook_at = runtime.index("static bool recorder_before_fresh_recording")
+    rtc_at = runtime.index("recorder_flush_pending_rtc_after_mount", hook_at)
     clear_at = runtime.index("shutdown_armed_clear", rtc_at)
-    start_at = runtime.index("recorder_start_session", clear_at)
-    assert rtc_at < clear_at < start_at
+    assert rtc_at < clear_at
+
+    recovery_at = base.index("device_manifest_recover_pending")
+    hook_call_at = base.index("RECORDER_BEFORE_FRESH_RECORDING()", recovery_at)
+    fresh_id_at = base.index("recorder_new_recording_id", hook_call_at)
+    assert recovery_at < hook_call_at < fresh_id_at
