@@ -4,6 +4,10 @@
 
 #include <stddef.h>
 
+#define RX_STATE_OPEN (1u << 31)
+#define RX_STATE_DIRTY (1u << 30)
+#define RX_STATE_COUNT_MASK (RX_STATE_DIRTY - 1u)
+
 static bool gate_has_pending_rx_discard(const usb_cdc_session_gate_t *gate) {
     return atomic_load_explicit(&gate->rx_discard_epoch,
                                 memory_order_seq_cst) !=
@@ -11,18 +15,63 @@ static bool gate_has_pending_rx_discard(const usb_cdc_session_gate_t *gate) {
                                 memory_order_seq_cst);
 }
 
-static void gate_rx_phase_lock(usb_cdc_session_gate_t *gate) {
-    bool expected = false;
+static bool gate_rx_admission_is_open(const usb_cdc_session_gate_t *gate) {
+    return atomic_load_explicit(&gate->rx_state, memory_order_seq_cst) ==
+           RX_STATE_OPEN;
+}
 
-    while (!atomic_compare_exchange_weak_explicit(
-        &gate->rx_phase_lock, &expected, true,
-        memory_order_acquire, memory_order_relaxed)) {
-        expected = false;
+static void gate_try_clear_rx_dirty(usb_cdc_session_gate_t *gate) {
+    uint32_t state;
+
+    for (;;) {
+        uint32_t desired;
+
+        state = atomic_load_explicit(&gate->rx_state, memory_order_seq_cst);
+        if ((state & RX_STATE_OPEN) != 0u ||
+            (state & RX_STATE_DIRTY) == 0u ||
+            (state & RX_STATE_COUNT_MASK) != 0u ||
+            gate_has_pending_rx_discard(gate)) {
+            return;
+        }
+
+        desired = state & ~RX_STATE_DIRTY;
+        if (atomic_compare_exchange_weak_explicit(
+                &gate->rx_state, &state, desired,
+                memory_order_seq_cst, memory_order_seq_cst)) {
+            return;
+        }
     }
 }
 
-static void gate_rx_phase_unlock(usb_cdc_session_gate_t *gate) {
-    atomic_store_explicit(&gate->rx_phase_lock, false, memory_order_release);
+static void gate_mark_rx_boundary_stale(usb_cdc_session_gate_t *gate) {
+    uint32_t state;
+
+    // The boundary epoch is published before RX admission is closed. If a
+    // worker reaches an empty read in between, that read is already after the
+    // lifecycle cutoff and may legitimately satisfy this epoch.
+    (void)atomic_fetch_add_explicit(&gate->rx_discard_epoch, 1u,
+                                    memory_order_seq_cst);
+
+    state = atomic_load_explicit(&gate->rx_state, memory_order_seq_cst);
+    for (;;) {
+        uint32_t desired = (state & RX_STATE_COUNT_MASK) | RX_STATE_DIRTY;
+        if (atomic_compare_exchange_weak_explicit(
+                &gate->rx_state, &state, desired,
+                memory_order_seq_cst, memory_order_seq_cst)) {
+            break;
+        }
+    }
+    gate_try_clear_rx_dirty(gate);
+}
+
+static void gate_close_rx_admission(usb_cdc_session_gate_t *gate) {
+    uint32_t expected = RX_STATE_OPEN;
+
+    // RESETTING is followed by the transport-owned stale-queue note. If RX was
+    // already closed/dirty, preserve that state and any in-flight classifiers.
+    (void)atomic_compare_exchange_strong_explicit(
+        &gate->rx_state, &expected, 0u,
+        memory_order_seq_cst, memory_order_seq_cst);
 }
 
 void usb_cdc_session_gate_init(usb_cdc_session_gate_t *gate) {
@@ -32,7 +81,7 @@ void usb_cdc_session_gate_init(usb_cdc_session_gate_t *gate) {
     atomic_init(&gate->generation, 1u);
     atomic_init(&gate->active_commands, 0u);
     atomic_init(&gate->phase, USB_CDC_SESSION_GATE_CLOSED);
-    atomic_init(&gate->rx_phase_lock, false);
+    atomic_init(&gate->rx_state, 0u);
     atomic_init(&gate->rx_discard_epoch, 0u);
     atomic_init(&gate->rx_drained_epoch, 0u);
 }
@@ -48,36 +97,48 @@ bool usb_cdc_session_gate_is_open(const usb_cdc_session_gate_t *gate) {
     if (gate == NULL) {
         return false;
     }
-    return atomic_load_explicit(&gate->phase, memory_order_acquire) ==
-           USB_CDC_SESSION_GATE_OPEN;
+    return atomic_load_explicit(&gate->phase, memory_order_seq_cst) ==
+               USB_CDC_SESSION_GATE_OPEN &&
+           gate_rx_admission_is_open(gate) &&
+           !gate_has_pending_rx_discard(gate);
 }
 
 bool usb_cdc_session_gate_open(usb_cdc_session_gate_t *gate) {
+    uint32_t phase;
     uint32_t expected;
-    bool opened = false;
 
     if (gate == NULL) {
         return false;
     }
 
-    // Linearize CLOSED/OPEN RX classification with CDC-ready publication.
-    // If RX was classified as stale first, its discard epoch is visible here
-    // and OPEN is refused until the worker drains through an empty read. If
-    // OPEN wins first, the callback observes OPEN and classifies its bytes as
-    // the first valid request of the new lifecycle-owned session.
-    gate_rx_phase_lock(gate);
-    if (!gate_has_pending_rx_discard(gate)) {
+    // Phase OPEN means the lifecycle owns an opening/open session; RX_STATE_OPEN
+    // is the actual CDC-ready publication point. Keeping these separate lets the
+    // worker drain stale TinyUSB bytes while command admission remains closed.
+    phase = atomic_load_explicit(&gate->phase, memory_order_seq_cst);
+    if (phase == USB_CDC_SESSION_GATE_CLOSED) {
         expected = USB_CDC_SESSION_GATE_CLOSED;
-        if (atomic_compare_exchange_strong_explicit(
+        if (!atomic_compare_exchange_strong_explicit(
                 &gate->phase, &expected, USB_CDC_SESSION_GATE_OPEN,
-                memory_order_seq_cst, memory_order_seq_cst)) {
-            opened = true;
-        } else if (expected == USB_CDC_SESSION_GATE_OPEN) {
-            opened = true;
+                memory_order_seq_cst, memory_order_seq_cst) &&
+            expected != USB_CDC_SESSION_GATE_OPEN) {
+            return false;
         }
+    } else if (phase != USB_CDC_SESSION_GATE_OPEN) {
+        return false;
     }
-    gate_rx_phase_unlock(gate);
-    return opened;
+
+    if (gate_rx_admission_is_open(gate)) {
+        return !gate_has_pending_rx_discard(gate);
+    }
+
+    // CLOSED-clean (zero) competes atomically with stale-RX callback
+    // registration. If a callback registers first, this CAS fails and the
+    // worker must drain its epoch. If OPEN wins first, the callback observes
+    // RX_STATE_OPEN and its bytes belong to the new session. No callback waits.
+    expected = 0u;
+    return atomic_compare_exchange_strong_explicit(
+        &gate->rx_state, &expected, RX_STATE_OPEN,
+        memory_order_seq_cst, memory_order_seq_cst);
 }
 
 void usb_cdc_session_gate_close(usb_cdc_session_gate_t *gate) {
@@ -92,8 +153,7 @@ void usb_cdc_session_gate_close(usb_cdc_session_gate_t *gate) {
             memory_order_seq_cst, memory_order_seq_cst)) {
         (void)atomic_fetch_add_explicit(&gate->generation, 1u,
                                         memory_order_seq_cst);
-        (void)atomic_fetch_add_explicit(&gate->rx_discard_epoch, 1u,
-                                        memory_order_seq_cst);
+        gate_mark_rx_boundary_stale(gate);
     }
 }
 
@@ -112,6 +172,7 @@ usb_cdc_session_snapshot_t usb_cdc_session_gate_snapshot(
     snapshot.admitted =
         atomic_load_explicit(&gate->phase, memory_order_seq_cst) ==
             USB_CDC_SESSION_GATE_OPEN &&
+        gate_rx_admission_is_open(gate) &&
         !gate_has_pending_rx_discard(gate);
 
     // Make the snapshot self-invalidating if teardown moved either state after
@@ -121,6 +182,7 @@ usb_cdc_session_snapshot_t usb_cdc_session_gate_snapshot(
              USB_CDC_SESSION_GATE_OPEN ||
          atomic_load_explicit(&gate->generation, memory_order_seq_cst) !=
              generation ||
+         !gate_rx_admission_is_open(gate) ||
          gate_has_pending_rx_discard(gate))) {
         snapshot.admitted = false;
     }
@@ -137,24 +199,54 @@ bool usb_cdc_session_gate_snapshot_is_current(
                USB_CDC_SESSION_GATE_OPEN &&
            atomic_load_explicit(&gate->generation, memory_order_seq_cst) ==
                snapshot.generation &&
+           gate_rx_admission_is_open(gate) &&
            !gate_has_pending_rx_discard(gate);
 }
 
 void usb_cdc_session_gate_note_rx(usb_cdc_session_gate_t *gate) {
+    uint32_t state;
+
     if (gate == NULL) {
         return;
     }
 
-    // This critical section is paired with gate_open(). It prevents a callback
-    // that observed CLOSED from publishing a stale epoch after CDC-ready has
-    // already been made visible to the lifecycle.
-    gate_rx_phase_lock(gate);
-    if (atomic_load_explicit(&gate->phase, memory_order_seq_cst) !=
-        USB_CDC_SESSION_GATE_OPEN) {
-        (void)atomic_fetch_add_explicit(&gate->rx_discard_epoch, 1u,
-                                        memory_order_seq_cst);
+    state = atomic_load_explicit(&gate->rx_state, memory_order_seq_cst);
+    for (;;) {
+        uint32_t count;
+        uint32_t desired;
+
+        if ((state & RX_STATE_OPEN) != 0u) {
+            return;
+        }
+
+        count = state & RX_STATE_COUNT_MASK;
+        if (count == RX_STATE_COUNT_MASK) {
+            // Practically unreachable, but remain fail-closed rather than wrap
+            // the callback count into a value that could be opened.
+            (void)atomic_fetch_add_explicit(&gate->rx_discard_epoch, 1u,
+                                            memory_order_seq_cst);
+            (void)atomic_fetch_or_explicit(&gate->rx_state, RX_STATE_DIRTY,
+                                           memory_order_seq_cst);
+            return;
+        }
+
+        desired = state + 1u;
+        if (atomic_compare_exchange_weak_explicit(
+                &gate->rx_state, &state, desired,
+                memory_order_seq_cst, memory_order_seq_cst)) {
+            break;
+        }
     }
-    gate_rx_phase_unlock(gate);
+
+    // Registration above prevents OPEN from winning until this stale callback
+    // has published its epoch and dirty marker. The final decrement makes the
+    // closed state eligible for clear only after publication is complete.
+    (void)atomic_fetch_add_explicit(&gate->rx_discard_epoch, 1u,
+                                    memory_order_seq_cst);
+    (void)atomic_fetch_or_explicit(&gate->rx_state, RX_STATE_DIRTY,
+                                   memory_order_seq_cst);
+    (void)atomic_fetch_sub_explicit(&gate->rx_state, 1u,
+                                    memory_order_seq_cst);
 }
 
 uint32_t usb_cdc_session_gate_rx_discard_epoch(
@@ -171,7 +263,8 @@ bool usb_cdc_session_gate_should_discard_rx(
     if (gate == NULL) {
         return true;
     }
-    return gate_has_pending_rx_discard(gate);
+    return !gate_rx_admission_is_open(gate) ||
+           gate_has_pending_rx_discard(gate);
 }
 
 void usb_cdc_session_gate_mark_rx_drained(usb_cdc_session_gate_t *gate,
@@ -191,6 +284,7 @@ void usb_cdc_session_gate_mark_rx_drained(usb_cdc_session_gate_t *gate,
                &gate->rx_drained_epoch, &current, observed_epoch,
                memory_order_release, memory_order_acquire)) {
     }
+    gate_try_clear_rx_dirty(gate);
 }
 
 bool usb_cdc_session_gate_command_begin(usb_cdc_session_gate_t *gate,
@@ -200,6 +294,7 @@ bool usb_cdc_session_gate_command_begin(usb_cdc_session_gate_t *gate,
             USB_CDC_SESSION_GATE_OPEN ||
         atomic_load_explicit(&gate->generation, memory_order_seq_cst) !=
             frame_generation ||
+        !gate_rx_admission_is_open(gate) ||
         gate_has_pending_rx_discard(gate)) {
         return false;
     }
@@ -215,6 +310,7 @@ bool usb_cdc_session_gate_command_begin(usb_cdc_session_gate_t *gate,
             USB_CDC_SESSION_GATE_OPEN ||
         atomic_load_explicit(&gate->generation, memory_order_seq_cst) !=
             frame_generation ||
+        !gate_rx_admission_is_open(gate) ||
         gate_has_pending_rx_discard(gate)) {
         (void)atomic_fetch_sub_explicit(&gate->active_commands, 1u,
                                         memory_order_seq_cst);
@@ -240,9 +336,11 @@ void usb_cdc_session_gate_reset(usb_cdc_session_gate_t *gate,
 
     // RESETTING is the teardown ownership state. gate_open() cannot change it,
     // so a reconnect/RX race cannot reopen admission while this function is
-    // establishing and waiting on the cutoff.
+    // establishing and waiting on the cutoff. RX admission is atomically closed
+    // without spinning; reset_session() then marks the transport queue stale.
     atomic_store_explicit(&gate->phase, USB_CDC_SESSION_GATE_RESETTING,
                           memory_order_seq_cst);
+    gate_close_rx_admission(gate);
     (void)atomic_fetch_add_explicit(&gate->generation, 1u,
                                     memory_order_seq_cst);
 
