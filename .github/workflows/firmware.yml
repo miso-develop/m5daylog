@@ -132,11 +132,12 @@ jobs:
               /tmp/usb_cdc_cjson_depth_harness
             '
 
-      - name: Run ESP-IDF v5.5.5 clean build
+      - name: Run ESP-IDF v5.5.5 clean build and CDC stack gate
         env:
           IDF_IMAGE: espressif/idf@sha256:6e2800a69f1c6521a5651da524f811e237d13e34cad369687916d0ad0bc4ef89
         run: |
           set -euo pipefail
+          stack_report="$GITHUB_WORKSPACE/firmware/build/cdc_stack_budget.txt"
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/workspace" \
             --workdir /workspace/firmware \
@@ -152,5 +153,9 @@ jobs:
               idf.py fullclean
               idf.py set-target esp32s3
               idf.py build
+              python3 /workspace/firmware/tests/check_cdc_stack_budget.py \
+                /workspace/firmware/build | tee /workspace/firmware/build/cdc_stack_budget.txt
             '
-          printf 'ESP-IDF: `v5.5.5`\nClean build: `PASS`\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'ESP-IDF: `v5.5.5`\nClean build: `PASS`\n\n### CDC stack budget\n```text\n' >> "$GITHUB_STEP_SUMMARY"
+          cat "$stack_report" >> "$GITHUB_STEP_SUMMARY"
+          printf '```\n' >> "$GITHUB_STEP_SUMMARY"
