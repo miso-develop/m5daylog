@@ -40,6 +40,7 @@ static volatile bool s_started = false;
 static volatile bool s_host_owned = false;
 static volatile bool s_barrier_pending = false;
 static volatile bool s_barrier_app_mounted = true;
+static volatile bool s_recording_recovered = false;
 static bool s_wav_finalized = false;
 static bool s_manifest_committed = false;
 static bool s_device_fs_released = false;
@@ -123,6 +124,7 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
             return;
         }
 
+        s_recording_recovered = false;
         s_wav_finalized = false;
         s_manifest_committed = false;
         s_device_fs_released = false;
@@ -150,6 +152,7 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
     if (event->id == TINYUSB_EVENT_SUSPENDED) {
         if (s_host_owned && !s_barrier_pending) {
             s_barrier_pending = true;
+            s_recording_recovered = false;
             // Suspend/bus-loss is ambiguous. It may only remove the device
             // logically and request the explicit quiescence barrier; it never
             // authorizes APP mount by itself.
@@ -168,6 +171,7 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
     if (event->id == TINYUSB_EVENT_DETACHED) {
         if (s_host_owned && !s_barrier_pending) {
             s_barrier_pending = true;
+            s_recording_recovered = false;
             ESP_LOGI(TAG,
                      "stage: usb, result: barrier-start, trigger: detach, owner: host");
             xEventGroupSetBits(s_usb_events, USB_BIT_BARRIER_REQUIRED);
@@ -196,6 +200,7 @@ esp_err_t usb_msc_ownership_init(void) {
     s_host_owned = false;
     s_barrier_pending = false;
     s_barrier_app_mounted = true;
+    s_recording_recovered = false;
     s_initialized = true;
     return ESP_OK;
 }
@@ -311,16 +316,29 @@ esp_err_t usb_msc_ownership_complete_disconnect_barrier(void) {
     return ESP_OK;
 }
 
+esp_err_t usb_msc_ownership_note_recording_recovered(void) {
+    if (!s_initialized || s_started || s_host_owned || s_barrier_pending ||
+        !s_barrier_app_mounted || !sd_mount_is_mounted()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_recording_recovered = true;
+    ESP_LOGI(TAG,
+             "stage: usb, result: recovery-proof, owner: device, recording: ready");
+    return ESP_OK;
+}
+
 esp_err_t usb_msc_ownership_rearm(void) {
     esp_err_t err;
 
     if (!s_initialized || s_started || s_host_owned || s_barrier_pending ||
-        !s_barrier_app_mounted || !sd_mount_is_mounted()) {
+        !s_barrier_app_mounted || !sd_mount_is_mounted() ||
+        !s_recording_recovered) {
         return ESP_ERR_INVALID_STATE;
     }
 
     xEventGroupClearBits(s_usb_events,
                          USB_PUBLIC_BITS | USB_BIT_PREPARE_OK);
+    s_recording_recovered = false;
     s_wav_finalized = false;
     s_manifest_committed = false;
     s_device_fs_released = false;
@@ -364,6 +382,10 @@ esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
 }
 
 esp_err_t usb_msc_ownership_complete_disconnect_barrier(void) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t usb_msc_ownership_note_recording_recovered(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
 

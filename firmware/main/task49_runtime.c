@@ -181,7 +181,8 @@ static void recorder_handle_usb_detach(void) {
     if (!recorder_wait_initial_recording()) {
         return;
     }
-    if (usb_msc_ownership_rearm() != ESP_OK) {
+    if (usb_msc_ownership_note_recording_recovered() != ESP_OK ||
+        usb_msc_ownership_rearm() != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_USB);
     }
 }

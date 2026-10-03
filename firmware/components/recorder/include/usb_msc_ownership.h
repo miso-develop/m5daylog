@@ -55,6 +55,11 @@ esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
 // Any failure leaves Device filesystem access disabled.
 esp_err_t usb_msc_ownership_complete_disconnect_barrier(void);
 
+// Record the fresh-session recovery proof after Device remount and the new
+// recorder session has observably reached RECORDING. This proof is accepted
+// only after a successful reverse barrier and is consumed by rearm.
+esp_err_t usb_msc_ownership_note_recording_recovered(void);
+
 // Start a fresh USB publication session only after Device remount and recording
 // recovery have completed. Stale event bits/proofs do not cross sessions.
 esp_err_t usb_msc_ownership_rearm(void);
