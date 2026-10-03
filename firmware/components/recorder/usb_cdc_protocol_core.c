@@ -1,0 +1,327 @@
+// Task #50: portable production parser/dispatcher + line framer.
+
+#include "usb_cdc_protocol_core.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "cJSON.h"
+#include "recorder_config.h"
+
+static bool cdc_id_valid(const char *id) {
+    size_t i;
+    size_t len;
+    if (id == NULL) {
+        return false;
+    }
+    len = strlen(id);
+    if (len == 0u || len > USB_CDC_PROTOCOL_MAX_ID_BYTES) {
+        return false;
+    }
+    for (i = 0; i < len; ++i) {
+        char c = id[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' ||
+              c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cdc_utf8_valid(const uint8_t *data, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        uint8_t c = data[i++];
+        uint32_t code;
+        unsigned need;
+        unsigned j;
+        if (c == 0u) {
+            return false;
+        }
+        if (c < 0x80u) {
+            continue;
+        }
+        if (c >= 0xc2u && c <= 0xdfu) {
+            code = c & 0x1fu;
+            need = 1u;
+        } else if (c >= 0xe0u && c <= 0xefu) {
+            code = c & 0x0fu;
+            need = 2u;
+        } else if (c >= 0xf0u && c <= 0xf4u) {
+            code = c & 0x07u;
+            need = 3u;
+        } else {
+            return false;
+        }
+        if (i + need > len) {
+            return false;
+        }
+        for (j = 0; j < need; ++j) {
+            uint8_t cc = data[i++];
+            if ((cc & 0xc0u) != 0x80u) {
+                return false;
+            }
+            code = (code << 6u) | (cc & 0x3fu);
+        }
+        if ((need == 1u && code < 0x80u) ||
+            (need == 2u && code < 0x800u) ||
+            (need == 3u && code < 0x10000u) || code > 0x10ffffu ||
+            (code >= 0xd800u && code <= 0xdfffu)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int cdc_error_response(char *out, size_t out_size, const char *id,
+                              const char *code) {
+    if (id != NULL && cdc_id_valid(id)) {
+        return snprintf(out, out_size,
+                        "{\"id\":\"%s\",\"ok\":false,\"error\":{"
+                        "\"code\":\"%s\",\"message\":\"%s\"}}",
+                        id, code, code);
+    }
+    return snprintf(out, out_size,
+                    "{\"id\":null,\"ok\":false,\"error\":{"
+                    "\"code\":\"%s\",\"message\":\"%s\"}}",
+                    code, code);
+}
+
+static bool cdc_args_empty(const cJSON *args) {
+    return cJSON_IsObject(args) && args->child == NULL;
+}
+
+static const char *cdc_rtc_error_code(rtc_correction_result_t result) {
+    switch (result) {
+        case RTC_CORRECTION_INVALID_ARGS:
+            return USB_CDC_ERROR_INVALID_ARGS;
+        case RTC_CORRECTION_RANGE_ERROR:
+            return USB_CDC_ERROR_RANGE_ERROR;
+        case RTC_CORRECTION_BUSY:
+            return USB_CDC_ERROR_BUSY;
+        case RTC_CORRECTION_INTERNAL_ERROR:
+        default:
+            return USB_CDC_ERROR_INTERNAL_ERROR;
+    }
+}
+
+void usb_cdc_protocol_framer_init(usb_cdc_protocol_framer_t *framer) {
+    usb_cdc_protocol_framer_reset(framer);
+}
+
+void usb_cdc_protocol_framer_reset(usb_cdc_protocol_framer_t *framer) {
+    if (framer == NULL) {
+        return;
+    }
+    framer->line_len = 0u;
+    framer->oversized = false;
+}
+
+usb_cdc_protocol_frame_result_t usb_cdc_protocol_framer_feed(
+    usb_cdc_protocol_framer_t *framer,
+    uint8_t byte,
+    const uint8_t **out_line,
+    size_t *out_len) {
+    size_t payload_len;
+    bool too_large;
+
+    if (out_line != NULL) {
+        *out_line = NULL;
+    }
+    if (out_len != NULL) {
+        *out_len = 0u;
+    }
+    if (framer == NULL || out_line == NULL || out_len == NULL) {
+        return USB_CDC_PROTOCOL_FRAME_NONE;
+    }
+
+    if (byte != '\n') {
+        if (!framer->oversized) {
+            if (framer->line_len < USB_CDC_PROTOCOL_MAX_LINE_BYTES + 1u) {
+                framer->line[framer->line_len++] = byte;
+            } else {
+                framer->oversized = true;
+            }
+        }
+        return USB_CDC_PROTOCOL_FRAME_NONE;
+    }
+
+    payload_len = framer->line_len;
+    if (payload_len != 0u && framer->line[payload_len - 1u] == '\r') {
+        payload_len--;
+    }
+    too_large = framer->oversized ||
+                payload_len > USB_CDC_PROTOCOL_MAX_LINE_BYTES;
+    *out_line = framer->line;
+    *out_len = too_large ? USB_CDC_PROTOCOL_MAX_LINE_BYTES + 1u : payload_len;
+    framer->line_len = 0u;
+    framer->oversized = false;
+    return too_large ? USB_CDC_PROTOCOL_FRAME_TOO_LARGE
+                     : USB_CDC_PROTOCOL_FRAME_LINE;
+}
+
+int usb_cdc_protocol_process_line(
+    const uint8_t *line,
+    size_t len,
+    char *out,
+    size_t out_size,
+    const usb_cdc_protocol_config_t *config,
+    usb_cdc_protocol_set_time_fn_t set_time) {
+    char json[USB_CDC_PROTOCOL_MAX_LINE_BYTES + 1u];
+    cJSON *root = NULL;
+    cJSON *id_item;
+    cJSON *cmd_item;
+    cJSON *args_item;
+    const char *id = NULL;
+    const char *cmd;
+    int n = -1;
+
+    if (out == NULL || out_size == 0u) {
+        return -1;
+    }
+    if (len > USB_CDC_PROTOCOL_MAX_LINE_BYTES) {
+        return cdc_error_response(out, out_size, NULL,
+                                  USB_CDC_ERROR_REQUEST_TOO_LARGE);
+    }
+    if (line == NULL) {
+        return -1;
+    }
+    if (!cdc_utf8_valid(line, len)) {
+        return cdc_error_response(out, out_size, NULL,
+                                  USB_CDC_ERROR_INVALID_JSON);
+    }
+    memcpy(json, line, len);
+    json[len] = '\0';
+
+    // Require the entire framed line to be one JSON value; do not accept a
+    // valid prefix followed by trailing non-whitespace bytes.
+    root = cJSON_ParseWithOpts(json, NULL, true);
+    if (root == NULL) {
+        return cdc_error_response(out, out_size, NULL,
+                                  USB_CDC_ERROR_INVALID_JSON);
+    }
+    if (!cJSON_IsObject(root)) {
+        n = cdc_error_response(out, out_size, NULL,
+                               USB_CDC_ERROR_INVALID_REQUEST);
+        goto done;
+    }
+    id_item = cJSON_GetObjectItemCaseSensitive(root, "id");
+    if (!cJSON_IsString(id_item) || id_item->valuestring == NULL ||
+        !cdc_id_valid(id_item->valuestring)) {
+        n = cdc_error_response(out, out_size, NULL,
+                               USB_CDC_ERROR_INVALID_REQUEST);
+        goto done;
+    }
+    id = id_item->valuestring;
+    cmd_item = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+    args_item = cJSON_GetObjectItemCaseSensitive(root, "args");
+    if (!cJSON_IsString(cmd_item) || cmd_item->valuestring == NULL ||
+        !cJSON_IsObject(args_item)) {
+        n = cdc_error_response(out, out_size, id,
+                               USB_CDC_ERROR_INVALID_REQUEST);
+        goto done;
+    }
+    cmd = cmd_item->valuestring;
+
+    if (strcmp(cmd, "PING") == 0) {
+        if (!cdc_args_empty(args_item)) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INVALID_ARGS);
+        } else {
+            n = snprintf(out, out_size,
+                         "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                         "\"pong\":true}}",
+                         id);
+        }
+    } else if (strcmp(cmd, "GET_INFO") == 0) {
+        if (!cdc_args_empty(args_item)) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INVALID_ARGS);
+        } else if (config == NULL || config->device_id == NULL) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INTERNAL_ERROR);
+        } else {
+            n = snprintf(
+                out, out_size,
+                "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                "\"protocolMajor\":%u,\"schemaVersion\":%u,"
+                "\"deviceId\":\"%s\",\"model\":\"%s\","
+                "\"firmwareVersion\":\"%s\",\"audioCapabilities\":{"
+                "\"sampleRate\":%u,\"bitDepth\":%u,\"channels\":%u,"
+                "\"format\":\"pcm\"}}}",
+                id, (unsigned)USB_CDC_PROTOCOL_MAJOR,
+                (unsigned)RECORDER_METADATA_SCHEMA_VERSION, config->device_id,
+                RECORDER_MODEL, RECORDER_FIRMWARE_VERSION,
+                (unsigned)RECORDER_SAMPLE_RATE_HZ,
+                (unsigned)RECORDER_BITS_PER_SAMPLE,
+                (unsigned)RECORDER_CHANNELS);
+        }
+    } else if (strcmp(cmd, "GET_STATUS") == 0) {
+        usb_cdc_protocol_status_t status;
+        memset(&status, 0, sizeof(status));
+        if (!cdc_args_empty(args_item)) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INVALID_ARGS);
+        } else if (config == NULL || config->status_provider == NULL ||
+                   !config->status_provider(&status, config->status_ctx) ||
+                   status.state == NULL || status.reason == NULL) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INTERNAL_ERROR);
+        } else if (status.battery_valid) {
+            n = snprintf(
+                out, out_size,
+                "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                "\"state\":\"%s\",\"reason\":\"%s\","
+                "\"batteryMv\":%d,\"rtcCorrectionPending\":%s}}",
+                id, status.state, status.reason, status.battery_mv,
+                status.rtc_correction_pending ? "true" : "false");
+        } else {
+            n = snprintf(
+                out, out_size,
+                "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                "\"state\":\"%s\",\"reason\":\"%s\","
+                "\"batteryMv\":null,\"rtcCorrectionPending\":%s}}",
+                id, status.state, status.reason,
+                status.rtc_correction_pending ? "true" : "false");
+        }
+    } else if (strcmp(cmd, "SET_TIME") == 0) {
+        cJSON *time_item = cJSON_GetObjectItemCaseSensitive(args_item, "time");
+        char normalized[RECORDER_ISO8601_STR_LEN];
+        rtc_correction_result_t result;
+        if (cJSON_GetArraySize(args_item) != 1 || !cJSON_IsString(time_item) ||
+            time_item->valuestring == NULL) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INVALID_ARGS);
+        } else if (set_time == NULL) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INTERNAL_ERROR);
+        } else {
+            memset(normalized, 0, sizeof(normalized));
+            result = set_time(time_item->valuestring, normalized,
+                              sizeof(normalized));
+            if (result != RTC_CORRECTION_OK) {
+                n = cdc_error_response(out, out_size, id,
+                                       cdc_rtc_error_code(result));
+            } else {
+                n = snprintf(out, out_size,
+                             "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                             "\"time\":\"%s\",\"eventPending\":true}}",
+                             id, normalized);
+            }
+        }
+    } else {
+        n = cdc_error_response(out, out_size, id,
+                               USB_CDC_ERROR_UNKNOWN_COMMAND);
+    }
+
+done:
+    // `id` points into root, so perform any overflow fallback while root is
+    // still alive. This keeps the error path free of use-after-free reads.
+    if (n < 0 || (size_t)n >= out_size) {
+        n = cdc_error_response(out, out_size, id,
+                               USB_CDC_ERROR_INTERNAL_ERROR);
+    }
+    cJSON_Delete(root);
+    return n;
+}
