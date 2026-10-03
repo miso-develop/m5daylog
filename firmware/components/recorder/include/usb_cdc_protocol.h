@@ -4,9 +4,10 @@
 //
 // Requests are UTF-8 JSON objects framed by LF (CRLF accepted on RX), with a
 // maximum payload of 1024 bytes excluding the terminator. Processing is
-// sequential and responses preserve request order. CDC transport callbacks
-// report connectivity/RX only; command admission is opened explicitly by the
-// recorder lifecycle after MSC ownership reaches USB_SYNC/CDC-ready.
+// sequential and responses preserve request order. CDC_EVENT_LINE_STATE_CHANGED
+// (DTR/RTS) resets partial framing/connectivity only; command admission is
+// opened explicitly by the recorder lifecycle after MSC ownership reaches
+// USB_SYNC/CDC-ready.
 
 #include <stdbool.h>
 #include <stddef.h>
