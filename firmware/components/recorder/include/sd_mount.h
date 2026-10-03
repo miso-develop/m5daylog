@@ -3,9 +3,8 @@
 // microSD SPI ownership + recording-directory bring-up.
 //
 // Task #49 makes the esp_tinyusb MSC storage object the single FAT/VFS owner
-// switch. The SD card and SPI transport stay initialized across an APP -> USB
-// -> APP cycle; only the filesystem registration moves. This prevents the
-// recorder and the PC from mounting/writing the same filesystem concurrently.
+// switch. Task #87 disables esp_tinyusb automatic ownership switching so a
+// suspend/bus-loss observation can only trigger an explicit quiescence barrier.
 
 #include <stdbool.h>
 
@@ -31,10 +30,18 @@ bool sd_mount_is_mounted(void);
 
 // Arm an APP -> USB handoff. The recorder keeps VFS access until its normal
 // terminal path calls sd_mount_unmount() after finalize + manifest commit.
-// At that point no Device file operation is allowed, but physical unmount is
-// left to esp_tinyusb's blocked MOUNT_START callback.
+// At that point no Device file operation is allowed, but the storage object is
+// kept alive until the explicit ownership transfer runs.
 esp_err_t sd_mount_release_for_usb(void);
 bool sd_mount_device_fs_released(void);
+
+// Task #87 explicit ownership transitions. APP -> USB is allowed only after
+// the recorder has logically released all Device filesystem access. USB -> APP
+// is allowed only after the USB device stack is quiesced; it deletes the old
+// USB-owned storage object first, so esp_tinyusb's deferred-write guard must
+// prove there is no queued host write before a new APP-owned storage is built.
+esp_err_t sd_mount_transfer_to_usb(void);
+esp_err_t sd_mount_transfer_to_app(void);
 
 // Called only from the esp_tinyusb storage callback after its physical
 // unmount/remount completes.
