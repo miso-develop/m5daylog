@@ -1,4 +1,4 @@
-"""Production-C regressions for Task #50 review findings REV-83-03/04."""
+"""Production-C regressions for Task #50 review findings REV-83-03..07."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ GATE = COMP / "usb_cdc_session_gate.c"
 GATE_HEADER = INCLUDE / "usb_cdc_session_gate.h"
 GATE_HARNESS = REPO / "firmware/tests/native/usb_cdc_session_gate_harness.c"
 TRANSPORT = COMP / "usb_cdc_protocol.c"
+PROTOCOL_HEADER = INCLUDE / "usb_cdc_protocol.h"
 RUNTIME = REPO / "firmware/main/task50_runtime.c"
 
 
@@ -64,10 +65,10 @@ def test_canonical_protocol_vectors_execute_production_c(tmp_path: Path) -> None
     assert "production protocol vectors: PASS" in run_result.stdout
 
 
-def test_detach_reset_dynamically_blocks_inflight_and_stale_commands(
+def test_detach_reset_dynamically_blocks_reopen_stale_batches_and_pre_ready_rx(
     tmp_path: Path,
 ) -> None:
-    """Execute the production session gate across SET_TIME/detach overlap."""
+    """Execute the production session gate across teardown/lifecycle races."""
 
     for required in (GATE, GATE_HEADER, GATE_HARNESS):
         assert required.exists(), f"missing production overlap source: {required}"
@@ -104,34 +105,72 @@ def test_detach_reset_dynamically_blocks_inflight_and_stale_commands(
         check=False,
     )
     assert run_result.returncode == 0, run_result.stdout + run_result.stderr
-    assert "production session gate overlap: PASS" in run_result.stdout
+    assert "production session gate lifecycle overlap: PASS" in run_result.stdout
 
 
-def test_transport_and_runtime_use_the_production_teardown_barrier() -> None:
-    """Wire the dynamically tested gate around the real command path/cutoff."""
+def test_transport_and_runtime_use_lifecycle_owned_admission_and_rx_snapshots() -> None:
+    """Wire the tested gate to the real RX path and recorder lifecycle cutoff."""
 
     src = TRANSPORT.read_text(encoding="utf-8")
+    header = PROTOCOL_HEADER.read_text(encoding="utf-8")
     runtime = RUNTIME.read_text(encoding="utf-8")
 
     assert '#include "usb_cdc_session_gate.h"' in src
-    worker_at = src.index("static void usb_cdc_worker_task")
+    assert "void usb_cdc_protocol_open_session(void);" in header
+
+    rx_at = src.index("static void usb_cdc_rx_callback")
+    line_state_at = src.index("static void usb_cdc_line_state_callback", rx_at)
+    worker_at = src.index("static void usb_cdc_worker_task", line_state_at)
     reset_at = src.index("void usb_cdc_protocol_reset_session", worker_at)
+    init_at = src.index("esp_err_t usb_cdc_protocol_init", reset_at)
+
+    rx_callback = src[rx_at:line_state_at]
+    line_callback = src[line_state_at:worker_at]
     worker = src[worker_at:reset_at]
+    reset_and_open = src[reset_at:init_at]
+
+    # TinyUSB transport callbacks may report connectivity/RX, but lifecycle
+    # ownership alone decides when commands become executable.
+    assert "usb_cdc_session_gate_open" not in rx_callback
+    assert "usb_cdc_session_gate_open" not in line_callback
+    assert "usb_cdc_session_gate_note_rx" in rx_callback
+
+    # Bind a dequeued batch to the gate state captured before TinyUSB read.
+    snapshot_at = worker.index("usb_cdc_session_gate_snapshot")
+    read_at = worker.index("tinyusb_cdcacm_read")
+    current_check_at = worker.index("usb_cdc_session_gate_snapshot_is_current", read_at)
+    discard_check_at = worker.index("usb_cdc_session_gate_should_discard_rx", read_at)
+    assert snapshot_at < read_at < current_check_at
+    assert snapshot_at < read_at < discard_check_at
+    assert "usb_cdc_session_gate_mark_rx_drained" in worker
+
     process_at = worker.index("usb_cdc_protocol_process_line")
     begin_at = worker.rfind("usb_cdc_session_gate_command_begin", 0, process_at)
     end_at = worker.index("usb_cdc_session_gate_command_end", process_at)
     assert begin_at >= 0
     assert begin_at < process_at < end_at
 
-    init_at = src.index("esp_err_t usb_cdc_protocol_init", reset_at)
-    reset = src[reset_at:init_at]
-    assert "s_connected = false" in reset
-    assert "usb_cdc_session_gate_reset" in reset
+    assert "s_connected = false" in reset_and_open
+    assert "usb_cdc_session_gate_reset" in reset_and_open
+    assert "void usb_cdc_protocol_open_session(void)" in reset_and_open
+    open_fn_at = reset_and_open.index("void usb_cdc_protocol_open_session(void)")
+    assert "usb_cdc_session_gate_open" in reset_and_open[open_fn_at:]
 
-    # Device remount/flush/restart begins only after that blocking reset returns.
-    detach_at = runtime.index("static void recorder_handle_usb_detach")
+    # Attach closes before prepare. Host-owned/USB_SYNC is the only lifecycle
+    # point that opens command admission. Detach closes again before recovery.
+    attach_at = runtime.index("static void recorder_handle_usb_attach")
+    host_owned_at = runtime.index("static void recorder_handle_usb_host_owned", attach_at)
+    detach_at = runtime.index("static void recorder_handle_usb_detach", host_owned_at)
     app_main_at = runtime.index("void app_main", detach_at)
+    attach = runtime[attach_at:host_owned_at]
+    host_owned = runtime[host_owned_at:detach_at]
     detach = runtime[detach_at:app_main_at]
+
+    assert "usb_cdc_protocol_reset_session();" in attach
+    transition = host_owned.index("RECORDER_STATE_USB_SYNC")
+    lifecycle_open = host_owned.index("usb_cdc_protocol_open_session();")
+    assert transition < lifecycle_open
+
     reset_call = detach.index("usb_cdc_protocol_reset_session();")
     remount = detach.index("sd_mount_remount_after_usb")
     flush = detach.index("rtc_correction_flush_pending_event", remount)
