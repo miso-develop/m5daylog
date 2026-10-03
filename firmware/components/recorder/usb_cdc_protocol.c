@@ -1,8 +1,9 @@
 // Task #50: bounded sequential USB CDC JSON protocol v1 transport.
 //
 // TinyUSB callbacks never parse JSON or synchronously flush TX. They only
-// signal a dedicated worker, avoiding callback-context deadlock/latency while
-// preserving strict request/response ordering. No request payload is logged.
+// update session admission and signal a dedicated worker. Complete commands are
+// executed behind a generation-tagged session gate so physical teardown has a
+// strict mutation cutoff before remount/event-flush/recording restart.
 
 #include "usb_cdc_protocol.h"
 
@@ -13,11 +14,11 @@
 
 #include "device_identity.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "rtc_correction.h"
 #include "tinyusb_cdc_acm.h"
 #include "usb_cdc_protocol_core.h"
+#include "usb_cdc_session_gate.h"
 
 #define CDC_RX_CHUNK_BYTES 256u
 #define CDC_RESPONSE_BYTES 768u
@@ -25,7 +26,7 @@
 
 static usb_cdc_protocol_config_t s_config;
 static TaskHandle_t s_worker = NULL;
-static SemaphoreHandle_t s_command_lock = NULL;
+static usb_cdc_session_gate_t s_session_gate;
 static volatile bool s_connected = false;
 static volatile bool s_reset_line = false;
 static bool s_initialized = false;
@@ -63,7 +64,10 @@ static bool cdc_write_response(const char *response, size_t len) {
 static void usb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
     (void)itf;
     (void)event;
+    // RX itself is sufficient evidence that the current post-reset CDC session
+    // is usable, even on hosts that do not assert DTR/RTS in the expected way.
     s_connected = true;
+    usb_cdc_session_gate_open(&s_session_gate);
     if (s_worker != NULL) {
         xTaskNotifyGive(s_worker);
     }
@@ -79,14 +83,28 @@ static void usb_cdc_line_state_callback(int itf, cdcacm_event_t *event) {
                 event->line_state_changed_data.rts;
     s_connected = connected;
     s_reset_line = true;
+    if (connected) {
+        usb_cdc_session_gate_open(&s_session_gate);
+    } else {
+        // Callback context must not block. Closing admission also increments the
+        // generation, so a complete frame from the old session cannot execute
+        // if a fast reconnect opens admission before the worker reaches it.
+        usb_cdc_session_gate_close(&s_session_gate);
+    }
     if (s_worker != NULL) {
         xTaskNotifyGive(s_worker);
     }
 }
 
+static void cdc_session_gate_wait(void *ctx) {
+    (void)ctx;
+    vTaskDelay(1);
+}
+
 static void usb_cdc_worker_task(void *arg) {
     usb_cdc_protocol_framer_t framer;
     uint8_t chunk[CDC_RX_CHUNK_BYTES];
+    uint32_t frame_generation = 0u;
     (void)arg;
 
     usb_cdc_protocol_framer_init(&framer);
@@ -115,24 +133,25 @@ static void usb_cdc_worker_task(void *arg) {
                 char response[CDC_RESPONSE_BYTES];
                 int response_len = 0;
 
+                // Tag the frame at its first byte. reset/close increments the
+                // generation, permanently invalidating a complete old-session
+                // frame even if the host reconnects before it executes.
+                if (framer.line_len == 0u && !framer.oversized) {
+                    frame_generation =
+                        usb_cdc_session_gate_generation(&s_session_gate);
+                }
                 frame_result = usb_cdc_protocol_framer_feed(
                     &framer, chunk[i], &frame_line, &frame_len);
                 if (frame_result == USB_CDC_PROTOCOL_FRAME_NONE) {
                     continue;
                 }
 
-                // Serialize every complete command against the physical USB
-                // teardown barrier. A reset closes admission first; therefore
-                // a worker that acquires this lock after reset must re-check
-                // s_connected and discard the line rather than mutate state.
-                if (s_command_lock != NULL &&
-                    xSemaphoreTake(s_command_lock, portMAX_DELAY) == pdTRUE) {
-                    if (s_connected) {
-                        response_len = usb_cdc_protocol_process_line(
-                            frame_line, frame_len, response, sizeof(response),
-                            &s_config, rtc_correction_apply);
-                    }
-                    xSemaphoreGive(s_command_lock);
+                if (usb_cdc_session_gate_command_begin(&s_session_gate,
+                                                       frame_generation)) {
+                    response_len = usb_cdc_protocol_process_line(
+                        frame_line, frame_len, response, sizeof(response),
+                        &s_config, rtc_correction_apply);
+                    usb_cdc_session_gate_command_end(&s_session_gate);
                 }
                 if (response_len > 0 && s_connected) {
                     (void)cdc_write_response(response, (size_t)response_len);
@@ -143,20 +162,16 @@ static void usb_cdc_worker_task(void *arg) {
 }
 
 void usb_cdc_protocol_reset_session(void) {
-    // Admission closes before the barrier. If a command already owns the
-    // mutex, wait for its entire parser/dispatcher + RTC/NVS transaction to
-    // finish. If it has not entered yet, its post-lock s_connected check
-    // prevents it from executing after this boundary. Consequently the caller
-    // may remount/flush only after all pre-boundary SET_TIME effects are fixed.
+    // Physical attach/detach uses a blocking reset. It closes admission and
+    // invalidates pre-reset frames before waiting for any command already in
+    // rtc_correction_apply() to finish its RTC/NVS transaction. Therefore the
+    // caller may remount/flush only after all pre-boundary effects are fixed.
     s_connected = false;
     s_reset_line = true;
     if (s_worker != NULL) {
         xTaskNotifyGive(s_worker);
     }
-    if (s_command_lock != NULL &&
-        xSemaphoreTake(s_command_lock, portMAX_DELAY) == pdTRUE) {
-        xSemaphoreGive(s_command_lock);
-    }
+    usb_cdc_session_gate_reset(&s_session_gate, cdc_session_gate_wait, NULL);
 }
 
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
@@ -168,10 +183,7 @@ esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
     if (s_initialized) {
         return ESP_OK;
     }
-    s_command_lock = xSemaphoreCreateMutex();
-    if (s_command_lock == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
+    usb_cdc_session_gate_init(&s_session_gate);
     s_config = *config;
     s_initialized = true;
     return ESP_OK;
