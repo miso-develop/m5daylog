@@ -32,6 +32,10 @@ typedef struct {
     _Atomic uint32_t generation;
     _Atomic uint32_t active_commands;
     _Atomic uint32_t phase;
+    // Serializes the CDC-ready publication decision with RX classification.
+    // Without this boundary, an RX callback can observe CLOSED immediately
+    // before lifecycle OPEN and publish a stale-discard epoch afterward.
+    _Atomic bool rx_phase_lock;
     // RX arriving while admission is closed/resetting is stale with respect to
     // the next lifecycle-owned CDC-ready point. The worker drains through an
     // empty TinyUSB read before clearing the corresponding epoch.
@@ -44,8 +48,11 @@ uint32_t usb_cdc_session_gate_generation(const usb_cdc_session_gate_t *gate);
 bool usb_cdc_session_gate_is_open(const usb_cdc_session_gate_t *gate);
 
 // Open command admission only from the recorder lifecycle's CDC-ready point.
-// A RESETTING gate cannot be reopened by a concurrent call.
-void usb_cdc_session_gate_open(usb_cdc_session_gate_t *gate);
+// Returns false while RESETTING, while the gate is not stably CLOSED, or while
+// stale RX still requires a drain-to-empty pass. RX classification is
+// serialized with the CLOSED -> OPEN publication so a callback cannot create a
+// stale discard epoch after this function successfully publishes CDC-ready.
+bool usb_cdc_session_gate_open(usb_cdc_session_gate_t *gate);
 
 // Non-blocking close for callback context. Already running commands may finish,
 // but old frames are immediately invalidated by the generation increment.
