@@ -98,6 +98,10 @@ class ContractSemanticParityTests(unittest.TestCase):
         document["schemaVersion"] = 1.0
         sync.validate_contract_document(document, CONTRACTS / "device.schema.json")
 
+    def test_accepts_datetime_with_terminal_lf_like_canonical_validator(self):
+        document = valid_manifest(updated_at="2026-10-03T12:00:00Z\n")
+        sync.validate_contract_document(document, CONTRACTS / "manifest.schema.json")
+
 
 @unittest.skipIf(not hasattr(os, "symlink"), "symlink unsupported")
 class NestedDeviceTargetTests(unittest.TestCase):
