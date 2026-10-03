@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "deviceId": "11111111-2222-4333-8444-555555555555",
+  "updatedAt": "2026-10-03T11:00:00+09:00",
+  "recordings": [
+    {
+      "recordingId": "01234567-89ab-4def-8123-456789abcdef",
+      "filename": "recordings/2026-10-03/104500_01234567-89ab-4def-8123-456789abcdef.wav",
+      "startedAt": "2026-10-03T10:45:00+09:00",
+      "durationMs": 875000,
+      "sizeBytes": 28000044,
+      "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "sampleRate": 16000,
+      "bitDepth": 16,
+      "channels": 1,
+      "state": "recovered",
+      "firmwareVersion": "0.1.0"
+    }
+  ]
+}
