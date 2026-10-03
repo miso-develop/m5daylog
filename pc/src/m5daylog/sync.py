@@ -506,19 +506,18 @@ def _device_root(mount: Path) -> Path:
         raise SyncValidationError("unable to resolve Device mount") from None
 
 
-def _reject_paths_inside_device(device_root: Path, *paths: Path) -> None:
-    """Reject paths whose current resolved target is on the Device mount.
+def _resolve_sync_target(path: Path) -> Path:
+    """Resolve existing reparse/symlink components without requiring the leaf."""
+    try:
+        return path.resolve(strict=False)
+    except OSError:
+        raise SyncValidationError("unable to resolve sync target paths") from None
 
-    ``Path.resolve(strict=False)`` follows existing symlink/reparse components
-    while allowing not-yet-created suffixes. This catches a local library root
-    that is safe itself but contains a nested junction/symlink into the Device,
-    as well as a pre-existing partial/final symlink that targets Device media.
-    """
+
+def _reject_paths_inside_device(device_root: Path, *paths: Path) -> None:
+    """Reject paths whose current resolved target is on the Device mount."""
     for path in paths:
-        try:
-            candidate = path.resolve(strict=False)
-        except OSError:
-            raise SyncValidationError("unable to resolve sync target paths") from None
+        candidate = _resolve_sync_target(path)
         try:
             candidate.relative_to(device_root)
         except ValueError:
@@ -526,19 +525,50 @@ def _reject_paths_inside_device(device_root: Path, *paths: Path) -> None:
         raise SyncValidationError("local sync target must be outside Device mount")
 
 
+def _reject_recording_target_paths(
+    device_root: Path,
+    resolved_library_root: Path,
+    *paths: Path,
+) -> None:
+    """Keep recording final/partial targets inside the pinned local library.
+
+    The library root is resolved once before local sync state is created. Each
+    derived target is then re-resolved at write/publication boundaries so a
+    nested reparse/symlink cannot redirect M5Daylog writes outside that root or
+    onto Device media.
+    """
+    for path in paths:
+        candidate = _resolve_sync_target(path)
+        try:
+            candidate.relative_to(device_root)
+        except ValueError:
+            pass
+        else:
+            raise SyncValidationError("local sync target must be outside Device mount")
+
+        try:
+            candidate.relative_to(resolved_library_root)
+        except ValueError:
+            raise SyncValidationError(
+                "local recording target must remain within library root"
+            ) from None
+
+
 def _reject_device_local_targets(
     mount: Path,
     library_root: Path,
     db_path: Path,
-) -> Path:
-    """Prevent caller-supplied local output paths from writing into Device media."""
+) -> tuple[Path, Path]:
+    """Validate caller-supplied roots before any local sync state is written."""
     device_root = _device_root(mount)
-    _reject_paths_inside_device(device_root, library_root, db_path)
-    return device_root
+    resolved_library_root = _resolve_sync_target(library_root)
+    _reject_paths_inside_device(device_root, resolved_library_root, db_path)
+    return device_root, resolved_library_root
 
 
 def _reject_derived_recording_targets(
     device_root: Path,
+    resolved_library_root: Path,
     library_root: Path,
     prepared: list[tuple[dict[str, Any], Path]],
 ) -> None:
@@ -546,7 +576,12 @@ def _reject_derived_recording_targets(
     for recording, _source in prepared:
         final_path = _target_path(library_root, recording)
         partial_path = Path(str(final_path) + ".partial")
-        _reject_paths_inside_device(device_root, final_path, partial_path)
+        _reject_recording_target_paths(
+            device_root,
+            resolved_library_root,
+            final_path,
+            partial_path,
+        )
 
 
 def sync_device(
@@ -566,8 +601,15 @@ def sync_device(
     prepared = _preflight(mount, device, manifest)
 
     db_target = Path(db_path).expanduser()
-    device_root = _reject_device_local_targets(mount, library, db_target)
-    _reject_derived_recording_targets(device_root, library, prepared)
+    device_root, resolved_library_root = _reject_device_local_targets(
+        mount, library, db_target
+    )
+    _reject_derived_recording_targets(
+        device_root,
+        resolved_library_root,
+        library,
+        prepared,
+    )
 
     db_file = init_db(db_target)
     connection = sqlite3.connect(str(db_file))
@@ -577,7 +619,12 @@ def sync_device(
         for recording, source in prepared:
             final_path = _target_path(library, recording)
             partial_path = Path(str(final_path) + ".partial")
-            _reject_paths_inside_device(device_root, final_path, partial_path)
+            _reject_recording_target_paths(
+                device_root,
+                resolved_library_root,
+                final_path,
+                partial_path,
+            )
 
             expected_size = recording["sizeBytes"]
             expected_sha = recording["sha256"]
@@ -609,8 +656,13 @@ def sync_device(
 
             final_path.parent.mkdir(parents=True, exist_ok=True)
             # Re-resolve after directory creation so an existing nested reparse
-            # point cannot be followed by the subsequent partial-file open.
-            _reject_paths_inside_device(device_root, final_path, partial_path)
+            # point cannot redirect the subsequent partial-file open.
+            _reject_recording_target_paths(
+                device_root,
+                resolved_library_root,
+                final_path,
+                partial_path,
+            )
             with source.open("rb") as reader:
                 copy_verified_stream(
                     reader,
@@ -620,13 +672,22 @@ def sync_device(
                 )
 
             # Re-check immediately before publication as well. This protects the
-            # no-clobber step from a pre-existing or newly surfaced final reparse
-            # target without changing the normal stale-partial recovery path.
-            _reject_paths_inside_device(device_root, final_path, partial_path)
+            # no-clobber step from a surfaced final/partial reparse target.
+            _reject_recording_target_paths(
+                device_root,
+                resolved_library_root,
+                final_path,
+                partial_path,
+            )
             try:
                 publish_no_clobber(partial_path, final_path)
             except FileExistsError:
-                _reject_paths_inside_device(device_root, final_path, partial_path)
+                _reject_recording_target_paths(
+                    device_root,
+                    resolved_library_root,
+                    final_path,
+                    partial_path,
+                )
                 if _file_matches(final_path, expected_size, expected_sha):
                     if partial_path.exists():
                         partial_path.unlink()
