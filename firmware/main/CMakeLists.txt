@@ -1,4 +1,4 @@
-# Task #49 compiles the proven Tasks #44-#48 main.c inside the USB ownership
-# coordinator translation unit. main.c remains the source-contract surface;
-# task49_runtime.c adds only lifecycle orchestration around it.
-idf_component_register(SRCS "task49_runtime.c" INCLUDE_DIRS "." REQUIRES recorder spi_flash)
+# Task #50 compiles the proven recorder main.c inside the USB coordinator
+# translation unit, preserving Task #49 exclusive MSC ownership while adding
+# CDC JSON and RTC-correction orchestration.
+idf_component_register(SRCS "task50_runtime.c" INCLUDE_DIRS "." REQUIRES recorder spi_flash)
