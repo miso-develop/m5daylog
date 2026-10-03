@@ -133,18 +133,17 @@ static esp_err_t sd_mount_install_msc_driver(void) {
 
 static esp_err_t sd_mount_create_storage(tinyusb_msc_mount_point_t mount_point) {
     tinyusb_msc_storage_config_t storage_cfg;
-    tinyusb_msc_storage_handle_t storage = NULL;
     esp_err_t err;
 
     if (!s_msc_driver_init || s_storage != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     sd_mount_fill_storage_config(&storage_cfg, mount_point);
-    err = tinyusb_msc_new_storage_sdmmc(&storage_cfg, &storage);
+    err = tinyusb_msc_new_storage_sdmmc(&storage_cfg, &s_storage);
     if (err != ESP_OK) {
+        s_storage = NULL;
         return err;
     }
-    s_storage = storage;
     return ESP_OK;
 }
 
