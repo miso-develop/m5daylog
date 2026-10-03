@@ -25,10 +25,14 @@ def test_barrier_teardown_precedes_storage_rebuild():
 def test_app_storage_rebuild_requires_zero_deferred_writes():
     sd = SD_C.read_text(encoding="utf-8")
 
+    helper_at = sd.index("static esp_err_t sd_mount_create_storage")
+    new_storage_at = sd.index("tinyusb_msc_new_storage_sdmmc", helper_at)
+    assert new_storage_at > helper_at
+
     fn_at = sd.index("esp_err_t sd_mount_transfer_to_app")
     delete_at = sd.index("tinyusb_msc_delete_storage", fn_at)
     clear_at = sd.index("s_storage = NULL", delete_at)
-    recreate_at = sd.index("tinyusb_msc_new_storage_sdmmc", clear_at)
+    recreate_at = sd.index("sd_mount_create_storage", clear_at)
     assert delete_at < clear_at < recreate_at
 
     # esp_tinyusb refuses storage deletion while deferred writes remain. The
