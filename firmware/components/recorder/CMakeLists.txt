@@ -18,6 +18,7 @@ idf_component_register(
         "sd_pcm_sink.c"
         "sd_mount.c"
         "usb_msc_ownership.c"
+        "usb_cdc_protocol_core.c"
         "usb_cdc_protocol.c"
         "rtc_correction.c"
     INCLUDE_DIRS

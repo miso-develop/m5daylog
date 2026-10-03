@@ -6,7 +6,8 @@
 // maximum payload of 1024 bytes excluding the terminator. Processing is
 // sequential and responses preserve request order. CDC_EVENT_LINE_STATE_CHANGED
 // (DTR/RTS) and the recorder's actual MSC USB session boundaries both reset
-// partial framing.
+// partial framing. A physical reset is also a command-execution barrier: when
+// it returns, no command admitted by the prior session is still executing.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -63,8 +64,9 @@ typedef struct {
 // unchanged.
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config);
 
-// Discard any partial RX frame at a real USB session boundary. The recorder
-// calls this on MSC attach/detach so a request can never span sessions.
+// Close command admission, wait for any command already executing to finish,
+// and discard partial RX framing at a real USB session boundary. This is the
+// teardown barrier required before remount/RTC-event flush/restart.
 void usb_cdc_protocol_reset_session(void);
 
 // Initialize CDC-ACM interface 0 and its dedicated sequential worker after

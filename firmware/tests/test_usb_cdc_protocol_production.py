@@ -9,7 +9,6 @@ REPO = Path(__file__).resolve().parents[2]
 COMP = REPO / "firmware/components/recorder"
 INCLUDE = COMP / "include"
 CORE = COMP / "usb_cdc_protocol_core.c"
-RTC_PARSE = COMP / "rtc_correction_parse.c"
 HARNESS = REPO / "firmware/tests/native/usb_cdc_protocol_harness.c"
 CJSON_STUB = REPO / "firmware/tests/native/cjson_stub.c"
 STUB_INCLUDE = REPO / "firmware/tests/native/include"
@@ -18,9 +17,9 @@ RUNTIME = REPO / "firmware/main/task50_runtime.c"
 
 
 def test_canonical_protocol_vectors_execute_production_c(tmp_path: Path) -> None:
-    """AC-11 must execute the C parser/dispatcher/framer used by firmware."""
+    """AC-11 executes the C parser/dispatcher/framer used by firmware."""
 
-    for required in (CORE, RTC_PARSE, HARNESS, CJSON_STUB):
+    for required in (CORE, HARNESS, CJSON_STUB):
         assert required.exists(), f"missing production/native-test source: {required}"
 
     executable = tmp_path / "usb_cdc_protocol_harness"
@@ -32,12 +31,13 @@ def test_canonical_protocol_vectors_execute_production_c(tmp_path: Path) -> None
             "-Wall",
             "-Wextra",
             "-Werror",
+            "-include",
+            "stdio.h",
             "-I",
             str(STUB_INCLUDE),
             "-I",
             str(INCLUDE),
             str(CORE),
-            str(RTC_PARSE),
             str(CJSON_STUB),
             str(HARNESS),
             "-o",

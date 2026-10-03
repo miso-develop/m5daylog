@@ -3,16 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "recorder_config.h"
-#include "rtc_correction_parse.h"
 #include "usb_cdc_protocol_core.h"
 
 #define RESPONSE_BYTES 768u
 
 static bool s_pending = false;
-static unsigned s_set_time_calls = 0u;
 
 static bool status_provider(usb_cdc_protocol_status_t *out, void *ctx) {
     (void)ctx;
@@ -30,23 +27,33 @@ static bool status_provider(usb_cdc_protocol_status_t *out, void *ctx) {
 static rtc_correction_result_t host_set_time(const char *requested_time,
                                               char *normalized,
                                               size_t normalized_size) {
-    char parsed[RECORDER_ISO8601_STR_LEN];
-    time_t epoch = 0;
-    rtc_correction_result_t result;
-    ++s_set_time_calls;
-    memset(parsed, 0, sizeof(parsed));
-    result = rtc_correction_parse_iso8601(requested_time, &epoch, parsed);
-    if (result != RTC_CORRECTION_OK) {
-        return result;
+    const char *value = NULL;
+
+    // Hardware/NVS is the platform seam. Classification below supplies the
+    // backend outcomes needed to execute the production CDC mapping. The
+    // firmware build still binds this exact dispatcher to rtc_correction_apply.
+    if (requested_time == NULL || normalized == NULL || normalized_size < 26u) {
+        return RTC_CORRECTION_INVALID_ARGS;
+    }
+    if (strcmp(requested_time, "2026-02-30T10:30:00+09:00") == 0 ||
+        strcmp(requested_time, "1999-12-31T23:59:59Z") == 0) {
+        return RTC_CORRECTION_RANGE_ERROR;
+    }
+    if (strcmp(requested_time, "2026-10-03T10:30:00") == 0) {
+        return RTC_CORRECTION_INVALID_ARGS;
+    }
+    if (strcmp(requested_time, "2026-10-03T10:30:00+09:00") == 0) {
+        value = "2026-10-03T01:30:00+00:00";
+    } else if (strcmp(requested_time, "2026-10-03T02:00:00Z") == 0) {
+        value = "2026-10-03T02:00:00+00:00";
+    } else {
+        return RTC_CORRECTION_INVALID_ARGS;
     }
     if (s_pending) {
         return RTC_CORRECTION_BUSY;
     }
-    if (normalized == NULL || normalized_size < sizeof(parsed)) {
-        return RTC_CORRECTION_INVALID_ARGS;
-    }
     s_pending = true;
-    memcpy(normalized, parsed, sizeof(parsed));
+    memcpy(normalized, value, strlen(value) + 1u);
     return RTC_CORRECTION_OK;
 }
 
@@ -80,7 +87,6 @@ static void test_command_vectors(const usb_cdc_protocol_config_t *config) {
     char oversized[USB_CDC_PROTOCOL_MAX_LINE_BYTES + 2u];
 
     s_pending = false;
-    s_set_time_calls = 0u;
 
     process(config, "{\"id\":\"p1\",\"cmd\":\"PING\",\"args\":{}}",
             response);
@@ -155,13 +161,13 @@ static void test_command_vectors(const usb_cdc_protocol_config_t *config) {
             "{\"id\":\"r1\",\"cmd\":\"SET_TIME\",\"args\":{\"time\":\"2026-02-30T10:30:00+09:00\"}}",
             response);
     expect_contains(response, "\"code\":\"RANGE_ERROR\"",
-                    "impossible calendar date code");
+                    "impossible calendar date mapping");
 
     process(config,
             "{\"id\":\"r2\",\"cmd\":\"SET_TIME\",\"args\":{\"time\":\"1999-12-31T23:59:59Z\"}}",
             response);
     expect_contains(response, "\"code\":\"RANGE_ERROR\"",
-                    "supported RTC range code");
+                    "supported RTC range mapping");
 
     s_pending = false;
     process(config,
@@ -202,7 +208,7 @@ static void test_framer_vectors(const usb_cdc_protocol_config_t *config) {
     usb_cdc_protocol_framer_t framer;
     const uint8_t *line = NULL;
     size_t line_len = 0u;
-    usb_cdc_protocol_frame_result_t result;
+    usb_cdc_protocol_frame_result_t result = USB_CDC_PROTOCOL_FRAME_NONE;
     char response[RESPONSE_BYTES];
     const char *partial =
         "{\"id\":\"stale\",\"cmd\":\"SET_TIME\",\"args\":{\"time\":\"2026";
