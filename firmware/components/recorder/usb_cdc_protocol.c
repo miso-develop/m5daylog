@@ -23,6 +23,7 @@
 
 #define CDC_RX_CHUNK_BYTES 256u
 #define CDC_RESPONSE_BYTES 768u
+#define CDC_WORKER_STACK_BYTES 6144u
 
 static usb_cdc_protocol_config_t s_config;
 static TaskHandle_t s_worker = NULL;
@@ -283,8 +284,8 @@ esp_err_t usb_cdc_protocol_start(void) {
     if (s_started) {
         return ESP_OK;
     }
-    if (xTaskCreate(usb_cdc_worker_task, "cdc_json", 6144, NULL, 3,
-                    &s_worker) != pdPASS) {
+    if (xTaskCreate(usb_cdc_worker_task, "cdc_json", CDC_WORKER_STACK_BYTES,
+                    NULL, 3, &s_worker) != pdPASS) {
         s_worker = NULL;
         return ESP_ERR_NO_MEM;
     }
