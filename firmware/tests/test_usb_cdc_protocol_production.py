@@ -1,4 +1,4 @@
-"""Production-C regressions for Task #50 review findings REV-83-03..07."""
+"""Production-C regressions for Task #50 review findings REV-83-03..08."""
 
 from __future__ import annotations
 
@@ -154,7 +154,10 @@ def test_transport_and_runtime_use_lifecycle_owned_admission_and_rx_snapshots() 
     assert "usb_cdc_session_gate_reset" in reset_and_open
     assert "void usb_cdc_protocol_open_session(void)" in reset_and_open
     open_fn_at = reset_and_open.index("void usb_cdc_protocol_open_session(void)")
-    assert "usb_cdc_session_gate_open" in reset_and_open[open_fn_at:]
+    open_region = reset_and_open[open_fn_at:]
+    assert "while (!usb_cdc_session_gate_open(&s_session_gate))" in open_region
+    assert "xTaskNotifyGive(s_worker)" in open_region
+    assert "vTaskDelay(1)" in open_region
 
     # Attach closes before prepare. Host-owned/USB_SYNC is the only lifecycle
     # point that opens command admission. Detach closes again before recovery.
