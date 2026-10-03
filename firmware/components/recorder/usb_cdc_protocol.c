@@ -1,9 +1,9 @@
 // Task #50: bounded sequential USB CDC JSON protocol v1 transport.
 //
-// TinyUSB callbacks never parse JSON or synchronously flush TX. They only
-// update session admission and signal a dedicated worker. Complete commands are
-// executed behind a generation-tagged session gate so physical teardown has a
-// strict mutation cutoff before remount/event-flush/recording restart.
+// TinyUSB callbacks never parse JSON or decide recorder lifecycle admission.
+// They only report connectivity/RX and signal a dedicated worker. Command
+// execution is admitted explicitly by the recorder's USB_SYNC/CDC-ready
+// lifecycle point and protected by a generation-tagged teardown barrier.
 
 #include "usb_cdc_protocol.h"
 
@@ -64,10 +64,12 @@ static bool cdc_write_response(const char *response, size_t len) {
 static void usb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
     (void)itf;
     (void)event;
-    // RX itself is sufficient evidence that the current post-reset CDC session
-    // is usable, even on hosts that do not assert DTR/RTS in the expected way.
     s_connected = true;
-    usb_cdc_session_gate_open(&s_session_gate);
+
+    // RX is transport evidence, not lifecycle authority. Bytes signalled before
+    // USB_SYNC/CDC-ready are marked stale and drained rather than making the
+    // command gate executable.
+    usb_cdc_session_gate_note_rx(&s_session_gate);
     if (s_worker != NULL) {
         xTaskNotifyGive(s_worker);
     }
@@ -83,14 +85,10 @@ static void usb_cdc_line_state_callback(int itf, cdcacm_event_t *event) {
                 event->line_state_changed_data.rts;
     s_connected = connected;
     s_reset_line = true;
-    if (connected) {
-        usb_cdc_session_gate_open(&s_session_gate);
-    } else {
-        // Callback context must not block. Closing admission also increments the
-        // generation, so a complete frame from the old session cannot execute
-        // if a fast reconnect opens admission before the worker reaches it.
-        usb_cdc_session_gate_close(&s_session_gate);
-    }
+
+    // DTR/RTS is not the recorder ownership lifecycle. It may reset framing and
+    // TX connectivity, but it never opens command admission. Physical attach /
+    // detach ownership boundaries are handled by reset_session() in task50.
     if (s_worker != NULL) {
         xTaskNotifyGive(s_worker);
     }
@@ -117,15 +115,40 @@ static void usb_cdc_worker_task(void *arg) {
             s_reset_line = false;
         }
         do {
+            usb_cdc_session_snapshot_t batch_snapshot;
+            uint32_t discard_epoch;
+
+            // Bind the TinyUSB batch to the session state that existed before
+            // acquisition. A reset between this snapshot and byte processing
+            // permanently invalidates the whole batch; it cannot be retagged as
+            // a later generation after reconnect.
+            batch_snapshot = usb_cdc_session_gate_snapshot(&s_session_gate);
+            discard_epoch =
+                usb_cdc_session_gate_rx_discard_epoch(&s_session_gate);
             got = 0u;
             if (tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, chunk, sizeof(chunk),
                                     &got) != ESP_OK) {
                 break;
             }
-            if (!s_connected) {
-                usb_cdc_protocol_framer_reset(&framer);
-                continue;  // drain stale bytes after disconnect; never execute
+
+            if (got == 0u) {
+                usb_cdc_session_gate_mark_rx_drained(&s_session_gate,
+                                                     discard_epoch);
+                break;
             }
+
+            if (s_reset_line) {
+                usb_cdc_protocol_framer_reset(&framer);
+                s_reset_line = false;
+            }
+            if (!s_connected ||
+                !usb_cdc_session_gate_snapshot_is_current(&s_session_gate,
+                                                          batch_snapshot) ||
+                usb_cdc_session_gate_should_discard_rx(&s_session_gate)) {
+                usb_cdc_protocol_framer_reset(&framer);
+                continue;
+            }
+
             for (i = 0u; i < got; ++i) {
                 const uint8_t *frame_line = NULL;
                 size_t frame_len = 0u;
@@ -133,12 +156,20 @@ static void usb_cdc_worker_task(void *arg) {
                 char response[CDC_RESPONSE_BYTES];
                 int response_len = 0;
 
-                // Tag the frame at its first byte. reset/close increments the
-                // generation, permanently invalidating a complete old-session
-                // frame even if the host reconnects before it executes.
+                // Revalidate at byte boundaries because reset may race a batch
+                // after acquisition. Any already-fed prefix is discarded.
+                if (s_reset_line || !s_connected ||
+                    !usb_cdc_session_gate_snapshot_is_current(
+                        &s_session_gate, batch_snapshot)) {
+                    usb_cdc_protocol_framer_reset(&framer);
+                    s_reset_line = false;
+                    break;
+                }
+
+                // A frame is tagged from the acquisition-time snapshot of its
+                // first byte, never from the gate state observed after a reset.
                 if (framer.line_len == 0u && !framer.oversized) {
-                    frame_generation =
-                        usb_cdc_session_gate_generation(&s_session_gate);
+                    frame_generation = batch_snapshot.generation;
                 }
                 frame_result = usb_cdc_protocol_framer_feed(
                     &framer, chunk[i], &frame_line, &frame_len);
@@ -162,16 +193,29 @@ static void usb_cdc_worker_task(void *arg) {
 }
 
 void usb_cdc_protocol_reset_session(void) {
-    // Physical attach/detach uses a blocking reset. It closes admission and
-    // invalidates pre-reset frames before waiting for any command already in
-    // rtc_correction_apply() to finish its RTC/NVS transaction. Therefore the
-    // caller may remount/flush only after all pre-boundary effects are fixed.
+    // Physical attach/detach owns this blocking reset. RESETTING prevents any
+    // concurrent reopen, generation invalidation rejects old frames/batches,
+    // and active commands finish before the caller can remount/flush/restart.
     s_connected = false;
     s_reset_line = true;
+    usb_cdc_session_gate_reset(&s_session_gate, cdc_session_gate_wait, NULL);
+    if (s_worker != NULL) {
+        // Reset marks the prior RX epoch stale. Wake the worker after that mark
+        // exists so it drains TinyUSB to an empty read before stale RX can ever
+        // become command input in a later lifecycle-owned open session.
+        xTaskNotifyGive(s_worker);
+    }
+}
+
+void usb_cdc_protocol_open_session(void) {
+    // Only task50's accepted USB_SYNC/CDC-ready transition calls this API.
+    // Pending stale RX, if any, remains non-executable until the worker has
+    // drained it to an empty read; snapshot/command admission checks enforce it.
+    s_reset_line = true;
+    usb_cdc_session_gate_open(&s_session_gate);
     if (s_worker != NULL) {
         xTaskNotifyGive(s_worker);
     }
-    usb_cdc_session_gate_reset(&s_session_gate, cdc_session_gate_wait, NULL);
 }
 
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
@@ -228,6 +272,9 @@ esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
 }
 
 void usb_cdc_protocol_reset_session(void) {
+}
+
+void usb_cdc_protocol_open_session(void) {
 }
 
 esp_err_t usb_cdc_protocol_start(void) {
