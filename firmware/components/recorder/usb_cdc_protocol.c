@@ -400,6 +400,14 @@ static void usb_cdc_worker_task(void *arg) {
     }
 }
 
+void usb_cdc_protocol_reset_session(void) {
+    s_connected = false;
+    s_reset_line = true;
+    if (s_worker != NULL) {
+        xTaskNotifyGive(s_worker);
+    }
+}
+
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
     if (config == NULL || config->device_id == NULL ||
         !device_identity_is_valid_uuid(config->device_id) ||
@@ -450,6 +458,9 @@ esp_err_t usb_cdc_protocol_start(void) {
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
     (void)config;
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+void usb_cdc_protocol_reset_session(void) {
 }
 
 esp_err_t usb_cdc_protocol_start(void) {

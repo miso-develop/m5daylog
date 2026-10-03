@@ -4,8 +4,8 @@
 //
 // Requests are UTF-8 JSON objects framed by LF (CRLF accepted on RX), with a
 // maximum payload of 1024 bytes excluding the terminator. Processing is
-// sequential and responses preserve request order. TinyUSB
-// CDC_EVENT_LINE_STATE_CHANGED resets partial framing on disconnect/reconnect.
+// sequential and responses preserve request order. DTR/RTS changes and the
+// recorder's actual MSC USB session boundaries both reset partial framing.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -61,6 +61,10 @@ typedef struct {
 // still owned by usb_msc_ownership_start() so MSC ownership semantics remain
 // unchanged.
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config);
+
+// Discard any partial RX frame at a real USB session boundary. The recorder
+// calls this on MSC attach/detach so a request can never span sessions.
+void usb_cdc_protocol_reset_session(void);
 
 // Initialize CDC-ACM interface 0 and its dedicated sequential worker after
 // the common TinyUSB driver has been installed by the MSC owner.

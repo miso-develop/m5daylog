@@ -162,6 +162,10 @@ static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
 static void recorder_handle_usb_attach(void) {
     EventBits_t done;
 
+    // MSC MOUNT_START is the actual new USB session boundary. Discard any
+    // stale partial CDC request before the host can own this session.
+    usb_cdc_protocol_reset_session();
+
     if (recorder_current_state() != RECORDER_STATE_RECORDING) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
@@ -205,6 +209,10 @@ static void recorder_handle_usb_host_owned(void) {
 }
 
 static void recorder_handle_usb_detach(void) {
+    // MSC remount-to-app completion is the actual detach boundary. Reset the
+    // CDC framer before SD remount/recovery so no line spans USB sessions.
+    usb_cdc_protocol_reset_session();
+
     if (recorder_current_state() != RECORDER_STATE_USB_SYNC) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;

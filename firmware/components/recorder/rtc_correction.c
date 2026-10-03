@@ -139,7 +139,7 @@ static rtc_correction_result_t rtc_parse_iso8601(const char *text,
     if (month < 1 || month > 12 || day < 1 ||
         day > rtc_days_in_month(year, month) || hour < 0 || hour > 23 ||
         minute < 0 || minute > 59 || second < 0 || second > 59) {
-        return RTC_CORRECTION_INVALID_ARGS;
+        return RTC_CORRECTION_RANGE_ERROR;
     }
 
     pos = 19u;
