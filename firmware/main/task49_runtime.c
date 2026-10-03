@@ -1,10 +1,10 @@
-// Task #49 runtime coordinator.
+// Tasks #49/#87 runtime coordinator.
 //
 // Keep the proven Tasks #44-#48 recorder implementation in main.c unchanged,
 // but compile it in this translation unit so this coordinator can reuse its
 // private lifecycle/task primitives. vTaskDelete is intercepted only to emit
 // task-completion bits before the original task destroys itself; this makes a
-// fast USB cable removal safe to restart without overlapping old tasks.
+// fast USB ownership cycle safe to restart without overlapping old tasks.
 
 #include <string.h>
 
@@ -127,7 +127,7 @@ static void recorder_handle_usb_attach(void) {
         (done & REC_BIT_WRITER_FINALIZED) == 0 ||
         recorder_current_state() != RECORDER_STATE_USB_PREPARE ||
         !sd_mount_device_fs_released()) {
-        // Never release TinyUSB's blocked MOUNT_START on any failed proof.
+        // Never release the blocked TinyUSB ATTACHED callback on failed proof.
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
@@ -151,7 +151,8 @@ static void recorder_handle_usb_host_owned(void) {
 }
 
 static void recorder_handle_usb_detach(void) {
-    if (recorder_current_state() != RECORDER_STATE_USB_SYNC) {
+    if (recorder_current_state() != RECORDER_STATE_USB_SYNC ||
+        usb_msc_ownership_is_host_owned()) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
@@ -165,8 +166,9 @@ static void recorder_handle_usb_detach(void) {
         return;
     }
 
-    // Processed-ACK retention is deliberately Task #52. Task #49 only
-    // restores exclusive Device ownership and starts a fresh recording ID.
+    // Processed-ACK retention is deliberately Task #52. Task #87 only
+    // restores exclusive Device ownership, starts a fresh recording ID, then
+    // re-enables USB after RECORDING is observable again.
     if (!recorder_transition_state(RECORDER_STATE_RECOVER,
                                    RECORDER_REASON_RECOVERY, 0)) {
         recorder_enter_error(RECORDER_REASON_USB);
@@ -174,6 +176,29 @@ static void recorder_handle_usb_detach(void) {
     }
     if (!recorder_start_session()) {
         recorder_enter_error(RECORDER_REASON_INTERNAL);
+        return;
+    }
+    if (!recorder_wait_initial_recording()) {
+        return;
+    }
+    if (usb_msc_ownership_rearm() != ESP_OK) {
+        recorder_enter_error(RECORDER_REASON_USB);
+    }
+}
+
+static void recorder_handle_usb_barrier(void) {
+    if (recorder_current_state() != RECORDER_STATE_USB_SYNC ||
+        sd_mount_is_mounted() ||
+        !usb_msc_ownership_is_host_owned()) {
+        recorder_enter_error(RECORDER_REASON_USB);
+        return;
+    }
+
+    // Success emits exactly one USB_MSC_EVENT_DETACH. The event loop consumes
+    // that event and performs REMOUNT once; this handler never remounts itself.
+    if (usb_msc_ownership_complete_disconnect_barrier() != ESP_OK) {
+        recorder_enter_error(RECORDER_REASON_USB);
+        return;
     }
 }
 
@@ -199,6 +224,9 @@ void app_main(void) {
                 break;
             case USB_MSC_EVENT_HOST_OWNED:
                 recorder_handle_usb_host_owned();
+                break;
+            case USB_MSC_EVENT_BARRIER_REQUIRED:
+                recorder_handle_usb_barrier();
                 break;
             case USB_MSC_EVENT_DETACH:
                 recorder_handle_usb_detach();
