@@ -102,6 +102,29 @@ class ContractSemanticParityTests(unittest.TestCase):
         document = valid_manifest(updated_at="2026-10-03T12:00:00Z\n")
         sync.validate_contract_document(document, CONTRACTS / "manifest.schema.json")
 
+    def test_sync_accepts_canonical_started_at_with_terminal_lf(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mount = root / "drive"
+            library = root / "library"
+            db_path = root / "state.db"
+            write_device(mount)
+
+            manifest_path = mount / "M5DAYLOG" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["recordings"][0]["startedAt"] = "2026-10-03T01:02:03+09:00\n"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            summary = sync.sync_device(
+                mount,
+                library_root=library,
+                db_path=db_path,
+                contracts_dir=CONTRACTS,
+            )
+            final = library / "2026" / "10" / "03" / "raw" / f"{RECORDING_ID}.wav"
+            self.assertEqual(summary.copied, 1)
+            self.assertTrue(final.is_file())
+
 
 @unittest.skipIf(not hasattr(os, "symlink"), "symlink unsupported")
 class NestedDeviceTargetTests(unittest.TestCase):
