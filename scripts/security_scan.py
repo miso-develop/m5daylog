@@ -67,6 +67,20 @@ SIGNATURE_PATTERNS = {
 # repository identifier. The rule recognizes the public naming convention only.
 _PRIVATE_REPO_MARKER = "-" + "private"
 _REPO_COMPONENT = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+_REPO_IDENTIFIER = (
+    r"(?:" + _REPO_COMPONENT + r"/)?"
+    + _REPO_COMPONENT
+    + re.escape(_PRIVATE_REPO_MARKER)
+)
+_REPO_URL_IDENTIFIER = (
+    r"https?://"
+    + _REPO_COMPONENT
+    + r"/"
+    + _REPO_COMPONENT
+    + r"/"
+    + _REPO_COMPONENT
+    + re.escape(_PRIVATE_REPO_MARKER)
+)
 
 PRIVACY_PATTERNS = {
     "machine-path-windows": re.compile(
@@ -85,12 +99,12 @@ PRIVACY_PATTERNS = {
         r"(?<![A-Za-z0-9:])/(?:home|Users)/[A-Za-z0-9][A-Za-z0-9._-]*"
     ),
     "private-repository-identifier": re.compile(
-        r"(?<![A-Za-z0-9._/\\-])(?:"
-        + _REPO_COMPONENT
-        + r"/)?"
-        + _REPO_COMPONENT
-        + re.escape(_PRIVATE_REPO_MARKER)
-        + r"(?![A-Za-z0-9._/\\-])"
+        r"(?:"
+        r"(?<![A-Za-z0-9._/\\-])" + _REPO_IDENTIFIER
+        + r"|(?<![A-Za-z0-9])" + _REPO_URL_IDENTIFIER
+        + r")"
+        + r"(?![A-Za-z0-9._/\\-])",
+        re.IGNORECASE,
     ),
 }
 
@@ -159,7 +173,7 @@ class AllowEntry:
 def normalize_relative_path(raw: str) -> str:
     path = PurePosixPath(raw.replace("\\", "/"))
     if path.is_absolute() or ".." in path.parts or not path.parts:
-        raise ScanError(f"invalid repository-relative path: {raw!r}")
+        raise ScanError("invalid repository-relative path")
     return path.as_posix()
 
 
@@ -175,7 +189,11 @@ def load_allowlist(root: Path) -> list[AllowEntry]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ScanError(f"cannot read or parse {ALLOWLIST_FILE}") from exc
-    if payload.get("version") != 1 or not isinstance(payload.get("entries"), list):
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or not isinstance(payload.get("entries"), list)
+    ):
         raise ScanError(f"{ALLOWLIST_FILE} must contain version=1 and an entries array")
 
     entries: list[AllowEntry] = []
