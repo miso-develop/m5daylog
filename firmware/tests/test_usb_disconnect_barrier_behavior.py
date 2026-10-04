@@ -1,9 +1,9 @@
-"""Task #87 Strategy 2 behavioral tests for explicit-eject USB quiescence.
+"""Task #87 Strategy 2 behavioral tests for gated MSC publication and eject.
 
 The production ownership coordinator and persistent lifecycle implementation are
 compiled together against deterministic host stubs. The scenarios execute the
-START STOP UNIT eject seam, failure injection, and boot-visible fail-closed
-state rather than relying on source-text ordering alone.
+initial hidden attach, storage ownership publication, START STOP UNIT eject,
+failure injection, and boot-visible fail-closed state.
 """
 
 from pathlib import Path
@@ -91,6 +91,7 @@ STUB_HEADERS = {
         #include <stdbool.h>
         #include <stdint.h>
         bool tud_disconnect(void);
+        bool tud_connect(void);
         bool __real_tud_msc_start_stop_cb(uint8_t lun,
                                           uint8_t power_condition,
                                           bool start,
@@ -195,6 +196,7 @@ HARNESS = r"""
     static bool g_release_requested;
     static bool g_device_fs_released;
     static int g_disconnect_calls;
+    static int g_connect_calls;
     static int g_real_start_stop_calls;
     static int g_uninstall_calls;
     static int g_release_storage_calls;
@@ -251,22 +253,21 @@ HARNESS = r"""
     }
     void vEventGroupDelete(EventGroupHandle_t group) { free(group); }
     EventBits_t xEventGroupSetBits(EventGroupHandle_t group, EventBits_t bits) {
-        group->bits |= bits; return group->bits;
+        group->bits |= bits;
+        return group->bits;
     }
     EventBits_t xEventGroupClearBits(EventGroupHandle_t group, EventBits_t bits) {
-        EventBits_t before = group->bits; group->bits &= ~bits; return before;
+        EventBits_t before = group->bits;
+        group->bits &= ~bits;
+        return before;
     }
     EventBits_t xEventGroupWaitBits(EventGroupHandle_t group,
                                     EventBits_t bits,
                                     BaseType_t clear_on_exit,
                                     BaseType_t wait_for_all,
                                     TickType_t ticks) {
-        (void)wait_for_all; (void)ticks;
-        if (bits == (1u << 1) && (group->bits & bits) == 0) {
-            g_release_requested = true;
-            g_device_fs_released = true;
-            CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
-        }
+        (void)wait_for_all;
+        (void)ticks;
         EventBits_t result = group->bits;
         if (clear_on_exit && (result & bits) != 0) group->bits &= ~bits;
         return result;
@@ -296,22 +297,37 @@ HARNESS = r"""
 
     esp_err_t tinyusb_msc_set_storage_callback(tinyusb_msc_storage_callback_t cb,
                                                 void *arg) {
-        g_storage_cb = cb; g_storage_arg = arg; return ESP_OK;
+        g_storage_cb = cb;
+        g_storage_arg = arg;
+        return ESP_OK;
     }
     esp_err_t tinyusb_driver_install(const tinyusb_config_t *config) {
-        g_device_cb = config->event_cb; g_device_arg = config->event_arg; return ESP_OK;
+        g_device_cb = config->event_cb;
+        g_device_arg = config->event_arg;
+        return ESP_OK;
     }
     esp_err_t tinyusb_driver_uninstall(void) {
-        g_uninstall_calls++; return g_uninstall_result;
+        g_uninstall_calls++;
+        return g_uninstall_result;
     }
     bool tud_disconnect(void) {
-        g_disconnect_calls++; return true;
+        g_disconnect_calls++;
+        return true;
+    }
+    bool tud_connect(void) {
+        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(!g_mounted);
+        g_connect_calls++;
+        return true;
     }
     bool __real_tud_msc_start_stop_cb(uint8_t lun,
                                       uint8_t power_condition,
                                       bool start,
                                       bool load_eject) {
-        (void)lun; (void)power_condition; (void)start; (void)load_eject;
+        (void)lun;
+        (void)power_condition;
+        (void)start;
+        (void)load_eject;
         g_real_start_stop_calls++;
         return true;
     }
@@ -334,8 +350,19 @@ HARNESS = r"""
         CHECK(usb_msc_ownership_init() == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
         CHECK(g_device_cb != NULL);
+
         g_device_cb(&attached, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+        CHECK(g_disconnect_calls == 1);
+        CHECK(g_connect_calls == 0);
+        CHECK(!g_nvs_has_value);
+        CHECK(g_mounted);
+        CHECK(!usb_msc_ownership_is_host_owned());
+
+        g_release_requested = true;
+        g_device_fs_released = true;
+        CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
+        CHECK(g_connect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
@@ -346,16 +373,17 @@ HARNESS = r"""
     static void prove_ambiguous_events_do_not_release(void) {
         tinyusb_event_t suspended = { .id = TINYUSB_EVENT_SUSPENDED };
         tinyusb_event_t detached = { .id = TINYUSB_EVENT_DETACHED };
+
         g_device_cb(&suspended, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
-        CHECK(g_disconnect_calls == 0);
+        CHECK(g_disconnect_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         assert_reboot_stays_fail_closed();
 
         /* Accidental pre-eject physical detach remains unresolved across boot. */
         g_device_cb(&detached, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
-        CHECK(g_disconnect_calls == 0);
+        CHECK(g_disconnect_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         assert_reboot_stays_fail_closed();
     }
@@ -363,7 +391,7 @@ HARNESS = r"""
     static void request_explicit_eject(void) {
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, true));
         CHECK(g_real_start_stop_calls == 0);
-        CHECK(g_disconnect_calls == 1);
+        CHECK(g_disconnect_calls == 2);
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_REQUESTED);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
@@ -373,7 +401,7 @@ HARNESS = r"""
     static void run_success(void) {
         shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
         enter_host_owned();
-        assert_reboot_stays_fail_closed(); /* PC-owned before eject */
+        assert_reboot_stays_fail_closed();
         prove_ambiguous_events_do_not_release();
         request_explicit_eject();
         CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_OK);
@@ -386,7 +414,6 @@ HARNESS = r"""
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_QUIESCED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
 
-        /* Only successful quiescence + durable ARMED permits manual WAKE. */
         CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
         CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
         CHECK(shutdown_armed_boot_action(true, &action) == ESP_OK);
@@ -398,7 +425,7 @@ HARNESS = r"""
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, true, true));
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, false));
         CHECK(g_real_start_stop_calls == 2);
-        CHECK(g_disconnect_calls == 0);
+        CHECK(g_disconnect_calls == 1);
         CHECK(g_nvs_commit_calls == 1);
         assert_reboot_stays_fail_closed();
         CHECK(next_event() == USB_MSC_EVENT_NONE);
