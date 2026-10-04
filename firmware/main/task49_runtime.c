@@ -179,18 +179,20 @@ static void recorder_handle_usb_release(void) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
+
+    // A successful quiesce now includes the durable lifecycle transition from
+    // HOST_UNRESOLVED to SHUTDOWN_ARMED. Failure at USB teardown, deferred-write
+    // proof, storage release, or NVS commit therefore leaves the device
+    // fail-closed and never reaches HOLD release.
     if (usb_msc_ownership_complete_release_quiesce() != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
-    if (shutdown_armed_commit() != ESP_OK) {
-        recorder_enter_error(RECORDER_REASON_USB);
-        return;
-    }
 
-    // Armed intent is durable before HOLD is dropped. With USB still present
-    // deep sleep is a functional shutdown; after cable removal HOLD=0 permits
-    // the board's power circuit to switch off. This path never remounts SD.
+    // Armed intent is already durable before HOLD is dropped. With USB still
+    // present deep sleep is a functional shutdown; after cable removal HOLD=0
+    // permits the board's power circuit to switch off. This path never remounts
+    // SD or starts another recorder session.
     if (recorder_power_release_hold() != ESP_OK) {
         ESP_LOGE(TAG, "stage: power, result: error, reason: hold release");
     }
@@ -210,6 +212,7 @@ void app_main(void) {
 
     // Maintain power before any persistent-state inspection. On an armed boot,
     // only the physical active-low WAKE button may authorize fresh recovery.
+    // HOST_UNRESOLVED always classifies as STAY_SHUTDOWN, even with WAKE held.
     if (recorder_power_enable_hold() != ESP_OK) {
         return;
     }
