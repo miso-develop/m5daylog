@@ -209,9 +209,9 @@ def load_allowlist(root: Path) -> list[AllowEntry]:
             reason=str(raw["reason"]).strip(),
         )
         if entry.rule not in ALLOWLISTABLE_RULES:
-            raise ScanError(f"allowlist entry {index} uses non-allowlistable rule: {entry.rule}")
+            raise ScanError(f"allowlist entry {index} uses non-allowlistable rule")
         if entry.kind not in {"synthetic-fixture", "public-test-vector"}:
-            raise ScanError(f"allowlist entry {index} has invalid kind: {entry.kind}")
+            raise ScanError(f"allowlist entry {index} has invalid kind")
         if not is_safe_fixture_path(entry.path):
             raise ScanError(f"allowlist entry {index} must target a designated fixture directory")
         if not re.fullmatch(r"[0-9a-f]{64}", entry.file_sha256):
