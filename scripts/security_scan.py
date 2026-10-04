@@ -182,6 +182,8 @@ def normalize_relative_path(raw: str) -> str:
 def normalize_public_text_label(raw: str | None) -> str:
     if raw is None or PUBLIC_TEXT_LABEL_PATTERN.fullmatch(raw) is None:
         raise ScanError("invalid or missing public-text input label")
+    if scan_text("public-text-label", raw):
+        raise ScanError("public-text input label is not safe diagnostic metadata")
     return raw
 
 
