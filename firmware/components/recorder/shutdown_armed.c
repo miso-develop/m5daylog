@@ -17,6 +17,11 @@ typedef enum {
     SHUTDOWN_LIFECYCLE_HOST_UNRESOLVED = 2,
 } shutdown_lifecycle_state_t;
 
+static esp_err_t shutdown_armed_finish_nvs(esp_err_t operation_err) {
+    esp_err_t deinit_err = nvs_flash_deinit();
+    return operation_err != ESP_OK ? operation_err : deinit_err;
+}
+
 static esp_err_t shutdown_armed_write(uint8_t value) {
     nvs_handle_t handle;
     esp_err_t err = nvs_flash_init();
@@ -25,14 +30,14 @@ static esp_err_t shutdown_armed_write(uint8_t value) {
     }
     err = nvs_open(k_namespace, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
-        return err;
+        return shutdown_armed_finish_nvs(err);
     }
     err = nvs_set_u8(handle, k_key, value);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
-    return err;
+    return shutdown_armed_finish_nvs(err);
 }
 
 static esp_err_t shutdown_armed_read_state(shutdown_lifecycle_state_t *state) {
@@ -50,24 +55,24 @@ static esp_err_t shutdown_armed_read_state(shutdown_lifecycle_state_t *state) {
     }
     err = nvs_open(k_namespace, NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
+        return shutdown_armed_finish_nvs(ESP_OK);
     }
     if (err != ESP_OK) {
-        return err;
+        return shutdown_armed_finish_nvs(err);
     }
     err = nvs_get_u8(handle, k_key, &value);
     nvs_close(handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
+        return shutdown_armed_finish_nvs(ESP_OK);
     }
     if (err != ESP_OK) {
-        return err;
+        return shutdown_armed_finish_nvs(err);
     }
     if (value > SHUTDOWN_LIFECYCLE_HOST_UNRESOLVED) {
-        return ESP_FAIL;
+        return shutdown_armed_finish_nvs(ESP_FAIL);
     }
     *state = (shutdown_lifecycle_state_t)value;
-    return ESP_OK;
+    return shutdown_armed_finish_nvs(ESP_OK);
 }
 
 esp_err_t shutdown_armed_read(bool *armed) {
