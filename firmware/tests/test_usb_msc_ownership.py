@@ -50,7 +50,9 @@ def test_usb_publish_gate_requires_finalize_manifest_and_device_fs_release():
     gate_region = src[publish_at : src.index("usb_storage_event_cb", publish_at)]
     for gate in ("wav_finalized", "manifest_committed", "device_fs_released"):
         assert gate in gate_region, gate
-    assert "USB_BIT_PREPARE_OK" in gate_region
+    unresolved_at = gate_region.index("shutdown_armed_mark_host_unresolved")
+    prepare_at = gate_region.index("USB_BIT_PREPARE_OK")
+    assert unresolved_at < prepare_at
 
 
 def test_attach_callback_blocks_before_host_ownership():
@@ -117,7 +119,7 @@ def test_explicit_eject_is_the_only_release_request_seam():
     assert "__real_tud_msc_start_stop_cb" in region
 
 
-def test_release_quiescence_stops_usb_before_storage_release_and_never_remounts():
+def test_release_quiescence_stops_usb_before_storage_release_and_durable_arm():
     hdr = USB_H.read_text(encoding="utf-8")
     src = USB_C.read_text(encoding="utf-8")
     sd_hdr = SD_H.read_text(encoding="utf-8")
@@ -128,7 +130,9 @@ def test_release_quiescence_stops_usb_before_storage_release_and_never_remounts(
     fn_at = src.index("usb_msc_ownership_complete_release_quiesce")
     uninstall_at = src.index("tinyusb_driver_uninstall", fn_at)
     release_at = src.index("sd_mount_release_usb_storage", uninstall_at)
-    assert uninstall_at < release_at
+    arm_at = src.index("shutdown_armed_commit", release_at)
+    retire_at = src.index("s_host_owned = false", arm_at)
+    assert uninstall_at < release_at < arm_at < retire_at
 
     sd_fn = sd.index("esp_err_t sd_mount_release_usb_storage")
     sd_region = sd[sd_fn:sd.index("\n}", sd_fn)]
@@ -145,11 +149,11 @@ def test_runtime_release_enters_persistent_shutdown_not_same_session_restart():
 
     for marker in (
         "usb_msc_ownership_complete_release_quiesce",
-        "shutdown_armed_commit",
         "recorder_power_release_hold",
         "recorder_power_enter_shutdown_sleep",
     ):
         assert marker in region, marker
+    assert "shutdown_armed_commit" not in region
     for forbidden in (
         "sd_mount_remount_after_usb",
         "recorder_start_session",
