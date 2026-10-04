@@ -101,7 +101,7 @@ PRIVACY_PATTERNS = {
     "private-repository-identifier": re.compile(
         r"(?:"
         r"(?<![A-Za-z0-9._/\\-])" + _REPO_IDENTIFIER
-        + r"(?![A-Za-z0-9._/\\-])"
+        + r"(?=(?:$|[^A-Za-z0-9._/\\-]|\.(?![A-Za-z0-9._/\\-])))"
         + r"|(?<![A-Za-z0-9])" + _REPO_URL_IDENTIFIER
         + r"(?=(?:\.git)?(?:$|[/?#]|[\s\"'<>),;]))"
         + r")",
