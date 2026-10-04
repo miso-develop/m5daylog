@@ -67,6 +67,11 @@ class SecurityScanReviewRegressionTests(unittest.TestCase):
     def test_detects_private_repository_url_before_sentence_period(self) -> None:
         self.assert_repository_url_detected_without_echo(".")
 
+    def test_detects_private_repository_url_before_ordinary_punctuation(self) -> None:
+        for suffix in ("!", ":"):
+            with self.subTest(suffix=suffix):
+                self.assert_repository_url_detected_without_echo(suffix)
+
     def test_detects_bare_private_repository_before_sentence_period(self) -> None:
         self.assert_repository_identifier_with_terminal_period_detected_without_echo("")
 
