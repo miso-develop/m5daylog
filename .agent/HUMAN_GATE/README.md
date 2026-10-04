@@ -1,6 +1,6 @@
 # Human Gate Policy
 
-version: 2
+version: 3
 
 ## Purpose
 
@@ -13,10 +13,13 @@ Human Gate evidence is part of acceptance. It must be reproducible, attributable
 When a task involves planning, executing, interpreting, recording, or resuming a Human Gate, read these files before giving execution instructions:
 
 1. `.agent/HUMAN_GATE/EXECUTION_RULES.md`
-2. `.agent/HUMAN_GATE/COMMAND_RULES.md`
-3. `.agent/HUMAN_GATE/COMMAND_FAILURE_PLAYBOOK.md`
+2. `.agent/HUMAN_GATE/PUBLICATION_RULES.md`
+3. `.agent/HUMAN_GATE/COMMAND_RULES.md`
+4. `.agent/HUMAN_GATE/COMMAND_FAILURE_PLAYBOOK.md`
 
 `EXECUTION_RULES.md` defines acceptance-session semantics, baseline, cycle validity, evidence classification, and final dispositions.
+
+`PUBLICATION_RULES.md` defines the structured/sanitized durable-evidence boundary and the validate-before-publish contract for generated instructions/evidence when repository/runtime tooling controls publication. It also distinguishes that pre-publication control from reactive GitHub-surface scanning.
 
 `COMMAND_RULES.md` defines the command packet, PowerShell/native-process, timeout, toolchain, reset/session-boundary, and observation requirements that Human Gate operator commands must follow.
 
@@ -43,6 +46,10 @@ Use neutral placeholders such as `<repo-root>`, `<worktree>`, `<evidence-dir>`, 
 
 A local Human Gate session may use machine-specific values transiently in the operator's shell, but those values must be sanitized before any result is persisted to public durable state.
 
+When repository/runtime tooling controls publication, sanitization policy alone is not sufficient: the final serialized candidate text must pass the public-text validation gate in `PUBLICATION_RULES.md` before publication. A finding or validator error aborts that controlled publication attempt.
+
+Repository policy cannot pre-block arbitrary text entered manually through the native GitHub UI. Such publication remains policy-governed and may additionally be covered by separate reactive scanning after GitHub has accepted the content.
+
 ## Evidence boundary
 
 Keep these categories separate:
@@ -53,5 +60,7 @@ Keep these categories separate:
 - acceptance verdicts.
 
 A successful command does not prove a physical acceptance criterion. A command-wrapper failure does not by itself prove a product failure. Record the observed product behavior independently from the harness/tooling behavior.
+
+Public durable evidence should be reduced to the structured/sanitized fields required to establish acceptance, while richer machine-local logs remain local by default. Validate the exact serialized public evidence according to `PUBLICATION_RULES.md` before any controlled publication.
 
 When a parser or wrapper verdict is later shown to be wrong, preserve the underlying raw observation, correct the harness verdict, and follow `EXECUTION_RULES.md` for whether the physical action must be repeated. Do not preserve a known false harness classification as product evidence.
