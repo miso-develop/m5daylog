@@ -1,4 +1,4 @@
-"""Task #87 behavioral tests for persistent SHUTDOWN_ARMED boot gating."""
+"""Task #87 behavioral tests for persistent shutdown lifecycle boot gating."""
 
 from pathlib import Path
 import shutil
@@ -64,6 +64,8 @@ HARNESS = r"""
 
     static bool g_has_value;
     static uint8_t g_value;
+    static bool g_pending;
+    static uint8_t g_pending_value;
     static int g_commit_calls;
     static esp_err_t g_flash_init_result = ESP_OK;
     static esp_err_t g_set_result = ESP_OK;
@@ -74,7 +76,11 @@ HARNESS = r"""
         CHECK(strcmp(name, "m5daylog") == 0);
         (void)mode; *handle = 7; return ESP_OK;
     }
-    void nvs_close(nvs_handle_t handle) { CHECK(handle == 7); }
+    void nvs_close(nvs_handle_t handle) {
+        CHECK(handle == 7);
+        /* Uncommitted writes do not survive closing/reboot in this harness. */
+        g_pending = false;
+    }
     esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *value) {
         CHECK(handle == 7);
         CHECK(strcmp(key, "shutdown_armed") == 0);
@@ -85,12 +91,17 @@ HARNESS = r"""
         CHECK(handle == 7);
         CHECK(strcmp(key, "shutdown_armed") == 0);
         if (g_set_result != ESP_OK) return g_set_result;
-        g_has_value = true; g_value = value; return ESP_OK;
+        g_pending = true; g_pending_value = value; return ESP_OK;
     }
     esp_err_t nvs_commit(nvs_handle_t handle) {
         CHECK(handle == 7);
         g_commit_calls++;
-        return g_commit_result;
+        if (g_commit_result != ESP_OK) return g_commit_result;
+        CHECK(g_pending);
+        g_has_value = true;
+        g_value = g_pending_value;
+        g_pending = false;
+        return ESP_OK;
     }
 
     static void run_persistence(void) {
@@ -129,11 +140,50 @@ HARNESS = r"""
         CHECK(action == SHUTDOWN_ARMED_BOOT_NORMAL);
     }
 
+    static void run_unresolved_reset_gate(void) {
+        shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
+
+        /* APP -> USB must make unresolved host ownership boot-visible first. */
+        CHECK(shutdown_armed_mark_host_unresolved() == ESP_OK);
+        CHECK(g_has_value && g_value == 2);
+
+        /* PC-owned reset and accidental pre-eject detach both stay fail-closed. */
+        CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+        CHECK(shutdown_armed_boot_action(true, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+        CHECK(g_value == 2);
+
+        /* Only the durable post-quiescence transition may authorize WAKE later. */
+        CHECK(shutdown_armed_commit() == ESP_OK);
+        CHECK(g_value == 1);
+        CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+        CHECK(shutdown_armed_boot_action(true, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
+    }
+
+    static void run_armed_transition_failure(void) {
+        shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
+
+        CHECK(shutdown_armed_mark_host_unresolved() == ESP_OK);
+        CHECK(g_value == 2);
+        g_commit_result = ESP_FAIL;
+        CHECK(shutdown_armed_commit() == ESP_FAIL);
+        CHECK(g_value == 2); /* failed commit must preserve durable unresolved */
+        g_commit_result = ESP_OK;
+
+        CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+        CHECK(shutdown_armed_boot_action(true, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+    }
+
     static void run_corrupt_marker(void) {
         bool armed = false;
         shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
         g_has_value = true;
-        g_value = 2;
+        g_value = 3;
         CHECK(shutdown_armed_read(&armed) == ESP_FAIL);
         CHECK(!armed);
         CHECK(shutdown_armed_boot_action(false, &action) == ESP_FAIL);
@@ -154,12 +204,15 @@ HARNESS = r"""
         g_commit_result = ESP_FAIL;
         CHECK(shutdown_armed_commit() == ESP_FAIL);
         CHECK(g_commit_calls == 1);
+        CHECK(!g_has_value);
     }
 
     int main(int argc, char **argv) {
         CHECK(argc == 2);
         if (strcmp(argv[1], "persistence") == 0) run_persistence();
         else if (strcmp(argv[1], "boot-gate") == 0) run_boot_gate();
+        else if (strcmp(argv[1], "unresolved-reset") == 0) run_unresolved_reset_gate();
+        else if (strcmp(argv[1], "armed-transition-failure") == 0) run_armed_transition_failure();
         else if (strcmp(argv[1], "corrupt") == 0) run_corrupt_marker();
         else if (strcmp(argv[1], "fail-closed") == 0) run_fail_closed();
         else CHECK(false);
@@ -200,7 +253,17 @@ def _build(tmp_path: Path) -> Path:
     return binary
 
 
-@pytest.mark.parametrize("scenario", ["persistence", "boot-gate", "corrupt", "fail-closed"])
-def test_shutdown_armed_persistence_and_boot_gate(tmp_path: Path, scenario: str) -> None:
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "persistence",
+        "boot-gate",
+        "unresolved-reset",
+        "armed-transition-failure",
+        "corrupt",
+        "fail-closed",
+    ],
+)
+def test_shutdown_lifecycle_persistence_and_boot_gate(tmp_path: Path, scenario: str) -> None:
     binary = _build(tmp_path)
     subprocess.run([str(binary), scenario], check=True, capture_output=True, text=True)
