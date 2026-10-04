@@ -1,7 +1,8 @@
 """Task #87 Strategy 2 source-order contracts.
 
 Behavioral host tests are the primary proof. These assertions lock the linker
-seam, release ordering, and the absence of same-session APP remount/rearm.
+seam, release ordering, durable ownership lifecycle, and absence of same-session
+APP remount/rearm.
 """
 
 from pathlib import Path
@@ -21,12 +22,23 @@ def test_start_stop_unit_has_one_to_one_linker_wrap_seam():
     assert "--wrap=tud_msc_start_stop_cb" in cmake
 
 
-def test_release_quiesce_tears_down_usb_before_deferred_write_proof():
+def test_publish_persists_unresolved_before_usb_transfer_can_proceed():
+    usb = USB_C.read_text(encoding="utf-8")
+    publish_at = usb.index("static bool usb_msc_publish")
+    unresolved_at = usb.index("shutdown_armed_mark_host_unresolved", publish_at)
+    prepare_at = usb.index("USB_BIT_PREPARE_OK", unresolved_at)
+    transfer_at = usb.index("sd_mount_transfer_to_usb", prepare_at)
+    assert publish_at < unresolved_at < prepare_at < transfer_at
+
+
+def test_release_quiesce_tears_down_usb_before_deferred_write_proof_and_durable_arm():
     usb = USB_C.read_text(encoding="utf-8")
     fn_at = usb.index("usb_msc_ownership_complete_release_quiesce")
     teardown_at = usb.index("tinyusb_driver_uninstall", fn_at)
     proof_at = usb.index("sd_mount_release_usb_storage", teardown_at)
-    assert teardown_at < proof_at
+    arm_at = usb.index("shutdown_armed_commit", proof_at)
+    retire_at = usb.index("s_host_owned = false", arm_at)
+    assert teardown_at < proof_at < arm_at < retire_at
 
 
 def test_release_never_rebuilds_app_storage_same_session():
@@ -39,15 +51,15 @@ def test_release_never_rebuilds_app_storage_same_session():
     assert "TINYUSB_MSC_STORAGE_MOUNT_APP" not in region
 
 
-def test_runtime_arms_before_hold_release_and_never_restarts_recording():
+def test_runtime_releases_hold_only_after_ownership_quiesce_returns_success():
     runtime = RUNTIME.read_text(encoding="utf-8")
     fn_at = runtime.index("static void recorder_handle_usb_release")
     quiesce_at = runtime.index("usb_msc_ownership_complete_release_quiesce", fn_at)
-    arm_at = runtime.index("shutdown_armed_commit", quiesce_at)
-    hold_at = runtime.index("recorder_power_release_hold", arm_at)
-    assert quiesce_at < arm_at < hold_at
+    hold_at = runtime.index("recorder_power_release_hold", quiesce_at)
+    assert quiesce_at < hold_at
 
     release_region = runtime[fn_at:runtime.index("\n}", fn_at)]
+    assert "shutdown_armed_commit" not in release_region
     assert "recorder_start_session" not in release_region
     assert "sd_mount_remount_after_usb" not in release_region
     assert "usb_msc_ownership_rearm" not in runtime
