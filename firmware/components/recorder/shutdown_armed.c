@@ -19,7 +19,17 @@ typedef enum {
 
 static esp_err_t shutdown_armed_finish_nvs(esp_err_t operation_err) {
     esp_err_t deinit_err = nvs_flash_deinit();
-    return operation_err != ESP_OK ? operation_err : deinit_err;
+    if (operation_err != ESP_OK) {
+        return operation_err;
+    }
+    // ESP_ERR_NVS_NOT_INITIALIZED already proves the desired cleanup
+    // postcondition. Do not turn an otherwise valid lifecycle read/write into
+    // a fail-closed boot solely because another owner already deinitialized
+    // the shared default NVS partition.
+    if (deinit_err == ESP_OK || deinit_err == ESP_ERR_NVS_NOT_INITIALIZED) {
+        return ESP_OK;
+    }
+    return deinit_err;
 }
 
 static esp_err_t shutdown_armed_write(uint8_t value) {
