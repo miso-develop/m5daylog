@@ -60,7 +60,13 @@ class PublicFinding:
     count: int
 
 
-FetchPage = Callable[[str, int, int], list[dict[str, object]]]
+@dataclass(frozen=True)
+class FetchPageResult:
+    items: list[dict[str, object]]
+    next_page: int | None
+
+
+FetchPage = Callable[[str, int, int], FetchPageResult | list[dict[str, object]]]
 
 
 def _require_object(value: object) -> dict[str, object]:
@@ -208,12 +214,27 @@ def _paginate(endpoint: str, fetch_page: FetchPage, page_size: int) -> Iterable[
     seen_pages: set[bytes] = set()
     while True:
         try:
-            items = fetch_page(endpoint, page, page_size)
+            result = fetch_page(endpoint, page, page_size)
         except SurfaceScanError:
             raise
         except Exception as exc:
             raise SurfaceScanError("api-request-failed") from exc
-        if not isinstance(items, list) or len(items) > page_size or any(not isinstance(item, dict) for item in items):
+
+        if isinstance(result, FetchPageResult):
+            items = result.items
+            next_page = result.next_page
+            metadata_driven = True
+        elif isinstance(result, list):
+            # Compatibility for pre-existing injected synthetic fixtures. The real
+            # GitHub fetch path always returns FetchPageResult and never infers
+            # production continuation from item count.
+            items = result
+            next_page = None if len(items) < page_size else page + 1
+            metadata_driven = False
+        else:
+            raise SurfaceScanError("api-response-invalid")
+
+        if len(items) > page_size or any(not isinstance(item, dict) for item in items):
             raise SurfaceScanError("api-response-invalid")
         if items:
             digest = _page_digest(items)
@@ -222,9 +243,14 @@ def _paginate(endpoint: str, fetch_page: FetchPage, page_size: int) -> Iterable[
             seen_pages.add(digest)
         for item in items:
             yield item
-        if len(items) < page_size:
+
+        if next_page is None:
             return
-        page += 1
+        if isinstance(next_page, bool) or not isinstance(next_page, int) or next_page != page + 1:
+            raise SurfaceScanError("api-pagination-ambiguous")
+        if metadata_driven and not items:
+            raise SurfaceScanError("api-pagination-ambiguous")
+        page = next_page
 
 
 def _api_positive_int(item: dict[str, object], key: str) -> int:
@@ -361,13 +387,90 @@ def audit_repository(
     return findings
 
 
+def _next_page_from_link(link_header: str | None, request_url: str, current_page: int) -> int | None:
+    if link_header is None:
+        return None
+    if not isinstance(link_header, str) or not link_header.strip():
+        raise SurfaceScanError("api-pagination-ambiguous")
+
+    relations: dict[str, str] = {}
+    for raw_entry in link_header.split(","):
+        parts = [part.strip() for part in raw_entry.split(";")]
+        if len(parts) < 2 or not parts[0].startswith("<") or not parts[0].endswith(">"):
+            raise SurfaceScanError("api-pagination-ambiguous")
+        target = parts[0][1:-1]
+        if not target:
+            raise SurfaceScanError("api-pagination-ambiguous")
+
+        rel_tokens: list[str] | None = None
+        for parameter in parts[1:]:
+            if "=" not in parameter:
+                raise SurfaceScanError("api-pagination-ambiguous")
+            name, value = (piece.strip() for piece in parameter.split("=", 1))
+            if not name or not value:
+                raise SurfaceScanError("api-pagination-ambiguous")
+            if name.lower() == "rel":
+                if rel_tokens is not None or len(value) < 2 or value[0] != '"' or value[-1] != '"':
+                    raise SurfaceScanError("api-pagination-ambiguous")
+                rel_tokens = value[1:-1].split()
+                if not rel_tokens:
+                    raise SurfaceScanError("api-pagination-ambiguous")
+
+        if rel_tokens is None:
+            raise SurfaceScanError("api-pagination-ambiguous")
+        for relation in rel_tokens:
+            if relation in relations:
+                raise SurfaceScanError("api-pagination-ambiguous")
+            relations[relation] = target
+
+    next_url = relations.get("next")
+    if next_url is None:
+        return None
+
+    try:
+        expected = urllib.parse.urlsplit(request_url)
+        candidate = urllib.parse.urlsplit(next_url)
+        expected_query = urllib.parse.parse_qs(
+            expected.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+        candidate_query = urllib.parse.parse_qs(
+            candidate.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+    except ValueError as exc:
+        raise SurfaceScanError("api-pagination-ambiguous") from exc
+
+    if (
+        expected.scheme != "https"
+        or expected.netloc != "api.github.com"
+        or candidate.scheme != expected.scheme
+        or candidate.netloc != expected.netloc
+        or candidate.path != expected.path
+        or candidate.fragment
+        or expected.fragment
+    ):
+        raise SurfaceScanError("api-pagination-ambiguous")
+    if expected_query.get("page") != [str(current_page)]:
+        raise SurfaceScanError("api-pagination-ambiguous")
+
+    next_page = current_page + 1
+    expected_next_query = {key: list(values) for key, values in expected_query.items()}
+    expected_next_query["page"] = [str(next_page)]
+    if candidate_query != expected_next_query:
+        raise SurfaceScanError("api-pagination-ambiguous")
+    return next_page
+
+
 def github_fetch_page(
     repository: str,
     token: str,
     endpoint: str,
     page: int,
     per_page: int,
-) -> list[dict[str, object]]:
+) -> FetchPageResult:
     if not REPOSITORY_RE.fullmatch(repository):
         raise SurfaceScanError("repository-invalid")
     if not token:
@@ -396,7 +499,9 @@ def github_fetch_page(
         with urllib.request.urlopen(request, timeout=30) as response:
             if response.status != 200:
                 raise SurfaceScanError("api-request-failed")
+            link_header = response.headers.get("Link")
             raw = response.read()
+        next_page = _next_page_from_link(link_header, url, page)
         payload = json.loads(raw)
     except SurfaceScanError:
         raise
@@ -404,7 +509,9 @@ def github_fetch_page(
         raise SurfaceScanError("api-request-failed") from exc
     if not isinstance(payload, list):
         raise SurfaceScanError("api-response-invalid")
-    return payload
+    if any(not isinstance(item, dict) for item in payload):
+        raise SurfaceScanError("api-response-invalid")
+    return FetchPageResult(payload, next_page)
 
 
 def _print_findings(findings: list[PublicFinding]) -> None:
@@ -426,7 +533,7 @@ def _run_event(args: argparse.Namespace) -> int:
 def _run_audit(args: argparse.Namespace) -> int:
     token = os.environ.get("GITHUB_TOKEN", "")
 
-    def fetch_page(endpoint: str, page: int, per_page: int) -> list[dict[str, object]]:
+    def fetch_page(endpoint: str, page: int, per_page: int) -> FetchPageResult:
         return github_fetch_page(args.repository, token, endpoint, page, per_page)
 
     findings = audit_repository(args.repository, fetch_page)
