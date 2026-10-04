@@ -387,6 +387,19 @@ def audit_repository(
     return findings
 
 
+def _pagination_resource_path_matches(expected_path: str, candidate_path: str) -> bool:
+    if candidate_path == expected_path:
+        return True
+
+    expected_match = re.fullmatch(r"/repos/[^/]+/[^/]+(?P<suffix>/.*)", expected_path)
+    candidate_match = re.fullmatch(r"/repositories/[1-9][0-9]*(?P<suffix>/.*)", candidate_path)
+    return bool(
+        expected_match
+        and candidate_match
+        and expected_match.group("suffix") == candidate_match.group("suffix")
+    )
+
+
 def _next_page_from_link(link_header: str | None, request_url: str, current_page: int) -> int | None:
     if link_header is None:
         return None
@@ -448,7 +461,7 @@ def _next_page_from_link(link_header: str | None, request_url: str, current_page
         or expected.netloc != "api.github.com"
         or candidate.scheme != expected.scheme
         or candidate.netloc != expected.netloc
-        or candidate.path != expected.path
+        or not _pagination_resource_path_matches(expected.path, candidate.path)
         or candidate.fragment
         or expected.fragment
     ):
