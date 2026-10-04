@@ -24,11 +24,10 @@
 static const char *TAG = "recorder_usb";
 
 #define USB_BIT_ATTACH              (1u << 0)
-#define USB_BIT_PREPARE_OK          (1u << 1)
-#define USB_BIT_HOST_OWNED          (1u << 2)
-#define USB_BIT_RELEASE_REQUESTED   (1u << 3)
-#define USB_BIT_RELEASE_QUIESCED    (1u << 4)
-#define USB_BIT_FAILED              (1u << 5)
+#define USB_BIT_HOST_OWNED          (1u << 1)
+#define USB_BIT_RELEASE_REQUESTED   (1u << 2)
+#define USB_BIT_RELEASE_QUIESCED    (1u << 3)
+#define USB_BIT_FAILED              (1u << 4)
 #define USB_PUBLIC_BITS             (USB_BIT_ATTACH | USB_BIT_HOST_OWNED | \
                                      USB_BIT_RELEASE_REQUESTED | \
                                      USB_BIT_RELEASE_QUIESCED | USB_BIT_FAILED)
@@ -52,14 +51,17 @@ static void usb_fail(const char *reason) {
 static bool usb_msc_publish(bool wav_finalized,
                             bool manifest_committed,
                             bool device_fs_released) {
+    esp_err_t err;
+
     if (!wav_finalized || !manifest_committed || !device_fs_released ||
-        s_usb_events == NULL) {
+        s_usb_events == NULL || s_host_owned || s_release_pending ||
+        !sd_mount_is_mounted()) {
         usb_fail("publish gate incomplete");
         return false;
     }
 
-    // The boot-visible unresolved marker must be durable before PREPARE_OK can
-    // admit the APP -> USB storage transfer. A reset from this point onward can
+    // The boot-visible unresolved marker must be durable before the APP-owned
+    // storage object is transferred to USB. A reset from this point onward can
     // therefore never forget that explicit host release is still required.
     if (shutdown_armed_mark_host_unresolved() != ESP_OK) {
         usb_fail("persist unresolved ownership");
@@ -69,9 +71,24 @@ static bool usb_msc_publish(bool wav_finalized,
     s_wav_finalized = wav_finalized;
     s_manifest_committed = manifest_committed;
     s_device_fs_released = device_fs_released;
-    xEventGroupSetBits(s_usb_events, USB_BIT_PREPARE_OK);
+
+    // The first physical attach is deliberately hidden with tud_disconnect().
+    // Only after esp_tinyusb has emitted MOUNT_COMPLETE for the USB mount do we
+    // reconnect the device. This prevents the host from observing a LUN whose
+    // capacity exists but whose TEST UNIT READY still reports MEDIUM NOT PRESENT.
+    err = sd_mount_transfer_to_usb();
+    if (err != ESP_OK || !s_host_owned || sd_mount_is_mounted()) {
+        usb_fail("host ownership transfer");
+        return false;
+    }
+    if (!tud_connect()) {
+        xEventGroupClearBits(s_usb_events, USB_BIT_HOST_OWNED);
+        usb_fail("host publication reconnect");
+        return false;
+    }
+
     ESP_LOGI(TAG,
-             "stage: usb, result: publish-ready, owner: device-released, mount: app");
+             "stage: usb, result: publish-ready, owner: host, mount: usb");
     return true;
 }
 
@@ -114,8 +131,6 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
     }
 
     if (event->id == TINYUSB_EVENT_ATTACHED) {
-        esp_err_t err;
-
         // Accidental cable removal before safe-eject leaves the medium owned by
         // USB. A later physical reconnect may re-enumerate that same host-owned
         // session so the PC can perform the missing explicit eject.
@@ -133,21 +148,18 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
         s_wav_finalized = false;
         s_manifest_committed = false;
         s_device_fs_released = false;
-        xEventGroupClearBits(s_usb_events, USB_BIT_PREPARE_OK);
+
+        // Do not expose an MSC LUN while Device finalization/release is still
+        // pending. The runtime receives ATTACH while the bus is logically
+        // disconnected; usb_msc_publish() reconnects only after USB ownership
+        // and media readiness are proven.
+        if (!tud_disconnect()) {
+            usb_fail("attach publication gate");
+            return;
+        }
         xEventGroupSetBits(s_usb_events, USB_BIT_ATTACH);
         ESP_LOGI(TAG,
-                 "stage: usb, result: attach, owner: device, mount: app");
-
-        // Do not finish SetConfiguration until recorder finalization, durable
-        // metadata, boot-visible unresolved ownership, and logical Device-FS
-        // release are all proven.
-        (void)xEventGroupWaitBits(s_usb_events, USB_BIT_PREPARE_OK,
-                                  pdTRUE, pdTRUE, portMAX_DELAY);
-        err = sd_mount_transfer_to_usb();
-        if (err != ESP_OK || !s_host_owned || sd_mount_is_mounted()) {
-            (void)tud_disconnect();
-            usb_fail("host ownership transfer");
-        }
+                 "stage: usb, result: attach-hidden, owner: device, mount: app");
         return;
     }
 
@@ -338,8 +350,8 @@ esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
     s_host_owned = false;
     s_release_pending = false;
     xEventGroupClearBits(s_usb_events,
-                         USB_BIT_ATTACH | USB_BIT_PREPARE_OK |
-                             USB_BIT_HOST_OWNED | USB_BIT_RELEASE_REQUESTED);
+                         USB_BIT_ATTACH | USB_BIT_HOST_OWNED |
+                             USB_BIT_RELEASE_REQUESTED);
     xEventGroupSetBits(s_usb_events, USB_BIT_RELEASE_QUIESCED);
     ESP_LOGI(TAG,
              "stage: usb, result: release-quiesced, owner: released, mount: none");
