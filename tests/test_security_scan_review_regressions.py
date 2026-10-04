@@ -64,6 +64,9 @@ class SecurityScanReviewRegressionTests(unittest.TestCase):
     def test_detects_private_repository_url_with_clone_suffix(self) -> None:
         self.assert_repository_url_detected_without_echo(".git")
 
+    def test_detects_private_repository_url_before_sentence_period(self) -> None:
+        self.assert_repository_url_detected_without_echo(".")
+
     def test_detects_bare_private_repository_before_sentence_period(self) -> None:
         self.assert_repository_identifier_with_terminal_period_detected_without_echo("")
 
@@ -74,10 +77,12 @@ class SecurityScanReviewRegressionTests(unittest.TestCase):
 
     def test_dotted_repository_continuations_remain_allowed(self) -> None:
         marker = "synthetic-project-42"
+        repo = synthetic_private_repo(marker)
         candidates = (
-            synthetic_private_repo(marker) + ".docs",
-            "public-owner/" + synthetic_private_repo(marker) + ".docs",
-            synthetic_private_repo(marker) + ".git",
+            repo + ".docs",
+            "public-owner/" + repo + ".docs",
+            repo + ".git",
+            "https://github.com/" + "public-owner/" + repo + ".docs",
         )
         for candidate in candidates:
             with self.subTest(candidate=candidate):
