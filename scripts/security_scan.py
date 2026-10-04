@@ -63,6 +63,45 @@ SIGNATURE_PATTERNS = {
     "credential-uri": re.compile(r"[a-z][a-z0-9+.-]{1,20}://[^\s/:@]+:[^\s/@]{8,}@", re.IGNORECASE),
 }
 
+# Privacy markers are deliberately composed rather than embedded as a concrete
+# repository identifier. The rule recognizes the public naming convention only.
+_PRIVATE_REPO_MARKER = "-" + "private"
+_REPO_COMPONENT = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+
+PRIVACY_PATTERNS = {
+    "machine-path-windows": re.compile(
+        r"(?<![A-Za-z0-9])"
+        r"[A-Za-z]:[\\/]+Users[\\/]+"
+        r"[A-Za-z0-9][A-Za-z0-9._ -]*",
+        re.IGNORECASE,
+    ),
+    "machine-path-wsl": re.compile(
+        r"(?:\\\\|//)(?:wsl\$|wsl\.localhost)[\\/]+"
+        r"[A-Za-z0-9][A-Za-z0-9._-]*[\\/]+home[\\/]+"
+        r"[A-Za-z0-9][A-Za-z0-9._-]*",
+        re.IGNORECASE,
+    ),
+    "machine-path-posix-home": re.compile(
+        r"(?<![A-Za-z0-9:])/(?:home|Users)/[A-Za-z0-9][A-Za-z0-9._-]*"
+    ),
+    "private-repository-identifier": re.compile(
+        r"(?<![A-Za-z0-9._/-])(?:"
+        + _REPO_COMPONENT
+        + r"/)?"
+        + _REPO_COMPONENT
+        + re.escape(_PRIVATE_REPO_MARKER)
+        + r"(?![A-Za-z0-9._-])"
+    ),
+}
+
+PRIVACY_MESSAGES = {
+    "machine-path-windows": "concrete Windows user-profile path",
+    "machine-path-wsl": "concrete WSL user-home path",
+    "machine-path-posix-home": "concrete POSIX/macOS user-home path",
+    "private-repository-identifier": "private repository identifier",
+}
+PRIVACY_RULES = frozenset(PRIVACY_PATTERNS)
+
 _CREDENTIAL_NAME = (
     r"(?:password|passwd|passphrase|secret|api[_-]?key|token|pat|"
     r"access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|"
@@ -87,9 +126,13 @@ LOG_SINK_PATTERN = re.compile(
 
 KNOWN_RULES = frozenset({
     "forbidden-path", "large-file", "audio-file", "env-template-value",
-    "credential-literal", "dangerous-log", *SIGNATURE_PATTERNS.keys(),
+    "credential-literal", "dangerous-log", *PRIVACY_RULES,
+    *SIGNATURE_PATTERNS.keys(),
 })
-ALLOWLISTABLE_RULES = KNOWN_RULES - {"forbidden-path", "large-file", "env-template-value"}
+NON_ALLOWLISTABLE_RULES = frozenset({
+    "forbidden-path", "large-file", "env-template-value", *PRIVACY_RULES,
+})
+ALLOWLISTABLE_RULES = KNOWN_RULES - NON_ALLOWLISTABLE_RULES
 
 
 class ScanError(RuntimeError):
@@ -186,6 +229,10 @@ def line_number(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
+def render_finding(finding: Finding) -> str:
+    return f"[security:scan] {finding.path}:{finding.line}: [{finding.rule}] {finding.message}"
+
+
 def scan_path(path: str) -> list[Finding]:
     lowered = path.lower()
     name = PurePosixPath(path).name.lower()
@@ -219,16 +266,26 @@ def scan_env_example(path: str, text: str) -> list[Finding]:
     return findings
 
 
+def scan_text(label: str, text: str) -> list[Finding]:
+    """Scan arbitrary candidate public text using non-echoing common rules."""
+    findings: list[Finding] = []
+    for rule, pattern in SIGNATURE_PATTERNS.items():
+        for match in pattern.finditer(text):
+            findings.append(Finding(label, line_number(text, match.start()), rule, "high-confidence credential/private-key signature"))
+
+    for rule, pattern in PRIVACY_PATTERNS.items():
+        for match in pattern.finditer(text):
+            findings.append(Finding(label, line_number(text, match.start()), rule, PRIVACY_MESSAGES[rule]))
+    return findings
+
+
 def scan_content(path: str, data: bytes) -> list[Finding]:
     if len(data) > MAX_FILE_BYTES:
         return [Finding(path, 1, "large-file", f"tracked file exceeds {MAX_FILE_BYTES} bytes and is not scanned")]
     text = data.decode("utf-8", errors="replace")
     suffix = PurePosixPath(path).suffix.lower()
-    findings = scan_env_example(path, text)
-
-    for rule, pattern in SIGNATURE_PATTERNS.items():
-        for match in pattern.finditer(text):
-            findings.append(Finding(path, line_number(text, match.start()), rule, "high-confidence credential/private-key signature"))
+    findings = scan_text(path, text)
+    findings.extend(scan_env_example(path, text))
 
     if suffix in CONFIG_SUFFIXES or PurePosixPath(path).name.startswith(".env"):
         for match in CREDENTIAL_LITERAL_PATTERN.finditer(text):
@@ -288,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     for entry in stale:
         print(f"[security:scan] ERROR: stale allowlist entry {entry.path} [{entry.rule}]", file=sys.stderr)
     for finding in findings:
-        print(f"[security:scan] {finding.path}:{finding.line}: [{finding.rule}] {finding.message}", file=sys.stderr)
+        print(render_finding(finding), file=sys.stderr)
 
     if findings or stale:
         print(f"[security:scan] FAILED: {len(findings)} finding(s), {len(stale)} stale allowlist entry/entries", file=sys.stderr)
