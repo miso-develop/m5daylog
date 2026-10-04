@@ -41,11 +41,53 @@ class SecurityScanReviewRegressionTests(unittest.TestCase):
         self.assertNotIn(marker, rendered)
         self.assertNotIn(candidate, rendered)
 
+    def assert_repository_identifier_with_terminal_period_detected_without_echo(
+        self, prefix: str
+    ) -> None:
+        marker = "synthetic-project-42"
+        candidate = prefix + synthetic_private_repo(marker) + "."
+        findings = security_scan.scan_text("candidate-public-text", candidate)
+        matching = [
+            finding
+            for finding in findings
+            if finding.rule == "private-repository-identifier"
+        ]
+        self.assertEqual(1, len(matching), findings)
+        rendered = security_scan.render_finding(matching[0])
+        self.assertNotIn(marker, matching[0].message)
+        self.assertNotIn(marker, rendered)
+        self.assertNotIn(candidate, rendered)
+
     def test_detects_private_repository_url_with_trailing_path(self) -> None:
         self.assert_repository_url_detected_without_echo("/issues/1")
 
     def test_detects_private_repository_url_with_clone_suffix(self) -> None:
         self.assert_repository_url_detected_without_echo(".git")
+
+    def test_detects_bare_private_repository_before_sentence_period(self) -> None:
+        self.assert_repository_identifier_with_terminal_period_detected_without_echo("")
+
+    def test_detects_owner_private_repository_before_sentence_period(self) -> None:
+        self.assert_repository_identifier_with_terminal_period_detected_without_echo(
+            "public-owner/"
+        )
+
+    def test_dotted_repository_continuations_remain_allowed(self) -> None:
+        marker = "synthetic-project-42"
+        candidates = (
+            synthetic_private_repo(marker) + ".docs",
+            "public-owner/" + synthetic_private_repo(marker) + ".docs",
+            synthetic_private_repo(marker) + ".git",
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                rules = {
+                    finding.rule
+                    for finding in security_scan.scan_text(
+                        "candidate-public-text", candidate
+                    )
+                }
+                self.assertNotIn("private-repository-identifier", rules)
 
     def test_invalid_utf8_allowlist_fails_closed_without_runtime_path_echo(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
