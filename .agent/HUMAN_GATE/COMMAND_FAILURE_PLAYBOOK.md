@@ -15,10 +15,14 @@ The goal is prevention and correct classification. A failure described here is n
 When a command wrapper, parser, shell, toolchain, host API, serial collector, or evidence-processing step fails:
 
 1. preserve the underlying product observation when it is independently valid;
-2. classify the affected command/harness phase as `BLOCKED` unless a valid product observation independently proves `FAIL`;
-3. use `NOT_RUN` only when the intended phase was never attempted;
-4. do not rerun destructive or physical actions merely because post-processing failed when immutable evidence can be reparsed;
-5. correct an earlier harness-generated verdict when later evidence proves that the parser or wrapper misclassified the same observation.
+2. record the command/harness defect separately from the Human Gate acceptance disposition; a tooling defect does not by itself force the acceptance result to `BLOCKED`;
+3. classify the affected acceptance observation as `BLOCKED` only when the defect prevents a valid observation or prevents the preserved evidence from being reconstructed with sufficient confidence;
+4. when independently valid evidence remains sufficient to evaluate the Acceptance Criterion, record `PASS` or `FAIL` according to that evidence even if the wrapper/parser itself failed or emitted a wrong verdict;
+5. use `NOT_RUN` only when the intended phase was never attempted;
+6. do not rerun destructive or physical actions merely because post-processing failed when immutable evidence can be reparsed;
+7. correct an earlier harness-generated verdict when later evidence proves that the parser or wrapper misclassified the same observation.
+
+The tooling diagnosis and the acceptance disposition are separate records. A parser/wrapper failure may therefore remain documented as a harness defect while the acceptance result is corrected to `PASS` or `FAIL` from independently valid evidence. Conversely, when the defect actually prevents a valid acceptance observation, the acceptance disposition remains `BLOCKED`.
 
 A corrected harness verdict does not erase the raw observation. It changes only the interpretation that was shown to be invalid.
 
