@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -72,6 +74,23 @@ class SecurityScanTests(unittest.TestCase):
         rendered = security_scan.render_finding(finding)
         self.assertNotIn(marker, rendered)
         self.assertNotIn(candidate, rendered)
+
+    def assert_allowlist_failure_non_echoing(self, payload: object, marker: str) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / security_scan.ALLOWLIST_FILE).write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            with self.assertRaises(security_scan.ScanError) as caught:
+                security_scan.load_allowlist(root)
+            self.assertNotIn(marker, str(caught.exception))
+
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                exit_code = security_scan.main(["--root", str(root)])
+            self.assertEqual(2, exit_code)
+            self.assertIn("[security:scan] ERROR:", stderr.getvalue())
+            self.assertNotIn(marker, stderr.getvalue())
 
     def test_detects_github_token_without_echoing_value(self) -> None:
         value = synthetic_github_token()
@@ -169,6 +188,17 @@ class SecurityScanTests(unittest.TestCase):
             candidate, "private-repository-identifier", marker
         )
 
+    def test_detects_repository_url_private_identifier_without_echo(self) -> None:
+        marker = "synthetic-project-42"
+        candidate = (
+            "https://github.com/"
+            + "public-owner/"
+            + synthetic_private_repo(marker)
+        )
+        self.assert_privacy_finding_non_echoing(
+            candidate, "private-repository-identifier", marker
+        )
+
     def test_multiple_privacy_findings_preserve_line_numbers_without_echo(self) -> None:
         user_marker = "synthetic-user-42"
         repo_marker = "synthetic-project-42"
@@ -261,6 +291,26 @@ class SecurityScanTests(unittest.TestCase):
             message = str(caught.exception)
             self.assertIn(security_scan.ALLOWLIST_FILE, message)
             self.assertNotIn(str(root), message)
+
+    def test_allowlist_rejects_non_object_json_without_echo(self) -> None:
+        marker = "synthetic-project-42"
+        payload = [synthetic_private_repo(marker)]
+        self.assert_allowlist_failure_non_echoing(payload, marker)
+
+    def test_allowlist_invalid_path_does_not_echo_candidate(self) -> None:
+        marker = "synthetic-user-42"
+        candidate = synthetic_posix_home("home", marker)
+        payload = {
+            "version": 1,
+            "entries": [{
+                "path": candidate,
+                "rule": "github-token",
+                "kind": "synthetic-fixture",
+                "file_sha256": "0" * 64,
+                "reason": "synthetic test",
+            }],
+        }
+        self.assert_allowlist_failure_non_echoing(payload, marker)
 
     def test_privacy_rules_cannot_be_allowlisted(self) -> None:
         privacy_rules = (
