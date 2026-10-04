@@ -85,12 +85,12 @@ PRIVACY_PATTERNS = {
         r"(?<![A-Za-z0-9:])/(?:home|Users)/[A-Za-z0-9][A-Za-z0-9._-]*"
     ),
     "private-repository-identifier": re.compile(
-        r"(?<![A-Za-z0-9._/-])(?:"
+        r"(?<![A-Za-z0-9._/\\-])(?:"
         + _REPO_COMPONENT
         + r"/)?"
         + _REPO_COMPONENT
         + re.escape(_PRIVATE_REPO_MARKER)
-        + r"(?![A-Za-z0-9._-])"
+        + r"(?![A-Za-z0-9._/\\-])"
     ),
 }
 
