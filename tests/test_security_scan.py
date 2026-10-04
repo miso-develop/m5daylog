@@ -252,6 +252,16 @@ class SecurityScanTests(unittest.TestCase):
             with self.assertRaises(security_scan.ScanError):
                 security_scan.load_allowlist(root)
 
+    def test_allowlist_read_error_does_not_echo_absolute_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / security_scan.ALLOWLIST_FILE).mkdir()
+            with self.assertRaises(security_scan.ScanError) as caught:
+                security_scan.load_allowlist(root)
+            message = str(caught.exception)
+            self.assertIn(security_scan.ALLOWLIST_FILE, message)
+            self.assertNotIn(str(root), message)
+
     def test_privacy_rules_cannot_be_allowlisted(self) -> None:
         privacy_rules = (
             "machine-path-windows",
@@ -309,6 +319,19 @@ class SecurityScanTests(unittest.TestCase):
             with mock.patch.object(security_scan, "git_tracked_files", return_value=["missing.txt"]):
                 with self.assertRaises(security_scan.ScanError):
                     security_scan.scan_repository(root)
+
+    def test_tracked_file_read_error_does_not_echo_absolute_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / security_scan.ALLOWLIST_FILE).write_text(
+                json.dumps({"version": 1, "entries": []}), encoding="utf-8"
+            )
+            with mock.patch.object(security_scan, "git_tracked_files", return_value=["missing.txt"]):
+                with self.assertRaises(security_scan.ScanError) as caught:
+                    security_scan.scan_repository(root)
+            message = str(caught.exception)
+            self.assertIn("missing.txt", message)
+            self.assertNotIn(str(root), message)
 
     def test_scanner_source_and_tests_do_not_self_trigger_privacy_rules(self) -> None:
         privacy_rules = {
