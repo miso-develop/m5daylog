@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "security_scan.py"
 SPEC = importlib.util.spec_from_file_location("security_scan_review_regressions", MODULE_PATH)
@@ -112,6 +113,37 @@ class SecurityScanReviewRegressionTests(unittest.TestCase):
             stderr = io.StringIO()
             with redirect_stderr(stderr):
                 exit_code = security_scan.main(["--root", str(root)])
+            rendered = stderr.getvalue()
+            self.assertEqual(2, exit_code)
+            self.assertIn("[security:scan] ERROR:", rendered)
+            self.assertNotIn("Traceback", rendered)
+            self.assertNotIn(str(root), rendered)
+
+    def test_non_utf8_tracked_filename_fails_closed_without_runtime_path_echo(self) -> None:
+        invalid_name = b"docs/synthetic-" + bytes([0xFF]) + b"-note.md"
+        completed = mock.Mock(
+            stdout=b"README.md\0" + invalid_name + b"\0",
+            stderr=b"",
+            returncode=0,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / security_scan.ALLOWLIST_FILE).write_text(
+                '{"version": 1, "entries": []}', encoding="utf-8"
+            )
+            stderr = io.StringIO()
+            with mock.patch.object(
+                security_scan.subprocess, "run", return_value=completed
+            ), redirect_stderr(stderr):
+                try:
+                    exit_code = security_scan.main(["--root", str(root)])
+                except Exception as exc:  # pragma: no cover - regression assertion
+                    self.fail(
+                        "scanner escaped sanitized error surface: "
+                        + type(exc).__name__
+                    )
+
             rendered = stderr.getvalue()
             self.assertEqual(2, exit_code)
             self.assertIn("[security:scan] ERROR:", rendered)
