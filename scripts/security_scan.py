@@ -86,17 +86,17 @@ PRIVACY_PATTERNS = {
     "machine-path-windows": re.compile(
         r"(?<![A-Za-z0-9])"
         r"[A-Za-z]:[\\/]+Users[\\/]+"
-        r"[A-Za-z0-9][A-Za-z0-9._ -]*",
+        r"[A-Za-z0-9._ -]+",
         re.IGNORECASE,
     ),
     "machine-path-wsl": re.compile(
         r"(?:\\\\|//)(?:wsl\$|wsl\.localhost)[\\/]+"
         r"[A-Za-z0-9][A-Za-z0-9._-]*[\\/]+home[\\/]+"
-        r"[A-Za-z0-9][A-Za-z0-9._-]*",
+        r"[A-Za-z0-9._-]+",
         re.IGNORECASE,
     ),
     "machine-path-posix-home": re.compile(
-        r"(?<![A-Za-z0-9:])/(?:home|Users)/[A-Za-z0-9][A-Za-z0-9._-]*"
+        r"(?<![A-Za-z0-9:])/(?:home|Users)/[A-Za-z0-9._-]+"
     ),
     "private-repository-identifier": re.compile(
         r"(?:"
