@@ -1,0 +1,30 @@
+name: GitHub Public Surface Historical Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  audit-public-surfaces:
+    name: security:github-surface-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout trusted default-branch scanner code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Audit historical public GitHub surfaces
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_SAFE: ${{ github.repository }}
+        run: >-
+          python3 scripts/github_surface_scan.py audit
+          --repository "$GITHUB_REPOSITORY_SAFE"
