@@ -63,6 +63,60 @@ SIGNATURE_PATTERNS = {
     "credential-uri": re.compile(r"[a-z][a-z0-9+.-]{1,20}://[^\s/:@]+:[^\s/@]{8,}@", re.IGNORECASE),
 }
 
+# Privacy markers are deliberately composed rather than embedded as a concrete
+# repository identifier. The rule recognizes the public naming convention only.
+_PRIVATE_REPO_MARKER = "-" + "private"
+_REPO_COMPONENT = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+_REPO_IDENTIFIER = (
+    r"(?:" + _REPO_COMPONENT + r"/)?"
+    + _REPO_COMPONENT
+    + re.escape(_PRIVATE_REPO_MARKER)
+)
+_REPO_URL_IDENTIFIER = (
+    r"https?://"
+    + _REPO_COMPONENT
+    + r"/"
+    + _REPO_COMPONENT
+    + r"/"
+    + _REPO_COMPONENT
+    + re.escape(_PRIVATE_REPO_MARKER)
+)
+
+PRIVACY_PATTERNS = {
+    "machine-path-windows": re.compile(
+        r"(?<![A-Za-z0-9])"
+        r"[A-Za-z]:[\\/]+Users[\\/]+"
+        r"[A-Za-z0-9._ -]+",
+        re.IGNORECASE,
+    ),
+    "machine-path-wsl": re.compile(
+        r"(?:\\\\|//)(?:wsl\$|wsl\.localhost)[\\/]+"
+        r"[A-Za-z0-9][A-Za-z0-9._-]*[\\/]+home[\\/]+"
+        r"[A-Za-z0-9._-]+",
+        re.IGNORECASE,
+    ),
+    "machine-path-posix-home": re.compile(
+        r"(?<![A-Za-z0-9:])/(?:home|Users)/[A-Za-z0-9._-]+"
+    ),
+    "private-repository-identifier": re.compile(
+        r"(?:"
+        r"(?<![A-Za-z0-9._/\\-])" + _REPO_IDENTIFIER
+        + r"(?=(?:$|[^A-Za-z0-9._/\\-]|\.(?![A-Za-z0-9._/\\-])))"
+        + r"|(?<![A-Za-z0-9])" + _REPO_URL_IDENTIFIER
+        + r"(?=(?:\.git)?(?:$|/|[^A-Za-z0-9._/\\-]|\.(?![A-Za-z0-9._/\\-])))"
+        + r")",
+        re.IGNORECASE,
+    ),
+}
+
+PRIVACY_MESSAGES = {
+    "machine-path-windows": "concrete Windows user-profile path",
+    "machine-path-wsl": "concrete WSL user-home path",
+    "machine-path-posix-home": "concrete POSIX/macOS user-home path",
+    "private-repository-identifier": "private repository identifier",
+}
+PRIVACY_RULES = frozenset(PRIVACY_PATTERNS)
+
 _CREDENTIAL_NAME = (
     r"(?:password|passwd|passphrase|secret|api[_-]?key|token|pat|"
     r"access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|"
@@ -87,9 +141,13 @@ LOG_SINK_PATTERN = re.compile(
 
 KNOWN_RULES = frozenset({
     "forbidden-path", "large-file", "audio-file", "env-template-value",
-    "credential-literal", "dangerous-log", *SIGNATURE_PATTERNS.keys(),
+    "credential-literal", "dangerous-log", *PRIVACY_RULES,
+    *SIGNATURE_PATTERNS.keys(),
 })
-ALLOWLISTABLE_RULES = KNOWN_RULES - {"forbidden-path", "large-file", "env-template-value"}
+NON_ALLOWLISTABLE_RULES = frozenset({
+    "forbidden-path", "large-file", "env-template-value", *PRIVACY_RULES,
+})
+ALLOWLISTABLE_RULES = KNOWN_RULES - NON_ALLOWLISTABLE_RULES
 
 
 class ScanError(RuntimeError):
@@ -116,7 +174,7 @@ class AllowEntry:
 def normalize_relative_path(raw: str) -> str:
     path = PurePosixPath(raw.replace("\\", "/"))
     if path.is_absolute() or ".." in path.parts or not path.parts:
-        raise ScanError(f"invalid repository-relative path: {raw!r}")
+        raise ScanError("invalid repository-relative path")
     return path.as_posix()
 
 
@@ -130,9 +188,13 @@ def load_allowlist(root: Path) -> list[AllowEntry]:
         raise ScanError(f"required allowlist file is missing: {ALLOWLIST_FILE}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ScanError(f"cannot read {ALLOWLIST_FILE}: {exc}") from exc
-    if payload.get("version") != 1 or not isinstance(payload.get("entries"), list):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScanError(f"cannot read or parse {ALLOWLIST_FILE}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or not isinstance(payload.get("entries"), list)
+    ):
         raise ScanError(f"{ALLOWLIST_FILE} must contain version=1 and an entries array")
 
     entries: list[AllowEntry] = []
@@ -148,9 +210,9 @@ def load_allowlist(root: Path) -> list[AllowEntry]:
             reason=str(raw["reason"]).strip(),
         )
         if entry.rule not in ALLOWLISTABLE_RULES:
-            raise ScanError(f"allowlist entry {index} uses non-allowlistable rule: {entry.rule}")
+            raise ScanError(f"allowlist entry {index} uses non-allowlistable rule")
         if entry.kind not in {"synthetic-fixture", "public-test-vector"}:
-            raise ScanError(f"allowlist entry {index} has invalid kind: {entry.kind}")
+            raise ScanError(f"allowlist entry {index} has invalid kind")
         if not is_safe_fixture_path(entry.path):
             raise ScanError(f"allowlist entry {index} must target a designated fixture directory")
         if not re.fullmatch(r"[0-9a-f]{64}", entry.file_sha256):
@@ -172,7 +234,14 @@ def git_tracked_files(root: Path) -> list[str]:
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ScanError("cannot enumerate Git-tracked files; run inside a Git worktree") from exc
-    paths = [normalize_relative_path(item.decode("utf-8")) for item in result.stdout.split(b"\0") if item]
+    try:
+        paths = [
+            normalize_relative_path(item.decode("utf-8"))
+            for item in result.stdout.split(b"\0")
+            if item
+        ]
+    except UnicodeDecodeError as exc:
+        raise ScanError("cannot decode Git-tracked file list as UTF-8") from exc
     if not paths:
         raise ScanError("Git reported no tracked files")
     return paths
@@ -184,6 +253,10 @@ def file_sha256(data: bytes) -> str:
 
 def line_number(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
+
+
+def render_finding(finding: Finding) -> str:
+    return f"[security:scan] {finding.path}:{finding.line}: [{finding.rule}] {finding.message}"
 
 
 def scan_path(path: str) -> list[Finding]:
@@ -219,16 +292,26 @@ def scan_env_example(path: str, text: str) -> list[Finding]:
     return findings
 
 
+def scan_text(label: str, text: str) -> list[Finding]:
+    """Scan arbitrary candidate public text using non-echoing common rules."""
+    findings: list[Finding] = []
+    for rule, pattern in SIGNATURE_PATTERNS.items():
+        for match in pattern.finditer(text):
+            findings.append(Finding(label, line_number(text, match.start()), rule, "high-confidence credential/private-key signature"))
+
+    for rule, pattern in PRIVACY_PATTERNS.items():
+        for match in pattern.finditer(text):
+            findings.append(Finding(label, line_number(text, match.start()), rule, PRIVACY_MESSAGES[rule]))
+    return findings
+
+
 def scan_content(path: str, data: bytes) -> list[Finding]:
     if len(data) > MAX_FILE_BYTES:
         return [Finding(path, 1, "large-file", f"tracked file exceeds {MAX_FILE_BYTES} bytes and is not scanned")]
     text = data.decode("utf-8", errors="replace")
     suffix = PurePosixPath(path).suffix.lower()
-    findings = scan_env_example(path, text)
-
-    for rule, pattern in SIGNATURE_PATTERNS.items():
-        for match in pattern.finditer(text):
-            findings.append(Finding(path, line_number(text, match.start()), rule, "high-confidence credential/private-key signature"))
+    findings = scan_text(path, text)
+    findings.extend(scan_env_example(path, text))
 
     if suffix in CONFIG_SUFFIXES or PurePosixPath(path).name.startswith(".env"):
         for match in CREDENTIAL_LITERAL_PATTERN.finditer(text):
@@ -265,7 +348,7 @@ def scan_repository(root: Path) -> tuple[list[Finding], list[AllowEntry]]:
         try:
             data = full_path.read_bytes()
         except OSError as exc:
-            raise ScanError(f"cannot read tracked file {relative}: {exc}") from exc
+            raise ScanError(f"cannot read tracked file {relative}") from exc
         hashes[relative] = file_sha256(data)
         findings.extend(scan_content(relative, data))
     return apply_allowlist(findings, hashes, entries)
@@ -288,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
     for entry in stale:
         print(f"[security:scan] ERROR: stale allowlist entry {entry.path} [{entry.rule}]", file=sys.stderr)
     for finding in findings:
-        print(f"[security:scan] {finding.path}:{finding.line}: [{finding.rule}] {finding.message}", file=sys.stderr)
+        print(render_finding(finding), file=sys.stderr)
 
     if findings or stale:
         print(f"[security:scan] FAILED: {len(findings)} finding(s), {len(stale)} stale allowlist entry/entries", file=sys.stderr)
