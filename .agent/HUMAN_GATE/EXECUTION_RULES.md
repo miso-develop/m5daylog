@@ -31,7 +31,7 @@ The session record should identify, using public-safe values only:
 - test phase / cycle number;
 - command result where applicable;
 - physical observation;
-- PASS / FAIL / BLOCKED disposition;
+- `PASS` / `FAIL` / `BLOCKED` / `NOT_RUN` disposition;
 - reason for any aborted cycle.
 
 Local evidence files may contain richer machine-specific diagnostics, but committed durable evidence must be sanitized according to `.agent/HUMAN_GATE/README.md`.
@@ -107,11 +107,11 @@ Examples:
 - a log collector stopped when a serial device re-enumerated;
 - the evidence parser failed even though the underlying command completed.
 
-A tooling failure means the acceptance result is `BLOCKED` or `NOT OBSERVED`, not automatically product `FAIL`.
+A tooling or harness failure that invalidates an attempted Human Gate observation is `BLOCKED`, not automatically product `FAIL`. If the required test phase was never attempted, use `NOT_RUN` instead.
 
 ### Product failure
 
-A product failure requires product behavior that contradicts an Acceptance Criterion under valid test preconditions.
+A product failure requires product behavior that contradicts an Acceptance Criterion under valid test preconditions and with a valid observation path.
 
 When possible, capture the first observable product error before recovery or reset changes the state.
 
@@ -150,11 +150,13 @@ Do not continue counting cycles from the failed revision unless the approved spe
 
 ## 12. Final disposition
 
-Human Gate completion must distinguish:
+Human Gate uses exactly these final dispositions for the stated test scope:
 
-- `PASS`: all required physical/manual observations for the stated scope passed;
-- `FAIL`: valid test preconditions were met and product behavior violated an Acceptance Criterion;
-- `BLOCKED`: tooling, environment, dependency, or unavailable hardware prevented a valid observation;
-- `NOT_RUN`: required test has not yet been attempted.
+- `PASS`: all required physical/manual observations for the stated scope were validly obtained and satisfied the Acceptance Criteria;
+- `FAIL`: valid test preconditions and a valid observation path were present, and the observed product behavior violated an Acceptance Criterion. This includes a bounded deadline expiring when the required product state or completion event was not observed even though the observation mechanism remained valid for the full required window;
+- `BLOCKED`: the test was attempted, but tooling, harness, environment, dependency, unavailable hardware, or loss of the required observation path prevented a valid acceptance observation;
+- `NOT_RUN`: the required test or phase has not yet been attempted.
+
+`NOT_OBSERVED` is not a Human Gate disposition. An inability to obtain a valid observation after an attempt maps to `BLOCKED`; an unattempted test maps to `NOT_RUN`.
 
 Never convert `BLOCKED` or `NOT_RUN` into `PASS` based on automated tests alone when physical evidence is required.
