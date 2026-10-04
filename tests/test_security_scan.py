@@ -219,6 +219,8 @@ class SecurityScanTests(unittest.TestCase):
             "/usr/local/bin/python3",
             "https://example.invalid/Users/example",
             "public-owner/public-project",
+            "local-" + "private" + "/",
+            "cache/segment-" + "private" + "/data",
         ]
         for value in safe_values:
             with self.subTest(value=value):
