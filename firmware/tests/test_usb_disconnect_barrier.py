@@ -11,6 +11,7 @@ REPO = Path(__file__).resolve().parents[2]
 USB_C = REPO / "firmware/components/recorder/usb_msc_ownership.c"
 SD_C = REPO / "firmware/components/recorder/sd_mount.c"
 RUNTIME = REPO / "firmware/main/task49_runtime.c"
+WAKE_RECOVERY = REPO / "firmware/main/task87_wake_recovery.c"
 MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
 
 
@@ -65,11 +66,25 @@ def test_runtime_releases_hold_only_after_ownership_quiesce_returns_success():
     assert "usb_msc_ownership_rearm" not in runtime
 
 
-def test_manual_wake_recovery_wrapper_orders_pending_rtc_before_armed_clear():
+def test_manual_wake_runtime_delegates_to_production_recovery_seam():
     runtime = RUNTIME.read_text(encoding="utf-8")
+    recovery = WAKE_RECOVERY.read_text(encoding="utf-8")
+
     fn_at = runtime.index("bool recorder_task87_manifest_sync_wav_dir")
     base_call_at = runtime.index("device_manifest_sync_wav_dir(", fn_at)
-    rtc_at = runtime.index("recorder_flush_pending_rtc_after_mount", base_call_at)
-    clear_at = runtime.index("shutdown_armed_clear", rtc_at)
-    assert base_call_at < rtc_at < clear_at
+    recover_at = runtime.index("task87_wake_recovery_complete_device_recovery", base_call_at)
+    assert base_call_at < recover_at
     assert "#define device_manifest_sync_wav_dir recorder_task87_manifest_sync_wav_dir" in runtime
+
+    seam_at = recovery.index("task87_wake_recovery_complete_device_recovery")
+    rtc_at = recovery.index("rtc_correction_flush_pending_event", seam_at)
+    clear_at = recovery.index("shutdown_armed_clear", rtc_at)
+    assert seam_at < rtc_at < clear_at
+
+    wait_at = runtime.index("static bool recorder_wait_initial_recording")
+    recording_at = runtime.index("RECORDER_STATE_RECORDING", wait_at)
+    fresh_id_at = runtime.index("s_seg_rec_id[0]", recording_at)
+    note_at = runtime.index("task87_wake_recovery_note_recording_started", fresh_id_at)
+    usb_gate_at = runtime.index("task87_wake_recovery_usb_rearm_allowed", note_at)
+    usb_init_at = runtime.index("usb_msc_ownership_init", usb_gate_at)
+    assert recording_at < fresh_id_at < note_at < usb_gate_at < usb_init_at
