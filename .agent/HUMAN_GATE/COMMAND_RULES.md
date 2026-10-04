@@ -140,7 +140,12 @@ On deadline expiry:
 - stop the phase;
 - print the last observed state;
 - preserve logs;
-- classify the phase as `BLOCKED`, `NOT OBSERVED`, or `FAIL` according to `.agent/HUMAN_GATE/EXECUTION_RULES.md`.
+- classify the phase according to `.agent/HUMAN_GATE/EXECUTION_RULES.md`:
+  - `FAIL` when valid preconditions and a valid observation path remained present for the required window but the expected product state or completion event did not occur;
+  - `BLOCKED` when tooling, harness, environment, dependency, hardware availability, or loss of the observation path prevented a valid acceptance observation;
+  - `NOT_RUN` only when the required phase was never attempted.
+
+Deadline expiry by itself does not determine the disposition; the validity of the test preconditions and observation path does.
 
 Never leave a Human Gate command with an unbounded polling loop.
 
