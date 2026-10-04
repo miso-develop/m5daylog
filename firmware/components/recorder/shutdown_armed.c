@@ -22,13 +22,17 @@ static esp_err_t shutdown_armed_finish_nvs(esp_err_t operation_err) {
     if (operation_err != ESP_OK) {
         return operation_err;
     }
-    // ESP_ERR_NVS_NOT_INITIALIZED already proves the desired cleanup
-    // postcondition. Do not turn an otherwise valid lifecycle read/write into
-    // a fail-closed boot solely because another owner already deinitialized
-    // the shared default NVS partition.
-    if (deinit_err == ESP_OK || deinit_err == ESP_ERR_NVS_NOT_INITIALIZED) {
+    if (deinit_err == ESP_OK) {
         return ESP_OK;
     }
+#ifdef ESP_ERR_NVS_NOT_INITIALIZED
+    // The default NVS partition is already deinitialized, so the desired
+    // cleanup postcondition holds. Do not turn an otherwise valid lifecycle
+    // read/write into a fail-closed boot for this idempotent disposition.
+    if (deinit_err == ESP_ERR_NVS_NOT_INITIALIZED) {
+        return ESP_OK;
+    }
+#endif
     return deinit_err;
 }
 
