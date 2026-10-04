@@ -51,18 +51,24 @@ def test_usb_publish_gate_requires_finalize_manifest_and_device_fs_release():
     for gate in ("wav_finalized", "manifest_committed", "device_fs_released"):
         assert gate in gate_region, gate
     unresolved_at = gate_region.index("shutdown_armed_mark_host_unresolved")
-    prepare_at = gate_region.index("USB_BIT_PREPARE_OK")
-    assert unresolved_at < prepare_at
+    transfer_at = gate_region.index("sd_mount_transfer_to_usb")
+    host_proof_at = gate_region.index("s_host_owned", transfer_at)
+    reconnect_at = gate_region.index("tud_connect", host_proof_at)
+    assert unresolved_at < transfer_at < host_proof_at < reconnect_at
 
 
-def test_attach_callback_blocks_before_host_ownership():
+def test_attach_callback_hides_msc_before_host_ownership():
     src = USB_C.read_text(encoding="utf-8")
     attached_at = src.index("TINYUSB_EVENT_ATTACHED")
-    wait_at = src.index("USB_BIT_PREPARE_OK", attached_at)
-    to_usb_at = src.index("sd_mount_transfer_to_usb", wait_at)
-    host_proof_at = src.index("s_host_owned", to_usb_at)
-    assert attached_at < wait_at < to_usb_at < host_proof_at
-    assert "portMAX_DELAY" in src[attached_at:to_usb_at]
+    suspend_at = src.index("#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK", attached_at)
+    region = src[attached_at:suspend_at]
+
+    disconnect_at = region.rindex("tud_disconnect")
+    attach_event_at = region.index("USB_BIT_ATTACH", disconnect_at)
+    assert disconnect_at < attach_event_at
+    assert "xEventGroupWaitBits" not in region
+    assert "sd_mount_transfer_to_usb" not in region
+    assert "tud_connect" not in region
 
 
 def test_usb_sync_keeps_device_filesystem_unmounted():
