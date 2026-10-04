@@ -15,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "sd_mount.h"
+#include "shutdown_armed.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_msc.h"
@@ -56,6 +57,15 @@ static bool usb_msc_publish(bool wav_finalized,
         usb_fail("publish gate incomplete");
         return false;
     }
+
+    // The boot-visible unresolved marker must be durable before PREPARE_OK can
+    // admit the APP -> USB storage transfer. A reset from this point onward can
+    // therefore never forget that explicit host release is still required.
+    if (shutdown_armed_mark_host_unresolved() != ESP_OK) {
+        usb_fail("persist unresolved ownership");
+        return false;
+    }
+
     s_wav_finalized = wav_finalized;
     s_manifest_committed = manifest_committed;
     s_device_fs_released = device_fs_released;
@@ -129,7 +139,8 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
                  "stage: usb, result: attach, owner: device, mount: app");
 
         // Do not finish SetConfiguration until recorder finalization, durable
-        // metadata, and logical Device-FS release are all proven.
+        // metadata, boot-visible unresolved ownership, and logical Device-FS
+        // release are all proven.
         (void)xEventGroupWaitBits(s_usb_events, USB_BIT_PREPARE_OK,
                                   pdTRUE, pdTRUE, portMAX_DELAY);
         err = sd_mount_transfer_to_usb();
@@ -311,6 +322,16 @@ esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
     err = sd_mount_release_usb_storage();
     if (err != ESP_OK) {
         usb_fail("usb storage release");
+        return err;
+    }
+
+    // Retire HOST_UNRESOLVED only after the host path is unreachable and the
+    // USB-owned storage object has been released. If this durable transition
+    // fails, keep volatile host ownership unresolved as well; a later reboot
+    // still sees HOST_UNRESOLVED and cannot mount/write the Device filesystem.
+    err = shutdown_armed_commit();
+    if (err != ESP_OK) {
+        usb_fail("persist shutdown armed");
         return err;
     }
 
