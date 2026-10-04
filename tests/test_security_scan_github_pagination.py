@@ -58,6 +58,37 @@ class GithubSurfacePaginationRegressionTests(unittest.TestCase):
 
         self.assertEqual("api-pagination-ambiguous", caught.exception.error_class)
 
+    def test_link_header_next_relation_is_bound_to_expected_request(self) -> None:
+        module = load_surface_scan()
+        request_url = (
+            "https://api.github.com/repos/public-owner/public-repo/issues"
+            "?per_page=2&page=1&state=all&sort=created&direction=asc"
+        )
+        link_header = (
+            '<https://api.github.com/repos/public-owner/public-repo/issues?per_page=2&page=2&state=all&sort=created&direction=asc>; rel="next", '
+            '<https://api.github.com/repos/public-owner/public-repo/issues?per_page=2&page=4&state=all&sort=created&direction=asc>; rel="last"'
+        )
+
+        self.assertEqual(2, module._next_page_from_link(link_header, request_url, 1))
+
+    def test_malformed_or_misdirected_link_header_fails_closed(self) -> None:
+        module = load_surface_scan()
+        request_url = (
+            "https://api.github.com/repos/public-owner/public-repo/issues"
+            "?per_page=2&page=1&state=all&sort=created&direction=asc"
+        )
+        invalid_headers = [
+            "not-a-link",
+            '<https://api.github.com/repos/public-owner/public-repo/pulls?per_page=2&page=2&state=all&sort=created&direction=asc>; rel="next"',
+            '<https://api.github.com/repos/public-owner/public-repo/issues?per_page=2&page=3&state=all&sort=created&direction=asc>; rel="next"',
+        ]
+
+        for header in invalid_headers:
+            with self.subTest(header=header):
+                with self.assertRaises(module.SurfaceScanError) as caught:
+                    module._next_page_from_link(header, request_url, 1)
+                self.assertEqual("api-pagination-ambiguous", caught.exception.error_class)
+
 
 if __name__ == "__main__":
     unittest.main()
