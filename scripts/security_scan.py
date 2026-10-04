@@ -188,7 +188,7 @@ def load_allowlist(root: Path) -> list[AllowEntry]:
         raise ScanError(f"required allowlist file is missing: {ALLOWLIST_FILE}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ScanError(f"cannot read or parse {ALLOWLIST_FILE}") from exc
     if (
         not isinstance(payload, dict)
