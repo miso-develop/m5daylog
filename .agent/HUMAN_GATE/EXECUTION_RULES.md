@@ -1,6 +1,6 @@
 # Human Gate Execution Rules
 
-version: 1
+version: 2
 
 ## 1. Scope
 
@@ -51,6 +51,8 @@ A baseline must verify the preconditions that make the cycle meaningful, for exa
 
 If the baseline fails, do not count the cycle. Diagnose or hand the failure back to the owning Role.
 
+When stale test state is reversibly retired or any other recovery changes a baseline prerequisite, preserve the prior state when feasible and establish a fresh baseline before counting subsequent cycles. The new observation is a new evidence session for baseline purposes even when the tested revision is unchanged.
+
 ## 5. One phase, one purpose
 
 Keep Human Gate phases small and observable.
@@ -81,6 +83,8 @@ Examples:
 
 Destructive or state-resetting actions may be used only when necessary and must not erase evidence needed to diagnose the failure that triggered them.
 
+A diagnostic operation can be non-destructive to persistent data while still changing runtime state, for example by resetting a target, changing boot mode, or forcing interface re-enumeration. Treat such a diagnostic as its own phase and re-establish runtime baseline afterward rather than assuming continuity across the operation.
+
 ## 7. Physical action instructions
 
 For every physical operator step:
@@ -105,9 +109,12 @@ Examples:
 - wrapper process hung after the underlying test already completed;
 - wrong tool version was resolved from PATH;
 - a log collector stopped when a serial device re-enumerated;
-- the evidence parser failed even though the underlying command completed.
+- the evidence parser failed even though the underlying command completed;
+- a parser attributed stale pre-action output to a later reset or boot session.
 
 A tooling or harness failure that invalidates an attempted Human Gate observation is `BLOCKED`, not automatically product `FAIL`. If the required test phase was never attempted, use `NOT_RUN` instead.
+
+If later analysis proves that an automatic harness verdict was wrong, correct that verdict explicitly. Preserve any independently valid raw product observations and do not retain the false harness-generated verdict as product evidence.
 
 ### Product failure
 
@@ -160,3 +167,19 @@ Human Gate uses exactly these final dispositions for the stated test scope:
 `NOT_OBSERVED` is not a Human Gate disposition. An inability to obtain a valid observation after an attempt maps to `BLOCKED`; an unattempted test maps to `NOT_RUN`.
 
 Never convert `BLOCKED` or `NOT_RUN` into `PASS` based on automated tests alone when physical evidence is required.
+
+## 13. Correcting a verdict without repeating the physical action
+
+A Human Gate may discover after execution that the command wrapper or parser generated the wrong disposition from valid captured evidence.
+
+When the raw evidence is immutable and its ordering/session boundary can be reconstructed reliably:
+
+1. preserve the raw evidence;
+2. identify the exact parser/wrapper defect;
+3. re-evaluate only the affected interpretation;
+4. record the corrected disposition;
+5. do not repeat a physical, destructive, or interruption action solely to regenerate evidence that is already valid.
+
+If the session boundary or preconditions cannot be reconstructed with confidence, do not guess. Classify the affected observation as `BLOCKED` and run a fresh bounded observation phase.
+
+Reusable command/parser failure modes should be added to `.agent/HUMAN_GATE/COMMAND_FAILURE_PLAYBOOK.md` so future Human Gates avoid the same defect.

@@ -1,6 +1,6 @@
 # Human Gate Policy
 
-version: 1
+version: 2
 
 ## Purpose
 
@@ -14,6 +14,13 @@ When a task involves planning, executing, interpreting, recording, or resuming a
 
 1. `.agent/HUMAN_GATE/EXECUTION_RULES.md`
 2. `.agent/HUMAN_GATE/COMMAND_RULES.md`
+3. `.agent/HUMAN_GATE/COMMAND_FAILURE_PLAYBOOK.md`
+
+`EXECUTION_RULES.md` defines acceptance-session semantics, baseline, cycle validity, evidence classification, and final dispositions.
+
+`COMMAND_RULES.md` defines the command packet, PowerShell/native-process, timeout, toolchain, reset/session-boundary, and observation requirements that Human Gate operator commands must follow.
+
+`COMMAND_FAILURE_PLAYBOOK.md` records reusable command/harness failure modes, their diagnostic signatures, prevention rules, and safe recovery methods. When a new command-side defect causes or nearly causes an invalid Human Gate verdict, add a generalized public-safe entry there rather than leaving the lesson only in chat history.
 
 These rules apply in addition to the active Role Contract, approved specification / Acceptance Criteria, current Issue / PR state, and `.agent/HANDOFF_PROTOCOL.md`.
 
@@ -46,3 +53,5 @@ Keep these categories separate:
 - acceptance verdicts.
 
 A successful command does not prove a physical acceptance criterion. A command-wrapper failure does not by itself prove a product failure. Record the observed product behavior independently from the harness/tooling behavior.
+
+When a parser or wrapper verdict is later shown to be wrong, preserve the underlying raw observation, correct the harness verdict, and follow `EXECUTION_RULES.md` for whether the physical action must be repeated. Do not preserve a known false harness classification as product evidence.
