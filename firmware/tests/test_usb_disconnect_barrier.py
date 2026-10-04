@@ -1,8 +1,8 @@
 """Task #87 Strategy 2 source-order contracts.
 
-Behavioral host tests are the primary proof. These assertions lock the linker
-seam, gated publication ordering, release ordering, durable ownership lifecycle,
-and absence of same-session APP remount/rearm.
+Behavioral host tests are the primary proof. These assertions lock the mount
+and explicit-eject linker seams, pre-configuration publication barrier, release
+ordering, durable ownership lifecycle, and absence of same-session APP remount.
 """
 
 from pathlib import Path
@@ -15,35 +15,44 @@ WAKE_RECOVERY = REPO / "firmware/main/task87_wake_recovery.c"
 MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
 
 
-def test_start_stop_unit_has_one_to_one_linker_wrap_seam():
+def test_tinyusb_callbacks_have_one_to_one_linker_wrap_seams():
     usb = USB_C.read_text(encoding="utf-8")
     cmake = MAIN_CMAKE.read_text(encoding="utf-8")
+    assert "__wrap_tud_mount_cb" in usb
+    assert "__real_tud_mount_cb" in usb
+    assert "--wrap=tud_mount_cb" in cmake
     assert "__wrap_tud_msc_start_stop_cb" in usb
     assert "__real_tud_msc_start_stop_cb" in usb
     assert "--wrap=tud_msc_start_stop_cb" in cmake
 
 
-def test_publish_persists_unresolved_before_usb_transfer_and_reconnect():
+def test_publish_persists_unresolved_before_releasing_prepare_barrier():
     usb = USB_C.read_text(encoding="utf-8")
     publish_at = usb.index("static bool usb_msc_publish")
     unresolved_at = usb.index("shutdown_armed_mark_host_unresolved", publish_at)
-    transfer_at = usb.index("sd_mount_transfer_to_usb", unresolved_at)
-    host_ready_at = usb.index("s_host_owned", transfer_at)
-    reconnect_at = usb.index("tud_connect", host_ready_at)
-    assert publish_at < unresolved_at < transfer_at < host_ready_at < reconnect_at
+    prepare_at = usb.index("USB_BIT_PREPARE_OK", unresolved_at)
+    assert publish_at < unresolved_at < prepare_at
 
 
-def test_first_attach_is_hidden_before_recorder_finalize_and_storage_transfer():
+def test_storage_mount_start_is_preconfiguration_prepare_barrier():
     usb = USB_C.read_text(encoding="utf-8")
-    callback_at = usb.index("static void usb_device_event_cb")
-    attached_at = usb.index("TINYUSB_EVENT_ATTACHED", callback_at)
-    suspend_at = usb.index("#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK", attached_at)
-    region = usb[attached_at:suspend_at]
-    disconnect_at = region.rindex("tud_disconnect")
-    attach_event_at = region.index("USB_BIT_ATTACH", disconnect_at)
-    assert disconnect_at < attach_event_at
-    assert "sd_mount_transfer_to_usb" not in region
-    assert "xEventGroupWaitBits" not in region
+    cb_at = usb.index("static void usb_storage_event_cb")
+    start_at = usb.index("TINYUSB_MSC_EVENT_MOUNT_START", cb_at)
+    complete_at = usb.index("TINYUSB_MSC_EVENT_MOUNT_COMPLETE", start_at)
+    region = usb[start_at:complete_at]
+    attach_at = region.index("USB_BIT_ATTACH")
+    wait_at = region.index("xEventGroupWaitBits", attach_at)
+    prepare_at = region.index("USB_BIT_PREPARE_OK", wait_at)
+    assert attach_at < wait_at < prepare_at
+
+
+def test_wrapped_mount_transfers_storage_before_real_post_config_callback():
+    usb = USB_C.read_text(encoding="utf-8")
+    fn_at = usb.index("void __wrap_tud_mount_cb")
+    transfer_at = usb.index("sd_mount_transfer_to_usb", fn_at)
+    host_proof_at = usb.index("s_host_owned", transfer_at)
+    real_at = usb.index("__real_tud_mount_cb", host_proof_at)
+    assert fn_at < transfer_at < host_proof_at < real_at
 
 
 def test_release_quiesce_tears_down_usb_before_deferred_write_proof_and_durable_arm():
