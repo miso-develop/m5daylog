@@ -174,7 +174,7 @@ def load_allowlist(root: Path) -> list[AllowEntry]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ScanError(f"cannot read {ALLOWLIST_FILE}: {exc}") from exc
+        raise ScanError(f"cannot read or parse {ALLOWLIST_FILE}") from exc
     if payload.get("version") != 1 or not isinstance(payload.get("entries"), list):
         raise ScanError(f"{ALLOWLIST_FILE} must contain version=1 and an entries array")
 
@@ -322,7 +322,7 @@ def scan_repository(root: Path) -> tuple[list[Finding], list[AllowEntry]]:
         try:
             data = full_path.read_bytes()
         except OSError as exc:
-            raise ScanError(f"cannot read tracked file {relative}: {exc}") from exc
+            raise ScanError(f"cannot read tracked file {relative}") from exc
         hashes[relative] = file_sha256(data)
         findings.extend(scan_content(relative, data))
     return apply_allowlist(findings, hashes, entries)
