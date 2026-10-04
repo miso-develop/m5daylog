@@ -84,6 +84,18 @@ class GithubSurfacePaginationRegressionTests(unittest.TestCase):
 
         self.assertEqual(2, module._next_page_from_link(link_header, request_url, 1))
 
+    def test_link_header_accepts_canonical_nested_review_resource(self) -> None:
+        module = load_surface_scan()
+        request_url = (
+            "https://api.github.com/repos/public-owner/public-repo/pulls/7/reviews"
+            "?per_page=2&page=1"
+        )
+        link_header = (
+            '<https://api.github.com/repositories/123456/pulls/7/reviews?per_page=2&page=2>; rel="next"'
+        )
+
+        self.assertEqual(2, module._next_page_from_link(link_header, request_url, 1))
+
     def test_malformed_or_misdirected_link_header_fails_closed(self) -> None:
         module = load_surface_scan()
         request_url = (
@@ -93,6 +105,8 @@ class GithubSurfacePaginationRegressionTests(unittest.TestCase):
         invalid_headers = [
             "not-a-link",
             '<https://api.github.com/repos/public-owner/public-repo/pulls?per_page=2&page=2&state=all&sort=created&direction=asc>; rel="next"',
+            '<https://api.github.com/repositories/123456/pulls?per_page=2&page=2&state=all&sort=created&direction=asc>; rel="next"',
+            '<https://api.github.com/repositories/not-numeric/issues?per_page=2&page=2&state=all&sort=created&direction=asc>; rel="next"',
             '<https://api.github.com/repos/public-owner/public-repo/issues?per_page=2&page=3&state=all&sort=created&direction=asc>; rel="next"',
         ]
 
