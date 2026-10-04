@@ -41,6 +41,7 @@ STUB_HEADERS = {
         #pragma once
         #include "esp_err.h"
         esp_err_t nvs_flash_init(void);
+        esp_err_t nvs_flash_deinit(void);
     """,
 }
 
@@ -72,6 +73,7 @@ HARNESS = r"""
     static esp_err_t g_commit_result = ESP_OK;
 
     esp_err_t nvs_flash_init(void) { return g_flash_init_result; }
+    esp_err_t nvs_flash_deinit(void) { return ESP_OK; }
     esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle) {
         CHECK(strcmp(name, "m5daylog") == 0);
         (void)mode; *handle = 7; return ESP_OK;
