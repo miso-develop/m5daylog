@@ -1,8 +1,8 @@
 """Task #87 Strategy 2 source-order contracts.
 
 Behavioral host tests are the primary proof. These assertions lock the linker
-seam, release ordering, durable ownership lifecycle, and absence of same-session
-APP remount/rearm.
+seam, gated publication ordering, release ordering, durable ownership lifecycle,
+and absence of same-session APP remount/rearm.
 """
 
 from pathlib import Path
@@ -23,13 +23,27 @@ def test_start_stop_unit_has_one_to_one_linker_wrap_seam():
     assert "--wrap=tud_msc_start_stop_cb" in cmake
 
 
-def test_publish_persists_unresolved_before_usb_transfer_can_proceed():
+def test_publish_persists_unresolved_before_usb_transfer_and_reconnect():
     usb = USB_C.read_text(encoding="utf-8")
     publish_at = usb.index("static bool usb_msc_publish")
     unresolved_at = usb.index("shutdown_armed_mark_host_unresolved", publish_at)
-    prepare_at = usb.index("USB_BIT_PREPARE_OK", unresolved_at)
-    transfer_at = usb.index("sd_mount_transfer_to_usb", prepare_at)
-    assert publish_at < unresolved_at < prepare_at < transfer_at
+    transfer_at = usb.index("sd_mount_transfer_to_usb", unresolved_at)
+    host_ready_at = usb.index("s_host_owned", transfer_at)
+    reconnect_at = usb.index("tud_connect", host_ready_at)
+    assert publish_at < unresolved_at < transfer_at < host_ready_at < reconnect_at
+
+
+def test_first_attach_is_hidden_before_recorder_finalize_and_storage_transfer():
+    usb = USB_C.read_text(encoding="utf-8")
+    callback_at = usb.index("static void usb_device_event_cb")
+    attached_at = usb.index("TINYUSB_EVENT_ATTACHED", callback_at)
+    suspend_at = usb.index("#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK", attached_at)
+    region = usb[attached_at:suspend_at]
+    disconnect_at = region.rindex("tud_disconnect")
+    attach_event_at = region.index("USB_BIT_ATTACH", disconnect_at)
+    assert disconnect_at < attach_event_at
+    assert "sd_mount_transfer_to_usb" not in region
+    assert "xEventGroupWaitBits" not in region
 
 
 def test_release_quiesce_tears_down_usb_before_deferred_write_proof_and_durable_arm():
