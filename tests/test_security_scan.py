@@ -312,6 +312,23 @@ class SecurityScanTests(unittest.TestCase):
         }
         self.assert_allowlist_failure_non_echoing(payload, marker)
 
+    def test_allowlist_invalid_rule_or_kind_does_not_echo_candidate(self) -> None:
+        marker = "synthetic-user-42"
+        candidate = synthetic_posix_home("home", marker)
+        base_entry = {
+            "path": "fixtures/synthetic/example.txt",
+            "rule": "github-token",
+            "kind": "synthetic-fixture",
+            "file_sha256": "0" * 64,
+            "reason": "synthetic test",
+        }
+        for field in ("rule", "kind"):
+            with self.subTest(field=field):
+                entry = dict(base_entry)
+                entry[field] = candidate
+                payload = {"version": 1, "entries": [entry]}
+                self.assert_allowlist_failure_non_echoing(payload, marker)
+
     def test_privacy_rules_cannot_be_allowlisted(self) -> None:
         privacy_rules = (
             "machine-path-windows",
