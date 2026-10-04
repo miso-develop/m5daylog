@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Dependency-free tracked-content leakage scanner for M5Daylog.
+"""Dependency-free repository and public-text leakage scanner for M5Daylog.
 
-The scanner fails closed when Git-tracked files cannot be enumerated/read and
+The scanner fails closed when required input cannot be enumerated/read and
 never includes a matched sensitive value in a Finding or diagnostic message.
 """
 
@@ -15,10 +15,11 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Iterable, TextIO
 
 ALLOWLIST_FILE = ".security-scan-allowlist.json"
 MAX_FILE_BYTES = 8 * 1024 * 1024
+PUBLIC_TEXT_LABEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 
 CODE_SUFFIXES = {
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".ino",
@@ -176,6 +177,12 @@ def normalize_relative_path(raw: str) -> str:
     if path.is_absolute() or ".." in path.parts or not path.parts:
         raise ScanError("invalid repository-relative path")
     return path.as_posix()
+
+
+def normalize_public_text_label(raw: str | None) -> str:
+    if raw is None or PUBLIC_TEXT_LABEL_PATTERN.fullmatch(raw) is None:
+        raise ScanError("invalid or missing public-text input label")
+    return raw
 
 
 def is_safe_fixture_path(path: str) -> bool:
@@ -355,13 +362,73 @@ def scan_repository(root: Path) -> tuple[list[Finding], list[AllowEntry]]:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scan tracked repository files for credential/private-data leakage")
+    parser = argparse.ArgumentParser(description="Scan repository or candidate public text for credential/private-data leakage")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    public_input = parser.add_mutually_exclusive_group()
+    public_input.add_argument(
+        "--public-text-stdin",
+        action="store_true",
+        help="scan candidate public text read from stdin",
+    )
+    public_input.add_argument(
+        "--public-text-file",
+        type=Path,
+        help="scan candidate public text read from a UTF-8 file",
+    )
+    parser.add_argument(
+        "--label",
+        help="safe abstract label used only for public-text finding locations",
+    )
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
+def read_public_text(args: argparse.Namespace, stdin: TextIO | None) -> tuple[str, str]:
+    label = normalize_public_text_label(args.label)
+    if args.public_text_stdin:
+        stream = sys.stdin if stdin is None else stdin
+        try:
+            return label, stream.read()
+        except (OSError, UnicodeError) as exc:
+            raise ScanError("cannot read public-text input") from exc
+
+    if args.public_text_file is not None:
+        try:
+            return label, args.public_text_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ScanError("cannot read or decode public-text input file") from exc
+
+    raise ScanError("public-text input mode is not selected")
+
+
+def run_public_text_validation(args: argparse.Namespace, stdin: TextIO | None) -> int:
+    try:
+        label, text = read_public_text(args, stdin)
+        findings = scan_text(label, text)
+    except Exception as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        print("[security:scan] ERROR: public-text validation could not be completed", file=sys.stderr)
+        return 2
+
+    for finding in findings:
+        print(render_finding(finding), file=sys.stderr)
+    if findings:
+        print(f"[security:scan] FAILED: {len(findings)} finding(s)", file=sys.stderr)
+        return 1
+
+    print("[security:scan] OK: public text")
+    return 0
+
+
+def main(argv: list[str] | None = None, *, stdin: TextIO | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    public_mode = args.public_text_stdin or args.public_text_file is not None
+    if public_mode:
+        return run_public_text_validation(args, stdin)
+    if args.label is not None:
+        print("[security:scan] ERROR: public-text label requires a public-text input mode", file=sys.stderr)
+        return 2
+
     try:
         findings, stale = scan_repository(args.root.resolve())
     except ScanError as exc:
