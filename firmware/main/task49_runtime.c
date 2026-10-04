@@ -21,6 +21,7 @@ static void recorder_task49_delete(TaskHandle_t task);
 #undef app_main
 
 #include "shutdown_armed.h"
+#include "task87_wake_recovery.h"
 #include "usb_msc_ownership.h"
 
 // The real manifest function remains in the recorder component; the macro
@@ -34,11 +35,6 @@ extern bool device_manifest_sync_wav_dir(const char *recordings_dir,
                                          uint32_t *out_added,
                                          uint32_t *out_skipped);
 
-// Task #50 provides this symbol when integrated. Keeping the hook weak lets #87
-// guarantee ordering without copying #50's still-independent implementation.
-extern esp_err_t rtc_correction_flush_pending_event(const char *events_path)
-    __attribute__((weak));
-
 #define REC_BIT_WRITER_FINALIZED (1u << 4)
 #define REC_BIT_CAPTURE_DONE     (1u << 5)
 #define REC_BIT_BATTERY_DONE     (1u << 6)
@@ -46,7 +42,7 @@ extern esp_err_t rtc_correction_flush_pending_event(const char *events_path)
                                   REC_BIT_CAPTURE_DONE | \
                                   REC_BIT_BATTERY_DONE)
 
-static bool s_manual_resume_pending = false;
+static task87_wake_recovery_t s_wake_recovery;
 
 static void recorder_task49_delete(TaskHandle_t task) {
     const char *name = pcTaskGetName(NULL);
@@ -67,13 +63,6 @@ static void recorder_task49_delete(TaskHandle_t task) {
     vTaskDelete(task);
 }
 
-static bool recorder_flush_pending_rtc_after_mount(void) {
-    if (rtc_correction_flush_pending_event == NULL) {
-        return true;
-    }
-    return rtc_correction_flush_pending_event(RECORDER_EVENTS_PATH) == ESP_OK;
-}
-
 bool recorder_task87_manifest_sync_wav_dir(const char *recordings_dir,
                                            const char *manifest_path,
                                            const char *tmp_path,
@@ -85,21 +74,16 @@ bool recorder_task87_manifest_sync_wav_dir(const char *recordings_dir,
     bool ok = device_manifest_sync_wav_dir(recordings_dir, manifest_path,
                                            tmp_path, device_id, updated_at,
                                            state, out_added, out_skipped);
-    if (!ok || !s_manual_resume_pending) {
+    if (!ok || !task87_wake_recovery_pending(&s_wake_recovery)) {
         return ok;
     }
 
-    // main.c calls manifest sync only after the recovery scan and while Device
-    // FAT/VFS ownership is established. Flush Task #50's durable pending event
-    // exactly here, then clear armed intent before main.c generates a fresh ID.
-    if (!recorder_flush_pending_rtc_after_mount()) {
-        return false;
-    }
-    if (shutdown_armed_clear() != ESP_OK) {
-        return false;
-    }
-    s_manual_resume_pending = false;
-    return true;
+    // main.c calls manifest sync only after Device FAT/VFS is mounted and the
+    // recovery scan has completed. The production seam executes Task #50's
+    // pending RTC flush (when linked) before clearing SHUTDOWN_ARMED. It keeps
+    // this boot pending until a new recordingId has reached RECORDING.
+    return task87_wake_recovery_complete_device_recovery(
+               &s_wake_recovery, RECORDER_EVENTS_PATH) == ESP_OK;
 }
 
 static void recorder_base_task(void *arg) {
@@ -117,6 +101,16 @@ static bool recorder_wait_initial_recording(void) {
         }
         state = recorder_current_state();
         if (state == RECORDER_STATE_RECORDING) {
+            // main.c writes s_seg_rec_id before the writer publishes READY and
+            // capture transitions RECOVER -> RECORDING. For a manual-WAKE boot,
+            // requiring this non-empty per-boot ID prevents stale recovery proof
+            // from authorizing USB publication without a fresh recorder session.
+            bool fresh_recording_id_present = s_seg_rec_id[0] != '\0';
+            if (task87_wake_recovery_note_recording_started(
+                    &s_wake_recovery, fresh_recording_id_present) != ESP_OK) {
+                recorder_enter_error(RECORDER_REASON_INTERNAL);
+                return false;
+            }
             return true;
         }
         if (state == RECORDER_STATE_ERROR ||
@@ -225,19 +219,30 @@ void app_main(void) {
         recorder_shutdown_armed_now();
         return;
     }
-    s_manual_resume_pending = action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME;
+    task87_wake_recovery_init(
+        &s_wake_recovery,
+        action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
 
     if (xTaskCreate(recorder_base_task, "rec_base", 6144, NULL, 2, NULL) !=
         pdPASS) {
-        if (s_manual_resume_pending) {
+        if (task87_wake_recovery_requires_shutdown(&s_wake_recovery)) {
             recorder_shutdown_armed_now();
         }
         return;
     }
     if (!recorder_wait_initial_recording()) {
-        if (s_manual_resume_pending) {
+        if (task87_wake_recovery_requires_shutdown(&s_wake_recovery)) {
             recorder_shutdown_armed_now();
         }
+        return;
+    }
+
+    // Manual-WAKE USB publication is a fresh-session privilege: even if future
+    // changes accidentally return from the recording wait early, the ownership
+    // stack cannot be rearmed until the production recovery seam says complete.
+    if (!task87_wake_recovery_usb_rearm_allowed(&s_wake_recovery)) {
+        recorder_enter_error(RECORDER_REASON_INTERNAL);
+        recorder_shutdown_armed_now();
         return;
     }
 
