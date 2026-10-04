@@ -313,23 +313,36 @@ bool sd_mount_device_fs_released(void) {
 }
 
 esp_err_t sd_mount_transfer_to_usb(void) {
+    bool transfer_ready;
     bool release_ready;
     esp_err_t err;
 
+    // Enter esp_tinyusb while Device still owns APP FAT/VFS. Its MOUNT_START
+    // callback is the pre-configuration barrier that asks the recorder to
+    // finalize, release Device filesystem access, and persist HOST_UNRESOLVED.
+    // Requiring that proof before this call would make MOUNT_START unreachable.
     portENTER_CRITICAL(&s_owner_lock);
-    release_ready = s_mounted && s_usb_release_requested &&
-                    s_device_fs_released;
+    transfer_ready = s_mounted && !s_usb_release_requested &&
+                     !s_device_fs_released;
     portEXIT_CRITICAL(&s_owner_lock);
-    if (!release_ready || s_storage == NULL) {
+    if (!transfer_ready || s_storage == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+
     err = tinyusb_msc_set_storage_mount_point(
         s_storage, TINYUSB_MSC_STORAGE_MOUNT_USB);
     if (err != ESP_OK) {
         return err;
     }
-    if (sd_mount_is_mounted()) {
-        return ESP_FAIL;
+
+    // Accept the transfer only after the MOUNT_START barrier has established
+    // recorder release proof and MOUNT_COMPLETE has retired APP ownership.
+    portENTER_CRITICAL(&s_owner_lock);
+    release_ready = !s_mounted && s_usb_release_requested &&
+                    s_device_fs_released;
+    portEXIT_CRITICAL(&s_owner_lock);
+    if (!release_ready) {
+        return ESP_ERR_INVALID_STATE;
     }
     return ESP_OK;
 }
