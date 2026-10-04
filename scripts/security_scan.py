@@ -234,7 +234,14 @@ def git_tracked_files(root: Path) -> list[str]:
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ScanError("cannot enumerate Git-tracked files; run inside a Git worktree") from exc
-    paths = [normalize_relative_path(item.decode("utf-8")) for item in result.stdout.split(b"\0") if item]
+    try:
+        paths = [
+            normalize_relative_path(item.decode("utf-8"))
+            for item in result.stdout.split(b"\0")
+            if item
+        ]
+    except UnicodeDecodeError as exc:
+        raise ScanError("cannot decode Git-tracked file list as UTF-8") from exc
     if not paths:
         raise ScanError("Git reported no tracked files")
     return paths
