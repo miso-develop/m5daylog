@@ -179,6 +179,21 @@ class PublicTextValidationTests(unittest.TestCase):
         self.assertNotIn(marker, stderr)
         self.assertNotIn(unsafe_label, stderr)
 
+    def test_sensitive_shaped_allowed_character_label_fails_closed_without_echo(self) -> None:
+        sensitive_label = "g" + "h" + "p_" + ("A" * 20)
+        marker = "synthetic-user-label-94"
+        candidate = "Inspect " + synthetic_windows_home(marker)
+        argv = ["--public-text-stdin", "--label", sensitive_label]
+
+        code, stdout, stderr = self.run_main(argv, stdin_text=candidate)
+
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertIn("[security:scan] ERROR:", stderr)
+        self.assertNotIn(sensitive_label, stdout)
+        self.assertNotIn(sensitive_label, stderr)
+        self.assert_candidate_not_echoed(candidate, stdout, stderr)
+
     def test_default_mode_still_uses_tracked_repository_scan(self) -> None:
         root = Path("synthetic-root")
         with mock.patch.object(
