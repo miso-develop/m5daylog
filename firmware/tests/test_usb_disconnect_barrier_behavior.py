@@ -1,8 +1,9 @@
 """Task #87 Strategy 2 behavioral tests for explicit-eject USB quiescence.
 
-The production C ownership coordinator is compiled against deterministic host
-stubs. These tests exercise the linker-wrapped START STOP UNIT callback used by
-esp_tinyusb 2.2.1, rather than inventing a duplicate TinyUSB callback symbol.
+The production ownership coordinator and persistent lifecycle implementation are
+compiled together against deterministic host stubs. The scenarios execute the
+START STOP UNIT eject seam, failure injection, and boot-visible fail-closed
+state rather than relying on source-text ordering alone.
 """
 
 from pathlib import Path
@@ -26,6 +27,7 @@ STUB_HEADERS = {
         #define ESP_ERR_INVALID_STATE 3
         #define ESP_ERR_NO_MEM 4
         #define ESP_ERR_NOT_SUPPORTED 5
+        #define ESP_ERR_NVS_NOT_FOUND 10
     """,
     "esp_log.h": r"""
         #pragma once
@@ -133,11 +135,23 @@ STUB_HEADERS = {
         void sd_mount_note_usb_owned(void);
         esp_err_t sd_mount_release_usb_storage(void);
     """,
-    "shutdown_armed.h": r"""
+    "nvs.h": r"""
+        #pragma once
+        #include <stdint.h>
+        #include "esp_err.h"
+        typedef int nvs_handle_t;
+        #define NVS_READONLY 0
+        #define NVS_READWRITE 1
+        esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle);
+        void nvs_close(nvs_handle_t handle);
+        esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *value);
+        esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value);
+        esp_err_t nvs_commit(nvs_handle_t handle);
+    """,
+    "nvs_flash.h": r"""
         #pragma once
         #include "esp_err.h"
-        esp_err_t shutdown_armed_mark_host_unresolved(void);
-        esp_err_t shutdown_armed_commit(void);
+        esp_err_t nvs_flash_init(void);
     """,
 }
 
@@ -150,6 +164,7 @@ HARNESS = r"""
 
     #include "freertos/FreeRTOS.h"
     #include "freertos/event_groups.h"
+    #include "nvs.h"
     #include "sd_mount.h"
     #include "shutdown_armed.h"
     #include "tinyusb.h"
@@ -182,13 +197,52 @@ HARNESS = r"""
     static int g_real_start_stop_calls;
     static int g_uninstall_calls;
     static int g_release_storage_calls;
-    static int g_mark_unresolved_calls;
-    static int g_arm_calls;
-    static int g_lifecycle_state = LIFECYCLE_NORMAL;
     static esp_err_t g_uninstall_result = ESP_OK;
     static esp_err_t g_release_storage_result = ESP_OK;
-    static esp_err_t g_mark_unresolved_result = ESP_OK;
-    static esp_err_t g_arm_result = ESP_OK;
+
+    /* Transactional NVS model: failed commit preserves the last durable value. */
+    static bool g_nvs_has_value;
+    static uint8_t g_nvs_value;
+    static bool g_nvs_pending;
+    static uint8_t g_nvs_pending_value;
+    static int g_nvs_commit_calls;
+    static esp_err_t g_nvs_commit_result = ESP_OK;
+
+    esp_err_t nvs_flash_init(void) { return ESP_OK; }
+    esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle) {
+        CHECK(strcmp(name, "m5daylog") == 0);
+        (void)mode;
+        *handle = 7;
+        return ESP_OK;
+    }
+    void nvs_close(nvs_handle_t handle) {
+        CHECK(handle == 7);
+        g_nvs_pending = false;
+    }
+    esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *value) {
+        CHECK(handle == 7);
+        CHECK(strcmp(key, "shutdown_armed") == 0);
+        if (!g_nvs_has_value) return ESP_ERR_NVS_NOT_FOUND;
+        *value = g_nvs_value;
+        return ESP_OK;
+    }
+    esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value) {
+        CHECK(handle == 7);
+        CHECK(strcmp(key, "shutdown_armed") == 0);
+        g_nvs_pending = true;
+        g_nvs_pending_value = value;
+        return ESP_OK;
+    }
+    esp_err_t nvs_commit(nvs_handle_t handle) {
+        CHECK(handle == 7);
+        g_nvs_commit_calls++;
+        if (g_nvs_commit_result != ESP_OK) return g_nvs_commit_result;
+        CHECK(g_nvs_pending);
+        g_nvs_has_value = true;
+        g_nvs_value = g_nvs_pending_value;
+        g_nvs_pending = false;
+        return ESP_OK;
+    }
 
     EventGroupHandle_t xEventGroupCreate(void) {
         return calloc(1, sizeof(struct event_group));
@@ -225,7 +279,7 @@ HARNESS = r"""
         if (!g_release_requested || !g_device_fs_released || !g_mounted) {
             return ESP_ERR_INVALID_STATE;
         }
-        CHECK(g_lifecycle_state == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(g_nvs_has_value && g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
         CHECK(g_storage_cb != NULL);
         g_storage_cb((void *)1, &event, g_storage_arg);
         return ESP_OK;
@@ -235,19 +289,6 @@ HARNESS = r"""
         g_release_storage_calls++;
         if (g_release_storage_result != ESP_OK) return g_release_storage_result;
         CHECK(!g_mounted);
-        return ESP_OK;
-    }
-
-    esp_err_t shutdown_armed_mark_host_unresolved(void) {
-        g_mark_unresolved_calls++;
-        if (g_mark_unresolved_result != ESP_OK) return g_mark_unresolved_result;
-        g_lifecycle_state = LIFECYCLE_HOST_UNRESOLVED;
-        return ESP_OK;
-    }
-    esp_err_t shutdown_armed_commit(void) {
-        g_arm_calls++;
-        if (g_arm_result != ESP_OK) return g_arm_result;
-        g_lifecycle_state = LIFECYCLE_ARMED;
         return ESP_OK;
     }
 
@@ -277,6 +318,15 @@ HARNESS = r"""
         return usb_msc_ownership_wait_event(0);
     }
 
+    static void assert_reboot_stays_fail_closed(void) {
+        shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
+        CHECK(g_nvs_has_value && g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+        CHECK(shutdown_armed_boot_action(true, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+    }
+
     static void enter_host_owned(void) {
         tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
         CHECK(usb_msc_ownership_init() == ESP_OK);
@@ -287,8 +337,8 @@ HARNESS = r"""
         CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
-        CHECK(g_mark_unresolved_calls == 1);
-        CHECK(g_lifecycle_state == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(g_nvs_commit_calls == 1);
+        CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
     }
 
     static void prove_ambiguous_events_do_not_release(void) {
@@ -298,12 +348,14 @@ HARNESS = r"""
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         CHECK(g_disconnect_calls == 0);
         CHECK(usb_msc_ownership_is_host_owned());
-        CHECK(g_lifecycle_state == LIFECYCLE_HOST_UNRESOLVED);
+        assert_reboot_stays_fail_closed();
+
+        /* Accidental pre-eject physical detach remains unresolved across boot. */
         g_device_cb(&detached, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         CHECK(g_disconnect_calls == 0);
         CHECK(usb_msc_ownership_is_host_owned());
-        CHECK(g_lifecycle_state == LIFECYCLE_HOST_UNRESOLVED);
+        assert_reboot_stays_fail_closed();
     }
 
     static void request_explicit_eject(void) {
@@ -313,22 +365,30 @@ HARNESS = r"""
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_REQUESTED);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
-        CHECK(g_lifecycle_state == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
     }
 
     static void run_success(void) {
+        shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
         enter_host_owned();
+        assert_reboot_stays_fail_closed(); /* PC-owned before eject */
         prove_ambiguous_events_do_not_release();
         request_explicit_eject();
         CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_OK);
         CHECK(g_uninstall_calls == 1);
         CHECK(g_release_storage_calls == 1);
-        CHECK(g_arm_calls == 1);
-        CHECK(g_lifecycle_state == LIFECYCLE_ARMED);
+        CHECK(g_nvs_commit_calls == 2);
+        CHECK(g_nvs_value == LIFECYCLE_ARMED);
         CHECK(!usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_QUIESCED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        /* Only successful quiescence + durable ARMED permits manual WAKE. */
+        CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+        CHECK(shutdown_armed_boot_action(true, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
     }
 
     static void run_non_eject_start_stop(void) {
@@ -337,8 +397,8 @@ HARNESS = r"""
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, false));
         CHECK(g_real_start_stop_calls == 2);
         CHECK(g_disconnect_calls == 0);
-        CHECK(g_arm_calls == 0);
-        CHECK(g_lifecycle_state == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(g_nvs_commit_calls == 1);
+        assert_reboot_stays_fail_closed();
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
@@ -350,8 +410,8 @@ HARNESS = r"""
         g_uninstall_result = ESP_FAIL;
         CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_FAIL);
         CHECK(g_release_storage_calls == 0);
-        CHECK(g_arm_calls == 0);
-        CHECK(g_lifecycle_state == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(g_nvs_commit_calls == 1);
+        assert_reboot_stays_fail_closed();
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
         CHECK(next_event() == USB_MSC_EVENT_FAILED);
@@ -364,8 +424,8 @@ HARNESS = r"""
         CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_FAIL);
         CHECK(g_uninstall_calls == 1);
         CHECK(g_release_storage_calls == 1);
-        CHECK(g_arm_calls == 0);
-        CHECK(g_lifecycle_state == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(g_nvs_commit_calls == 1);
+        assert_reboot_stays_fail_closed();
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
         CHECK(next_event() == USB_MSC_EVENT_FAILED);
@@ -374,12 +434,13 @@ HARNESS = r"""
     static void run_armed_commit_failure(void) {
         enter_host_owned();
         request_explicit_eject();
-        g_arm_result = ESP_FAIL;
+        g_nvs_commit_result = ESP_FAIL;
         CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_FAIL);
         CHECK(g_uninstall_calls == 1);
         CHECK(g_release_storage_calls == 1);
-        CHECK(g_arm_calls == 1);
-        CHECK(g_lifecycle_state == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(g_nvs_commit_calls == 2);
+        CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
+        assert_reboot_stays_fail_closed();
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
         CHECK(next_event() == USB_MSC_EVENT_FAILED);
@@ -420,7 +481,9 @@ def _build(tmp_path: Path) -> Path:
             cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
             "-DESP_PLATFORM", "-DCONFIG_TINYUSB_SUSPEND_CALLBACK=1",
             "-I", str(stubs), "-I", str(INCLUDE),
-            str(RECORDER / "usb_msc_ownership.c"), str(harness),
+            str(RECORDER / "usb_msc_ownership.c"),
+            str(RECORDER / "shutdown_armed.c"),
+            str(harness),
             "-o", str(binary),
         ],
         check=True,
@@ -433,6 +496,6 @@ def _build(tmp_path: Path) -> Path:
 @pytest.mark.parametrize(
     "scenario", ["success", "non-eject", "teardown", "deferred", "arm-failure"]
 )
-def test_strategy2_explicit_eject_behavior(tmp_path: Path, scenario: str) -> None:
+def test_strategy2_explicit_eject_and_reboot_behavior(tmp_path: Path, scenario: str) -> None:
     binary = _build(tmp_path)
     subprocess.run([str(binary), scenario], check=True, capture_output=True, text=True)
