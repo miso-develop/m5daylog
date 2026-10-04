@@ -1,4 +1,4 @@
-"""Task #87 regression: early shutdown boot-gate NVS must not stay resident."""
+"""Task #87 regression: early shutdown boot-gate NVS lifecycle semantics."""
 
 from pathlib import Path
 import shutil
@@ -21,6 +21,7 @@ STUB_HEADERS = {
         #define ESP_ERR_INVALID_STATE 3
         #define ESP_ERR_NOT_SUPPORTED 5
         #define ESP_ERR_NVS_NOT_FOUND 10
+        #define ESP_ERR_NVS_NOT_INITIALIZED 11
     """,
     "nvs.h": r"""
         #pragma once
@@ -67,6 +68,7 @@ HARNESS = r"""
     static uint8_t g_pending_value;
     static int g_init_calls;
     static int g_deinit_calls;
+    static esp_err_t g_deinit_result = ESP_OK;
 
     esp_err_t nvs_flash_init(void) {
         g_initialized = true;
@@ -78,7 +80,7 @@ HARNESS = r"""
         CHECK(g_initialized);
         g_initialized = false;
         g_deinit_calls++;
-        return ESP_OK;
+        return g_deinit_result;
     }
 
     esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle) {
@@ -115,27 +117,42 @@ HARNESS = r"""
 
     int main(void) {
         shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN;
+        bool armed = false;
 
-        /* A normal boot probes durable state before recorder tasks are created. */
+        /*
+         * ESP-IDF documents ESP_ERR_NVS_NOT_INITIALIZED as the only non-OK
+         * nvs_flash_deinit() disposition. It already means the desired cleanup
+         * postcondition holds, so a successful NORMAL boot-state read must not
+         * turn that cleanup status into a shutdown authorization failure.
+         */
+        g_deinit_result = ESP_ERR_NVS_NOT_INITIALIZED;
         CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
         CHECK(action == SHUTDOWN_ARMED_BOOT_NORMAL);
         CHECK(!g_initialized);
         CHECK(g_init_calls == 1);
         CHECK(g_deinit_calls == 1);
 
-        /* Writes must also release NVS after their durable commit completes. */
+        /* Durable writes still release NVS after their commit completes. */
+        g_deinit_result = ESP_OK;
         CHECK(shutdown_armed_commit() == ESP_OK);
         CHECK(g_has_value && g_value == 1);
         CHECK(!g_initialized);
         CHECK(g_init_calls == 2);
         CHECK(g_deinit_calls == 2);
 
+        /* Unexpected cleanup errors remain fail-closed. */
+        g_deinit_result = ESP_FAIL;
+        CHECK(shutdown_armed_read(&armed) == ESP_FAIL);
+        CHECK(!g_initialized);
+        CHECK(g_init_calls == 3);
+        CHECK(g_deinit_calls == 3);
+
         return 0;
     }
 """
 
 
-def test_shutdown_gate_releases_nvs_between_lifecycle_operations(tmp_path: Path) -> None:
+def test_shutdown_gate_handles_nvs_cleanup_without_false_shutdown(tmp_path: Path) -> None:
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if cc is None:
         pytest.skip("host C compiler is unavailable")
