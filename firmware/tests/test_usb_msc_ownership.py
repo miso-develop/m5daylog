@@ -94,6 +94,16 @@ def test_real_attached_callback_enters_transfer_barrier_before_host_use():
     assert wrapper_at < wrapper_transfer_at < real_at
 
 
+def test_usb_event_coordinator_runs_before_tinyusb_driver_start():
+    runtime = RUNTIME.read_text(encoding="utf-8")
+
+    worker_at = runtime.index("static void recorder_usb_event_task")
+    app_at = runtime.index("void app_main")
+    create_at = runtime.index("xTaskCreate(recorder_usb_event_task", app_at)
+    start_at = runtime.index("usb_msc_ownership_start()", create_at)
+    assert worker_at < app_at < create_at < start_at
+
+
 def test_usb_sync_keeps_device_filesystem_unmounted():
     runtime = RUNTIME.read_text(encoding="utf-8")
     sd = SD_C.read_text(encoding="utf-8")
