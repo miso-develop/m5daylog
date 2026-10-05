@@ -1,11 +1,15 @@
 // Tasks #49/#87: exclusive recorder microSD ownership with Strategy 2 eject.
 //
-// APP -> USB publication is gated before SetConfiguration completes: the
-// wrapped TinyUSB mount callback transfers the existing APP storage to USB,
-// and the storage MOUNT_START callback blocks until recorder finalization,
-// durable manifest state, and Device-FS release are proven. Generic detach /
-// suspend never authorizes Device ownership. The only normal reverse trigger
-// is SCSI START STOP UNIT(load_eject=1,start=0).
+// APP -> USB publication is gated before SetConfiguration completes. With
+// esp_tinyusb 2.2.1 and auto_mount_off=1, its synchronous ATTACHED device event
+// is the reliable entry point into the storage transfer barrier: MOUNT_START
+// wakes the recorder coordinator and blocks until recorder finalization,
+// durable manifest state, and Device-FS release are proven. The legacy linker
+// wraps remain compatible fallback seams but are not required for the real
+// TinyUSB callback ordering. Generic detach / suspend never authorizes Device
+// ownership. The only normal reverse trigger is SCSI START STOP UNIT
+// (load_eject=1,start=0), observed after command completion as well as by the
+// compatibility wrapper.
 
 #include "usb_msc_ownership.h"
 
@@ -35,6 +39,7 @@ static const char *TAG = "recorder_usb";
 #define USB_PUBLIC_BITS             (USB_BIT_ATTACH | USB_BIT_HOST_OWNED | \
                                      USB_BIT_RELEASE_REQUESTED | \
                                      USB_BIT_RELEASE_QUIESCED | USB_BIT_FAILED)
+#define USB_SCSI_CMD_START_STOP_UNIT 0x1bu
 
 static EventGroupHandle_t s_usb_events = NULL;
 static volatile bool s_initialized = false;
@@ -99,7 +104,7 @@ static void usb_storage_event_cb(tinyusb_msc_storage_handle_t handle,
         // Wake the recorder coordinator, then block the TinyUSB task until all
         // Device file I/O is finalized and HOST_UNRESOLVED is durable. Only
         // after this callback returns can the storage become USB-ready and the
-        // wrapped tud_mount_cb continue to the post-configuration ATTACHED event.
+        // surrounding SetConfiguration handling complete.
         s_wav_finalized = false;
         s_manifest_committed = false;
         s_device_fs_released = false;
@@ -134,23 +139,43 @@ static void usb_storage_event_cb(tinyusb_msc_storage_handle_t handle,
 }
 
 static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
+    esp_err_t err;
+
     (void)arg;
     if (event == NULL || s_usb_events == NULL) {
         return;
     }
 
     if (event->id == TINYUSB_EVENT_ATTACHED) {
-        // esp_tinyusb emits ATTACHED only after SetConfiguration. At that point
-        // the wrapped mount callback must already have completed APP -> USB.
+        // esp_tinyusb emits this synchronously from its tud_mount_cb while
+        // TinyUSB is still handling SET_CONFIGURATION. With auto_mount_off=1
+        // storage is still APP-owned, so enter the same blocking MOUNT_START
+        // barrier here. This path does not depend on GNU ld --wrap reaching the
+        // TinyUSB translation unit's internal tud_mount_cb call.
+        if (!s_host_owned) {
+            if (!s_initialized || !s_started || s_release_pending ||
+                !sd_mount_is_mounted()) {
+                (void)tud_disconnect();
+                usb_fail("attach ownership state");
+                return;
+            }
+            err = sd_mount_transfer_to_usb();
+            if (err != ESP_OK || !s_host_owned || sd_mount_is_mounted()) {
+                (void)tud_disconnect();
+                usb_fail("host ownership transfer");
+                return;
+            }
+        }
+
         // A later physical reconnect may reuse the same unresolved host-owned
         // session so the PC can perform the still-required explicit eject.
-        if (s_host_owned && !s_release_pending && !sd_mount_is_mounted()) {
+        if (!s_release_pending && !sd_mount_is_mounted()) {
             ESP_LOGI(TAG,
                      "stage: usb, result: configured, owner: host, mount: usb");
             return;
         }
         (void)tud_disconnect();
-        usb_fail("configured before host ownership");
+        usb_fail("configured ownership mismatch");
         return;
     }
 
@@ -172,13 +197,11 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
     }
 }
 
-// esp_tinyusb 2.2.1's tud_mount_cb is invoked by TinyUSB after the host sends
-// SetConfiguration, but before esp_tinyusb publishes TINYUSB_EVENT_ATTACHED.
-// auto_mount_off remains enabled in sd_mount.c, so esp_tinyusb does not change
-// storage ownership automatically in tud_mount_cb/tud_umount_cb. Wrap only the
-// mount side: perform the guarded APP -> USB transfer first, then delegate to
-// the real callback. Generic unmount therefore stays non-authoritative and can
-// never remount APP storage in this powered session.
+// Compatibility seam for the original implementation. The current pinned
+// TinyUSB keeps its tud_mount_cb call inside the same translation unit as the
+// weak definition, so production correctness no longer depends on this GNU ld
+// wrap being reached. If a toolchain/library layout does route through it, the
+// same storage barrier remains safe and idempotent with the ATTACHED callback.
 extern void __real_tud_mount_cb(void);
 
 void __wrap_tud_mount_cb(void) {
@@ -216,8 +239,36 @@ void __wrap_tud_mount_cb(void) {
     __real_tud_mount_cb();
 }
 
-// GNU ld --wrap gives a one-to-one seam over the strong callback provided by
-// esp_tinyusb 2.2.1 without defining a duplicate tud_msc_start_stop_cb symbol.
+static bool usb_request_explicit_eject(void) {
+    // If a compatibility wrap already observed this exact command, the SCSI
+    // completion callback must be idempotent rather than converting a valid
+    // release into an error.
+    if (s_release_pending) {
+        return true;
+    }
+    if (!s_initialized || !s_started || !s_host_owned ||
+        sd_mount_is_mounted()) {
+        usb_fail("explicit eject state");
+        return false;
+    }
+
+    // Mark first so no concurrent/repeated eject can open another release path.
+    // The SCSI-completion path reaches this only after command status has been
+    // transferred; logical disconnect then blocks new host command admission.
+    s_release_pending = true;
+    if (!tud_disconnect()) {
+        usb_fail("explicit eject disconnect");
+        return false;
+    }
+    xEventGroupSetBits(s_usb_events, USB_BIT_RELEASE_REQUESTED);
+    ESP_LOGI(TAG,
+             "stage: usb, result: explicit-eject, owner: host, action: release-quiesce");
+    return true;
+}
+
+// Compatibility seam for the original implementation. The reliable production
+// observation is tud_msc_scsi_complete_cb below, which TinyUSB exposes as a weak
+// callback and esp_tinyusb 2.2.1 does not override.
 extern bool __real_tud_msc_start_stop_cb(uint8_t lun,
                                          uint8_t power_condition,
                                          bool start,
@@ -228,27 +279,26 @@ bool __wrap_tud_msc_start_stop_cb(uint8_t lun,
                                   bool start,
                                   bool load_eject) {
     if (load_eject && !start) {
-        if (!s_initialized || !s_started || !s_host_owned ||
-            s_release_pending || sd_mount_is_mounted()) {
-            usb_fail("explicit eject state");
-            return false;
-        }
-
-        // Mark first so no concurrent/repeated eject can open another release
-        // path. Logical disconnect blocks new host command admission; runtime
-        // then tears down TinyUSB before releasing the storage object.
-        s_release_pending = true;
-        if (!tud_disconnect()) {
-            usb_fail("explicit eject disconnect");
-            return false;
-        }
-        xEventGroupSetBits(s_usb_events, USB_BIT_RELEASE_REQUESTED);
-        ESP_LOGI(TAG,
-                 "stage: usb, result: explicit-eject, owner: host, action: release-quiesce");
-        return true;
+        return usb_request_explicit_eject();
     }
 
     return __real_tud_msc_start_stop_cb(lun, power_condition, start, load_eject);
+}
+
+void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
+    bool load_eject;
+    bool start;
+
+    (void)lun;
+    if (scsi_cmd == NULL || scsi_cmd[0] != USB_SCSI_CMD_START_STOP_UNIT) {
+        return;
+    }
+
+    load_eject = (scsi_cmd[4] & 0x02u) != 0;
+    start = (scsi_cmd[4] & 0x01u) != 0;
+    if (load_eject && !start) {
+        (void)usb_request_explicit_eject();
+    }
 }
 
 esp_err_t usb_msc_ownership_init(void) {
