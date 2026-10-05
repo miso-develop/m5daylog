@@ -9,6 +9,10 @@ The production device-event callback must therefore enter the existing
 APP -> USB transfer barrier from this ATTACHED callback. Treating this order as
 an error reproduces the physical failure seen at Human Gate: RECORDING -> ERROR
 without USB_PREPARE and without durable HOST_UNRESOLVED.
+
+The callback may also arrive before ``tinyusb_driver_install()`` returns. That
+window must be admitted explicitly; otherwise first enumeration becomes timing
+sensitive and can be disconnected before MSC publication starts.
 """
 
 from pathlib import Path
@@ -66,6 +70,7 @@ def _build(tmp_path: Path) -> Path:
             static EventGroupHandle_t s_usb_events = &g_events;
             static volatile bool s_initialized = true;
             static volatile bool s_started = true;
+            static volatile bool s_starting = false;
             static volatile bool s_host_owned = false;
             static volatile bool s_release_pending = false;
             static bool g_mounted = true;
@@ -127,6 +132,7 @@ def _build(tmp_path: Path) -> Path:
                 memset(&g_events, 0, sizeof(g_events));
                 s_initialized = true;
                 s_started = true;
+                s_starting = false;
                 s_host_owned = false;
                 s_release_pending = false;
                 g_mounted = true;
@@ -141,6 +147,18 @@ def _build(tmp_path: Path) -> Path:
                 reset_state();
 
                 if (strcmp(argv[1], "real-order") == 0) {
+                    usb_device_event_cb(&attached, NULL);
+                    CHECK(g_transfer_calls == 1);
+                    CHECK(g_disconnect_calls == 0);
+                    CHECK((g_events.bits & USB_BIT_ATTACH) != 0);
+                    CHECK((g_events.bits & USB_BIT_FAILED) == 0);
+                    CHECK(s_host_owned);
+                    CHECK(!g_mounted);
+                } else if (strcmp(argv[1], "start-in-progress") == 0) {
+                    /* ATTACHED may be delivered synchronously before
+                     * tinyusb_driver_install() has returned to the caller. */
+                    s_started = false;
+                    s_starting = true;
                     usb_device_event_cb(&attached, NULL);
                     CHECK(g_transfer_calls == 1);
                     CHECK(g_disconnect_calls == 0);
@@ -176,7 +194,9 @@ def _build(tmp_path: Path) -> Path:
     return binary
 
 
-@pytest.mark.parametrize("scenario", ["real-order", "transfer-failure"])
+@pytest.mark.parametrize(
+    "scenario", ["real-order", "start-in-progress", "transfer-failure"]
+)
 def test_production_attached_callback_enters_transfer_barrier(
     tmp_path: Path, scenario: str
 ) -> None:
