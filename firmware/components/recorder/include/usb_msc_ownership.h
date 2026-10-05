@@ -43,8 +43,8 @@ esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
                                                    bool manifest_committed,
                                                    bool device_fs_released);
 
-// Valid only after the explicit START STOP UNIT(load_eject=1,start=0) wrapper
-// has logically disconnected the device and emitted RELEASE_REQUESTED. Stops
+// Valid only after exact START STOP UNIT(load_eject=1,start=0) observation has
+// logically disconnected the device and emitted RELEASE_REQUESTED. Stops
 // TinyUSB first, then destroys the USB storage object; the latter is the
 // esp_tinyusb deferred-write-zero proof. It never builds APP storage.
 esp_err_t usb_msc_ownership_complete_release_quiesce(void);
