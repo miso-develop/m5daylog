@@ -96,6 +96,36 @@ class GithubSurfacePaginationRegressionTests(unittest.TestCase):
 
         self.assertEqual(2, module._next_page_from_link(link_header, request_url, 1))
 
+    def test_link_header_accepts_navigation_only_query_from_github(self) -> None:
+        module = load_surface_scan()
+        request_url = (
+            "https://api.github.com/repos/public-owner/public-repo/issues"
+            "?per_page=2&page=1&state=all&sort=created&direction=asc"
+        )
+        link_header = (
+            '<https://api.github.com/repositories/123456/issues?page=2>; rel="next", '
+            '<https://api.github.com/repositories/123456/issues?page=4>; rel="last"'
+        )
+
+        self.assertEqual(2, module._next_page_from_link(link_header, request_url, 1))
+
+    def test_link_header_rejects_changed_or_unexpected_query_values(self) -> None:
+        module = load_surface_scan()
+        request_url = (
+            "https://api.github.com/repos/public-owner/public-repo/issues"
+            "?per_page=2&page=1&state=all&sort=created&direction=asc"
+        )
+        invalid_headers = [
+            '<https://api.github.com/repositories/123456/issues?page=2&state=closed>; rel="next"',
+            '<https://api.github.com/repositories/123456/issues?page=2&unexpected=value>; rel="next"',
+        ]
+
+        for header in invalid_headers:
+            with self.subTest(header=header):
+                with self.assertRaises(module.SurfaceScanError) as caught:
+                    module._next_page_from_link(header, request_url, 1)
+                self.assertEqual("api-pagination-ambiguous", caught.exception.error_class)
+
     def test_malformed_or_misdirected_link_header_fails_closed(self) -> None:
         module = load_surface_scan()
         request_url = (

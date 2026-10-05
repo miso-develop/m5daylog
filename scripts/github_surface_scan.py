@@ -470,10 +470,13 @@ def _next_page_from_link(link_header: str | None, request_url: str, current_page
         raise SurfaceScanError("api-pagination-ambiguous")
 
     next_page = current_page + 1
-    expected_next_query = {key: list(values) for key, values in expected_query.items()}
-    expected_next_query["page"] = [str(next_page)]
-    if candidate_query != expected_next_query:
+    if candidate_query.get("page") != [str(next_page)]:
         raise SurfaceScanError("api-pagination-ambiguous")
+    for key, values in candidate_query.items():
+        if key == "page":
+            continue
+        if expected_query.get(key) != values:
+            raise SurfaceScanError("api-pagination-ambiguous")
     return next_page
 
 
