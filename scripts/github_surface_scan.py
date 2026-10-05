@@ -400,7 +400,7 @@ def _pagination_resource_path_matches(expected_path: str, candidate_path: str) -
     )
 
 
-def _next_page_from_link(link_header: str | None, request_url: str, current_page: int) -> int | None:
+def _next_url_from_link(link_header: str | None, request_url: str) -> str | None:
     if link_header is None:
         return None
     if not isinstance(link_header, str) or not link_header.strip():
@@ -466,68 +466,128 @@ def _next_page_from_link(link_header: str | None, request_url: str, current_page
         or expected.fragment
     ):
         raise SurfaceScanError("api-pagination-ambiguous")
-    if expected_query.get("page") != [str(current_page)]:
-        raise SurfaceScanError("api-pagination-ambiguous")
 
-    next_page = current_page + 1
-    if candidate_query.get("page") != [str(next_page)]:
-        raise SurfaceScanError("api-pagination-ambiguous")
-    for key, values in candidate_query.items():
-        if key == "page":
-            continue
-        if expected_query.get(key) != values:
+    # Preserve GitHub-owned continuation state, but never allow pagination to
+    # silently drop or change the stable semantics of the initial audit request.
+    missing_semantics: list[tuple[str, str]] = []
+    for key in ("per_page", "state", "sort", "direction"):
+        expected_values = expected_query.get(key)
+        candidate_values = candidate_query.get(key)
+        if expected_values is not None and len(expected_values) != 1:
             raise SurfaceScanError("api-pagination-ambiguous")
-    return next_page
+        if candidate_values is not None:
+            if (
+                expected_values is None
+                or len(candidate_values) != 1
+                or candidate_values != expected_values
+            ):
+                raise SurfaceScanError("api-pagination-ambiguous")
+        elif expected_values is not None:
+            missing_semantics.append((key, expected_values[0]))
+
+    if missing_semantics:
+        semantic_query = urllib.parse.urlencode(missing_semantics)
+        combined_query = (
+            f"{candidate.query}&{semantic_query}" if candidate.query else semantic_query
+        )
+        next_url = urllib.parse.urlunsplit(
+            (candidate.scheme, candidate.netloc, candidate.path, combined_query, "")
+        )
+
+    return next_url
 
 
-def github_fetch_page(
-    repository: str,
-    token: str,
-    endpoint: str,
-    page: int,
-    per_page: int,
-) -> FetchPageResult:
-    if not REPOSITORY_RE.fullmatch(repository):
-        raise SurfaceScanError("repository-invalid")
-    if not token:
-        raise SurfaceScanError("auth-missing")
+def _initial_github_url(repository: str, endpoint: str, page: int, per_page: int) -> str:
     if not endpoint.startswith("/") or ".." in endpoint:
         raise SurfaceScanError("api-endpoint-invalid")
+    if isinstance(page, bool) or not isinstance(page, int) or page <= 0:
+        raise SurfaceScanError("api-pagination-ambiguous")
+    if isinstance(per_page, bool) or not isinstance(per_page, int) or per_page < 1 or per_page > 100:
+        raise SurfaceScanError("pagination-config-invalid")
 
     params: dict[str, str | int] = {"per_page": per_page, "page": page}
     if endpoint in {"/issues", "/pulls"}:
         params.update({"state": "all", "sort": "created", "direction": "asc"})
     elif endpoint in {"/issues/comments", "/pulls/comments"}:
         params.update({"sort": "created", "direction": "asc"})
+    return f"{API_ROOT}/repos/{repository}{endpoint}?{urllib.parse.urlencode(params)}"
 
-    url = f"{API_ROOT}/repos/{repository}{endpoint}?{urllib.parse.urlencode(params)}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "m5daylog-public-surface-audit",
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            if response.status != 200:
-                raise SurfaceScanError("api-request-failed")
-            link_header = response.headers.get("Link")
-            raw = response.read()
-        next_page = _next_page_from_link(link_header, url, page)
-        payload = json.loads(raw)
-    except SurfaceScanError:
-        raise
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, UnicodeError) as exc:
-        raise SurfaceScanError("api-request-failed") from exc
-    if not isinstance(payload, list):
-        raise SurfaceScanError("api-response-invalid")
-    if any(not isinstance(item, dict) for item in payload):
-        raise SurfaceScanError("api-response-invalid")
-    return FetchPageResult(payload, next_page)
+
+def make_github_fetch_page(repository: str, token: str) -> FetchPage:
+    if not REPOSITORY_RE.fullmatch(repository):
+        raise SurfaceScanError("repository-invalid")
+    if not token:
+        raise SurfaceScanError("auth-missing")
+
+    continuations: dict[tuple[str, int], str] = {}
+    seen_urls: dict[str, set[str]] = {}
+
+    def fetch_page(endpoint: str, page: int, per_page: int) -> FetchPageResult:
+        if not endpoint.startswith("/") or ".." in endpoint:
+            raise SurfaceScanError("api-endpoint-invalid")
+        if isinstance(page, bool) or not isinstance(page, int) or page <= 0:
+            raise SurfaceScanError("api-pagination-ambiguous")
+
+        if page == 1:
+            url = _initial_github_url(repository, endpoint, page, per_page)
+        else:
+            url = continuations.pop((endpoint, page), "")
+            if not url:
+                raise SurfaceScanError("api-pagination-ambiguous")
+
+        endpoint_seen = seen_urls.setdefault(endpoint, set())
+        if url in endpoint_seen:
+            raise SurfaceScanError("api-pagination-stalled")
+        endpoint_seen.add(url)
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "m5daylog-public-surface-audit",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                if response.status != 200:
+                    raise SurfaceScanError("api-request-failed")
+                link_header = response.headers.get("Link")
+                raw = response.read()
+            next_url = _next_url_from_link(link_header, url)
+            payload = json.loads(raw)
+        except SurfaceScanError:
+            raise
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            OSError,
+            TimeoutError,
+            json.JSONDecodeError,
+            UnicodeError,
+        ) as exc:
+            raise SurfaceScanError("api-request-failed") from exc
+
+        if not isinstance(payload, list):
+            raise SurfaceScanError("api-response-invalid")
+        if any(not isinstance(item, dict) for item in payload):
+            raise SurfaceScanError("api-response-invalid")
+
+        next_page: int | None = None
+        if next_url is not None:
+            if next_url in endpoint_seen:
+                raise SurfaceScanError("api-pagination-stalled")
+            next_page = page + 1
+            continuation_key = (endpoint, next_page)
+            if continuation_key in continuations:
+                raise SurfaceScanError("api-pagination-ambiguous")
+            continuations[continuation_key] = next_url
+
+        return FetchPageResult(payload, next_page)
+
+    return fetch_page
 
 
 def _print_findings(findings: list[PublicFinding]) -> None:
@@ -548,10 +608,7 @@ def _run_event(args: argparse.Namespace) -> int:
 
 def _run_audit(args: argparse.Namespace) -> int:
     token = os.environ.get("GITHUB_TOKEN", "")
-
-    def fetch_page(endpoint: str, page: int, per_page: int) -> FetchPageResult:
-        return github_fetch_page(args.repository, token, endpoint, page, per_page)
-
+    fetch_page = make_github_fetch_page(args.repository, token)
     findings = audit_repository(args.repository, fetch_page)
     _print_findings(findings)
     if findings:
