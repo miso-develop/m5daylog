@@ -4,7 +4,9 @@
 // esp_tinyusb 2.2.1 and auto_mount_off=1, its synchronous ATTACHED device event
 // is the reliable entry point into the storage transfer barrier: MOUNT_START
 // wakes the recorder coordinator and blocks until recorder finalization,
-// durable manifest state, and Device-FS release are proven. The legacy linker
+// durable manifest state, and Device-FS release are proven. ATTACHED may arrive
+// after driver installation begins but before tinyusb_driver_install() returns,
+// so that bounded STARTING window is a valid ownership state. The legacy linker
 // wraps remain compatible fallback seams but are not required for the real
 // TinyUSB callback ordering. Generic detach / suspend never authorizes Device
 // ownership. The only normal reverse trigger is SCSI START STOP UNIT
@@ -43,6 +45,7 @@ static const char *TAG = "recorder_usb";
 
 static EventGroupHandle_t s_usb_events = NULL;
 static volatile bool s_initialized = false;
+static volatile bool s_starting = false;
 static volatile bool s_started = false;
 static volatile bool s_host_owned = false;
 static volatile bool s_release_pending = false;
@@ -150,11 +153,11 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
         // esp_tinyusb emits this synchronously from its tud_mount_cb while
         // TinyUSB is still handling SET_CONFIGURATION. With auto_mount_off=1
         // storage is still APP-owned, so enter the same blocking MOUNT_START
-        // barrier here. This path does not depend on GNU ld --wrap reaching the
-        // TinyUSB translation unit's internal tud_mount_cb call.
+        // barrier here. This may happen before tinyusb_driver_install() returns;
+        // s_starting marks that bounded, valid callback window.
         if (!s_host_owned) {
-            if (!s_initialized || !s_started || s_release_pending ||
-                !sd_mount_is_mounted()) {
+            if (!s_initialized || (!s_started && !s_starting) ||
+                s_release_pending || !sd_mount_is_mounted()) {
                 (void)tud_disconnect();
                 usb_fail("attach ownership state");
                 return;
@@ -207,7 +210,7 @@ extern void __real_tud_mount_cb(void);
 void __wrap_tud_mount_cb(void) {
     esp_err_t err;
 
-    if (!s_initialized || !s_started || s_release_pending) {
+    if (!s_initialized || (!s_started && !s_starting) || s_release_pending) {
         (void)tud_disconnect();
         usb_fail("mount callback state");
         return;
@@ -319,6 +322,8 @@ esp_err_t usb_msc_ownership_init(void) {
         s_usb_events = NULL;
         return err;
     }
+    s_starting = false;
+    s_started = false;
     s_host_owned = false;
     s_release_pending = false;
     s_initialized = true;
@@ -330,7 +335,7 @@ esp_err_t usb_msc_ownership_start(void) {
     esp_err_t err;
 
     if (!s_initialized || !sd_mount_is_mounted() || s_host_owned ||
-        s_release_pending) {
+        s_release_pending || s_starting) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_started) {
@@ -339,12 +344,17 @@ esp_err_t usb_msc_ownership_start(void) {
     config = (tinyusb_config_t)TINYUSB_DEFAULT_CONFIG();
     config.event_cb = usb_device_event_cb;
     config.event_arg = NULL;
+
+    // The driver can publish ATTACHED from its USB task before install returns.
+    // Admit that callback only for this exact bounded start operation.
+    s_starting = true;
     err = tinyusb_driver_install(&config);
     if (err == ESP_OK) {
         s_started = true;
         ESP_LOGI(TAG,
                  "stage: usb, result: ready, owner: device, mount: app");
     }
+    s_starting = false;
     return err;
 }
 
