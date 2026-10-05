@@ -43,6 +43,7 @@ extern bool device_manifest_sync_wav_dir(const char *recordings_dir,
                                   REC_BIT_BATTERY_DONE)
 
 static task87_wake_recovery_t s_wake_recovery;
+static TaskHandle_t s_usb_event_task = NULL;
 
 static void recorder_task49_delete(TaskHandle_t task) {
     const char *name = pcTaskGetName(NULL);
@@ -200,6 +201,37 @@ static void recorder_shutdown_armed_now(void) {
     recorder_power_enter_shutdown_sleep();
 }
 
+static void recorder_usb_event_task(void *arg) {
+    (void)arg;
+
+    // This coordinator must already be runnable when TinyUSB starts. The driver
+    // can emit ATTACHED before tinyusb_driver_install() returns, and its storage
+    // MOUNT_START callback blocks until this task completes recorder finalization
+    // and publishes USB_BIT_PREPARE_OK through the ownership module.
+    for (;;) {
+        switch (usb_msc_ownership_wait_event(UINT32_MAX)) {
+            case USB_MSC_EVENT_ATTACH:
+                recorder_handle_usb_attach();
+                break;
+            case USB_MSC_EVENT_HOST_OWNED:
+                recorder_handle_usb_host_owned();
+                break;
+            case USB_MSC_EVENT_RELEASE_REQUESTED:
+                recorder_handle_usb_release();
+                break;
+            case USB_MSC_EVENT_RELEASE_QUIESCED:
+                // The successful requester enters deep sleep synchronously.
+                break;
+            case USB_MSC_EVENT_FAILED:
+                recorder_enter_error(RECORDER_REASON_USB);
+                break;
+            case USB_MSC_EVENT_NONE:
+            default:
+                break;
+        }
+    }
+}
+
 void app_main(void) {
     bool manual_wake = false;
     shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN;
@@ -246,32 +278,28 @@ void app_main(void) {
         return;
     }
 
-    if (usb_msc_ownership_init() != ESP_OK ||
-        usb_msc_ownership_start() != ESP_OK) {
+    if (usb_msc_ownership_init() != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
 
-    for (;;) {
-        switch (usb_msc_ownership_wait_event(UINT32_MAX)) {
-            case USB_MSC_EVENT_ATTACH:
-                recorder_handle_usb_attach();
-                break;
-            case USB_MSC_EVENT_HOST_OWNED:
-                recorder_handle_usb_host_owned();
-                break;
-            case USB_MSC_EVENT_RELEASE_REQUESTED:
-                recorder_handle_usb_release();
-                break;
-            case USB_MSC_EVENT_RELEASE_QUIESCED:
-                // The successful requester enters deep sleep synchronously.
-                break;
-            case USB_MSC_EVENT_FAILED:
-                recorder_enter_error(RECORDER_REASON_USB);
-                break;
-            case USB_MSC_EVENT_NONE:
-            default:
-                break;
-        }
+    // Start the coordinator before installing TinyUSB. A first host
+    // SET_CONFIGURATION can race ahead of tinyusb_driver_install() returning;
+    // the storage callback must have another runnable task available to satisfy
+    // its recorder-finalization barrier rather than deadlocking the install.
+    if (xTaskCreate(recorder_usb_event_task, "rec_usb", 4096, NULL, 3,
+                    &s_usb_event_task) != pdPASS) {
+        s_usb_event_task = NULL;
+        recorder_enter_error(RECORDER_REASON_USB);
+        return;
     }
+    if (usb_msc_ownership_start() != ESP_OK) {
+        vTaskDelete(s_usb_event_task);
+        s_usb_event_task = NULL;
+        recorder_enter_error(RECORDER_REASON_USB);
+        return;
+    }
+
+    // USB lifecycle ownership now belongs to rec_usb; returning retires the
+    // ESP-IDF main task without removing the coordinator.
 }
