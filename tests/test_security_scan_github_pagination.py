@@ -121,7 +121,7 @@ class GithubSurfacePaginationRegressionTests(unittest.TestCase):
 
         self.assertEqual(next_url, module._next_url_from_link(link_header, request_url))
 
-    def test_link_header_preserves_opaque_github_pagination_query(self) -> None:
+    def test_link_header_preserves_opaque_github_pagination_query_and_required_semantics(self) -> None:
         module = load_surface_scan()
         request_url = (
             "https://api.github.com/repos/public-owner/public-repo/issues/comments"
@@ -131,16 +131,18 @@ class GithubSurfacePaginationRegressionTests(unittest.TestCase):
             "https://api.github.com/repositories/123456/issues/comments"
             "?per_page=2&after=opaque-pagination-token"
         )
+        expected_url = f"{next_url}&sort=created&direction=asc"
         link_header = f'<{next_url}>; rel="next"'
 
-        self.assertEqual(next_url, module._next_url_from_link(link_header, request_url))
+        self.assertEqual(expected_url, module._next_url_from_link(link_header, request_url))
 
-    def test_page_fetcher_uses_exact_validated_next_url(self) -> None:
+    def test_page_fetcher_preserves_required_semantics_when_link_omits_them(self) -> None:
         module = load_surface_scan()
         next_url = (
             "https://api.github.com/repositories/123456/issues"
             "?per_page=1&after=opaque-pagination-token"
         )
+        expected_request_url = f"{next_url}&state=all&sort=created&direction=asc"
         responses = [
             FakeResponse(
                 [{"number": 1, "title": "safe", "body": "safe"}],
@@ -161,7 +163,7 @@ class GithubSurfacePaginationRegressionTests(unittest.TestCase):
 
         self.assertEqual(2, first.next_page)
         self.assertIsNone(second.next_page)
-        self.assertEqual(next_url, requested_urls[1])
+        self.assertEqual(expected_request_url, requested_urls[1])
 
     def test_link_header_rejects_changed_semantic_filters(self) -> None:
         module = load_surface_scan()
