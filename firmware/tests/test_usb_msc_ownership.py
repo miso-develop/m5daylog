@@ -1,8 +1,8 @@
 """Tasks #49/#87 source contracts for Strategy 2 USB ownership.
 
 Executable host-C tests carry the behavioral proof. These checks protect the
-pre-configuration APP -> USB gate and reject regressions to automatic
-suspend/detach ownership return.
+pre-configuration APP -> USB gate, the real esp_tinyusb callback ordering, and
+reject regressions to automatic suspend/detach ownership return.
 """
 
 from pathlib import Path
@@ -31,6 +31,8 @@ def test_usb_ownership_module_is_built_and_tinyusb_is_pinned():
     assert "esp_tinyusb" in manifest
     assert "==2.2.1" in manifest
     assert 'SRCS "task49_runtime.c"' in main_cmake
+    # Compatibility wrappers remain available, but correctness is separately
+    # locked to the real device/SCSI callbacks below.
     assert "--wrap=tud_mount_cb" in main_cmake
     assert "--wrap=tud_msc_start_stop_cb" in main_cmake
     assert ".auto_mount_off = 1" in sd
@@ -72,21 +74,24 @@ def test_storage_mount_start_blocks_before_host_ownership_switch():
     assert "portMAX_DELAY" in region
 
 
-def test_wrapped_mount_transfers_before_post_config_attached_event():
+def test_real_attached_callback_enters_transfer_barrier_before_host_use():
     src = USB_C.read_text(encoding="utf-8")
-    fn_at = src.index("void __wrap_tud_mount_cb")
-    transfer_at = src.index("sd_mount_transfer_to_usb", fn_at)
-    host_owned_at = src.index("s_host_owned", transfer_at)
-    real_at = src.index("__real_tud_mount_cb", host_owned_at)
-    assert fn_at < transfer_at < host_owned_at < real_at
-
     device_cb_at = src.index("static void usb_device_event_cb")
     attached_at = src.index("TINYUSB_EVENT_ATTACHED", device_cb_at)
     suspend_at = src.index("#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK", attached_at)
     attached_region = src[attached_at:suspend_at]
-    assert "USB_BIT_ATTACH" not in attached_region
-    assert "sd_mount_transfer_to_usb" not in attached_region
-    assert "s_host_owned" in attached_region
+
+    transfer_at = attached_region.index("sd_mount_transfer_to_usb")
+    host_owned_at = attached_region.index("s_host_owned", transfer_at)
+    fail_at = attached_region.index("host ownership transfer", transfer_at)
+    assert transfer_at < host_owned_at < fail_at
+
+    # The existing wrapper is compatibility-only; it still routes through the
+    # same guarded transfer if a future linker/library layout reaches it.
+    wrapper_at = src.index("void __wrap_tud_mount_cb")
+    wrapper_transfer_at = src.index("sd_mount_transfer_to_usb", wrapper_at)
+    real_at = src.index("__real_tud_mount_cb", wrapper_transfer_at)
+    assert wrapper_at < wrapper_transfer_at < real_at
 
 
 def test_usb_sync_keeps_device_filesystem_unmounted():
@@ -118,8 +123,8 @@ def test_ambiguous_suspend_and_detach_never_authorize_release():
 
     assert "CONFIG_TINYUSB_SUSPEND_CALLBACK=y" in sdkconfig
     callback_at = src.index("static void usb_device_event_cb")
-    wrapper_at = src.index("// esp_tinyusb 2.2.1's tud_mount_cb", callback_at)
-    ambiguous_region = src[callback_at:wrapper_at]
+    compatibility_at = src.index("// Compatibility seam for the original implementation.", callback_at)
+    ambiguous_region = src[callback_at:compatibility_at]
     assert "TINYUSB_EVENT_SUSPENDED" in ambiguous_region
     assert "TINYUSB_EVENT_DETACHED" in ambiguous_region
     suspend_region = ambiguous_region[ambiguous_region.index("TINYUSB_EVENT_SUSPENDED"):]
@@ -128,19 +133,31 @@ def test_ambiguous_suspend_and_detach_never_authorize_release():
     assert "ambiguous" in suspend_region.lower()
 
 
-def test_explicit_eject_is_the_only_release_request_seam():
+def test_explicit_eject_is_observed_by_real_scsi_completion_seam():
     hdr = USB_H.read_text(encoding="utf-8")
     src = USB_C.read_text(encoding="utf-8")
 
     assert "USB_MSC_EVENT_RELEASE_REQUESTED" in hdr
-    wrapper_at = src.index("__wrap_tud_msc_start_stop_cb")
-    next_fn = src.index("usb_msc_ownership_init", wrapper_at)
-    region = src[wrapper_at:next_fn]
-    assert "load_eject" in region
-    assert "!start" in region
-    assert "USB_BIT_RELEASE_REQUESTED" in region
-    assert "tud_disconnect" in region
-    assert "__real_tud_msc_start_stop_cb" in region
+
+    helper_at = src.index("static bool usb_request_explicit_eject")
+    wrapper_at = src.index("__wrap_tud_msc_start_stop_cb", helper_at)
+    helper_region = src[helper_at:wrapper_at]
+    assert "USB_BIT_RELEASE_REQUESTED" in helper_region
+    assert "tud_disconnect" in helper_region
+    assert "s_release_pending" in helper_region
+
+    callback_at = src.index("void tud_msc_scsi_complete_cb", wrapper_at)
+    next_fn = src.index("usb_msc_ownership_init", callback_at)
+    callback_region = src[callback_at:next_fn]
+    assert "USB_SCSI_CMD_START_STOP_UNIT" in callback_region
+    assert "scsi_cmd[4] & 0x02u" in callback_region
+    assert "scsi_cmd[4] & 0x01u" in callback_region
+    assert "usb_request_explicit_eject" in callback_region
+
+    wrapper_region = src[wrapper_at:callback_at]
+    assert "load_eject" in wrapper_region
+    assert "!start" in wrapper_region
+    assert "usb_request_explicit_eject" in wrapper_region
 
 
 def test_release_quiescence_stops_usb_before_storage_release_and_durable_arm():
