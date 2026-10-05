@@ -56,7 +56,7 @@ _SLACK = "x" + "ox[baprs]-"
 SIGNATURE_PATTERNS = {
     "github-token": re.compile(r"(?:" + _GITHUB_CLASSIC + r"[A-Za-z0-9]{20,}|" + re.escape(_GITHUB_FINE) + r"[A-Za-z0-9_]{20,})"),
     "huggingface-token": re.compile(re.escape(_HF) + r"[A-Za-z0-9]{20,}"),
-    "openai-token": re.compile(re.escape(_OPENAI) + r"[A-Za-z0-9_-]{20,}"),
+    "openai-token": re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(_OPENAI) + r"[A-Za-z0-9_-]{20,}"),
     "aws-access-key": re.compile(re.escape(_AWS) + r"[0-9A-Z]{16}"),
     "slack-token": re.compile(re.escape(_SLACK) + r"[A-Za-z0-9-]{16,}"),
     "private-key": re.compile(r"-{5}BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-{5}"),
@@ -97,7 +97,8 @@ PRIVACY_PATTERNS = {
         re.IGNORECASE,
     ),
     "machine-path-posix-home": re.compile(
-        r"(?<![A-Za-z0-9:])/(?:home|Users)/[A-Za-z0-9._-]+"
+        r"(?<![A-Za-z0-9:])/(?:home|Users)/"
+        r"(?=[A-Za-z0-9._-]*[A-Za-z0-9])[A-Za-z0-9._-]+"
     ),
     "private-repository-identifier": re.compile(
         r"(?:"
