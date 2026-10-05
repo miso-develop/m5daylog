@@ -1,12 +1,12 @@
 """Task #87 regression for real TinyUSB SetConfiguration callback ordering.
 
 esp_tinyusb 2.2.1 publishes ``TINYUSB_EVENT_ATTACHED`` from its strong
-``tud_mount_cb``.  TinyUSB invokes that callback while handling
-SET_CONFIGURATION and before completing the control request.  With
+``tud_mount_cb``. TinyUSB invokes that callback while handling
+SET_CONFIGURATION and before completing the control request. With
 ``auto_mount_off=1`` the storage is still APP-owned at this point.
 
 The production device-event callback must therefore enter the existing
-APP -> USB transfer barrier from this ATTACHED callback.  Treating this order as
+APP -> USB transfer barrier from this ATTACHED callback. Treating this order as
 an error reproduces the physical failure seen at Human Gate: RECORDING -> ERROR
 without USB_PREPARE and without durable HOST_UNRESOLVED.
 """
@@ -25,7 +25,7 @@ USB_OWNERSHIP_C = REPO / "firmware/components/recorder/usb_msc_ownership.c"
 def _production_device_event_callback() -> str:
     source = USB_OWNERSHIP_C.read_text(encoding="utf-8")
     start = source.index("static void usb_device_event_cb(")
-    end = source.index("\n// esp_tinyusb 2.2.1", start)
+    end = source.index("\n// Compatibility seam for the original implementation.", start)
     return source[start:end]
 
 
@@ -64,6 +64,8 @@ def _build(tmp_path: Path) -> Path:
 
             static struct event_group g_events;
             static EventGroupHandle_t s_usb_events = &g_events;
+            static volatile bool s_initialized = true;
+            static volatile bool s_started = true;
             static volatile bool s_host_owned = false;
             static volatile bool s_release_pending = false;
             static bool g_mounted = true;
@@ -123,6 +125,8 @@ def _build(tmp_path: Path) -> Path:
             r"""
             static void reset_state(void) {
                 memset(&g_events, 0, sizeof(g_events));
+                s_initialized = true;
+                s_started = true;
                 s_host_owned = false;
                 s_release_pending = false;
                 g_mounted = true;
