@@ -467,14 +467,32 @@ def _next_url_from_link(link_header: str | None, request_url: str) -> str | None
     ):
         raise SurfaceScanError("api-pagination-ambiguous")
 
-    # Link query parameters are GitHub-owned pagination state. Preserve them
-    # exactly instead of inferring a page-number contract. Endpoint semantics
-    # remain fail-closed: if a stable request filter is repeated in the Link it
-    # must retain the original value. Pagination-specific/opaque parameters are
-    # deliberately allowed so GitHub can evolve its continuation representation.
+    # Preserve GitHub-owned continuation state, but never allow pagination to
+    # silently drop or change the stable semantics of the initial audit request.
+    missing_semantics: list[tuple[str, str]] = []
     for key in ("per_page", "state", "sort", "direction"):
-        if key in candidate_query and candidate_query[key] != expected_query.get(key):
+        expected_values = expected_query.get(key)
+        candidate_values = candidate_query.get(key)
+        if expected_values is not None and len(expected_values) != 1:
             raise SurfaceScanError("api-pagination-ambiguous")
+        if candidate_values is not None:
+            if (
+                expected_values is None
+                or len(candidate_values) != 1
+                or candidate_values != expected_values
+            ):
+                raise SurfaceScanError("api-pagination-ambiguous")
+        elif expected_values is not None:
+            missing_semantics.append((key, expected_values[0]))
+
+    if missing_semantics:
+        semantic_query = urllib.parse.urlencode(missing_semantics)
+        combined_query = (
+            f"{candidate.query}&{semantic_query}" if candidate.query else semantic_query
+        )
+        next_url = urllib.parse.urlunsplit(
+            (candidate.scheme, candidate.netloc, candidate.path, combined_query, "")
+        )
 
     return next_url
 
