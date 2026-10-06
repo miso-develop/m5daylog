@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#define USB_MSC_RELEASE_ATTEMPT_MAX_BYTES 64u
+
 #ifdef ESP_PLATFORM
 #include "esp_err.h"
 #else
@@ -47,6 +49,25 @@ esp_err_t usb_msc_ownership_begin_prepare(void);
 esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
                                                    bool manifest_committed,
                                                    bool device_fs_released);
+
+typedef enum {
+    USB_MSC_RELEASE_STORAGE_ACCEPTED = 0,
+    USB_MSC_RELEASE_STORAGE_INVALID_ARGS,
+    USB_MSC_RELEASE_STORAGE_WRONG_STATE,
+    USB_MSC_RELEASE_STORAGE_CONFLICT,
+} usb_msc_release_storage_result_t;
+
+// D-031 normal Windows release authority. Acceptance atomically closes MSC
+// backend admission before returning but does not signal teardown until the CDC
+// transport confirms the accepted response has completed.
+usb_msc_release_storage_result_t usb_msc_ownership_accept_release_storage(
+    const char *release_attempt_id);
+bool usb_msc_ownership_release_response_complete(
+    const char *release_attempt_id);
+
+// Ordinary CDC requests are admitted only in the current PC-owned session
+// before release acceptance. Ambiguous bus/line-state signals never open it.
+bool usb_msc_ownership_release_command_admission_open(void);
 
 // Valid only after exact START STOP UNIT(load_eject=1,start=0) has completed
 // its SCSI status transaction and emitted RELEASE_REQUESTED. Stops TinyUSB
