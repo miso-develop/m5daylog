@@ -21,11 +21,16 @@ CONFIG_FATFS_MAX_LFN=255
 # Fix the image header to 8MB; never select 2MB.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 
-# Task #49: expose the finalized recording volume as USB Mass Storage only.
-# CDC is intentionally deferred to Task #50. The SD/VFS ownership gate lives
-# in usb_msc_ownership.c and never formats media on mount failure.
+# Tasks #49/#87: one composite TinyUSB device. MSC keeps exclusive microSD
+# ownership; D-031 adds the minimal canonical CDC v1 RELEASE_STORAGE transport.
+# Task #50 will extend this same parser/dispatcher after rebasing onto #87.
 CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=4096
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=2048
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=2048
+CONFIG_TINYUSB_CDC_EP_BUFSIZE=512
 
 # Task #87: stock self-powered hardware has no dedicated firmware-readable
 # VBUS sense. Suspend/bus-loss callbacks are diagnostic-only ambiguous signals;
