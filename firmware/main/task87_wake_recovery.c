@@ -43,7 +43,7 @@ esp_err_t task87_wake_recovery_complete_device_recovery(
         }
     }
 
-    err = shutdown_armed_clear();
+    err = shutdown_armed_mark_wake_recovery_pending();
     if (err != ESP_OK) {
         return err;
     }
@@ -64,6 +64,9 @@ esp_err_t task87_wake_recovery_note_recording_started(
     if (!recovery->device_recovery_complete ||
         !fresh_recording_id_present) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (shutdown_armed_complete_wake_recovery() != ESP_OK) {
+        return ESP_FAIL;
     }
 
     recovery->fresh_recording_started = true;
