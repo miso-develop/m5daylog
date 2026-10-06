@@ -108,7 +108,7 @@ def _build(tmp_path: Path) -> Path:
                     s_provisional_attached = true;
                     s_publish_triggered = false;
                     g_mounted = true;
-                    cdb[0] = 0x12u; /* INQUIRY */
+                    cdb[0] = 0x00u; /* TEST UNIT READY */
                     tud_msc_scsi_complete_cb(0, cdb);
                     CHECK(s_publish_triggered);
                     CHECK((g_events.bits & USB_BIT_ATTACH) != 0);
