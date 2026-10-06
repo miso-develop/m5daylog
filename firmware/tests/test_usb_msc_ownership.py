@@ -200,10 +200,11 @@ def test_runtime_release_enters_persistent_shutdown_not_same_session_restart():
 
     for marker in (
         "usb_msc_ownership_complete_release_quiesce",
-        "recorder_power_release_hold",
-        "recorder_power_enter_shutdown_sleep",
+        "recorder_power_shutdown",
     ):
         assert marker in region, marker
+    # HOLD release + wake-source disable + deep-sleep ordering is executed by
+    # test_recorder_power_behavior.py against the production power module.
     assert "shutdown_armed_commit" not in region
     for forbidden in (
         "sd_mount_remount_after_usb",
