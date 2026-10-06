@@ -119,11 +119,9 @@ STUB_HEADERS = {
         g_disconnect_calls++;
         return true;
     }
-    void __real_tud_mount_cb(void) {
-        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
-        g_real_mount_calls++;
-        CHECK(g_device_cb != NULL);
-        g_device_cb(&attached, g_device_arg);
+    bool tud_connect(void) {
+        g_connect_calls++;
+        return true;
     }
     bool __real_tud_msc_start_stop_cb(uint8_t lun,
                                       uint8_t power_condition,
