@@ -1,18 +1,13 @@
-"""Task #87 regression for real TinyUSB SetConfiguration callback ordering.
+"""Task #87 regression for two-phase TinyUSB MSC publication.
 
-esp_tinyusb 2.2.1 publishes ``TINYUSB_EVENT_ATTACHED`` from its strong
-``tud_mount_cb``. TinyUSB invokes that callback while handling
-SET_CONFIGURATION and before completing the control request. With
-``auto_mount_off=1`` the storage is still APP-owned at this point.
+The first SetConfiguration/ATTACHED callback is only a trigger.  The device must
+logically disconnect before recorder finalization and APP -> USB storage
+transfer, because changing the LUN ownership re-entrantly inside esp_tinyusb's
+strong tud_mount_cb left Windows with a configured USB device but no USBSTOR
+interface at Human Gate.
 
-The production device-event callback must therefore enter the existing
-APP -> USB transfer barrier from this ATTACHED callback. Treating this order as
-an error reproduces the physical failure seen at Human Gate: RECORDING -> ERROR
-without USB_PREPARE and without durable HOST_UNRESOLVED.
-
-The callback may also arrive before ``tinyusb_driver_install()`` returns. That
-window must be admitted explicitly; otherwise first enumeration becomes timing
-sensitive and can be disconnected before MSC publication starts.
+After the first callback returns, the recorder coordinator performs the durable
+publication barrier and later reconnects with the storage already USB-owned.
 """
 
 from pathlib import Path
@@ -73,10 +68,9 @@ def _build(tmp_path: Path) -> Path:
             static volatile bool s_starting = false;
             static volatile bool s_host_owned = false;
             static volatile bool s_release_pending = false;
+            static volatile bool s_publish_triggered = false;
             static bool g_mounted = true;
-            static int g_transfer_calls;
             static int g_disconnect_calls;
-            static esp_err_t g_transfer_result = ESP_OK;
 
             #define CHECK(expr) do { \
                 if (!(expr)) { \
@@ -96,20 +90,6 @@ def _build(tmp_path: Path) -> Path:
 
             bool sd_mount_is_mounted(void) {
                 return g_mounted;
-            }
-
-            esp_err_t sd_mount_transfer_to_usb(void) {
-                g_transfer_calls++;
-                if (g_transfer_result != ESP_OK) {
-                    return g_transfer_result;
-                }
-
-                /* Model production MOUNT_START -> coordinator ATTACH and the
-                 * eventual MOUNT_COMPLETE after release proof is supplied. */
-                xEventGroupSetBits(s_usb_events, USB_BIT_ATTACH);
-                g_mounted = false;
-                s_host_owned = true;
-                return ESP_OK;
             }
 
             bool tud_disconnect(void) {
@@ -135,10 +115,9 @@ def _build(tmp_path: Path) -> Path:
                 s_starting = false;
                 s_host_owned = false;
                 s_release_pending = false;
+                s_publish_triggered = false;
                 g_mounted = true;
-                g_transfer_calls = 0;
                 g_disconnect_calls = 0;
-                g_transfer_result = ESP_OK;
             }
 
             int main(int argc, char **argv) {
@@ -146,34 +125,34 @@ def _build(tmp_path: Path) -> Path:
                 CHECK(argc == 2);
                 reset_state();
 
-                if (strcmp(argv[1], "real-order") == 0) {
+                if (strcmp(argv[1], "first-attach") == 0) {
                     usb_device_event_cb(&attached, NULL);
-                    CHECK(g_transfer_calls == 1);
-                    CHECK(g_disconnect_calls == 0);
+                    CHECK(g_disconnect_calls == 1);
                     CHECK((g_events.bits & USB_BIT_ATTACH) != 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
-                    CHECK(s_host_owned);
-                    CHECK(!g_mounted);
+                    CHECK(s_publish_triggered);
+                    CHECK(!s_host_owned);
+                    CHECK(g_mounted);
                 } else if (strcmp(argv[1], "start-in-progress") == 0) {
-                    /* ATTACHED may be delivered synchronously before
-                     * tinyusb_driver_install() has returned to the caller. */
                     s_started = false;
                     s_starting = true;
                     usb_device_event_cb(&attached, NULL);
-                    CHECK(g_transfer_calls == 1);
-                    CHECK(g_disconnect_calls == 0);
+                    CHECK(g_disconnect_calls == 1);
                     CHECK((g_events.bits & USB_BIT_ATTACH) != 0);
+                    CHECK((g_events.bits & USB_BIT_FAILED) == 0);
+                    CHECK(s_publish_triggered);
+                    CHECK(!s_host_owned);
+                    CHECK(g_mounted);
+                } else if (strcmp(argv[1], "prepared-reconnect") == 0) {
+                    s_publish_triggered = true;
+                    s_host_owned = true;
+                    g_mounted = false;
+                    usb_device_event_cb(&attached, NULL);
+                    CHECK(g_disconnect_calls == 0);
+                    CHECK((g_events.bits & USB_BIT_ATTACH) == 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
                     CHECK(s_host_owned);
                     CHECK(!g_mounted);
-                } else if (strcmp(argv[1], "transfer-failure") == 0) {
-                    g_transfer_result = ESP_FAIL;
-                    usb_device_event_cb(&attached, NULL);
-                    CHECK(g_transfer_calls == 1);
-                    CHECK(g_disconnect_calls == 1);
-                    CHECK((g_events.bits & USB_BIT_FAILED) != 0);
-                    CHECK(!s_host_owned);
-                    CHECK(g_mounted);
                 } else {
                     CHECK(false);
                 }
@@ -195,9 +174,9 @@ def _build(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    "scenario", ["real-order", "start-in-progress", "transfer-failure"]
+    "scenario", ["first-attach", "start-in-progress", "prepared-reconnect"]
 )
-def test_production_attached_callback_enters_transfer_barrier(
+def test_production_attached_callback_uses_two_phase_publication(
     tmp_path: Path, scenario: str
 ) -> None:
     binary = _build(tmp_path)
