@@ -97,8 +97,7 @@ STUB_HEADERS = {
         #include <stdbool.h>
         #include <stdint.h>
         bool tud_disconnect(void);
-        void __real_tud_mount_cb(void);
-        void __wrap_tud_mount_cb(void);
+        bool tud_connect(void);
         bool __real_tud_msc_start_stop_cb(uint8_t lun,
                                           uint8_t power_condition,
                                           bool start,
@@ -204,8 +203,9 @@ HARNESS = r"""
     static bool g_release_requested;
     static bool g_device_fs_released;
     static int g_disconnect_calls;
+    static int g_connect_calls;
     static int g_transfer_calls;
-    static int g_real_mount_calls;
+    static TickType_t g_delay_ticks;
     static int g_real_start_stop_calls;
     static int g_uninstall_calls;
     static int g_release_storage_calls;
