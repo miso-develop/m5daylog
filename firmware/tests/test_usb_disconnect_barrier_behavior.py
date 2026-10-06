@@ -98,14 +98,8 @@ STUB_HEADERS = {
         #include <stdint.h>
         bool tud_disconnect(void);
         bool tud_connect(void);
-        bool __real_tud_msc_start_stop_cb(uint8_t lun,
-                                          uint8_t power_condition,
-                                          bool start,
-                                          bool load_eject);
-        bool __wrap_tud_msc_start_stop_cb(uint8_t lun,
-                                          uint8_t power_condition,
-                                          bool start,
-                                          bool load_eject);
+        void tud_msc_scsi_complete_cb(uint8_t lun,
+                                      uint8_t const scsi_cmd[16]);
     """,
     "tinyusb_msc.h": r"""
         #pragma once
@@ -208,7 +202,6 @@ HARNESS = r"""
     static TickType_t g_delay_ticks;
     static bool g_connect_result = true;
     static esp_err_t g_transfer_result = ESP_OK;
-    static int g_real_start_stop_calls;
     static int g_uninstall_calls;
     static int g_release_storage_calls;
     static esp_err_t g_uninstall_result = ESP_OK;
@@ -337,15 +330,6 @@ HARNESS = r"""
         g_connect_calls++;
         return g_connect_result;
     }
-    bool __real_tud_msc_start_stop_cb(uint8_t lun,
-                                      uint8_t power_condition,
-                                      bool start,
-                                      bool load_eject) {
-        (void)lun; (void)power_condition; (void)start; (void)load_eject;
-        g_real_start_stop_calls++;
-        return true;
-    }
-
     static usb_msc_ownership_event_t next_event(void) {
         return usb_msc_ownership_wait_event(0);
     }
@@ -361,6 +345,7 @@ HARNESS = r"""
 
     static void enter_host_owned(void) {
         tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+        uint8_t test_unit_ready[16] = {0};
 
         CHECK(usb_msc_ownership_init() == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
@@ -368,10 +353,15 @@ HARNESS = r"""
         CHECK(g_storage_cb != NULL);
 
         g_device_cb(&attached, g_device_arg);
-        CHECK(g_disconnect_calls == 1);
+        CHECK(g_disconnect_calls == 0);
         CHECK(g_connect_calls == 0);
         CHECK(g_transfer_calls == 0);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        tud_msc_scsi_complete_cb(0, test_unit_ready);
         CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+        CHECK(usb_msc_ownership_begin_prepare() == ESP_OK);
+        CHECK(g_disconnect_calls == 1);
 
         g_release_requested = true;
         g_device_fs_released = true;
@@ -420,8 +410,10 @@ HARNESS = r"""
     }
 
     static void request_explicit_eject(void) {
-        CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, true));
-        CHECK(g_real_start_stop_calls == 0);
+        uint8_t eject[16] = {0};
+        eject[0] = 0x1bu;
+        eject[4] = 0x02u; /* LOEJ=1, START=0 */
+        tud_msc_scsi_complete_cb(0, eject);
         CHECK(g_disconnect_calls == 2);
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_REQUESTED);
         CHECK(usb_msc_ownership_is_host_owned());
@@ -452,10 +444,14 @@ HARNESS = r"""
     }
 
     static void run_non_eject_start_stop(void) {
+        uint8_t start_cmd[16] = {0};
+        uint8_t other_cmd[16] = {0};
         enter_host_owned();
-        CHECK(__wrap_tud_msc_start_stop_cb(0, 0, true, true));
-        CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, false));
-        CHECK(g_real_start_stop_calls == 2);
+        start_cmd[0] = 0x1bu;
+        start_cmd[4] = 0x03u; /* LOEJ=1, START=1 */
+        other_cmd[0] = 0x00u; /* TEST UNIT READY while host-owned */
+        tud_msc_scsi_complete_cb(0, start_cmd);
+        tud_msc_scsi_complete_cb(0, other_cmd);
         CHECK(g_disconnect_calls == 1);
         CHECK(g_nvs_commit_calls == 1);
         assert_reboot_stays_fail_closed();
@@ -508,12 +504,17 @@ HARNESS = r"""
 
     static void begin_failed_publication_case(void) {
         tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+        uint8_t test_unit_ready[16] = {0};
 
         CHECK(usb_msc_ownership_init() == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
         g_device_cb(&attached, g_device_arg);
-        CHECK(g_disconnect_calls == 1);
+        CHECK(g_disconnect_calls == 0);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+        tud_msc_scsi_complete_cb(0, test_unit_ready);
         CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+        CHECK(usb_msc_ownership_begin_prepare() == ESP_OK);
+        CHECK(g_disconnect_calls == 1);
         g_release_requested = true;
         g_device_fs_released = true;
     }
