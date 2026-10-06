@@ -23,6 +23,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "sd_mount.h"
 #include "shutdown_armed.h"
 #include "tinyusb.h"
@@ -40,9 +42,12 @@ static const char *TAG = "recorder_usb";
 #define USB_PUBLIC_BITS             (USB_BIT_ATTACH | USB_BIT_HOST_OWNED | \
                                      USB_BIT_RELEASE_REQUESTED | \
                                      USB_BIT_RELEASE_QUIESCED | USB_BIT_FAILED)
-#define USB_SCSI_CMD_TEST_UNIT_READY   0x00u
-#define USB_SCSI_CMD_START_STOP_UNIT 0x1bu
-#define USB_REENUM_DISCONNECT_MS     1000u
+#define USB_SCSI_CMD_TEST_UNIT_READY      0x00u
+#define USB_SCSI_CMD_START_STOP_UNIT      0x1bu
+#define USB_SCSI_CMD_PREVENT_ALLOW        0x1eu
+#define USB_SCSI_CMD_SYNCHRONIZE_CACHE_10 0x35u
+#define USB_SCSI_CMD_SYNCHRONIZE_CACHE_16 0x91u
+#define USB_REENUM_DISCONNECT_MS           1000u
 #define USB_SCSI_SENSE_NOT_READY      0x02u
 #define USB_SCSI_ASC_MEDIUM_NOT_PRESENT 0x3au
 #define USB_SCSI_ASCQ_NONE            0x00u
@@ -64,6 +69,10 @@ int32_t __real_tud_msc_write10_cb(uint8_t lun,
                                   uint32_t offset,
                                   uint8_t *buffer,
                                   uint32_t bufsize);
+bool __real_tud_msc_start_stop_cb(uint8_t lun,
+                                  uint8_t power_condition,
+                                  bool start,
+                                  bool load_eject);
 
 static EventGroupHandle_t s_usb_events = NULL;
 static volatile bool s_initialized = false;
@@ -79,6 +88,197 @@ static volatile bool s_transfer_authorized = false;
 static bool s_wav_finalized = false;
 static bool s_manifest_committed = false;
 static bool s_device_fs_released = false;
+
+// Human-Gate diagnostic trace. These fields never authorize release. TinyUSB
+// callbacks update only lock-free RAM counters; the recorder coordinator is
+// the sole context that persists a bounded snapshot to NVS.
+static volatile uint32_t s_trace_session = 0;
+static volatile uint32_t s_trace_start_stop_requests = 0;
+static volatile uint32_t s_trace_start_stop_completions = 0;
+static volatile uint32_t s_trace_prevent_allow_completions = 0;
+static volatile uint32_t s_trace_sync_cache_completions = 0;
+static volatile uint32_t s_trace_last_start_stop_power = 0;
+static volatile uint32_t s_trace_last_start_stop_flags = 0;
+static volatile uint32_t s_trace_last_control_opcode = 0;
+static volatile uint32_t s_trace_last_control_byte4 = 0;
+static volatile uint32_t s_trace_update_seq = 0;
+static uint32_t s_trace_flushed_seq = 0;
+
+static uint8_t usb_scsi_trace_u8(uint32_t value) {
+    return value > UINT8_MAX ? UINT8_MAX : (uint8_t)value;
+}
+
+static void usb_scsi_trace_mark_dirty(void) {
+    (void)__atomic_add_fetch(&s_trace_update_seq, 1u, __ATOMIC_RELEASE);
+}
+
+static void usb_scsi_trace_begin_session(void) {
+    uint32_t session =
+        __atomic_add_fetch(&s_trace_session, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_start_stop_requests, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_start_stop_completions, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_prevent_allow_completions, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_sync_cache_completions, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_last_start_stop_power, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_last_start_stop_flags, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_last_control_opcode, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_last_control_byte4, 0u, __ATOMIC_RELAXED);
+    usb_scsi_trace_mark_dirty();
+    ESP_LOGI(TAG,
+             "stage: usb-trace, result: session-start, session: %lu",
+             (unsigned long)session);
+}
+
+static void usb_scsi_trace_note_start_stop_request(uint8_t power_condition,
+                                                   bool start,
+                                                   bool load_eject) {
+    uint32_t flags;
+
+    if (!s_host_owned) {
+        return;
+    }
+    flags = (load_eject ? 0x02u : 0u) | (start ? 0x01u : 0u);
+    (void)__atomic_add_fetch(&s_trace_start_stop_requests, 1u,
+                             __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_last_start_stop_power,
+                     (uint32_t)(power_condition & 0x0fu), __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_last_start_stop_flags, flags, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_last_control_opcode,
+                     USB_SCSI_CMD_START_STOP_UNIT, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_last_control_byte4,
+                     ((uint32_t)(power_condition & 0x0fu) << 4) | flags,
+                     __ATOMIC_RELAXED);
+    usb_scsi_trace_mark_dirty();
+}
+
+static void usb_scsi_trace_note_command_complete(
+    uint8_t const scsi_cmd[16]) {
+    uint8_t opcode;
+
+    if (!s_host_owned || scsi_cmd == NULL) {
+        return;
+    }
+    opcode = scsi_cmd[0];
+    if (opcode == USB_SCSI_CMD_START_STOP_UNIT) {
+        (void)__atomic_add_fetch(&s_trace_start_stop_completions, 1u,
+                                 __ATOMIC_RELAXED);
+    } else if (opcode == USB_SCSI_CMD_PREVENT_ALLOW) {
+        (void)__atomic_add_fetch(&s_trace_prevent_allow_completions, 1u,
+                                 __ATOMIC_RELAXED);
+    } else if (opcode == USB_SCSI_CMD_SYNCHRONIZE_CACHE_10 ||
+               opcode == USB_SCSI_CMD_SYNCHRONIZE_CACHE_16) {
+        (void)__atomic_add_fetch(&s_trace_sync_cache_completions, 1u,
+                                 __ATOMIC_RELAXED);
+    } else {
+        return;
+    }
+    __atomic_store_n(&s_trace_last_control_opcode, opcode, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_trace_last_control_byte4, scsi_cmd[4],
+                     __ATOMIC_RELAXED);
+    usb_scsi_trace_mark_dirty();
+}
+
+static esp_err_t usb_scsi_trace_finish_nvs(esp_err_t operation_err) {
+    esp_err_t deinit_err = nvs_flash_deinit();
+    if (operation_err != ESP_OK) {
+        return operation_err;
+    }
+    if (deinit_err == ESP_OK) {
+        return ESP_OK;
+    }
+#ifdef ESP_ERR_NVS_NOT_INITIALIZED
+    if (deinit_err == ESP_ERR_NVS_NOT_INITIALIZED) {
+        return ESP_OK;
+    }
+#endif
+    return deinit_err;
+}
+
+esp_err_t usb_msc_ownership_flush_scsi_trace(void) {
+    nvs_handle_t handle;
+    esp_err_t err;
+    uint32_t seq;
+    uint32_t session;
+    uint32_t ss_req;
+    uint32_t ss_done;
+    uint32_t pa_done;
+    uint32_t sync_done;
+    uint32_t ss_power;
+    uint32_t ss_flags;
+    uint32_t last_op;
+    uint32_t last_b4;
+
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    seq = __atomic_load_n(&s_trace_update_seq, __ATOMIC_ACQUIRE);
+    if (seq == s_trace_flushed_seq) {
+        return ESP_OK;
+    }
+
+    session = __atomic_load_n(&s_trace_session, __ATOMIC_RELAXED);
+    ss_req = __atomic_load_n(&s_trace_start_stop_requests, __ATOMIC_RELAXED);
+    ss_done =
+        __atomic_load_n(&s_trace_start_stop_completions, __ATOMIC_RELAXED);
+    pa_done =
+        __atomic_load_n(&s_trace_prevent_allow_completions, __ATOMIC_RELAXED);
+    sync_done =
+        __atomic_load_n(&s_trace_sync_cache_completions, __ATOMIC_RELAXED);
+    ss_power =
+        __atomic_load_n(&s_trace_last_start_stop_power, __ATOMIC_RELAXED);
+    ss_flags =
+        __atomic_load_n(&s_trace_last_start_stop_flags, __ATOMIC_RELAXED);
+    last_op =
+        __atomic_load_n(&s_trace_last_control_opcode, __ATOMIC_RELAXED);
+    last_b4 =
+        __atomic_load_n(&s_trace_last_control_byte4, __ATOMIC_RELAXED);
+
+    err = nvs_flash_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_open("m5daylog", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return usb_scsi_trace_finish_nvs(err);
+    }
+
+#define TRACE_SET_U8(key, value)                                      \
+    do {                                                               \
+        if (err == ESP_OK) {                                           \
+            err = nvs_set_u8(handle, (key), usb_scsi_trace_u8(value)); \
+        }                                                              \
+    } while (0)
+    TRACE_SET_U8("scsi_valid", 1u);
+    TRACE_SET_U8("scsi_session", session);
+    TRACE_SET_U8("scsi_ss_req", ss_req);
+    TRACE_SET_U8("scsi_ss_done", ss_done);
+    TRACE_SET_U8("scsi_ss_power", ss_power);
+    TRACE_SET_U8("scsi_ss_flags", ss_flags);
+    TRACE_SET_U8("scsi_pa_done", pa_done);
+    TRACE_SET_U8("scsi_sync_done", sync_done);
+    TRACE_SET_U8("scsi_last_op", last_op);
+    TRACE_SET_U8("scsi_last_b4", last_b4);
+#undef TRACE_SET_U8
+
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    err = usb_scsi_trace_finish_nvs(err);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (__atomic_load_n(&s_trace_update_seq, __ATOMIC_ACQUIRE) == seq) {
+        s_trace_flushed_seq = seq;
+    }
+    ESP_LOGI(TAG,
+             "stage: usb-trace, result: persisted, session: %lu, ss_req: %lu, ss_done: %lu, pa_done: %lu, sync_done: %lu, last_op: 0x%02lx, last_b4: 0x%02lx",
+             (unsigned long)session, (unsigned long)ss_req,
+             (unsigned long)ss_done, (unsigned long)pa_done,
+             (unsigned long)sync_done, (unsigned long)last_op,
+             (unsigned long)last_b4);
+    return ESP_OK;
+}
 
 static void usb_fail(const char *reason) {
     if (s_usb_events != NULL) {
@@ -228,6 +428,7 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
                 return;
             }
             s_host_owned = true;
+            usb_scsi_trace_begin_session();
             s_provisional_attached = false;
             s_prepare_disconnected = false;
             xEventGroupSetBits(s_usb_events, USB_BIT_HOST_OWNED);
@@ -317,6 +518,17 @@ static bool usb_request_explicit_eject(void) {
     return true;
 }
 
+bool __wrap_tud_msc_start_stop_cb(uint8_t lun,
+                                  uint8_t power_condition,
+                                  bool start,
+                                  bool load_eject) {
+    // Observation only. Release authority remains exclusively in the
+    // post-status tud_msc_scsi_complete_cb path below.
+    usb_scsi_trace_note_start_stop_request(power_condition, start, load_eject);
+    return __real_tud_msc_start_stop_cb(lun, power_condition, start,
+                                        load_eject);
+}
+
 void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
     bool load_eject;
     bool start;
@@ -341,6 +553,7 @@ void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
         return;
     }
 
+    usb_scsi_trace_note_command_complete(scsi_cmd);
     if (scsi_cmd[0] != USB_SCSI_CMD_START_STOP_UNIT) {
         return;
     }
@@ -616,6 +829,9 @@ esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
     return ESP_ERR_NOT_SUPPORTED;
 }
 esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+esp_err_t usb_msc_ownership_flush_scsi_trace(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
 bool usb_msc_ownership_is_host_owned(void) { return false; }

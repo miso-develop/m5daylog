@@ -32,10 +32,12 @@ idf_component_register(
 
 # Task #87: once the post-status explicit-eject completion sets
 # s_release_pending, no later MSC command may reach the storage backend while
-# the recorder coordinator is still scheduling TinyUSB teardown. Wrap only the
-# media/data callbacks; START STOP UNIT and mount/configuration status ordering
-# remain owned by TinyUSB and the production completion callback.
+# the recorder coordinator is still scheduling TinyUSB teardown. The
+# START STOP UNIT wrapper below is observation-only Human-Gate instrumentation:
+# it always delegates to esp_tinyusb and never grants release. Authority remains
+# exclusively in the production post-status completion callback.
 target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=tud_msc_start_stop_cb"
     "-Wl,--wrap=tud_msc_test_unit_ready_cb"
     "-Wl,--wrap=tud_msc_capacity_cb"
     "-Wl,--wrap=tud_msc_read10_cb"

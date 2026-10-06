@@ -54,6 +54,10 @@ esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
 // esp_tinyusb deferred-write-zero proof. It never builds APP storage.
 esp_err_t usb_msc_ownership_complete_release_quiesce(void);
 
+// Human-Gate diagnostic only: persist the latest non-authoritative SCSI
+// observation counters. Failure to persist diagnostics never grants release.
+esp_err_t usb_msc_ownership_flush_scsi_trace(void);
+
 bool usb_msc_ownership_is_host_owned(void);
 
 #ifdef __cplusplus

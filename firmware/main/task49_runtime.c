@@ -42,6 +42,7 @@ extern bool device_manifest_sync_wav_dir(const char *recordings_dir,
 #define REC_TASK_DONE_MASK       (REC_BIT_WRITER_FINALIZED | \
                                   REC_BIT_CAPTURE_DONE | \
                                   REC_BIT_BATTERY_DONE)
+#define USB_TRACE_FLUSH_INTERVAL_MS 250u
 
 static task87_wake_recovery_t s_wake_recovery;
 static TaskHandle_t s_usb_event_task = NULL;
@@ -164,6 +165,19 @@ static void recorder_handle_usb_attach(void) {
     }
 }
 
+static void recorder_flush_usb_scsi_trace(void) {
+    static bool warned = false;
+    esp_err_t err = usb_msc_ownership_flush_scsi_trace();
+
+    if (err == ESP_OK) {
+        warned = false;
+    } else if (!warned) {
+        ESP_LOGW(TAG,
+                 "stage: usb-trace, result: persist-error, action: diagnostic-only");
+        warned = true;
+    }
+}
+
 static void recorder_handle_usb_host_owned(void) {
     if (recorder_current_state() != RECORDER_STATE_USB_PREPARE ||
         sd_mount_is_mounted() ||
@@ -174,7 +188,9 @@ static void recorder_handle_usb_host_owned(void) {
     if (!recorder_transition_state(RECORDER_STATE_USB_SYNC,
                                    RECORDER_REASON_USB, 0)) {
         recorder_enter_error(RECORDER_REASON_USB);
+        return;
     }
+    recorder_flush_usb_scsi_trace();
 }
 
 static void recorder_handle_usb_release(void) {
@@ -184,6 +200,11 @@ static void recorder_handle_usb_release(void) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
+
+    // Persist diagnostic request/completion counters before teardown. This
+    // observation cannot authorize release and a trace-write failure does not
+    // weaken the product's fail-closed ownership state.
+    recorder_flush_usb_scsi_trace();
 
     // A successful quiesce now includes the durable lifecycle transition from
     // HOST_UNRESOLVED to SHUTDOWN_ARMED. Failure at USB teardown, deferred-write
@@ -220,7 +241,7 @@ static void recorder_usb_event_task(void *arg) {
     // SCSI evidence and signal this task; recorder finalization and APP -> USB
     // ownership transfer remain outside the USB stack callback path.
     for (;;) {
-        switch (usb_msc_ownership_wait_event(UINT32_MAX)) {
+        switch (usb_msc_ownership_wait_event(USB_TRACE_FLUSH_INTERVAL_MS)) {
             case USB_MSC_EVENT_ATTACH:
                 recorder_handle_usb_attach();
                 break;
@@ -240,6 +261,7 @@ static void recorder_usb_event_task(void *arg) {
             default:
                 break;
         }
+        recorder_flush_usb_scsi_trace();
     }
 }
 

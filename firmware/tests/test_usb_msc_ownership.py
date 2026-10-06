@@ -32,12 +32,13 @@ def test_usb_ownership_module_is_built_and_tinyusb_is_pinned():
     assert "==2.2.1" in manifest
     assert 'SRCS "task49_runtime.c"' in main_cmake
     # Publication/eject authority remains on TinyUSB's post-status completion
-    # callback. Only backend data/readiness callbacks are wrapped so a completed
-    # eject closes new storage admission before asynchronous driver teardown.
+    # callback. START STOP is wrapped only for non-authoritative Human-Gate
+    # observation; backend data/readiness wrappers close storage admission after
+    # the completion callback authorizes release.
     assert "--wrap=tud_mount_cb" not in main_cmake
     assert "--wrap=tud_mount_cb" not in cmake
     assert "--wrap=tud_msc_start_stop_cb" not in main_cmake
-    assert "--wrap=tud_msc_start_stop_cb" not in cmake
+    assert "--wrap=tud_msc_start_stop_cb" in cmake
     for callback in (
         "tud_msc_test_unit_ready_cb",
         "tud_msc_capacity_cb",
@@ -226,8 +227,14 @@ def test_explicit_eject_is_observed_by_real_scsi_completion_seam():
     assert "scsi_cmd[4] & 0x01u" in callback_region
     assert "usb_request_explicit_eject" in callback_region
 
-    assert "__wrap_tud_msc_start_stop_cb" not in src
-    assert "__real_tud_msc_start_stop_cb" not in src
+    wrapper_at = src.index("bool __wrap_tud_msc_start_stop_cb")
+    completion_at = src.index("void tud_msc_scsi_complete_cb", wrapper_at)
+    wrapper_region = src[wrapper_at:completion_at]
+    assert "usb_scsi_trace_note_start_stop_request" in wrapper_region
+    assert "__real_tud_msc_start_stop_cb" in wrapper_region
+    assert "usb_request_explicit_eject" not in wrapper_region
+    assert "USB_BIT_RELEASE_REQUESTED" not in wrapper_region
+    assert "s_release_pending =" not in wrapper_region
 
 
 def test_release_quiescence_stops_usb_before_storage_release_and_durable_arm():
@@ -291,3 +298,20 @@ def test_usb_ownership_logs_metadata_only():
         assert forbidden not in src
     for marker in ("attach", "owner", "mount", "eject"):
         assert marker in src, marker
+
+
+def test_scsi_trace_is_diagnostic_only_and_flushed_from_coordinator():
+    src = USB_C.read_text(encoding="utf-8")
+    runtime = RUNTIME.read_text(encoding="utf-8")
+
+    wrapper_at = src.index("bool __wrap_tud_msc_start_stop_cb")
+    completion_at = src.index("void tud_msc_scsi_complete_cb", wrapper_at)
+    wrapper_region = src[wrapper_at:completion_at]
+    assert "return __real_tud_msc_start_stop_cb" in wrapper_region
+    assert "usb_request_explicit_eject" not in wrapper_region
+
+    assert "usb_msc_ownership_flush_scsi_trace" in src
+    assert "nvs_set_u8" in src
+    assert "USB_TRACE_FLUSH_INTERVAL_MS" in runtime
+    assert "usb_msc_ownership_wait_event(USB_TRACE_FLUSH_INTERVAL_MS)" in runtime
+    assert "recorder_flush_usb_scsi_trace();" in runtime

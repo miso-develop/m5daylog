@@ -58,6 +58,9 @@ def _build(tmp_path: Path) -> Path:
             static volatile bool s_publish_triggered = true;
             static bool g_mounted = false;
             static int g_disconnect_calls;
+            static int g_trace_complete_calls;
+            static uint8_t g_trace_last_opcode;
+            static uint8_t g_trace_last_byte4;
 
             #define CHECK(expr) do { \
                 if (!(expr)) { \
@@ -76,6 +79,12 @@ def _build(tmp_path: Path) -> Path:
             static void usb_fail(const char *reason) {
                 (void)reason;
                 xEventGroupSetBits(s_usb_events, USB_BIT_FAILED);
+            }
+            static void usb_scsi_trace_note_command_complete(
+                uint8_t const scsi_cmd[16]) {
+                g_trace_complete_calls++;
+                g_trace_last_opcode = scsi_cmd[0];
+                g_trace_last_byte4 = scsi_cmd[4];
             }
             """
         )
@@ -96,6 +105,9 @@ def _build(tmp_path: Path) -> Path:
                 s_publish_triggered = true;
                 g_mounted = false;
                 g_disconnect_calls = 0;
+                g_trace_complete_calls = 0;
+                g_trace_last_opcode = 0;
+                g_trace_last_byte4 = 0;
             }
 
             int main(int argc, char **argv) {
@@ -117,6 +129,7 @@ def _build(tmp_path: Path) -> Path:
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
                     CHECK(!s_release_pending);
                     CHECK(g_disconnect_calls == 0);
+                    CHECK(g_trace_complete_calls == 0);
                 } else if (strcmp(argv[1], "eject") == 0) {
                     cdb[0] = USB_SCSI_CMD_START_STOP_UNIT;
                     cdb[4] = 0x02u; /* LOEJ=1, START=0 */
@@ -125,10 +138,14 @@ def _build(tmp_path: Path) -> Path:
                     CHECK(g_disconnect_calls == 0);
                     CHECK((g_events.bits & USB_BIT_RELEASE_REQUESTED) != 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
+                    CHECK(g_trace_complete_calls == 1);
+                    CHECK(g_trace_last_opcode == USB_SCSI_CMD_START_STOP_UNIT);
+                    CHECK(g_trace_last_byte4 == 0x02u);
 
                     /* Duplicate observation is idempotent. */
                     tud_msc_scsi_complete_cb(0, cdb);
                     CHECK(g_disconnect_calls == 0);
+                    CHECK(g_trace_complete_calls == 2);
                 } else if (strcmp(argv[1], "start") == 0) {
                     cdb[0] = USB_SCSI_CMD_START_STOP_UNIT;
                     cdb[4] = 0x03u; /* LOEJ=1, START=1: not release */
@@ -136,6 +153,8 @@ def _build(tmp_path: Path) -> Path:
                     CHECK(!s_release_pending);
                     CHECK(g_disconnect_calls == 0);
                     CHECK(g_events.bits == 0);
+                    CHECK(g_trace_complete_calls == 1);
+                    CHECK(g_trace_last_byte4 == 0x03u);
                 } else if (strcmp(argv[1], "other") == 0) {
                     cdb[0] = 0x00u;
                     tud_msc_scsi_complete_cb(0, cdb);
