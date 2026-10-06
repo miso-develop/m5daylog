@@ -114,8 +114,10 @@ def test_manual_wake_runtime_delegates_to_production_recovery_seam():
 
     seam_at = recovery.index("task87_wake_recovery_complete_device_recovery")
     rtc_at = recovery.index("rtc_correction_flush_pending_event", seam_at)
-    clear_at = recovery.index("shutdown_armed_clear", rtc_at)
-    assert seam_at < rtc_at < clear_at
+    pending_at = recovery.index("shutdown_armed_mark_wake_recovery_pending", rtc_at)
+    proof_at = recovery.index("task87_wake_recovery_note_recording_started", pending_at)
+    complete_at = recovery.index("shutdown_armed_complete_wake_recovery", proof_at)
+    assert seam_at < rtc_at < pending_at < proof_at < complete_at
 
     wait_at = runtime.index("static bool recorder_wait_initial_recording")
     recording_at = runtime.index("RECORDER_STATE_RECORDING", wait_at)
