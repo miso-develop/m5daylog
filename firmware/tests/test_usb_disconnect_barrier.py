@@ -55,7 +55,7 @@ def test_explicit_eject_closes_backend_admission_before_async_teardown():
     helper_at = usb.index("static bool usb_request_explicit_eject")
     callback_at = usb.index("void tud_msc_scsi_complete_cb", helper_at)
     helper = usb[helper_at:callback_at]
-    pending_at = helper.index("s_release_pending = true")
+    pending_at = helper.index("atomic_compare_exchange_strong_explicit")
     event_at = helper.index("USB_BIT_RELEASE_REQUESTED", pending_at)
     assert pending_at < event_at
     assert "tud_disconnect" not in helper
