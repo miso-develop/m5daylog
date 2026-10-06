@@ -199,6 +199,8 @@ static cJSON *parse_object(const char *json) {
             args_body = extract_args_body(json);
             if (args_body != NULL && *skip_ws(args_body) != '\0') {
                 int time_type = member_type(args_body, "time");
+                int release_type =
+                    member_type(args_body, "releaseAttemptId");
                 if (time_type != 0) {
                     if (time_type == CJSON_STUB_STRING) {
                         value = extract_string_value(args_body, "time");
@@ -206,6 +208,20 @@ static cJSON *parse_object(const char *json) {
                         free(value);
                     } else {
                         append_child(args, node_new(time_type, "time", NULL));
+                    }
+                }
+                if (release_type != 0) {
+                    if (release_type == CJSON_STUB_STRING) {
+                        value = extract_string_value(
+                            args_body, "releaseAttemptId");
+                        append_child(
+                            args,
+                            node_new(release_type, "releaseAttemptId", value));
+                        free(value);
+                    } else {
+                        append_child(
+                            args,
+                            node_new(release_type, "releaseAttemptId", NULL));
                     }
                 }
                 if (strstr(args_body, "\"extra\"") != NULL) {
