@@ -40,6 +40,7 @@ static const char *TAG = "recorder_usb";
 #define USB_PUBLIC_BITS             (USB_BIT_ATTACH | USB_BIT_HOST_OWNED | \
                                      USB_BIT_RELEASE_REQUESTED | \
                                      USB_BIT_RELEASE_QUIESCED | USB_BIT_FAILED)
+#define USB_SCSI_CMD_TEST_UNIT_READY   0x00u
 #define USB_SCSI_CMD_START_STOP_UNIT 0x1bu
 #define USB_REENUM_DISCONNECT_MS     1000u
 
@@ -300,7 +301,13 @@ void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
     // esp_tinyusb reports the medium not ready to the host.
     if (!s_storage_usb_owned && s_provisional_attached &&
         !s_publish_triggered) {
-        (void)usb_note_initial_msc_command_complete();
+        // Wait specifically for TEST UNIT READY. esp_tinyusb answers it with
+        // MEDIUM NOT PRESENT while the storage is APP-owned, so the host has
+        // explicitly observed the pre-publication no-media state before the
+        // coordinator disconnects.
+        if (scsi_cmd[0] == USB_SCSI_CMD_TEST_UNIT_READY) {
+            (void)usb_note_initial_msc_command_complete();
+        }
         return;
     }
 
