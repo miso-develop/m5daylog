@@ -175,13 +175,13 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
     }
 
     if (event->id == TINYUSB_EVENT_ATTACHED) {
-        if (!s_host_owned) {
+        if (!s_storage_usb_owned) {
             // The first SetConfiguration is a detection trigger only. Do not
             // mutate MSC storage ownership from inside esp_tinyusb's
             // tud_mount_cb; Human Gate showed that Windows can retain the USB
             // device while never creating a USBSTOR interface in that shape.
             if (!s_initialized || (!s_started && !s_starting) ||
-                s_release_pending || s_publish_triggered ||
+                s_host_owned || s_release_pending || s_publish_triggered ||
                 !sd_mount_is_mounted()) {
                 (void)tud_disconnect();
                 usb_fail("attach ownership state");
@@ -199,13 +199,29 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
             return;
         }
 
-        // This is the deliberate second enumeration (or a later physical
-        // reconnect of the same unresolved host-owned session). The LUN was
-        // already switched to USB before tud_connect(), so SetConfiguration
-        // exposes a stable MSC backend to the host.
-        if (!s_release_pending && !sd_mount_is_mounted()) {
+        if (!s_host_owned) {
+            // This is the deliberate second enumeration. Storage ownership was
+            // transferred while detached; only this fresh SetConfiguration
+            // promotes the volatile lifecycle to host-configured / USB_SYNC.
+            if (!s_initialized || (!s_started && !s_starting) ||
+                !s_publish_triggered || s_release_pending ||
+                sd_mount_is_mounted()) {
+                (void)tud_disconnect();
+                usb_fail("publication reattach state");
+                return;
+            }
+            s_host_owned = true;
+            xEventGroupSetBits(s_usb_events, USB_BIT_HOST_OWNED);
             ESP_LOGI(TAG,
                      "stage: usb, result: configured, owner: host, mount: usb");
+            return;
+        }
+
+        // A later physical reconnect may reuse the same unresolved host-owned
+        // session so the PC can still perform the required explicit eject.
+        if (!s_release_pending && !sd_mount_is_mounted()) {
+            ESP_LOGI(TAG,
+                     "stage: usb, result: reconfigured, owner: host, mount: usb");
             return;
         }
         (void)tud_disconnect();
