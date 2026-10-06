@@ -75,12 +75,12 @@ def test_release_never_rebuilds_app_storage_same_session():
     assert "TINYUSB_MSC_STORAGE_MOUNT_APP" not in region
 
 
-def test_runtime_releases_hold_only_after_ownership_quiesce_returns_success():
+def test_runtime_enters_guarded_shutdown_only_after_ownership_quiesce_success():
     runtime = RUNTIME.read_text(encoding="utf-8")
     fn_at = runtime.index("static void recorder_handle_usb_release")
     quiesce_at = runtime.index("usb_msc_ownership_complete_release_quiesce", fn_at)
-    hold_at = runtime.index("recorder_power_release_hold", quiesce_at)
-    assert quiesce_at < hold_at
+    shutdown_at = runtime.index("recorder_power_shutdown", quiesce_at)
+    assert quiesce_at < shutdown_at
 
     release_region = runtime[fn_at:runtime.index("\n}", fn_at)]
     assert "shutdown_armed_commit" not in release_region
