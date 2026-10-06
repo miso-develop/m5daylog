@@ -42,7 +42,8 @@ def _build(tmp_path: Path) -> Path:
             #define USB_BIT_ATTACH (1u << 0)
             #define USB_BIT_RELEASE_REQUESTED (1u << 3)
             #define USB_BIT_FAILED (1u << 5)
-            #define USB_SCSI_CMD_TEST_UNIT_READY 0x00u\n            #define USB_SCSI_CMD_START_STOP_UNIT 0x1bu
+            #define USB_SCSI_CMD_TEST_UNIT_READY 0x00u
+            #define USB_SCSI_CMD_START_STOP_UNIT 0x1bu
 
             typedef struct event_group { uint32_t bits; } *EventGroupHandle_t;
             static struct event_group g_events;
