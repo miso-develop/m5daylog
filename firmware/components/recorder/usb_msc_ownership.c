@@ -8,9 +8,10 @@
 // class binding. Only then does the recorder coordinator soft-disconnect outside
 // the USB callback, finalize recording, persist HOST_UNRESOLVED, switch the
 // storage APP -> USB, and reconnect with an already USB-owned LUN. Generic
-// detach / suspend never authorizes Device ownership. The only normal reverse
-// trigger is START STOP UNIT(load_eject=1,start=0), observed after its SCSI
-// status transaction completes.
+// detach / suspend never authorizes Device ownership. D-031 normal reverse
+// authority is CDC RELEASE_STORAGE after PC-side quiescence. A qualified
+// post-status START STOP UNIT remains compatibility-only and converges on the
+// same admission gate/quiescence path.
 
 #include "usb_msc_ownership.h"
 
