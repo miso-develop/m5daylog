@@ -86,6 +86,22 @@ def _build(tmp_path: Path) -> Path:
                 g_trace_last_opcode = scsi_cmd[0];
                 g_trace_last_byte4 = scsi_cmd[4];
             }
+            static void usb_scsi_trace_note_start_stop_request(
+                uint8_t power_condition, bool start, bool load_eject) {
+                (void)power_condition;
+                (void)start;
+                (void)load_eject;
+            }
+            bool __real_tud_msc_start_stop_cb(uint8_t lun,
+                                              uint8_t power_condition,
+                                              bool start,
+                                              bool load_eject) {
+                (void)lun;
+                (void)power_condition;
+                (void)start;
+                (void)load_eject;
+                return true;
+            }
             """
         )
         + "\n"

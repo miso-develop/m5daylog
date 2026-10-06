@@ -102,6 +102,9 @@ def _build(tmp_path: Path) -> Path:
                 (void)reason;
                 xEventGroupSetBits(s_usb_events, USB_BIT_FAILED);
             }
+            static void usb_scsi_trace_begin_session(void) {
+                /* Observation-only helper is not under test here. */
+            }
             """
         )
         + "\n"

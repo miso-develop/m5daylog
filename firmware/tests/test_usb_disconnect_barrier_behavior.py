@@ -391,6 +391,16 @@ HARNESS = r"""
         g_real_write_calls++;
         return (int32_t)bufsize;
     }
+    bool __real_tud_msc_start_stop_cb(uint8_t lun,
+                                      uint8_t power_condition,
+                                      bool start,
+                                      bool load_eject) {
+        (void)lun;
+        (void)power_condition;
+        (void)start;
+        (void)load_eject;
+        return true;
+    }
     static usb_msc_ownership_event_t next_event(void) {
         return usb_msc_ownership_wait_event(0);
     }
