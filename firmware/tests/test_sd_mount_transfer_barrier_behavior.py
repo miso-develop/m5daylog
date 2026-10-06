@@ -1,9 +1,9 @@
 """Task #87 regression for the production APP -> USB transfer barrier.
 
 The test extracts and executes the real ``sd_mount_transfer_to_usb`` function
-body against a minimal deterministic harness. This keeps the behavioral seam
-focused while proving that MOUNT_START can run before recorder release proof,
-and that the proof is nevertheless required before the transfer is accepted.
+body against a minimal deterministic harness. It proves detached publication is
+admitted only after recorder/Device-FS release proof already exists, and that
+the synchronous storage switch must retire the remaining APP mount.
 """
 
 from pathlib import Path
@@ -56,8 +56,8 @@ def _build(tmp_path: Path) -> Path:
             #define portEXIT_CRITICAL(lock) ((void)(lock))
 
             static bool s_mounted = true;
-            static bool s_usb_release_requested = false;
-            static bool s_device_fs_released = false;
+            static bool s_usb_release_requested = true;
+            static bool s_device_fs_released = true;
             static void *s_storage = (void *)1;
 
             static int g_transfer_calls;
@@ -73,26 +73,22 @@ def _build(tmp_path: Path) -> Path:
                 CHECK(mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB);
                 g_transfer_calls++;
 
-                /* Production must admit the mount operation while APP still owns
-                 * FAT/VFS and before recorder release proof exists. The real
-                 * MOUNT_START callback blocks here until that proof is produced. */
+                /* Detached publication requires recorder release proof before
+                 * the APP -> USB storage switch is admitted. */
                 CHECK(s_mounted);
-                CHECK(!s_usb_release_requested);
-                CHECK(!s_device_fs_released);
+                CHECK(s_usb_release_requested);
+                CHECK(s_device_fs_released);
 
                 if (g_mode == 2) {
                     return ESP_FAIL;
                 }
                 if (g_mode == 1) {
-                    /* Model a broken callback/transfer that moved ownership but
-                     * failed to establish recorder release proof. */
-                    s_mounted = false;
+                    /* Model a broken transfer that returns success without
+                     * retiring the remaining APP mount. */
                     return ESP_OK;
                 }
 
-                /* Successful MOUNT_START barrier completion. */
-                s_usb_release_requested = true;
-                s_device_fs_released = true;
+                /* Successful synchronous APP -> USB mount-point transition. */
                 s_mounted = false;
                 return ESP_OK;
             }
@@ -116,20 +112,37 @@ def _build(tmp_path: Path) -> Path:
                     CHECK(s_usb_release_requested);
                     CHECK(s_device_fs_released);
                 } else if (strcmp(argv[1], "missing-proof") == 0) {
+                    s_device_fs_released = false;
+                    result = sd_mount_transfer_to_usb();
+                    CHECK(result == ESP_ERR_INVALID_STATE);
+                    CHECK(g_transfer_calls == 0);
+                    CHECK(s_mounted);
+                    CHECK(s_usb_release_requested);
+                    CHECK(!s_device_fs_released);
+                } else if (strcmp(argv[1], "not-requested") == 0) {
+                    s_usb_release_requested = false;
+                    result = sd_mount_transfer_to_usb();
+                    CHECK(result == ESP_ERR_INVALID_STATE);
+                    CHECK(g_transfer_calls == 0);
+                    CHECK(s_mounted);
+                    CHECK(!s_usb_release_requested);
+                    CHECK(s_device_fs_released);
+                } else if (strcmp(argv[1], "missing-complete") == 0) {
                     g_mode = 1;
                     result = sd_mount_transfer_to_usb();
                     CHECK(result == ESP_ERR_INVALID_STATE);
                     CHECK(g_transfer_calls == 1);
-                    CHECK(!s_usb_release_requested);
-                    CHECK(!s_device_fs_released);
+                    CHECK(s_mounted);
+                    CHECK(s_usb_release_requested);
+                    CHECK(s_device_fs_released);
                 } else if (strcmp(argv[1], "transfer-failure") == 0) {
                     g_mode = 2;
                     result = sd_mount_transfer_to_usb();
                     CHECK(result == ESP_FAIL);
                     CHECK(g_transfer_calls == 1);
                     CHECK(s_mounted);
-                    CHECK(!s_usb_release_requested);
-                    CHECK(!s_device_fs_released);
+                    CHECK(s_usb_release_requested);
+                    CHECK(s_device_fs_released);
                 } else {
                     CHECK(false);
                 }
@@ -150,7 +163,10 @@ def _build(tmp_path: Path) -> Path:
     return binary
 
 
-@pytest.mark.parametrize("scenario", ["success", "missing-proof", "transfer-failure"])
+@pytest.mark.parametrize(
+    "scenario",
+    ["success", "missing-proof", "not-requested", "missing-complete", "transfer-failure"],
+)
 def test_production_transfer_barrier_order_and_postconditions(
     tmp_path: Path, scenario: str
 ) -> None:
