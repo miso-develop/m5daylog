@@ -1,11 +1,10 @@
-"""Task #87 regression for pre-configuration MSC publication gating.
+"""Task #87 regression for two-phase MSC publication.
 
-The pinned esp_tinyusb reports TINYUSB_EVENT_ATTACHED only after SetConfiguration.
-Strategy 2 therefore wraps tud_mount_cb and performs the APP -> USB storage
-transfer there. The storage MOUNT_START callback is the early barrier that blocks
-configuration until recorder finalization, durable metadata, and Device-FS
-release are proven. auto_mount_off remains enabled so generic detach never
-remounts APP storage.
+The first esp_tinyusb ATTACHED/SetConfiguration is a trigger only.  Production
+must soft-disconnect before durable HOST_UNRESOLVED publication and APP -> USB
+storage transfer, then wait a host-visible detach interval and reconnect with
+the LUN already USB-owned.  This protects the physical Windows failure where a
+device enumerated but no USBSTOR/Disk interface appeared.
 """
 
 from pathlib import Path
@@ -18,7 +17,6 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 RECORDER = REPO / "firmware/components/recorder"
 INCLUDE = RECORDER / "include"
-USB_C = RECORDER / "usb_msc_ownership.c"
 MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
 
 STUB_HEADERS = {
@@ -68,6 +66,11 @@ STUB_HEADERS = {
                                         BaseType_t wait_for_all,
                                         TickType_t ticks);
     """,
+    "freertos/task.h": r"""
+        #pragma once
+        #include "freertos/FreeRTOS.h"
+        void vTaskDelay(TickType_t ticks);
+    """,
     "tinyusb.h": r"""
         #pragma once
         #include "esp_err.h"
@@ -96,8 +99,6 @@ STUB_HEADERS = {
         #include <stdint.h>
         bool tud_disconnect(void);
         bool tud_connect(void);
-        void __real_tud_mount_cb(void);
-        void __wrap_tud_mount_cb(void);
         bool __real_tud_msc_start_stop_cb(uint8_t lun,
                                           uint8_t power_condition,
                                           bool start,
@@ -172,6 +173,7 @@ HARNESS = r"""
 
     #include "freertos/FreeRTOS.h"
     #include "freertos/event_groups.h"
+    #include "freertos/task.h"
     #include "nvs.h"
     #include "sd_mount.h"
     #include "shutdown_armed.h"
@@ -197,10 +199,10 @@ HARNESS = r"""
     static bool g_mounted = true;
     static bool g_release_requested;
     static bool g_device_fs_released;
-    static bool g_prepare_wait_seen;
     static int g_disconnect_calls;
+    static int g_connect_calls;
     static int g_transfer_calls;
-    static int g_real_mount_calls;
+    static TickType_t g_delay_ticks;
     static bool g_nvs_has_value;
     static uint8_t g_nvs_value;
     static bool g_nvs_pending;
@@ -260,38 +262,30 @@ HARNESS = r"""
                                     BaseType_t wait_for_all,
                                     TickType_t ticks) {
         (void)wait_for_all;
-        CHECK(ticks == portMAX_DELAY || ticks == 0);
-        if (ticks == portMAX_DELAY) {
-            g_prepare_wait_seen = true;
-            CHECK((group->bits & (1u << 0)) != 0);
-            CHECK(!g_nvs_has_value);
-            CHECK(g_mounted);
-            g_release_requested = true;
-            g_device_fs_released = true;
-            CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
-        }
+        (void)ticks;
         EventBits_t result = group->bits;
         if (clear_on_exit && (result & bits) != 0) group->bits &= ~bits;
         return result;
     }
+    void vTaskDelay(TickType_t ticks) { g_delay_ticks = ticks; }
 
     bool sd_mount_is_mounted(void) { return g_mounted; }
     esp_err_t sd_mount_transfer_to_usb(void) {
-        tinyusb_msc_event_t mount_start = {
+        tinyusb_msc_event_t start = {
             .id = TINYUSB_MSC_EVENT_MOUNT_START,
             .mount_point = TINYUSB_MSC_STORAGE_MOUNT_APP,
         };
-        tinyusb_msc_event_t mount_complete = {
+        tinyusb_msc_event_t complete = {
             .id = TINYUSB_MSC_EVENT_MOUNT_COMPLETE,
             .mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB,
         };
         g_transfer_calls++;
         CHECK(g_storage_cb != NULL);
-        g_storage_cb((void *)1, &mount_start, g_storage_arg);
+        CHECK(g_nvs_has_value && g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
+        g_storage_cb((void *)1, &start, g_storage_arg);
         CHECK(g_release_requested);
         CHECK(g_device_fs_released);
-        CHECK(g_nvs_has_value && g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
-        g_storage_cb((void *)1, &mount_complete, g_storage_arg);
+        g_storage_cb((void *)1, &complete, g_storage_arg);
         return ESP_OK;
     }
     void sd_mount_note_usb_owned(void) { g_mounted = false; }
@@ -309,17 +303,8 @@ HARNESS = r"""
         return ESP_OK;
     }
     esp_err_t tinyusb_driver_uninstall(void) { return ESP_OK; }
-    bool tud_disconnect(void) {
-        g_disconnect_calls++;
-        return true;
-    }
-    bool tud_connect(void) { return true; }
-    void __real_tud_mount_cb(void) {
-        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
-        g_real_mount_calls++;
-        CHECK(g_device_cb != NULL);
-        g_device_cb(&attached, g_device_arg);
-    }
+    bool tud_disconnect(void) { g_disconnect_calls++; return true; }
+    bool tud_connect(void) { g_connect_calls++; return true; }
     bool __real_tud_msc_start_stop_cb(uint8_t lun,
                                       uint8_t power_condition,
                                       bool start,
@@ -333,30 +318,41 @@ HARNESS = r"""
     }
 
     int main(void) {
+        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+
         CHECK(usb_msc_ownership_init() == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
-        CHECK(g_storage_cb != NULL);
         CHECK(g_device_cb != NULL);
+        CHECK(g_storage_cb != NULL);
 
-        /* Wrapped mount runs before esp_tinyusb reports post-config ATTACHED. */
-        __wrap_tud_mount_cb();
-        CHECK(g_prepare_wait_seen);
-        CHECK(g_transfer_calls == 1);
-        CHECK(g_real_mount_calls == 1);
+        /* First configuration is deliberately abandoned before ownership work. */
+        g_device_cb(&attached, g_device_arg);
+        CHECK(g_disconnect_calls == 1);
+        CHECK(g_connect_calls == 0);
+        CHECK(g_transfer_calls == 0);
+        CHECK(g_mounted);
+        CHECK(!g_nvs_has_value);
+        CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+
+        /* Model recorder USB_PREPARE completion, then publish while detached. */
+        g_release_requested = true;
+        g_device_fs_released = true;
+        CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
         CHECK(g_nvs_has_value);
         CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
-        CHECK(g_disconnect_calls == 0);
-        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(g_transfer_calls == 1);
         CHECK(!g_mounted);
-        CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(g_delay_ticks == 250u);
+        CHECK(g_connect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
 
-        /* Re-enumeration of the same unresolved host-owned session reuses USB ownership. */
-        __wrap_tud_mount_cb();
+        /* Fresh enumeration sees an already USB-owned LUN and stays connected. */
+        g_device_cb(&attached, g_device_arg);
+        CHECK(g_disconnect_calls == 1);
+        CHECK(g_connect_calls == 1);
         CHECK(g_transfer_calls == 1);
-        CHECK(g_real_mount_calls == 2);
-        CHECK(g_disconnect_calls == 0);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         return 0;
     }
@@ -370,7 +366,7 @@ def _write_headers(root: Path) -> None:
         path.write_text(textwrap.dedent(content), encoding="utf-8")
 
 
-def test_wrapped_mount_blocks_configuration_until_device_release(tmp_path: Path) -> None:
+def test_two_phase_publication_reconnects_only_after_usb_owned_lun(tmp_path: Path) -> None:
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if cc is None:
         pytest.skip("host C compiler is unavailable")
@@ -399,8 +395,7 @@ def test_wrapped_mount_blocks_configuration_until_device_release(tmp_path: Path)
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
-def test_strategy2_wraps_tinyusb_mount_before_post_config_attach() -> None:
-    usb = USB_C.read_text(encoding="utf-8")
+def test_mount_wrapper_is_not_used_for_publication() -> None:
     cmake = MAIN_CMAKE.read_text(encoding="utf-8")
-    assert "__wrap_tud_mount_cb" in usb
-    assert "--wrap=tud_mount_cb" in cmake
+    assert "--wrap=tud_mount_cb" not in cmake
+    assert "--wrap=tud_msc_start_stop_cb" in cmake
