@@ -376,8 +376,8 @@ HARNESS = r"""
         CHECK(g_transfer_calls == 1);
         CHECK(g_delay_ticks == 250u);
         CHECK(g_connect_calls == 1);
-        CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
-        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(!usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
         CHECK(g_nvs_commit_calls == 1);
         CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
@@ -385,6 +385,8 @@ HARNESS = r"""
         g_device_cb(&attached, g_device_arg);
         CHECK(g_disconnect_calls == 1);
         CHECK(g_connect_calls == 1);
+        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
     }
 
