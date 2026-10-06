@@ -24,10 +24,19 @@ def test_usb_status_boundaries_preserve_control_callbacks_and_wrap_backend_io():
     assert "__real_tud_mount_cb" not in usb
     assert "--wrap=tud_mount_cb" not in main_cmake
     assert "--wrap=tud_mount_cb" not in recorder_cmake
-    assert "__wrap_tud_msc_start_stop_cb" not in usb
-    assert "__real_tud_msc_start_stop_cb" not in usb
+    # START STOP is wrapped for observation only. The wrapper must delegate
+    # unchanged and must not grant release; authority remains post-status.
+    assert "__wrap_tud_msc_start_stop_cb" in usb
+    assert "__real_tud_msc_start_stop_cb" in usb
     assert "--wrap=tud_msc_start_stop_cb" not in main_cmake
-    assert "--wrap=tud_msc_start_stop_cb" not in recorder_cmake
+    assert "--wrap=tud_msc_start_stop_cb" in recorder_cmake
+    wrapper_at = usb.index("bool __wrap_tud_msc_start_stop_cb")
+    complete_at = usb.index("void tud_msc_scsi_complete_cb", wrapper_at)
+    wrapper = usb[wrapper_at:complete_at]
+    assert "usb_scsi_trace_note_start_stop_request" in wrapper
+    assert "return __real_tud_msc_start_stop_cb" in wrapper
+    assert "usb_request_explicit_eject" not in wrapper
+    assert "USB_BIT_RELEASE_REQUESTED" not in wrapper
     assert "tud_msc_scsi_complete_cb" in usb
 
     for callback in (
