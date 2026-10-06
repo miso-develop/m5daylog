@@ -17,9 +17,11 @@ esp_err_t recorder_power_init(void);
 esp_err_t recorder_power_read_battery_mv(int *battery_mv);
 void recorder_power_deinit(void);
 
-// Functional shutdown while USB power remains. HOLD is expected to have been
-// released first; no automatic wake source is armed here.
-void recorder_power_enter_shutdown_sleep(void);
+// Enter Strategy-2 functional shutdown. This first disables all ESP sleep
+// wake sources, then releases battery HOLD and enters deep sleep. Preparation
+// failure returns an error and deliberately does not sleep; on hardware a
+// successful esp_deep_sleep_start() does not return.
+esp_err_t recorder_power_shutdown(void);
 
 #ifdef __cplusplus
 }
