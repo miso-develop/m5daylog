@@ -1,7 +1,7 @@
 """Task #87 Strategy 2 source-order contracts.
 
 Behavioral host tests are the primary proof. These assertions lock two-phase
-MSC publication, the explicit-eject seam, durable ownership ordering, and the
+MSC publication, the CDC release seam, durable ownership ordering, and the
 absence of same-session APP remount.
 """
 
@@ -24,8 +24,8 @@ def test_usb_status_boundaries_preserve_control_callbacks_and_wrap_backend_io():
     assert "__real_tud_mount_cb" not in usb
     assert "--wrap=tud_mount_cb" not in main_cmake
     assert "--wrap=tud_mount_cb" not in recorder_cmake
-    # START STOP is wrapped for observation only. The wrapper must delegate
-    # unchanged and must not grant release; authority remains post-status.
+    # START STOP is observation-only both at request and post-status completion.
+    # Only canonical CDC RELEASE_STORAGE may close the backend release gate.
     assert "__wrap_tud_msc_start_stop_cb" in usb
     assert "__real_tud_msc_start_stop_cb" in usb
     assert "--wrap=tud_msc_start_stop_cb" not in main_cmake
@@ -50,15 +50,24 @@ def test_usb_status_boundaries_preserve_control_callbacks_and_wrap_backend_io():
         assert f"--wrap={callback}" in recorder_cmake
 
 
-def test_explicit_eject_closes_backend_admission_before_async_teardown():
+def test_cdc_release_closes_backend_admission_before_async_teardown():
     usb = USB_C.read_text(encoding="utf-8")
-    helper_at = usb.index("static bool usb_request_explicit_eject")
-    callback_at = usb.index("void tud_msc_scsi_complete_cb", helper_at)
-    helper = usb[helper_at:callback_at]
-    pending_at = helper.index("atomic_compare_exchange_strong_explicit")
-    event_at = helper.index("USB_BIT_RELEASE_REQUESTED", pending_at)
-    assert pending_at < event_at
-    assert "tud_disconnect" not in helper
+    accept_at = usb.index(
+        "usb_msc_release_storage_result_t usb_msc_ownership_accept_release_storage"
+    )
+    response_at = usb.index(
+        "bool usb_msc_ownership_release_response_complete", accept_at
+    )
+    accept = usb[accept_at:response_at]
+    pending_at = accept.index("atomic_compare_exchange_strong_explicit")
+    assert "USB_BIT_RELEASE_REQUESTED" not in accept[pending_at:]
+    assert "tud_disconnect" not in accept
+
+    scsi_at = usb.index("void tud_msc_scsi_complete_cb")
+    init_at = usb.index("esp_err_t usb_msc_ownership_init", scsi_at)
+    scsi = usb[scsi_at:init_at]
+    assert "USB_BIT_RELEASE_REQUESTED" not in scsi
+    assert "atomic_compare_exchange_strong_explicit" not in scsi
 
     start_at = usb.index("bool __wrap_tud_msc_test_unit_ready_cb")
     end_at = usb.index("esp_err_t usb_msc_ownership_start", start_at)

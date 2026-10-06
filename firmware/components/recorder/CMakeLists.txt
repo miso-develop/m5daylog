@@ -37,9 +37,9 @@ idf_component_register(
 
 # Task #87 / D-031: RELEASE_STORAGE acceptance sets the shared release gate
 # before its CDC success response, so no later MSC command can reach storage
-# while the response/teardown boundary is pending. Qualified post-status SCSI
-# eject may set the same gate as an optional compatibility path. The START STOP
-# wrapper remains observation-only diagnostic instrumentation.
+# while the response/teardown boundary is pending. SCSI START STOP request and
+# post-status completion are diagnostic-only because Windows shell safe-remove
+# may emit them without canonical RELEASE_STORAGE authority.
 target_link_libraries(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=tud_msc_start_stop_cb"
     "-Wl,--wrap=tud_msc_test_unit_ready_cb"

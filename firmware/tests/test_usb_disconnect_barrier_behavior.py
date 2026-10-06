@@ -2,9 +2,9 @@
 
 The production ownership coordinator and persistent lifecycle implementation are
 compiled together against deterministic host stubs. The scenarios execute the
-two-phase disconnect/transfer/reconnect publication path, explicit START STOP
-UNIT eject, ambiguous bus events, failure injection, reconnect freshness, and
-durable fail-closed boot classification.
+two-phase disconnect/transfer/reconnect publication path, canonical CDC release,
+non-authoritative SCSI observations, ambiguous bus events, failure injection,
+reconnect freshness, and durable fail-closed boot classification.
 """
 
 from pathlib import Path
@@ -480,11 +480,13 @@ HARNESS = r"""
         CHECK(!g_mounted);
     }
 
-    static void request_explicit_eject(void) {
-        uint8_t eject[16] = {0};
-        eject[0] = 0x1bu;
-        eject[4] = 0x02u; /* LOEJ=1, START=0 */
-        tud_msc_scsi_complete_cb(0, eject);
+    static void request_cdc_release(const char *attempt_id) {
+        CHECK(usb_msc_ownership_release_command_admission_open());
+        CHECK(usb_msc_ownership_accept_release_storage(attempt_id) ==
+              USB_MSC_RELEASE_STORAGE_ACCEPTED);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(!usb_msc_ownership_release_command_admission_open());
+        CHECK(usb_msc_ownership_release_response_complete(attempt_id));
         CHECK(g_disconnect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_REQUESTED);
         CHECK(usb_msc_ownership_is_host_owned());
@@ -492,7 +494,7 @@ HARNESS = r"""
         CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
     }
 
-    static void run_post_eject_io_gate(void) {
+    static void run_post_release_io_gate(void) {
         uint8_t buffer[512] = {0};
         uint32_t block_count = 0;
         uint16_t block_size = 0;
@@ -518,7 +520,7 @@ HARNESS = r"""
         CHECK(g_real_write_calls == 1);
         CHECK(g_sense_calls == 0);
 
-        request_explicit_eject();
+        request_cdc_release("attempt-release");
         CHECK(g_uninstall_calls == 0);
         CHECK(g_release_storage_calls == 0);
 
@@ -614,7 +616,7 @@ HARNESS = r"""
         enter_host_owned();
         assert_reboot_stays_fail_closed();
         prove_ambiguous_events_do_not_release();
-        request_explicit_eject();
+        request_cdc_release("attempt-release");
         CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_OK);
         CHECK(g_uninstall_calls == 1);
         CHECK(g_release_storage_calls == 1);
@@ -631,26 +633,31 @@ HARNESS = r"""
         CHECK(action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
     }
 
-    static void run_non_eject_start_stop(void) {
+    static void run_scsi_non_authoritative(void) {
+        uint8_t eject_cmd[16] = {0};
         uint8_t start_cmd[16] = {0};
         uint8_t other_cmd[16] = {0};
         enter_host_owned();
+        eject_cmd[0] = 0x1bu;
+        eject_cmd[4] = 0x02u; /* LOEJ=1, START=0: shell-compatible eject */
         start_cmd[0] = 0x1bu;
         start_cmd[4] = 0x03u; /* LOEJ=1, START=1 */
         other_cmd[0] = 0x00u; /* TEST UNIT READY while host-owned */
+        tud_msc_scsi_complete_cb(0, eject_cmd);
         tud_msc_scsi_complete_cb(0, start_cmd);
         tud_msc_scsi_complete_cb(0, other_cmd);
         CHECK(g_disconnect_calls == 1);
         CHECK(g_nvs_commit_calls == 1);
         assert_reboot_stays_fail_closed();
         CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(usb_msc_ownership_release_command_admission_open());
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
     }
 
     static void run_teardown_failure(void) {
         enter_host_owned();
-        request_explicit_eject();
+        request_cdc_release("attempt-release");
         g_uninstall_result = ESP_FAIL;
         CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_FAIL);
         CHECK(g_release_storage_calls == 0);
@@ -663,7 +670,7 @@ HARNESS = r"""
 
     static void run_deferred_write_failure(void) {
         enter_host_owned();
-        request_explicit_eject();
+        request_cdc_release("attempt-release");
         g_release_storage_result = ESP_FAIL;
         CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_FAIL);
         CHECK(g_uninstall_calls == 1);
@@ -677,7 +684,7 @@ HARNESS = r"""
 
     static void run_armed_commit_failure(void) {
         enter_host_owned();
-        request_explicit_eject();
+        request_cdc_release("attempt-release");
         g_nvs_commit_result = ESP_FAIL;
         CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_FAIL);
         CHECK(g_uninstall_calls == 1);
@@ -754,7 +761,7 @@ HARNESS = r"""
     int main(int argc, char **argv) {
         CHECK(argc == 2);
         if (strcmp(argv[1], "success") == 0) run_success();
-        else if (strcmp(argv[1], "non-eject") == 0) run_non_eject_start_stop();
+        else if (strcmp(argv[1], "scsi-non-authoritative") == 0) run_scsi_non_authoritative();
         else if (strcmp(argv[1], "teardown") == 0) run_teardown_failure();
         else if (strcmp(argv[1], "deferred") == 0) run_deferred_write_failure();
         else if (strcmp(argv[1], "arm-failure") == 0) run_armed_commit_failure();
@@ -764,8 +771,8 @@ HARNESS = r"""
             run_transfer_failure();
         else if (strcmp(argv[1], "reconnect-failure") == 0)
             run_reconnect_failure();
-        else if (strcmp(argv[1], "post-eject-io-gate") == 0)
-            run_post_eject_io_gate();
+        else if (strcmp(argv[1], "post-release-io-gate") == 0)
+            run_post_release_io_gate();
         else if (strcmp(argv[1], "cdc-release-wrong-state") == 0)
             run_cdc_release_wrong_state();
         else if (strcmp(argv[1], "cdc-release-gate") == 0)
@@ -814,18 +821,18 @@ def _build(tmp_path: Path) -> Path:
     "scenario",
     [
         "success",
-        "non-eject",
+        "scsi-non-authoritative",
         "teardown",
         "deferred",
         "arm-failure",
         "publish-persist-failure",
         "transfer-failure",
         "reconnect-failure",
-        "post-eject-io-gate",
+        "post-release-io-gate",
         "cdc-release-wrong-state",
         "cdc-release-gate",
     ],
 )
-def test_strategy2_explicit_eject_and_reboot_behavior(tmp_path: Path, scenario: str) -> None:
+def test_strategy2_release_authority_and_reboot_behavior(tmp_path: Path, scenario: str) -> None:
     binary = _build(tmp_path)
     subprocess.run([str(binary), scenario], check=True, capture_output=True, text=True)

@@ -1,9 +1,10 @@
 """Task #87 regression for TinyUSB's post-status SCSI completion seam.
 
-Before publication, the first completed MSC command is class-binding proof and
-must only trigger recorder preparation. After USB ownership is established,
-only START STOP UNIT(load_eject=1,start=0) may authorize Strategy 2 release.
-Both decisions occur after the command status transaction has completed.
+Before publication, the first completed MSC TEST UNIT READY is class-binding
+proof and may trigger recorder preparation. After USB ownership is established,
+all SCSI completions, including START STOP UNIT(load_eject=1,start=0), are
+diagnostic-only. D-031 release authority belongs exclusively to canonical CDC
+RELEASE_STORAGE.
 """
 
 from pathlib import Path
@@ -21,9 +22,9 @@ def _production_eject_functions() -> str:
     source = USB_OWNERSHIP_C.read_text(encoding="utf-8")
     helper_start = source.index("static bool usb_note_initial_msc_command_complete(")
     cdc_helpers = source.index("static bool usb_release_attempt_id_valid", helper_start)
-    scsi_helper = source.index("static bool usb_request_explicit_eject", cdc_helpers)
-    cb_end = source.index("\nesp_err_t usb_msc_ownership_init", scsi_helper)
-    return source[helper_start:cdc_helpers] + "\n" + source[scsi_helper:cb_end]
+    scsi_wrapper = source.index("bool __wrap_tud_msc_start_stop_cb", cdc_helpers)
+    cb_end = source.index("\nesp_err_t usb_msc_ownership_init", scsi_wrapper)
+    return source[helper_start:cdc_helpers] + "\n" + source[scsi_wrapper:cb_end]
 
 
 def _build(tmp_path: Path) -> Path:
@@ -57,8 +58,6 @@ def _build(tmp_path: Path) -> Path:
             static volatile bool s_storage_usb_owned = true;
             static volatile bool s_host_owned = true;
             static _Atomic bool s_release_pending = false;
-            static _Atomic bool s_release_waiting_response = false;
-            static char s_release_attempt_id[65];
             static volatile bool s_provisional_attached = false;
             static volatile bool s_publish_triggered = true;
             static bool g_mounted = false;
@@ -81,10 +80,6 @@ def _build(tmp_path: Path) -> Path:
             }
             bool sd_mount_is_mounted(void) { return g_mounted; }
             bool tud_disconnect(void) { g_disconnect_calls++; return true; }
-            static void usb_fail(const char *reason) {
-                (void)reason;
-                xEventGroupSetBits(s_usb_events, USB_BIT_FAILED);
-            }
             static void usb_scsi_trace_note_command_complete(
                 uint8_t const scsi_cmd[16]) {
                 g_trace_complete_calls++;
@@ -122,8 +117,6 @@ def _build(tmp_path: Path) -> Path:
                 s_storage_usb_owned = true;
                 s_host_owned = true;
                 s_release_pending = false;
-                s_release_waiting_response = false;
-                s_release_attempt_id[0] = '\0';
                 s_provisional_attached = false;
                 s_publish_triggered = true;
                 g_mounted = false;
@@ -157,16 +150,18 @@ def _build(tmp_path: Path) -> Path:
                     cdb[0] = USB_SCSI_CMD_START_STOP_UNIT;
                     cdb[4] = 0x02u; /* LOEJ=1, START=0 */
                     tud_msc_scsi_complete_cb(0, cdb);
-                    CHECK(s_release_pending);
+                    CHECK(!s_release_pending);
                     CHECK(g_disconnect_calls == 0);
-                    CHECK((g_events.bits & USB_BIT_RELEASE_REQUESTED) != 0);
+                    CHECK((g_events.bits & USB_BIT_RELEASE_REQUESTED) == 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
                     CHECK(g_trace_complete_calls == 1);
                     CHECK(g_trace_last_opcode == USB_SCSI_CMD_START_STOP_UNIT);
                     CHECK(g_trace_last_byte4 == 0x02u);
 
-                    /* Duplicate observation is idempotent. */
+                    /* Duplicate shell/SCSI observations remain non-authoritative. */
                     tud_msc_scsi_complete_cb(0, cdb);
+                    CHECK(!s_release_pending);
+                    CHECK((g_events.bits & USB_BIT_RELEASE_REQUESTED) == 0);
                     CHECK(g_disconnect_calls == 0);
                     CHECK(g_trace_complete_calls == 2);
                 } else if (strcmp(argv[1], "start") == 0) {
@@ -205,7 +200,7 @@ def _build(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize("scenario", ["probe", "eject", "start", "other"])
-def test_production_scsi_completion_separates_probe_from_explicit_eject(
+def test_production_scsi_completion_is_observation_only_after_publication(
     tmp_path: Path, scenario: str
 ) -> None:
     binary = _build(tmp_path)

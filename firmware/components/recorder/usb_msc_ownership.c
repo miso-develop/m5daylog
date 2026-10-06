@@ -580,49 +580,19 @@ bool usb_msc_ownership_release_response_complete(
     return true;
 }
 
-static bool usb_request_explicit_eject(void) {
-    bool expected = false;
-
-    // Optional compatibility path: qualified post-status SCSI eject converges
-    // on the same atomic backend gate and coordinator quiescence path.
-    if (atomic_load_explicit(&s_release_pending, memory_order_acquire)) {
-        return true;
-    }
-    if (!s_initialized || !s_started || !s_host_owned ||
-        sd_mount_is_mounted()) {
-        usb_fail("explicit eject state");
-        return false;
-    }
-    if (!atomic_compare_exchange_strong_explicit(
-            &s_release_pending, &expected, true,
-            memory_order_acq_rel, memory_order_acquire)) {
-        return true;
-    }
-
-    s_release_attempt_id[0] = '\0';
-    atomic_store_explicit(&s_release_waiting_response, false,
-                          memory_order_release);
-    xEventGroupSetBits(s_usb_events, USB_BIT_RELEASE_REQUESTED);
-    ESP_LOGI(TAG,
-             "stage: usb, result: explicit-eject, owner: host, action: release-quiesce");
-    return true;
-}
-
 bool __wrap_tud_msc_start_stop_cb(uint8_t lun,
                                   uint8_t power_condition,
                                   bool start,
                                   bool load_eject) {
-    // Observation only. Release authority remains exclusively in the
-    // post-status tud_msc_scsi_complete_cb path below.
+    // D-031: START STOP remains diagnostic-only. Windows shell safe-remove
+    // may emit this command, so neither this request callback nor the later
+    // post-status completion may grant Device release authority.
     usb_scsi_trace_note_start_stop_request(power_condition, start, load_eject);
     return __real_tud_msc_start_stop_cb(lun, power_condition, start,
                                         load_eject);
 }
 
 void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
-    bool load_eject;
-    bool start;
-
     (void)lun;
     if (scsi_cmd == NULL) {
         return;
@@ -643,16 +613,10 @@ void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
         return;
     }
 
+    // Post-status SCSI completion is observation-only after publication.
+    // RELEASE_STORAGE acceptance is the sole normal release authority under
+    // D-031; shell/taskbar safe-remove must therefore remain fail-closed.
     usb_scsi_trace_note_command_complete(scsi_cmd);
-    if (scsi_cmd[0] != USB_SCSI_CMD_START_STOP_UNIT) {
-        return;
-    }
-
-    load_eject = (scsi_cmd[4] & 0x02u) != 0;
-    start = (scsi_cmd[4] & 0x01u) != 0;
-    if (load_eject && !start) {
-        (void)usb_request_explicit_eject();
-    }
 }
 
 esp_err_t usb_msc_ownership_init(void) {
