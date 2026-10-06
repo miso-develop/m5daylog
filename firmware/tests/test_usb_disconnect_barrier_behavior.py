@@ -276,17 +276,12 @@ HARNESS = r"""
                                     BaseType_t wait_for_all,
                                     TickType_t ticks) {
         (void)wait_for_all;
-        if (bits == (1u << 1) && ticks == portMAX_DELAY &&
-            (group->bits & bits) == 0) {
-            /* Model runtime USB_PREPARE -> writer finalize -> Device-FS release. */
-            g_release_requested = true;
-            g_device_fs_released = true;
-            CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
-        }
+        (void)ticks;
         EventBits_t result = group->bits;
         if (clear_on_exit && (result & bits) != 0) group->bits &= ~bits;
         return result;
     }
+    void vTaskDelay(TickType_t ticks) { g_delay_ticks = ticks; }
 
     bool sd_mount_is_mounted(void) { return g_mounted; }
     esp_err_t sd_mount_transfer_to_usb(void) {
