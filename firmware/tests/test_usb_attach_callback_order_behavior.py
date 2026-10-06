@@ -1,13 +1,9 @@
-"""Task #87 regression for two-phase TinyUSB MSC publication.
+"""Task #87 regression for the provisional TinyUSB ATTACHED callback.
 
-The first SetConfiguration/ATTACHED callback is only a trigger.  The device must
-logically disconnect before recorder finalization and APP -> USB storage
-transfer, because changing the LUN ownership re-entrantly inside esp_tinyusb's
-strong tud_mount_cb left Windows with a configured USB device but no USBSTOR
-interface at Human Gate.
-
-After the first callback returns, the recorder coordinator performs the durable
-publication barrier and later reconnects with the storage already USB-owned.
+esp_tinyusb invokes ATTACHED from tud_mount_cb before TinyUSB sends the
+SET_CONFIGURATION status stage. The callback may record provisional state but
+must not disconnect, signal recorder preparation, or mutate storage ownership.
+A later completed MSC command supplies class-binding proof.
 """
 
 from pathlib import Path
@@ -70,7 +66,9 @@ def _build(tmp_path: Path) -> Path:
             static volatile bool s_storage_usb_owned = false;
             static volatile bool s_host_owned = false;
             static volatile bool s_release_pending = false;
+            static volatile bool s_provisional_attached = false;
             static volatile bool s_publish_triggered = false;
+            static volatile bool s_prepare_disconnected = false;
             static bool g_mounted = true;
             static int g_disconnect_calls;
             static bool g_disconnect_result = true;
@@ -119,7 +117,9 @@ def _build(tmp_path: Path) -> Path:
                 s_storage_usb_owned = false;
                 s_host_owned = false;
                 s_release_pending = false;
+                s_provisional_attached = false;
                 s_publish_triggered = false;
+                s_prepare_disconnected = false;
                 g_mounted = true;
                 g_disconnect_calls = 0;
                 g_disconnect_result = true;
@@ -132,33 +132,38 @@ def _build(tmp_path: Path) -> Path:
 
                 if (strcmp(argv[1], "first-attach") == 0) {
                     usb_device_event_cb(&attached, NULL);
-                    CHECK(g_disconnect_calls == 1);
-                    CHECK((g_events.bits & USB_BIT_ATTACH) != 0);
+                    CHECK(g_disconnect_calls == 0);
+                    CHECK((g_events.bits & USB_BIT_ATTACH) == 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
-                    CHECK(s_publish_triggered);
+                    CHECK(s_provisional_attached);
+                    CHECK(!s_publish_triggered);
                     CHECK(!s_host_owned);
                     CHECK(g_mounted);
                 } else if (strcmp(argv[1], "start-in-progress") == 0) {
                     s_started = false;
                     s_starting = true;
                     usb_device_event_cb(&attached, NULL);
-                    CHECK(g_disconnect_calls == 1);
-                    CHECK((g_events.bits & USB_BIT_ATTACH) != 0);
+                    CHECK(g_disconnect_calls == 0);
+                    CHECK((g_events.bits & USB_BIT_ATTACH) == 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
-                    CHECK(s_publish_triggered);
+                    CHECK(s_provisional_attached);
+                    CHECK(!s_publish_triggered);
                     CHECK(!s_host_owned);
                     CHECK(g_mounted);
-                } else if (strcmp(argv[1], "disconnect-failure") == 0) {
-                    g_disconnect_result = false;
+                } else if (strcmp(argv[1], "duplicate-provisional") == 0) {
                     usb_device_event_cb(&attached, NULL);
-                    CHECK(g_disconnect_calls == 1);
+                    usb_device_event_cb(&attached, NULL);
+                    CHECK(g_disconnect_calls == 0);
                     CHECK((g_events.bits & USB_BIT_ATTACH) == 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) != 0);
+                    CHECK(s_provisional_attached);
                     CHECK(!s_publish_triggered);
                     CHECK(!s_host_owned);
                     CHECK(g_mounted);
                 } else if (strcmp(argv[1], "prepared-reconnect") == 0) {
+                    s_provisional_attached = true;
                     s_publish_triggered = true;
+                    s_prepare_disconnected = true;
                     s_storage_usb_owned = true;
                     g_mounted = false;
                     usb_device_event_cb(&attached, NULL);
@@ -167,6 +172,8 @@ def _build(tmp_path: Path) -> Path:
                     CHECK((g_events.bits & USB_BIT_HOST_OWNED) != 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
                     CHECK(s_host_owned);
+                    CHECK(!s_provisional_attached);
+                    CHECK(!s_prepare_disconnected);
                     CHECK(!g_mounted);
                 } else {
                     CHECK(false);
@@ -190,9 +197,9 @@ def _build(tmp_path: Path) -> Path:
 
 @pytest.mark.parametrize(
     "scenario",
-    ["first-attach", "start-in-progress", "disconnect-failure", "prepared-reconnect"]
+    ["first-attach", "start-in-progress", "duplicate-provisional", "prepared-reconnect"]
 )
-def test_production_attached_callback_uses_two_phase_publication(
+def test_production_attached_callback_preserves_set_configuration_status(
     tmp_path: Path, scenario: str
 ) -> None:
     binary = _build(tmp_path)
