@@ -20,7 +20,7 @@ USB_OWNERSHIP_C = REPO / "firmware/components/recorder/usb_msc_ownership.c"
 def _production_device_event_callback() -> str:
     source = USB_OWNERSHIP_C.read_text(encoding="utf-8")
     start = source.index("static void usb_device_event_cb(")
-    end = source.index("\nstatic bool usb_request_explicit_eject", start)
+    end = source.index("\nstatic bool usb_note_initial_msc_command_complete", start)
     return source[start:end]
 
 
