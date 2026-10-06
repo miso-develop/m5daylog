@@ -238,6 +238,17 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
 #endif
 
     if (event->id == TINYUSB_EVENT_DETACHED) {
+        if (!s_storage_usb_owned && !s_host_owned &&
+            s_provisional_attached && !s_publish_triggered) {
+            // The host never reached the no-media TEST UNIT READY proof, so it
+            // never owned the card and no durable publication transition
+            // started. Retire only the provisional configuration and allow a
+            // later cable attach to retry while recording continues.
+            s_provisional_attached = false;
+            ESP_LOGI(TAG,
+                     "stage: usb, result: provisional-detach, owner: device, action: retry-allowed");
+            return;
+        }
         if (s_host_owned) {
             ESP_LOGW(TAG,
                      "stage: usb, result: ambiguous-detach, owner: host, action: none");
@@ -274,13 +285,11 @@ static bool usb_request_explicit_eject(void) {
     }
 
     // Mark first so no concurrent/repeated eject can open another release path.
-    // The SCSI-completion path reaches this only after command status has been
-    // transferred; logical disconnect then blocks new host command admission.
+    // TinyUSB invokes this callback only after the START STOP command status
+    // transaction has completed. Do not tear down USB from inside that callback;
+    // the recorder coordinator consumes RELEASE_REQUESTED and uninstalls
+    // TinyUSB before releasing the storage backend.
     s_release_pending = true;
-    if (!tud_disconnect()) {
-        usb_fail("explicit eject disconnect");
-        return false;
-    }
     xEventGroupSetBits(s_usb_events, USB_BIT_RELEASE_REQUESTED);
     ESP_LOGI(TAG,
              "stage: usb, result: explicit-eject, owner: host, action: release-quiesce");
