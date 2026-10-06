@@ -329,7 +329,6 @@ esp_err_t usb_msc_ownership_init(void) {
     s_starting = false;
     s_started = false;
     s_storage_usb_owned = false;
-    s_storage_usb_owned = false;
     s_host_owned = false;
     s_release_pending = false;
     s_publish_triggered = false;
@@ -452,6 +451,7 @@ esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
         return err;
     }
 
+    s_storage_usb_owned = false;
     s_host_owned = false;
     s_release_pending = false;
     s_publish_triggered = false;
