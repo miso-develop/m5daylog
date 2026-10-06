@@ -160,6 +160,16 @@ def _build(tmp_path: Path) -> Path:
                     CHECK(!s_publish_triggered);
                     CHECK(!s_host_owned);
                     CHECK(g_mounted);
+                } else if (strcmp(argv[1], "provisional-detach") == 0) {
+                    tinyusb_event_t detached = { .id = TINYUSB_EVENT_DETACHED };
+                    usb_device_event_cb(&attached, NULL);
+                    CHECK(s_provisional_attached);
+                    usb_device_event_cb(&detached, NULL);
+                    CHECK(!s_provisional_attached);
+                    CHECK(!s_publish_triggered);
+                    CHECK(g_disconnect_calls == 0);
+                    CHECK(g_events.bits == 0);
+                    CHECK(g_mounted);
                 } else if (strcmp(argv[1], "prepared-reconnect") == 0) {
                     s_provisional_attached = true;
                     s_publish_triggered = true;
@@ -197,7 +207,13 @@ def _build(tmp_path: Path) -> Path:
 
 @pytest.mark.parametrize(
     "scenario",
-    ["first-attach", "start-in-progress", "duplicate-provisional", "prepared-reconnect"]
+    [
+        "first-attach",
+        "start-in-progress",
+        "duplicate-provisional",
+        "provisional-detach",
+        "prepared-reconnect",
+    ]
 )
 def test_production_attached_callback_preserves_set_configuration_status(
     tmp_path: Path, scenario: str
