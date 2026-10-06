@@ -506,6 +506,62 @@ HARNESS = r"""
         CHECK(next_event() == USB_MSC_EVENT_FAILED);
     }
 
+    static void begin_failed_publication_case(void) {
+        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+
+        CHECK(usb_msc_ownership_init() == ESP_OK);
+        CHECK(usb_msc_ownership_start() == ESP_OK);
+        g_device_cb(&attached, g_device_arg);
+        CHECK(g_disconnect_calls == 1);
+        CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+        g_release_requested = true;
+        g_device_fs_released = true;
+    }
+
+    static void run_publication_persist_failure(void) {
+        begin_failed_publication_case();
+        g_nvs_commit_result = ESP_FAIL;
+        CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) ==
+              ESP_ERR_INVALID_STATE);
+        CHECK(g_nvs_commit_calls == 1);
+        CHECK(!g_nvs_has_value);
+        CHECK(g_transfer_calls == 0);
+        CHECK(g_connect_calls == 0);
+        CHECK(g_mounted);
+        CHECK(!usb_msc_ownership_is_host_owned());
+        CHECK(next_event() == USB_MSC_EVENT_FAILED);
+    }
+
+    static void run_transfer_failure(void) {
+        begin_failed_publication_case();
+        g_transfer_result = ESP_FAIL;
+        CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) ==
+              ESP_ERR_INVALID_STATE);
+        CHECK(g_nvs_has_value);
+        CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(g_transfer_calls == 1);
+        CHECK(g_connect_calls == 0);
+        CHECK(g_mounted);
+        CHECK(!usb_msc_ownership_is_host_owned());
+        CHECK(next_event() == USB_MSC_EVENT_FAILED);
+        assert_reboot_stays_fail_closed();
+    }
+
+    static void run_reconnect_failure(void) {
+        begin_failed_publication_case();
+        g_connect_result = false;
+        CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) ==
+              ESP_ERR_INVALID_STATE);
+        CHECK(g_nvs_has_value);
+        CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
+        CHECK(g_transfer_calls == 1);
+        CHECK(g_connect_calls == 1);
+        CHECK(!g_mounted);
+        CHECK(!usb_msc_ownership_is_host_owned());
+        CHECK(next_event() == USB_MSC_EVENT_FAILED);
+        assert_reboot_stays_fail_closed();
+    }
+
     int main(int argc, char **argv) {
         CHECK(argc == 2);
         if (strcmp(argv[1], "success") == 0) run_success();
@@ -513,6 +569,12 @@ HARNESS = r"""
         else if (strcmp(argv[1], "teardown") == 0) run_teardown_failure();
         else if (strcmp(argv[1], "deferred") == 0) run_deferred_write_failure();
         else if (strcmp(argv[1], "arm-failure") == 0) run_armed_commit_failure();
+        else if (strcmp(argv[1], "publish-persist-failure") == 0)
+            run_publication_persist_failure();
+        else if (strcmp(argv[1], "transfer-failure") == 0)
+            run_transfer_failure();
+        else if (strcmp(argv[1], "reconnect-failure") == 0)
+            run_reconnect_failure();
         else CHECK(false);
         return 0;
     }
@@ -554,7 +616,17 @@ def _build(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    "scenario", ["success", "non-eject", "teardown", "deferred", "arm-failure"]
+    "scenario",
+    [
+        "success",
+        "non-eject",
+        "teardown",
+        "deferred",
+        "arm-failure",
+        "publish-persist-failure",
+        "transfer-failure",
+        "reconnect-failure",
+    ],
 )
 def test_strategy2_explicit_eject_and_reboot_behavior(tmp_path: Path, scenario: str) -> None:
     binary = _build(tmp_path)
