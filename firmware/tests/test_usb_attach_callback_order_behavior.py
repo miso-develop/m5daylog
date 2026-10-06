@@ -73,6 +73,7 @@ def _build(tmp_path: Path) -> Path:
             static volatile bool s_publish_triggered = false;
             static bool g_mounted = true;
             static int g_disconnect_calls;
+            static bool g_disconnect_result = true;
 
             #define CHECK(expr) do { \
                 if (!(expr)) { \
@@ -96,7 +97,7 @@ def _build(tmp_path: Path) -> Path:
 
             bool tud_disconnect(void) {
                 g_disconnect_calls++;
-                return true;
+                return g_disconnect_result;
             }
 
             static void usb_fail(const char *reason) {
@@ -121,6 +122,7 @@ def _build(tmp_path: Path) -> Path:
                 s_publish_triggered = false;
                 g_mounted = true;
                 g_disconnect_calls = 0;
+                g_disconnect_result = true;
             }
 
             int main(int argc, char **argv) {
@@ -144,6 +146,15 @@ def _build(tmp_path: Path) -> Path:
                     CHECK((g_events.bits & USB_BIT_ATTACH) != 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
                     CHECK(s_publish_triggered);
+                    CHECK(!s_host_owned);
+                    CHECK(g_mounted);
+                } else if (strcmp(argv[1], "disconnect-failure") == 0) {
+                    g_disconnect_result = false;
+                    usb_device_event_cb(&attached, NULL);
+                    CHECK(g_disconnect_calls == 1);
+                    CHECK((g_events.bits & USB_BIT_ATTACH) == 0);
+                    CHECK((g_events.bits & USB_BIT_FAILED) != 0);
+                    CHECK(!s_publish_triggered);
                     CHECK(!s_host_owned);
                     CHECK(g_mounted);
                 } else if (strcmp(argv[1], "prepared-reconnect") == 0) {
@@ -178,7 +189,8 @@ def _build(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    "scenario", ["first-attach", "start-in-progress", "prepared-reconnect"]
+    "scenario",
+    ["first-attach", "start-in-progress", "disconnect-failure", "prepared-reconnect"]
 )
 def test_production_attached_callback_uses_two_phase_publication(
     tmp_path: Path, scenario: str
