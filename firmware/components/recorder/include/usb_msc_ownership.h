@@ -39,6 +39,11 @@ esp_err_t usb_msc_ownership_init(void);
 esp_err_t usb_msc_ownership_start(void);
 usb_msc_ownership_event_t usb_msc_ownership_wait_event(uint32_t timeout_ms);
 
+// Valid only after a completed provisional MSC command proves that the host has
+// finished SET_CONFIGURATION and bound the MSC class. Performs the logical
+// disconnect from the recorder coordinator, never from a TinyUSB callback.
+esp_err_t usb_msc_ownership_begin_prepare(void);
+
 esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
                                                    bool manifest_committed,
                                                    bool device_fs_released);
