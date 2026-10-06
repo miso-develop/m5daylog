@@ -317,13 +317,13 @@ esp_err_t sd_mount_transfer_to_usb(void) {
     bool release_ready;
     esp_err_t err;
 
-    // Enter esp_tinyusb while Device still owns APP FAT/VFS. Its MOUNT_START
-    // callback is the pre-configuration barrier that asks the recorder to
-    // finalize, release Device filesystem access, and persist HOST_UNRESOLVED.
-    // Requiring that proof before this call would make MOUNT_START unreachable.
+    // Recorder finalization and Device filesystem access release are already
+    // proven before this detached ownership switch. The esp_tinyusb storage
+    // object still carries the APP mount until the synchronous mount-point
+    // transition below retires FAT/VFS and emits MOUNT_COMPLETE.
     portENTER_CRITICAL(&s_owner_lock);
-    transfer_ready = s_mounted && !s_usb_release_requested &&
-                     !s_device_fs_released;
+    transfer_ready = s_mounted && s_usb_release_requested &&
+                     s_device_fs_released;
     portEXIT_CRITICAL(&s_owner_lock);
     if (!transfer_ready || s_storage == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -335,8 +335,9 @@ esp_err_t sd_mount_transfer_to_usb(void) {
         return err;
     }
 
-    // Accept the transfer only after the MOUNT_START barrier has established
-    // recorder release proof and MOUNT_COMPLETE has retired APP ownership.
+    // Accept the transfer only after MOUNT_COMPLETE has retired the remaining
+    // APP mount. Recorder release proof is a precondition, not a callback side
+    // effect, so detached publication cannot bypass it.
     portENTER_CRITICAL(&s_owner_lock);
     release_ready = !s_mounted && s_usb_release_requested &&
                     s_device_fs_released;
