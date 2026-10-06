@@ -65,6 +65,11 @@ STUB_HEADERS = {
                                         BaseType_t wait_for_all,
                                         TickType_t ticks);
     """,
+    "freertos/task.h": r"""
+        #pragma once
+        #include "freertos/FreeRTOS.h"
+        void vTaskDelay(TickType_t ticks);
+    """,
     "tinyusb.h": r"""
         #pragma once
         #include "esp_err.h"
@@ -168,6 +173,7 @@ HARNESS = r"""
 
     #include "freertos/FreeRTOS.h"
     #include "freertos/event_groups.h"
+    #include "freertos/task.h"
     #include "nvs.h"
     #include "sd_mount.h"
     #include "shutdown_armed.h"
