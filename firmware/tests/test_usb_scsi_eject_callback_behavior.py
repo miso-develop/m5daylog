@@ -20,8 +20,10 @@ USB_OWNERSHIP_C = REPO / "firmware/components/recorder/usb_msc_ownership.c"
 def _production_eject_functions() -> str:
     source = USB_OWNERSHIP_C.read_text(encoding="utf-8")
     helper_start = source.index("static bool usb_note_initial_msc_command_complete(")
-    cb_end = source.index("\nesp_err_t usb_msc_ownership_init", helper_start)
-    return source[helper_start:cb_end]
+    cdc_helpers = source.index("static bool usb_release_attempt_id_valid", helper_start)
+    scsi_helper = source.index("static bool usb_request_explicit_eject", cdc_helpers)
+    cb_end = source.index("\nesp_err_t usb_msc_ownership_init", scsi_helper)
+    return source[helper_start:cdc_helpers] + "\n" + source[scsi_helper:cb_end]
 
 
 def _build(tmp_path: Path) -> Path:
@@ -35,6 +37,7 @@ def _build(tmp_path: Path) -> Path:
             r"""
             #include <stdbool.h>
             #include <stdint.h>
+            #include <stdatomic.h>
             #include <stdio.h>
             #include <stdlib.h>
             #include <string.h>
@@ -53,7 +56,9 @@ def _build(tmp_path: Path) -> Path:
             static volatile bool s_started = true;
             static volatile bool s_storage_usb_owned = true;
             static volatile bool s_host_owned = true;
-            static volatile bool s_release_pending = false;
+            static _Atomic bool s_release_pending = false;
+            static _Atomic bool s_release_waiting_response = false;
+            static char s_release_attempt_id[65];
             static volatile bool s_provisional_attached = false;
             static volatile bool s_publish_triggered = true;
             static bool g_mounted = false;
@@ -117,6 +122,8 @@ def _build(tmp_path: Path) -> Path:
                 s_storage_usb_owned = true;
                 s_host_owned = true;
                 s_release_pending = false;
+                s_release_waiting_response = false;
+                s_release_attempt_id[0] = '\0';
                 s_provisional_attached = false;
                 s_publish_triggered = true;
                 g_mounted = false;
