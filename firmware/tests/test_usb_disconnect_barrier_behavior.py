@@ -2,9 +2,9 @@
 
 The production ownership coordinator and persistent lifecycle implementation are
 compiled together against deterministic host stubs. The scenarios execute the
-wrapped pre-configuration mount path, explicit START STOP UNIT eject, ambiguous
-bus events, failure injection, reconnect freshness, and durable fail-closed boot
-classification.
+two-phase disconnect/transfer/reconnect publication path, explicit START STOP
+UNIT eject, ambiguous bus events, failure injection, reconnect freshness, and
+durable fail-closed boot classification.
 """
 
 from pathlib import Path
@@ -417,7 +417,7 @@ HARNESS = r"""
     static void request_explicit_eject(void) {
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, true));
         CHECK(g_real_start_stop_calls == 0);
-        CHECK(g_disconnect_calls == 1);
+        CHECK(g_disconnect_calls == 2);
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_REQUESTED);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
@@ -451,7 +451,7 @@ HARNESS = r"""
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, true, true));
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, false));
         CHECK(g_real_start_stop_calls == 2);
-        CHECK(g_disconnect_calls == 0);
+        CHECK(g_disconnect_calls == 1);
         CHECK(g_nvs_commit_calls == 1);
         assert_reboot_stays_fail_closed();
         CHECK(next_event() == USB_MSC_EVENT_NONE);
