@@ -146,21 +146,38 @@ STUB_HEADERS = {
     }
 
     static void enter_host_owned(void) {
+        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+
         CHECK(usb_msc_ownership_init() == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
         CHECK(g_device_cb != NULL);
         CHECK(g_storage_cb != NULL);
 
-        __wrap_tud_mount_cb();
-        CHECK(g_transfer_calls == 1);
-        CHECK(g_real_mount_calls == 1);
-        CHECK(g_disconnect_calls == 0);
+        /* First SetConfiguration is deliberately abandoned. */
+        g_device_cb(&attached, g_device_arg);
+        CHECK(g_disconnect_calls == 1);
+        CHECK(g_connect_calls == 0);
+        CHECK(g_transfer_calls == 0);
         CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+
+        /* Recorder finalization/Device-FS release happens while detached. */
+        g_release_requested = true;
+        g_device_fs_released = true;
+        CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
+        CHECK(g_transfer_calls == 1);
+        CHECK(g_delay_ticks == 250u);
+        CHECK(g_connect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
         CHECK(g_nvs_commit_calls == 1);
         CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
+
+        /* Fresh enumeration starts with an already USB-owned LUN. */
+        g_device_cb(&attached, g_device_arg);
+        CHECK(g_disconnect_calls == 1);
+        CHECK(g_connect_calls == 1);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
     }
 
     static void prove_ambiguous_events_do_not_release(void) {
