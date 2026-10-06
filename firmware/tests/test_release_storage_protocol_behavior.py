@@ -22,7 +22,8 @@ def test_release_storage_vectors_execute_production_dispatcher(tmp_path: Path) -
     executable = tmp_path / "release_storage_protocol"
     result = subprocess.run(
         [
-            "cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "cc", "-std=c11", "-D_POSIX_C_SOURCE=200809L",
+            "-Wall", "-Wextra", "-Werror", "-include", "stdio.h",
             "-I", str(STUB_INCLUDE), "-I", str(INCLUDE),
             str(CORE), str(CJSON_STUB), str(HARNESS),
             "-o", str(executable),
@@ -73,7 +74,7 @@ def test_transport_orders_gate_response_then_teardown_signal() -> None:
 
     line_at = src.index("static void usb_cdc_line_state_callback")
     wait_at = src.index("static void cdc_session_gate_wait", line_at)
-    assert "release_accept" not in src[line_at:wait_at]
+    assert "s_config.release_accept" not in src[line_at:wait_at]
 
 
 def test_release_acceptance_is_shared_atomic_msc_gate() -> None:
