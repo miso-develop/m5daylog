@@ -121,13 +121,13 @@ def _build(tmp_path: Path) -> Path:
                     cdb[4] = 0x02u; /* LOEJ=1, START=0 */
                     tud_msc_scsi_complete_cb(0, cdb);
                     CHECK(s_release_pending);
-                    CHECK(g_disconnect_calls == 1);
+                    CHECK(g_disconnect_calls == 0);
                     CHECK((g_events.bits & USB_BIT_RELEASE_REQUESTED) != 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
 
                     /* Duplicate observation is idempotent. */
                     tud_msc_scsi_complete_cb(0, cdb);
-                    CHECK(g_disconnect_calls == 1);
+                    CHECK(g_disconnect_calls == 0);
                 } else if (strcmp(argv[1], "start") == 0) {
                     cdb[0] = USB_SCSI_CMD_START_STOP_UNIT;
                     cdb[4] = 0x03u; /* LOEJ=1, START=1: not release */
