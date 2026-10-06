@@ -306,7 +306,7 @@ HARNESS = r"""
 
     int main(void) {
         tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
-        uint8_t inquiry[16] = {0x12u};
+        uint8_t test_unit_ready[16] = {0x00u};
 
         CHECK(usb_msc_ownership_init() == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
@@ -325,7 +325,7 @@ HARNESS = r"""
 
         /* SCSI completion occurs after command status and proves MSC class
          * binding. Only then may the recorder coordinator begin prepare. */
-        tud_msc_scsi_complete_cb(0, inquiry);
+        tud_msc_scsi_complete_cb(0, test_unit_ready);
         CHECK(next_event() == USB_MSC_EVENT_ATTACH);
         CHECK(g_disconnect_calls == 0);
         CHECK(usb_msc_ownership_begin_prepare() == ESP_OK);
