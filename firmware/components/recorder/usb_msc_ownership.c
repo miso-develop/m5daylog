@@ -49,6 +49,7 @@ static EventGroupHandle_t s_usb_events = NULL;
 static volatile bool s_initialized = false;
 static volatile bool s_starting = false;
 static volatile bool s_started = false;
+static volatile bool s_storage_usb_owned = false;
 static volatile bool s_host_owned = false;
 static volatile bool s_release_pending = false;
 static volatile bool s_publish_triggered = false;
@@ -70,8 +71,8 @@ static bool usb_msc_publish(bool wav_finalized,
     esp_err_t err;
 
     if (!wav_finalized || !manifest_committed || !device_fs_released ||
-        s_usb_events == NULL || s_host_owned || s_release_pending ||
-        !s_publish_triggered || !sd_mount_is_mounted()) {
+        s_usb_events == NULL || s_storage_usb_owned || s_host_owned ||
+        s_release_pending || !s_publish_triggered || !sd_mount_is_mounted()) {
         usb_fail("publish gate incomplete");
         return false;
     }
@@ -96,7 +97,7 @@ static bool usb_msc_publish(bool wav_finalized,
     // SetConfiguration whose MSC LUN changes ownership re-entrantly.
     err = sd_mount_transfer_to_usb();
     s_transfer_authorized = false;
-    if (err != ESP_OK || !s_host_owned || sd_mount_is_mounted()) {
+    if (err != ESP_OK || !s_storage_usb_owned || sd_mount_is_mounted()) {
         usb_fail("host ownership transfer");
         return false;
     }
@@ -128,7 +129,8 @@ static void usb_storage_event_cb(tinyusb_msc_storage_handle_t handle,
     if (event->id == TINYUSB_MSC_EVENT_MOUNT_START) {
         if (event->mount_point != TINYUSB_MSC_STORAGE_MOUNT_APP ||
             !s_publish_triggered || !s_transfer_authorized ||
-            s_host_owned || s_release_pending || !sd_mount_is_mounted() ||
+            s_storage_usb_owned || s_host_owned || s_release_pending ||
+            !sd_mount_is_mounted() ||
             !s_wav_finalized || !s_manifest_committed ||
             !s_device_fs_released) {
             usb_fail("unexpected ownership switch");
@@ -148,10 +150,9 @@ static void usb_storage_event_cb(tinyusb_msc_storage_handle_t handle,
         if (event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB &&
             s_transfer_authorized) {
             sd_mount_note_usb_owned();
-            s_host_owned = true;
-            xEventGroupSetBits(s_usb_events, USB_BIT_HOST_OWNED);
+            s_storage_usb_owned = true;
             ESP_LOGI(TAG,
-                     "stage: usb, result: storage-ready, owner: host, mount: usb");
+                     "stage: usb, result: storage-ready, owner: host-reserved, mount: usb");
         } else {
             // Strategy 2 never permits a same-session USB -> APP remount or an
             // ownership switch that bypassed the durable publication barrier.
