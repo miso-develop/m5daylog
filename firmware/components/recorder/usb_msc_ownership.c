@@ -1,18 +1,16 @@
 // Tasks #49/#87: exclusive recorder microSD ownership with Strategy 2 eject.
 //
 // APP -> USB publication uses two host enumerations. With esp_tinyusb 2.2.1
-// and auto_mount_off=1, the first ATTACHED event is only a connection trigger:
-// it soft-disconnects immediately, then the recorder coordinator finalizes,
-// persists HOST_UNRESOLVED, and switches the storage APP -> USB while no host
-// configuration is active. A delayed reconnect starts a fresh enumeration with
-// an already USB-owned LUN. This avoids mutating MSC ownership re-entrantly
-// inside esp_tinyusb's strong tud_mount_cb, which physically produced a USB
-// device without a Windows USBSTOR interface. ATTACHED may arrive after driver
-// installation begins but before tinyusb_driver_install() returns, so that
-// bounded STARTING window remains valid. Generic detach / suspend never
-// authorizes Device ownership. The only normal reverse trigger is SCSI START
-// STOP UNIT (load_eject=1,start=0), observed after command completion and by
-// the compatibility wrapper.
+// and auto_mount_off=1, the first ATTACHED event is provisional only. Espressif
+// invokes that event from tud_mount_cb before TinyUSB sends the status stage for
+// SET_CONFIGURATION, so disconnecting inside ATTACHED aborts configuration on
+// Windows. Instead, a completed MSC SCSI command proves both configuration and
+// class binding. Only then does the recorder coordinator soft-disconnect outside
+// the USB callback, finalize recording, persist HOST_UNRESOLVED, switch the
+// storage APP -> USB, and reconnect with an already USB-owned LUN. Generic
+// detach / suspend never authorizes Device ownership. The only normal reverse
+// trigger is START STOP UNIT(load_eject=1,start=0), observed after its SCSI
+// status transaction completes.
 
 #include "usb_msc_ownership.h"
 
@@ -52,7 +50,9 @@ static volatile bool s_started = false;
 static volatile bool s_storage_usb_owned = false;
 static volatile bool s_host_owned = false;
 static volatile bool s_release_pending = false;
+static volatile bool s_provisional_attached = false;
 static volatile bool s_publish_triggered = false;
+static volatile bool s_prepare_disconnected = false;
 static volatile bool s_transfer_authorized = false;
 static bool s_wav_finalized = false;
 static bool s_manifest_committed = false;
@@ -72,15 +72,16 @@ static bool usb_msc_publish(bool wav_finalized,
 
     if (!wav_finalized || !manifest_committed || !device_fs_released ||
         s_usb_events == NULL || s_storage_usb_owned || s_host_owned ||
-        s_release_pending || !s_publish_triggered || !sd_mount_is_mounted()) {
+        s_release_pending || !s_provisional_attached || !s_publish_triggered ||
+        !s_prepare_disconnected || !sd_mount_is_mounted()) {
         usb_fail("publish gate incomplete");
         return false;
     }
 
-    // The first host SetConfiguration is deliberately only a trigger. The
-    // device-event callback has already soft-disconnected before this point.
-    // Make unresolved host ownership boot-visible before the storage can ever
-    // become USB-owned.
+    // A completed provisional MSC command has already proved host class
+    // binding, and the coordinator has soft-disconnected outside TinyUSB's
+    // SetConfiguration/SCSI callbacks. Make unresolved ownership boot-visible
+    // before the storage can ever become USB-owned.
     if (shutdown_armed_mark_host_unresolved() != ESP_OK) {
         usb_fail("persist unresolved ownership");
         return false;
@@ -177,26 +178,19 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
 
     if (event->id == TINYUSB_EVENT_ATTACHED) {
         if (!s_storage_usb_owned) {
-            // The first SetConfiguration is a detection trigger only. Do not
-            // mutate MSC storage ownership from inside esp_tinyusb's
-            // tud_mount_cb; Human Gate showed that Windows can retain the USB
-            // device while never creating a USBSTOR interface in that shape.
+            // esp_tinyusb emits ATTACHED from tud_mount_cb before TinyUSB sends
+            // the SET_CONFIGURATION status stage. Record provisional
+            // configuration only; disconnecting here aborts that control
+            // transaction and can prevent Windows from binding USBSTOR.
             if (!s_initialized || (!s_started && !s_starting) ||
                 s_host_owned || s_release_pending || s_publish_triggered ||
-                !sd_mount_is_mounted()) {
-                (void)tud_disconnect();
+                s_provisional_attached || !sd_mount_is_mounted()) {
                 usb_fail("attach ownership state");
                 return;
             }
-            s_publish_triggered = true;
-            if (!tud_disconnect()) {
-                s_publish_triggered = false;
-                usb_fail("publication disconnect");
-                return;
-            }
-            xEventGroupSetBits(s_usb_events, USB_BIT_ATTACH);
+            s_provisional_attached = true;
             ESP_LOGI(TAG,
-                     "stage: usb, result: publication-trigger, owner: device, action: disconnect-prepare");
+                     "stage: usb, result: provisional-configured, owner: device, action: wait-msc-command");
             return;
         }
 
@@ -205,13 +199,15 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
             // transferred while detached; only this fresh SetConfiguration
             // promotes the volatile lifecycle to host-configured / USB_SYNC.
             if (!s_initialized || (!s_started && !s_starting) ||
-                !s_publish_triggered || s_release_pending ||
-                sd_mount_is_mounted()) {
+                !s_publish_triggered || !s_prepare_disconnected ||
+                s_release_pending || sd_mount_is_mounted()) {
                 (void)tud_disconnect();
                 usb_fail("publication reattach state");
                 return;
             }
             s_host_owned = true;
+            s_provisional_attached = false;
+            s_prepare_disconnected = false;
             xEventGroupSetBits(s_usb_events, USB_BIT_HOST_OWNED);
             ESP_LOGI(TAG,
                      "stage: usb, result: configured, owner: host, mount: usb");
@@ -247,10 +243,26 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
         }
     }
 }
+static bool usb_note_initial_msc_command_complete(void) {
+    if (!s_initialized || (!s_started && !s_starting) ||
+        !s_provisional_attached || s_storage_usb_owned || s_host_owned ||
+        s_release_pending || s_publish_triggered || !sd_mount_is_mounted()) {
+        return false;
+    }
+
+    // TinyUSB invokes tud_msc_scsi_complete_cb only after the command status
+    // transaction has completed. This is the earliest semantic proof that the
+    // host finished SET_CONFIGURATION and bound the MSC class.
+    s_publish_triggered = true;
+    xEventGroupSetBits(s_usb_events, USB_BIT_ATTACH);
+    ESP_LOGI(TAG,
+             "stage: usb, result: msc-command-complete, owner: device, action: prepare");
+    return true;
+}
+
 static bool usb_request_explicit_eject(void) {
-    // If a compatibility wrap already observed this exact command, the SCSI
-    // completion callback must be idempotent rather than converting a valid
-    // release into an error.
+    // The completion callback can be observed more than once for a retried
+    // command; release admission is idempotent after the first valid eject.
     if (s_release_pending) {
         return true;
     }
@@ -274,31 +286,25 @@ static bool usb_request_explicit_eject(void) {
     return true;
 }
 
-// Compatibility seam for the original implementation. The reliable production
-// observation is tud_msc_scsi_complete_cb below, which TinyUSB exposes as a weak
-// callback and esp_tinyusb 2.2.1 does not override.
-extern bool __real_tud_msc_start_stop_cb(uint8_t lun,
-                                         uint8_t power_condition,
-                                         bool start,
-                                         bool load_eject);
-
-bool __wrap_tud_msc_start_stop_cb(uint8_t lun,
-                                  uint8_t power_condition,
-                                  bool start,
-                                  bool load_eject) {
-    if (load_eject && !start) {
-        return usb_request_explicit_eject();
-    }
-
-    return __real_tud_msc_start_stop_cb(lun, power_condition, start, load_eject);
-}
-
 void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
     bool load_eject;
     bool start;
 
     (void)lun;
-    if (scsi_cmd == NULL || scsi_cmd[0] != USB_SCSI_CMD_START_STOP_UNIT) {
+    if (scsi_cmd == NULL) {
+        return;
+    }
+
+    // Before publication, the first completed SCSI command is deliberately
+    // consumed only as class-binding proof. Storage remains APP-owned and
+    // esp_tinyusb reports the medium not ready to the host.
+    if (!s_storage_usb_owned && s_provisional_attached &&
+        !s_publish_triggered) {
+        (void)usb_note_initial_msc_command_complete();
+        return;
+    }
+
+    if (scsi_cmd[0] != USB_SCSI_CMD_START_STOP_UNIT) {
         return;
     }
 
@@ -332,7 +338,9 @@ esp_err_t usb_msc_ownership_init(void) {
     s_storage_usb_owned = false;
     s_host_owned = false;
     s_release_pending = false;
+    s_provisional_attached = false;
     s_publish_triggered = false;
+    s_prepare_disconnected = false;
     s_transfer_authorized = false;
     s_initialized = true;
     return ESP_OK;
@@ -359,9 +367,10 @@ esp_err_t usb_msc_ownership_start(void) {
     err = tinyusb_driver_install(&config);
     if (err == ESP_OK) {
         s_started = true;
-        // ATTACHED may already have requested the provisional disconnect
-        // before tinyusb_driver_install() returns. The coordinator owns all
-        // storage transfer and reconnect work outside that callback.
+        // ATTACHED/SCSI probing may already have started before install
+        // returns. Publication disconnect and storage ownership work remain in
+        // the lower-priority recorder coordinator, never inside TinyUSB
+        // SetConfiguration/SCSI callbacks.
         ESP_LOGI(TAG, "stage: usb, result: driver-ready");
     }
     s_starting = false;
@@ -400,6 +409,29 @@ usb_msc_ownership_event_t usb_msc_ownership_wait_event(uint32_t timeout_ms) {
         xEventGroupClearBits(s_usb_events, selected);
     }
     return event;
+}
+
+esp_err_t usb_msc_ownership_begin_prepare(void) {
+    if (!s_initialized || (!s_started && !s_starting) ||
+        !s_provisional_attached || !s_publish_triggered ||
+        s_storage_usb_owned || s_host_owned || s_release_pending ||
+        !sd_mount_is_mounted()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_prepare_disconnected) {
+        return ESP_OK;
+    }
+
+    // This runs in recorder_usb_event_task after an MSC command's CSW/status
+    // has completed. It must never run from tud_mount_cb or a SCSI callback.
+    if (!tud_disconnect()) {
+        usb_fail("publication disconnect");
+        return ESP_FAIL;
+    }
+    s_prepare_disconnected = true;
+    ESP_LOGI(TAG,
+             "stage: usb, result: publication-disconnect, owner: device, action: finalize");
+    return ESP_OK;
 }
 
 esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
@@ -455,7 +487,9 @@ esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
     s_storage_usb_owned = false;
     s_host_owned = false;
     s_release_pending = false;
+    s_provisional_attached = false;
     s_publish_triggered = false;
+    s_prepare_disconnected = false;
     s_transfer_authorized = false;
     xEventGroupClearBits(s_usb_events,
                          USB_BIT_ATTACH | USB_BIT_HOST_OWNED |
@@ -477,6 +511,9 @@ esp_err_t usb_msc_ownership_start(void) { return ESP_ERR_NOT_SUPPORTED; }
 usb_msc_ownership_event_t usb_msc_ownership_wait_event(uint32_t timeout_ms) {
     (void)timeout_ms;
     return USB_MSC_EVENT_NONE;
+}
+esp_err_t usb_msc_ownership_begin_prepare(void) {
+    return ESP_ERR_NOT_SUPPORTED;
 }
 esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
                                                    bool manifest_committed,
