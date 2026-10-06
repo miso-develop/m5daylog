@@ -60,17 +60,227 @@ STUB_HEADERS = {
         EventBits_t xEventGroupSetBits(EventGroupHandle_t group, EventBits_t bits);
         EventBits_t xEventGroupClearBits(EventGroupHandle_t group, EventBits_t bits);
         EventBits_t xEventGroupWaitBits(EventGroupHandle_t group,
+                                        EventBits_t bits,
+                                        BaseType_t clear_on_exit,
+                                        BaseType_t wait_for_all,
+                                        TickType_t ticks);
+    """,
+    "tinyusb.h": r"""
+        #pragma once
+        #include "esp_err.h"
+        typedef enum {
+            TINYUSB_EVENT_ATTACHED = 1,
+            TINYUSB_EVENT_DETACHED = 2,
+            TINYUSB_EVENT_SUSPENDED = 3,
+        } tinyusb_event_id_t;
+        typedef struct { tinyusb_event_id_t id; } tinyusb_event_t;
+        typedef void (*tinyusb_event_cb_t)(tinyusb_event_t *event, void *arg);
+        typedef struct {
+            tinyusb_event_cb_t event_cb;
+            void *event_arg;
+        } tinyusb_config_t;
+        #define TINYUSB_DEFAULT_CONFIG() ((tinyusb_config_t){0})
+        esp_err_t tinyusb_driver_install(const tinyusb_config_t *config);
+        esp_err_t tinyusb_driver_uninstall(void);
+    """,
+    "tinyusb_default_config.h": r"""
+        #pragma once
+        #include "tinyusb.h"
+    """,
+    "tusb.h": r"""
+        #pragma once
+        #include <stdbool.h>
+        #include <stdint.h>
+        bool tud_disconnect(void);
+        void __real_tud_mount_cb(void);
+        void __wrap_tud_mount_cb(void);
+        bool __real_tud_msc_start_stop_cb(uint8_t lun,
+                                          uint8_t power_condition,
+                                          bool start,
+                                          bool load_eject);
+        bool __wrap_tud_msc_start_stop_cb(uint8_t lun,
+                                          uint8_t power_condition,
+                                          bool start,
+                                          bool load_eject);
+    """,
+    "tinyusb_msc.h": r"""
+        #pragma once
+        #include "esp_err.h"
+        typedef void *tinyusb_msc_storage_handle_t;
+        typedef enum {
+            TINYUSB_MSC_STORAGE_MOUNT_APP = 1,
+            TINYUSB_MSC_STORAGE_MOUNT_USB = 2,
+        } tinyusb_msc_mount_point_t;
+        typedef enum {
+            TINYUSB_MSC_EVENT_MOUNT_START = 1,
+            TINYUSB_MSC_EVENT_MOUNT_COMPLETE = 2,
+            TINYUSB_MSC_EVENT_MOUNT_FAILED = 3,
+            TINYUSB_MSC_EVENT_FORMAT_REQUIRED = 4,
+            TINYUSB_MSC_EVENT_FORMAT_FAILED = 5,
+        } tinyusb_msc_event_id_t;
+        typedef struct {
+            tinyusb_msc_event_id_t id;
+            tinyusb_msc_mount_point_t mount_point;
+        } tinyusb_msc_event_t;
+        typedef void (*tinyusb_msc_storage_callback_t)(
+            tinyusb_msc_storage_handle_t,
+            tinyusb_msc_event_t *,
+            void *);
+        esp_err_t tinyusb_msc_set_storage_callback(
+            tinyusb_msc_storage_callback_t callback, void *arg);
+    """,
+    "sd_mount.h": r"""
+        #pragma once
+        #include <stdbool.h>
+        #include "esp_err.h"
+        bool sd_mount_is_mounted(void);
+        esp_err_t sd_mount_transfer_to_usb(void);
+        void sd_mount_note_usb_owned(void);
+        esp_err_t sd_mount_release_usb_storage(void);
+    """,
+    "nvs.h": r"""
+        #pragma once
+        #include <stdint.h>
+        #include "esp_err.h"
+        typedef int nvs_handle_t;
+        #define NVS_READONLY 0
+        #define NVS_READWRITE 1
+        esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle);
+        void nvs_close(nvs_handle_t handle);
+        esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *value);
+        esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value);
+        esp_err_t nvs_commit(nvs_handle_t handle);
+    """,
+    "nvs_flash.h": r"""
+        #pragma once
+        #include "esp_err.h"
+        esp_err_t nvs_flash_init(void);
+        esp_err_t nvs_flash_deinit(void);
+    """,
+}
+
+HARNESS = r"""
+    #include <stdbool.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+
+    #include "freertos/FreeRTOS.h"
+    #include "freertos/event_groups.h"
+    #include "nvs.h"
+    #include "sd_mount.h"
+    #include "shutdown_armed.h"
+    #include "tinyusb.h"
+    #include "tinyusb_msc.h"
+    #include "tusb.h"
+    #include "usb_msc_ownership.h"
+
+    #define CHECK(expr) do { \
+        if (!(expr)) { \
+            fprintf(stderr, "CHECK failed %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+            exit(2); \
+        } \
+    } while (0)
+
+    enum {
+        LIFECYCLE_NORMAL = 0,
+        LIFECYCLE_ARMED = 1,
+        LIFECYCLE_HOST_UNRESOLVED = 2,
+    };
+
+    struct event_group { EventBits_t bits; };
+    static tinyusb_event_cb_t g_device_cb;
+    static void *g_device_arg;
+    static tinyusb_msc_storage_callback_t g_storage_cb;
+    static void *g_storage_arg;
+    static bool g_mounted = true;
+    static bool g_release_requested;
+    static bool g_device_fs_released;
+    static int g_disconnect_calls;
+    static int g_transfer_calls;
+    static int g_real_mount_calls;
+    static int g_real_start_stop_calls;
+    static int g_uninstall_calls;
+    static int g_release_storage_calls;
+    static esp_err_t g_uninstall_result = ESP_OK;
+    static esp_err_t g_release_storage_result = ESP_OK;
+
+    /* Transactional NVS model: failed commit preserves the last durable value. */
+    static bool g_nvs_has_value;
+    static uint8_t g_nvs_value;
+    static bool g_nvs_pending;
+    static uint8_t g_nvs_pending_value;
+    static int g_nvs_commit_calls;
+    static esp_err_t g_nvs_commit_result = ESP_OK;
+
+    esp_err_t nvs_flash_init(void) { return ESP_OK; }
+    esp_err_t nvs_flash_deinit(void) { return ESP_OK; }
+    esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle) {
+        CHECK(strcmp(name, "m5daylog") == 0);
+        (void)mode;
+        *handle = 7;
+        return ESP_OK;
+    }
+    void nvs_close(nvs_handle_t handle) {
+        CHECK(handle == 7);
+        g_nvs_pending = false;
+    }
+    esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *value) {
+        CHECK(handle == 7);
+        CHECK(strcmp(key, "shutdown_armed") == 0);
+        if (!g_nvs_has_value) return ESP_ERR_NVS_NOT_FOUND;
+        *value = g_nvs_value;
+        return ESP_OK;
+    }
+    esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value) {
+        CHECK(handle == 7);
+        CHECK(strcmp(key, "shutdown_armed") == 0);
+        g_nvs_pending = true;
+        g_nvs_pending_value = value;
+        return ESP_OK;
+    }
+    esp_err_t nvs_commit(nvs_handle_t handle) {
+        CHECK(handle == 7);
+        g_nvs_commit_calls++;
+        if (g_nvs_commit_result != ESP_OK) return g_nvs_commit_result;
+        CHECK(g_nvs_pending);
+        g_nvs_has_value = true;
+        g_nvs_value = g_nvs_pending_value;
+        g_nvs_pending = false;
+        return ESP_OK;
+    }
+
+    EventGroupHandle_t xEventGroupCreate(void) {
+        return calloc(1, sizeof(struct event_group));
+    }
+    void vEventGroupDelete(EventGroupHandle_t group) { free(group); }
+    EventBits_t xEventGroupSetBits(EventGroupHandle_t group, EventBits_t bits) {
+        group->bits |= bits;
+        return group->bits;
+    }
+    EventBits_t xEventGroupClearBits(EventGroupHandle_t group, EventBits_t bits) {
+        EventBits_t before = group->bits;
+        group->bits &= ~bits;
+        return before;
+    }
+    EventBits_t xEventGroupWaitBits(EventGroupHandle_t group,
                                     EventBits_t bits,
                                     BaseType_t clear_on_exit,
                                     BaseType_t wait_for_all,
                                     TickType_t ticks) {
         (void)wait_for_all;
-        (void)ticks;
+        if (bits == (1u << 1) && ticks == portMAX_DELAY &&
+            (group->bits & bits) == 0) {
+            /* Model runtime USB_PREPARE -> writer finalize -> Device-FS release. */
+            g_release_requested = true;
+            g_device_fs_released = true;
+            CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
+        }
         EventBits_t result = group->bits;
         if (clear_on_exit && (result & bits) != 0) group->bits &= ~bits;
         return result;
     }
-    void vTaskDelay(TickType_t ticks) { g_delay_ticks = ticks; }
 
     bool sd_mount_is_mounted(void) { return g_mounted; }
     esp_err_t sd_mount_transfer_to_usb(void) {
@@ -119,9 +329,11 @@ STUB_HEADERS = {
         g_disconnect_calls++;
         return true;
     }
-    bool tud_connect(void) {
-        g_connect_calls++;
-        return true;
+    void __real_tud_mount_cb(void) {
+        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+        g_real_mount_calls++;
+        CHECK(g_device_cb != NULL);
+        g_device_cb(&attached, g_device_arg);
     }
     bool __real_tud_msc_start_stop_cb(uint8_t lun,
                                       uint8_t power_condition,
@@ -146,63 +358,45 @@ STUB_HEADERS = {
     }
 
     static void enter_host_owned(void) {
-        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
-
         CHECK(usb_msc_ownership_init() == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
         CHECK(g_device_cb != NULL);
         CHECK(g_storage_cb != NULL);
 
-        /* First SetConfiguration is deliberately abandoned. */
-        g_device_cb(&attached, g_device_arg);
-        CHECK(g_disconnect_calls == 1);
-        CHECK(g_connect_calls == 0);
-        CHECK(g_transfer_calls == 0);
-        CHECK(next_event() == USB_MSC_EVENT_ATTACH);
-
-        /* Recorder finalization/Device-FS release happens while detached. */
-        g_release_requested = true;
-        g_device_fs_released = true;
-        CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
+        __wrap_tud_mount_cb();
         CHECK(g_transfer_calls == 1);
-        CHECK(g_delay_ticks == 250u);
-        CHECK(g_connect_calls == 1);
+        CHECK(g_real_mount_calls == 1);
+        CHECK(g_disconnect_calls == 0);
+        CHECK(next_event() == USB_MSC_EVENT_ATTACH);
         CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
         CHECK(g_nvs_commit_calls == 1);
         CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
-
-        /* Fresh enumeration starts with an already USB-owned LUN. */
-        g_device_cb(&attached, g_device_arg);
-        CHECK(g_disconnect_calls == 1);
-        CHECK(g_connect_calls == 1);
-        CHECK(next_event() == USB_MSC_EVENT_NONE);
     }
 
     static void prove_ambiguous_events_do_not_release(void) {
         tinyusb_event_t suspended = { .id = TINYUSB_EVENT_SUSPENDED };
         tinyusb_event_t detached = { .id = TINYUSB_EVENT_DETACHED };
-        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
 
         g_device_cb(&suspended, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
-        CHECK(g_disconnect_calls == 1);
+        CHECK(g_disconnect_calls == 0);
         CHECK(usb_msc_ownership_is_host_owned());
         assert_reboot_stays_fail_closed();
 
         /* Accidental pre-eject physical detach remains unresolved. */
         g_device_cb(&detached, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
-        CHECK(g_disconnect_calls == 1);
+        CHECK(g_disconnect_calls == 0);
         CHECK(usb_msc_ownership_is_host_owned());
         assert_reboot_stays_fail_closed();
 
-        /* Reconfiguration reuses the USB-owned storage without APP remount. */
-        g_device_cb(&attached, g_device_arg);
+        /* Reconfiguration reuses the existing USB-owned storage; no stale APP proof. */
+        __wrap_tud_mount_cb();
         CHECK(g_transfer_calls == 1);
-        CHECK(g_connect_calls == 1);
-        CHECK(g_disconnect_calls == 1);
+        CHECK(g_real_mount_calls == 2);
+        CHECK(g_disconnect_calls == 0);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
@@ -211,7 +405,7 @@ STUB_HEADERS = {
     static void request_explicit_eject(void) {
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, true));
         CHECK(g_real_start_stop_calls == 0);
-        CHECK(g_disconnect_calls == 2);
+        CHECK(g_disconnect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_REQUESTED);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
@@ -245,7 +439,7 @@ STUB_HEADERS = {
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, true, true));
         CHECK(__wrap_tud_msc_start_stop_cb(0, 0, false, false));
         CHECK(g_real_start_stop_calls == 2);
-        CHECK(g_disconnect_calls == 1);
+        CHECK(g_disconnect_calls == 0);
         CHECK(g_nvs_commit_calls == 1);
         assert_reboot_stays_fail_closed();
         CHECK(next_event() == USB_MSC_EVENT_NONE);
