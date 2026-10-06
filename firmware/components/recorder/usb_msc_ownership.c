@@ -43,7 +43,7 @@ static const char *TAG = "recorder_usb";
                                      USB_BIT_RELEASE_REQUESTED | \
                                      USB_BIT_RELEASE_QUIESCED | USB_BIT_FAILED)
 #define USB_SCSI_CMD_START_STOP_UNIT 0x1bu
-#define USB_REENUM_DISCONNECT_MS     250u
+#define USB_REENUM_DISCONNECT_MS     1000u
 
 static EventGroupHandle_t s_usb_events = NULL;
 static volatile bool s_initialized = false;
@@ -104,8 +104,9 @@ static bool usb_msc_publish(bool wav_finalized,
 
     // Force a fresh host enumeration only after the LUN is USB-owned. Espressif
     // uses the same disconnect/delay/connect pattern in its USB host-device
-    // tests. A conservative interval avoids Windows retaining the provisional
-    // configuration that had no host-accessible medium.
+    // tests (their MSC reconnect case uses 1000 ms). Matching that proven
+    // interval avoids Windows retaining the provisional configuration that had
+    // no host-accessible medium.
     vTaskDelay(pdMS_TO_TICKS(USB_REENUM_DISCONNECT_MS));
     if (!tud_connect()) {
         usb_fail("publication reconnect");
