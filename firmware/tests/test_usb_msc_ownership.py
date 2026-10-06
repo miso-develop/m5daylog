@@ -1,7 +1,7 @@
 """Tasks #49/#87 source contracts for Strategy 2 USB ownership.
 
 Executable host-C tests carry the behavioral proof. These checks protect the
-pre-configuration APP -> USB gate, the real esp_tinyusb callback ordering, and
+two-phase APP -> USB publication gate, fresh host configuration proof, and
 reject regressions to automatic suspend/detach ownership return.
 """
 
@@ -80,6 +80,26 @@ def test_storage_mount_start_only_accepts_pre_authorized_detached_transfer():
         assert marker in region, marker
     assert "xEventGroupWaitBits" not in region
     assert "USB_BIT_ATTACH" not in region
+
+
+def test_host_owned_event_requires_fresh_configuration_after_storage_ready():
+    src = USB_C.read_text(encoding="utf-8")
+
+    storage_at = src.index("static void usb_storage_event_cb")
+    complete_at = src.index("TINYUSB_MSC_EVENT_MOUNT_COMPLETE", storage_at)
+    device_at = src.index("static void usb_device_event_cb", complete_at)
+    complete_region = src[complete_at:device_at]
+    assert "s_storage_usb_owned = true" in complete_region
+    assert "s_host_owned = true" not in complete_region
+    assert "USB_BIT_HOST_OWNED" not in complete_region
+
+    attached_at = src.index("TINYUSB_EVENT_ATTACHED", device_at)
+    suspend_at = src.index("#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK", attached_at)
+    attached_region = src[attached_at:suspend_at]
+    storage_ready_at = attached_region.index("if (!s_host_owned)")
+    host_owned_at = attached_region.index("s_host_owned = true", storage_ready_at)
+    event_at = attached_region.index("USB_BIT_HOST_OWNED", host_owned_at)
+    assert storage_ready_at < host_owned_at < event_at
 
 
 def test_real_attached_callback_disconnects_before_publication_work():
