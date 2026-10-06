@@ -35,12 +35,11 @@ idf_component_register(
         esp_tinyusb
 )
 
-# Task #87: once the post-status explicit-eject completion sets
-# s_release_pending, no later MSC command may reach the storage backend while
-# the recorder coordinator is still scheduling TinyUSB teardown. The
-# START STOP UNIT wrapper below is observation-only Human-Gate instrumentation:
-# it always delegates to esp_tinyusb and never grants release. Authority remains
-# exclusively in the production post-status completion callback.
+# Task #87 / D-031: RELEASE_STORAGE acceptance sets the shared release gate
+# before its CDC success response, so no later MSC command can reach storage
+# while the response/teardown boundary is pending. Qualified post-status SCSI
+# eject may set the same gate as an optional compatibility path. The START STOP
+# wrapper remains observation-only diagnostic instrumentation.
 target_link_libraries(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=tud_msc_start_stop_cb"
     "-Wl,--wrap=tud_msc_test_unit_ready_cb"
