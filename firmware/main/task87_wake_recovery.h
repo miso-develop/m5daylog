@@ -25,15 +25,17 @@ bool task87_wake_recovery_pending(const task87_wake_recovery_t *recovery);
 
 // Called only after Device FAT/VFS ownership is established and the normal
 // recovery scan + manifest sync have completed. Task #50's pending RTC event is
-// flushed first (when linked), then the durable SHUTDOWN_ARMED marker is
-// cleared. Failure leaves the per-boot manual resume pending/fail-closed.
+// flushed first (when linked), then SHUTDOWN_ARMED is replaced by a durable
+// WAKE_RECOVERY_PENDING gate. Failure leaves the per-boot and durable lifecycle
+// fail-closed.
 esp_err_t task87_wake_recovery_complete_device_recovery(
     task87_wake_recovery_t *recovery,
     const char *events_path);
 
 // Called when the recorder has actually reached RECORDING. A manual-WAKE boot
 // is accepted only if device recovery completed and main.c produced a non-empty
-// fresh recordingId for this boot. Until then USB publication remains blocked.
+// fresh recordingId for this boot. Only then is the durable recovery gate
+// cleared to NORMAL; until then reset and USB publication remain fail-closed.
 esp_err_t task87_wake_recovery_note_recording_started(
     task87_wake_recovery_t *recovery,
     bool fresh_recording_id_present);
