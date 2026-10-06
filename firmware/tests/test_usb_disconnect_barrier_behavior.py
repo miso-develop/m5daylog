@@ -551,6 +551,64 @@ HARNESS = r"""
         CHECK(!g_mounted);
     }
 
+    static void run_cdc_release_wrong_state(void) {
+        CHECK(usb_msc_ownership_init() == ESP_OK);
+        CHECK(usb_msc_ownership_start() == ESP_OK);
+        CHECK(!usb_msc_ownership_release_command_admission_open());
+        CHECK(usb_msc_ownership_accept_release_storage("attempt-early") ==
+              USB_MSC_RELEASE_STORAGE_WRONG_STATE);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(g_uninstall_calls == 0);
+        CHECK(g_release_storage_calls == 0);
+    }
+
+    static void run_cdc_release_gate(void) {
+        uint8_t buffer[512] = {0};
+        int read_before;
+        int write_before;
+
+        enter_host_owned();
+        CHECK(usb_msc_ownership_release_command_admission_open());
+
+        CHECK(usb_msc_ownership_accept_release_storage("attempt-1") ==
+              USB_MSC_RELEASE_STORAGE_ACCEPTED);
+
+        /* Acceptance closes backend + ordinary CDC admission before response. */
+        CHECK(!usb_msc_ownership_release_command_admission_open());
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(g_uninstall_calls == 0);
+        CHECK(g_release_storage_calls == 0);
+
+        read_before = g_real_read_calls;
+        write_before = g_real_write_calls;
+        CHECK(__wrap_tud_msc_read10_cb(0, 7u, 0u, buffer,
+                                       sizeof(buffer)) == -1);
+        CHECK(__wrap_tud_msc_write10_cb(0, 7u, 0u, buffer,
+                                        sizeof(buffer)) == -1);
+        CHECK(g_real_read_calls == read_before);
+        CHECK(g_real_write_calls == write_before);
+
+        /* Duplicate and distinct attempts cannot create transition #2. */
+        CHECK(usb_msc_ownership_accept_release_storage("attempt-1") ==
+              USB_MSC_RELEASE_STORAGE_CONFLICT);
+        CHECK(usb_msc_ownership_accept_release_storage("attempt-2") ==
+              USB_MSC_RELEASE_STORAGE_CONFLICT);
+        CHECK(!usb_msc_ownership_release_response_complete("attempt-2"));
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        /* Matching response completion is the only CDC teardown signal. */
+        CHECK(usb_msc_ownership_release_response_complete("attempt-1"));
+        CHECK(next_event() == USB_MSC_EVENT_RELEASE_REQUESTED);
+        CHECK(!usb_msc_ownership_release_response_complete("attempt-1"));
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        CHECK(usb_msc_ownership_complete_release_quiesce() == ESP_OK);
+        CHECK(g_uninstall_calls == 1);
+        CHECK(g_release_storage_calls == 1);
+        CHECK(g_nvs_value == LIFECYCLE_ARMED);
+        CHECK(next_event() == USB_MSC_EVENT_RELEASE_QUIESCED);
+    }
+
     static void run_success(void) {
         shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
         enter_host_owned();
@@ -708,6 +766,10 @@ HARNESS = r"""
             run_reconnect_failure();
         else if (strcmp(argv[1], "post-eject-io-gate") == 0)
             run_post_eject_io_gate();
+        else if (strcmp(argv[1], "cdc-release-wrong-state") == 0)
+            run_cdc_release_wrong_state();
+        else if (strcmp(argv[1], "cdc-release-gate") == 0)
+            run_cdc_release_gate();
         else CHECK(false);
         return 0;
     }
@@ -760,6 +822,8 @@ def _build(tmp_path: Path) -> Path:
         "transfer-failure",
         "reconnect-failure",
         "post-eject-io-gate",
+        "cdc-release-wrong-state",
+        "cdc-release-gate",
     ],
 )
 def test_strategy2_explicit_eject_and_reboot_behavior(tmp_path: Path, scenario: str) -> None:
