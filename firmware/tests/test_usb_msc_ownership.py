@@ -207,7 +207,7 @@ def test_explicit_eject_is_observed_by_real_scsi_completion_seam():
     callback_at = src.index("void tud_msc_scsi_complete_cb", helper_at)
     helper_region = src[helper_at:callback_at]
     assert "USB_BIT_RELEASE_REQUESTED" in helper_region
-    assert "tud_disconnect" in helper_region
+    assert "tud_disconnect" not in helper_region
     assert "s_release_pending" in helper_region
 
     next_fn = src.index("usb_msc_ownership_init", callback_at)
