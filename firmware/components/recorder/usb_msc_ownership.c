@@ -328,6 +328,8 @@ esp_err_t usb_msc_ownership_init(void) {
     }
     s_starting = false;
     s_started = false;
+    s_storage_usb_owned = false;
+    s_storage_usb_owned = false;
     s_host_owned = false;
     s_release_pending = false;
     s_publish_triggered = false;
@@ -340,8 +342,8 @@ esp_err_t usb_msc_ownership_start(void) {
     tinyusb_config_t config;
     esp_err_t err;
 
-    if (!s_initialized || !sd_mount_is_mounted() || s_host_owned ||
-        s_release_pending || s_starting) {
+    if (!s_initialized || !sd_mount_is_mounted() || s_storage_usb_owned ||
+        s_host_owned || s_release_pending || s_starting) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_started) {
@@ -357,10 +359,9 @@ esp_err_t usb_msc_ownership_start(void) {
     err = tinyusb_driver_install(&config);
     if (err == ESP_OK) {
         s_started = true;
-        // ATTACHED may already have completed the synchronous APP -> USB
-        // transfer before tinyusb_driver_install() returns. Do not publish a
-        // stale owner/mount claim here; the MOUNT_COMPLETE/configured events
-        // carry the authoritative ownership trace for Human Gate evidence.
+        // ATTACHED may already have requested the provisional disconnect
+        // before tinyusb_driver_install() returns. The coordinator owns all
+        // storage transfer and reconnect work outside that callback.
         ESP_LOGI(TAG, "stage: usb, result: driver-ready");
     }
     s_starting = false;
@@ -416,8 +417,8 @@ esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
 esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
     esp_err_t err;
 
-    if (!s_initialized || !s_started || !s_host_owned ||
-        !s_release_pending || sd_mount_is_mounted()) {
+    if (!s_initialized || !s_started || !s_storage_usb_owned ||
+        !s_host_owned || !s_release_pending || sd_mount_is_mounted()) {
         return ESP_ERR_INVALID_STATE;
     }
 
