@@ -18,6 +18,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <string.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -80,7 +82,11 @@ static volatile bool s_starting = false;
 static volatile bool s_started = false;
 static volatile bool s_storage_usb_owned = false;
 static volatile bool s_host_owned = false;
-static volatile bool s_release_pending = false;
+// Shared D-031 release gate. The first successful transition to true blocks
+// wrapped MSC backend admission before any CDC success response is emitted.
+static _Atomic bool s_release_pending = false;
+static _Atomic bool s_release_waiting_response = false;
+static char s_release_attempt_id[USB_MSC_RELEASE_ATTEMPT_MAX_BYTES + 1u];
 static volatile bool s_provisional_attached = false;
 static volatile bool s_publish_triggered = false;
 static volatile bool s_prepare_disconnected = false;
@@ -494,10 +500,91 @@ static bool usb_note_initial_msc_command_complete(void) {
     return true;
 }
 
+static bool usb_release_attempt_id_valid(const char *value) {
+    size_t i;
+    size_t len;
+
+    if (value == NULL) {
+        return false;
+    }
+    len = strlen(value);
+    if (len == 0u || len > USB_MSC_RELEASE_ATTEMPT_MAX_BYTES) {
+        return false;
+    }
+    for (i = 0u; i < len; ++i) {
+        char c = value[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+              c == ':' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool usb_msc_ownership_release_command_admission_open(void) {
+    return s_initialized && s_started && s_storage_usb_owned && s_host_owned &&
+           !sd_mount_is_mounted() &&
+           !atomic_load_explicit(&s_release_pending, memory_order_acquire);
+}
+
+usb_msc_release_storage_result_t usb_msc_ownership_accept_release_storage(
+    const char *release_attempt_id) {
+    bool expected = false;
+
+    if (!usb_release_attempt_id_valid(release_attempt_id)) {
+        return USB_MSC_RELEASE_STORAGE_INVALID_ARGS;
+    }
+    if (!s_initialized || !s_started || !s_storage_usb_owned ||
+        !s_host_owned || sd_mount_is_mounted()) {
+        return USB_MSC_RELEASE_STORAGE_WRONG_STATE;
+    }
+
+    // This CAS is the D-031 acceptance boundary. The MSC wrappers observe the
+    // same atomic gate, so later block I/O cannot reach esp_tinyusb storage even
+    // while CDC remains alive long enough to return the success response.
+    if (!atomic_compare_exchange_strong_explicit(
+            &s_release_pending, &expected, true,
+            memory_order_acq_rel, memory_order_acquire)) {
+        return USB_MSC_RELEASE_STORAGE_CONFLICT;
+    }
+
+    memcpy(s_release_attempt_id, release_attempt_id,
+           strlen(release_attempt_id) + 1u);
+    atomic_store_explicit(&s_release_waiting_response, true,
+                          memory_order_release);
+    ESP_LOGI(TAG,
+             "stage: usb, result: release-command-accepted, owner: host, action: gate-backend");
+    return USB_MSC_RELEASE_STORAGE_ACCEPTED;
+}
+
+bool usb_msc_ownership_release_response_complete(
+    const char *release_attempt_id) {
+    if (!usb_release_attempt_id_valid(release_attempt_id) ||
+        !atomic_load_explicit(&s_release_pending, memory_order_acquire) ||
+        !atomic_load_explicit(&s_release_waiting_response,
+                              memory_order_acquire) ||
+        !s_initialized || !s_started || !s_host_owned ||
+        strcmp(s_release_attempt_id, release_attempt_id) != 0) {
+        return false;
+    }
+
+    // Teardown is signalled only after the accepted CDC response has been
+    // flushed. The backend gate has already been closed since acceptance.
+    atomic_store_explicit(&s_release_waiting_response, false,
+                          memory_order_release);
+    xEventGroupSetBits(s_usb_events, USB_BIT_RELEASE_REQUESTED);
+    ESP_LOGI(TAG,
+             "stage: usb, result: release-response-complete, owner: host, action: release-quiesce");
+    return true;
+}
+
 static bool usb_request_explicit_eject(void) {
-    // The completion callback can be observed more than once for a retried
-    // command; release admission is idempotent after the first valid eject.
-    if (s_release_pending) {
+    bool expected = false;
+
+    // Optional compatibility path: qualified post-status SCSI eject converges
+    // on the same atomic backend gate and coordinator quiescence path.
+    if (atomic_load_explicit(&s_release_pending, memory_order_acquire)) {
         return true;
     }
     if (!s_initialized || !s_started || !s_host_owned ||
@@ -505,13 +592,15 @@ static bool usb_request_explicit_eject(void) {
         usb_fail("explicit eject state");
         return false;
     }
+    if (!atomic_compare_exchange_strong_explicit(
+            &s_release_pending, &expected, true,
+            memory_order_acq_rel, memory_order_acquire)) {
+        return true;
+    }
 
-    // Mark first so no concurrent/repeated eject can open another release path.
-    // TinyUSB invokes this callback only after the START STOP command status
-    // transaction has completed. Do not tear down USB from inside that callback;
-    // the recorder coordinator consumes RELEASE_REQUESTED and uninstalls
-    // TinyUSB before releasing the storage backend.
-    s_release_pending = true;
+    s_release_attempt_id[0] = '\0';
+    atomic_store_explicit(&s_release_waiting_response, false,
+                          memory_order_release);
     xEventGroupSetBits(s_usb_events, USB_BIT_RELEASE_REQUESTED);
     ESP_LOGI(TAG,
              "stage: usb, result: explicit-eject, owner: host, action: release-quiesce");
@@ -587,7 +676,10 @@ esp_err_t usb_msc_ownership_init(void) {
     s_started = false;
     s_storage_usb_owned = false;
     s_host_owned = false;
-    s_release_pending = false;
+    atomic_store_explicit(&s_release_pending, false, memory_order_release);
+    atomic_store_explicit(&s_release_waiting_response, false,
+                          memory_order_release);
+    s_release_attempt_id[0] = '\0';
     s_provisional_attached = false;
     s_publish_triggered = false;
     s_prepare_disconnected = false;
@@ -755,7 +847,11 @@ esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
     esp_err_t err;
 
     if (!s_initialized || !s_started || !s_storage_usb_owned ||
-        !s_host_owned || !s_release_pending || sd_mount_is_mounted()) {
+        !s_host_owned ||
+        !atomic_load_explicit(&s_release_pending, memory_order_acquire) ||
+        atomic_load_explicit(&s_release_waiting_response,
+                             memory_order_acquire) ||
+        sd_mount_is_mounted()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -791,7 +887,10 @@ esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
 
     s_storage_usb_owned = false;
     s_host_owned = false;
-    s_release_pending = false;
+    atomic_store_explicit(&s_release_pending, false, memory_order_release);
+    atomic_store_explicit(&s_release_waiting_response, false,
+                          memory_order_release);
+    s_release_attempt_id[0] = '\0';
     s_provisional_attached = false;
     s_publish_triggered = false;
     s_prepare_disconnected = false;
@@ -828,6 +927,17 @@ esp_err_t usb_msc_ownership_note_prepare_complete(bool wav_finalized,
     (void)device_fs_released;
     return ESP_ERR_NOT_SUPPORTED;
 }
+usb_msc_release_storage_result_t usb_msc_ownership_accept_release_storage(
+    const char *release_attempt_id) {
+    (void)release_attempt_id;
+    return USB_MSC_RELEASE_STORAGE_WRONG_STATE;
+}
+bool usb_msc_ownership_release_response_complete(
+    const char *release_attempt_id) {
+    (void)release_attempt_id;
+    return false;
+}
+bool usb_msc_ownership_release_command_admission_open(void) { return false; }
 esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
