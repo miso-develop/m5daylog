@@ -351,8 +351,11 @@ esp_err_t usb_msc_ownership_start(void) {
     err = tinyusb_driver_install(&config);
     if (err == ESP_OK) {
         s_started = true;
-        ESP_LOGI(TAG,
-                 "stage: usb, result: ready, owner: device, mount: app");
+        // ATTACHED may already have completed the synchronous APP -> USB
+        // transfer before tinyusb_driver_install() returns. Do not publish a
+        // stale owner/mount claim here; the MOUNT_COMPLETE/configured events
+        // carry the authoritative ownership trace for Human Gate evidence.
+        ESP_LOGI(TAG, "stage: usb, result: driver-ready");
     }
     s_starting = false;
     return err;
