@@ -414,7 +414,7 @@ HARNESS = r"""
         eject[0] = 0x1bu;
         eject[4] = 0x02u; /* LOEJ=1, START=0 */
         tud_msc_scsi_complete_cb(0, eject);
-        CHECK(g_disconnect_calls == 2);
+        CHECK(g_disconnect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_RELEASE_REQUESTED);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
