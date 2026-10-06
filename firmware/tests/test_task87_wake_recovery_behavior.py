@@ -28,7 +28,8 @@ STUB_HEADERS = {
     "shutdown_armed.h": r"""
         #pragma once
         #include "esp_err.h"
-        esp_err_t shutdown_armed_clear(void);
+        esp_err_t shutdown_armed_mark_wake_recovery_pending(void);
+        esp_err_t shutdown_armed_complete_wake_recovery(void);
     """,
 }
 
@@ -51,7 +52,8 @@ HARNESS = r"""
     static char g_trace[16];
     static size_t g_trace_len;
     static esp_err_t g_rtc_result = ESP_OK;
-    static esp_err_t g_clear_result = ESP_OK;
+    static esp_err_t g_pending_result = ESP_OK;
+    static esp_err_t g_complete_result = ESP_OK;
 
     static void trace(char value) {
         CHECK(g_trace_len + 1 < sizeof(g_trace));
@@ -66,16 +68,22 @@ HARNESS = r"""
         return g_rtc_result;
     }
 
-    esp_err_t shutdown_armed_clear(void) {
+    esp_err_t shutdown_armed_mark_wake_recovery_pending(void) {
+        trace('P');
+        return g_pending_result;
+    }
+
+    esp_err_t shutdown_armed_complete_wake_recovery(void) {
         trace('C');
-        return g_clear_result;
+        return g_complete_result;
     }
 
     static void reset_stubs(void) {
         memset(g_trace, 0, sizeof(g_trace));
         g_trace_len = 0;
         g_rtc_result = ESP_OK;
-        g_clear_result = ESP_OK;
+        g_pending_result = ESP_OK;
+        g_complete_result = ESP_OK;
     }
 
     static void run_success(void) {
@@ -89,15 +97,15 @@ HARNESS = r"""
 
         CHECK(task87_wake_recovery_complete_device_recovery(
                   &recovery, "/sdcard/M5DAYLOG/events.jsonl") == ESP_OK);
-        CHECK(strcmp(g_trace, "RC") == 0);
+        CHECK(strcmp(g_trace, "RP") == 0);
 
-        /* Armed intent is cleared only after pending recovery, but USB remains
-         * blocked until this boot proves a newly generated recordingId reached
-         * RECORDING. */
+        /* Recovery replaces SHUTDOWN_ARMED with a durable fail-closed pending
+         * marker; NORMAL is not committed until fresh recording proof. */
         CHECK(task87_wake_recovery_pending(&recovery));
         CHECK(task87_wake_recovery_requires_shutdown(&recovery));
         CHECK(!task87_wake_recovery_usb_rearm_allowed(&recovery));
         CHECK(task87_wake_recovery_note_recording_started(&recovery, true) == ESP_OK);
+        CHECK(strcmp(g_trace, "RPC") == 0);
         CHECK(!task87_wake_recovery_pending(&recovery));
         CHECK(!task87_wake_recovery_requires_shutdown(&recovery));
         CHECK(task87_wake_recovery_usb_rearm_allowed(&recovery));
@@ -119,15 +127,15 @@ HARNESS = r"""
               ESP_ERR_INVALID_STATE);
     }
 
-    static void run_clear_failure(void) {
+    static void run_pending_transition_failure(void) {
         task87_wake_recovery_t recovery;
         reset_stubs();
-        g_clear_result = ESP_FAIL;
+        g_pending_result = ESP_FAIL;
         task87_wake_recovery_init(&recovery, true);
 
         CHECK(task87_wake_recovery_complete_device_recovery(
                   &recovery, "/sdcard/M5DAYLOG/events.jsonl") == ESP_FAIL);
-        CHECK(strcmp(g_trace, "RC") == 0);
+        CHECK(strcmp(g_trace, "RP") == 0);
         CHECK(task87_wake_recovery_pending(&recovery));
         CHECK(task87_wake_recovery_requires_shutdown(&recovery));
         CHECK(!task87_wake_recovery_usb_rearm_allowed(&recovery));
@@ -149,29 +157,30 @@ HARNESS = r"""
         CHECK(!task87_wake_recovery_usb_rearm_allowed(&recovery));
     }
 
-    static void run_stale_state_reset(void) {
+    static void run_recording_proof_failure(void) {
         task87_wake_recovery_t recovery;
         reset_stubs();
         task87_wake_recovery_init(&recovery, true);
         CHECK(task87_wake_recovery_complete_device_recovery(
                   &recovery, "/sdcard/M5DAYLOG/events.jsonl") == ESP_OK);
-        CHECK(task87_wake_recovery_pending(&recovery));
+        CHECK(strcmp(g_trace, "RP") == 0);
 
-        /* app_main reinitializes this production context every fresh boot. */
-        task87_wake_recovery_init(&recovery, false);
-        CHECK(!task87_wake_recovery_pending(&recovery));
-        CHECK(!task87_wake_recovery_requires_shutdown(&recovery));
-        CHECK(task87_wake_recovery_usb_rearm_allowed(&recovery));
-        CHECK(task87_wake_recovery_note_recording_started(&recovery, false) == ESP_OK);
+        g_complete_result = ESP_FAIL;
+        CHECK(task87_wake_recovery_note_recording_started(&recovery, true) ==
+              ESP_FAIL);
+        CHECK(strcmp(g_trace, "RPC") == 0);
+        CHECK(task87_wake_recovery_pending(&recovery));
+        CHECK(task87_wake_recovery_requires_shutdown(&recovery));
+        CHECK(!task87_wake_recovery_usb_rearm_allowed(&recovery));
     }
 
     int main(int argc, char **argv) {
         CHECK(argc == 2);
         if (strcmp(argv[1], "success") == 0) run_success();
         else if (strcmp(argv[1], "rtc-failure") == 0) run_rtc_failure();
-        else if (strcmp(argv[1], "clear-failure") == 0) run_clear_failure();
+        else if (strcmp(argv[1], "pending-transition-failure") == 0) run_pending_transition_failure();
         else if (strcmp(argv[1], "missing-fresh-id") == 0) run_missing_fresh_id();
-        else if (strcmp(argv[1], "stale-reset") == 0) run_stale_state_reset();
+        else if (strcmp(argv[1], "recording-proof-failure") == 0) run_recording_proof_failure();
         else CHECK(false);
         return 0;
     }
@@ -212,7 +221,13 @@ def _build(tmp_path: Path) -> Path:
 
 @pytest.mark.parametrize(
     "scenario",
-    ["success", "rtc-failure", "clear-failure", "missing-fresh-id", "stale-reset"],
+    [
+        "success",
+        "rtc-failure",
+        "pending-transition-failure",
+        "missing-fresh-id",
+        "recording-proof-failure",
+    ],
 )
 def test_manual_wake_recovery_behavior(tmp_path: Path, scenario: str) -> None:
     binary = _build(tmp_path)
