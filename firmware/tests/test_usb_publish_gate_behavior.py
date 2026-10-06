@@ -1,10 +1,11 @@
-"""Task #87 regression for two-phase MSC publication.
+"""Task #87 regression for post-status two-phase MSC publication.
 
-The first esp_tinyusb ATTACHED/SetConfiguration is a trigger only.  Production
-must soft-disconnect before durable HOST_UNRESOLVED publication and APP -> USB
-storage transfer, then wait a host-visible detach interval and reconnect with
-the LUN already USB-owned.  This protects the physical Windows failure where a
-device enumerated but no USBSTOR/Disk interface appeared.
+The first esp_tinyusb ATTACHED callback executes before SET_CONFIGURATION status
+is sent, so it must never disconnect. A completed provisional MSC SCSI command
+proves Windows finished configuration and class binding. The recorder
+coordinator may then disconnect, complete the durable HOST_UNRESOLVED + APP ->
+USB ownership transfer, wait a host-visible detach interval, and reconnect with
+the LUN already USB-owned.
 """
 
 from pathlib import Path
@@ -99,14 +100,8 @@ STUB_HEADERS = {
         #include <stdint.h>
         bool tud_disconnect(void);
         bool tud_connect(void);
-        bool __real_tud_msc_start_stop_cb(uint8_t lun,
-                                          uint8_t power_condition,
-                                          bool start,
-                                          bool load_eject);
-        bool __wrap_tud_msc_start_stop_cb(uint8_t lun,
-                                          uint8_t power_condition,
-                                          bool start,
-                                          bool load_eject);
+        void tud_msc_scsi_complete_cb(uint8_t lun,
+                                      uint8_t const scsi_cmd[16]);
     """,
     "tinyusb_msc.h": r"""
         #pragma once
@@ -305,34 +300,37 @@ HARNESS = r"""
     esp_err_t tinyusb_driver_uninstall(void) { return ESP_OK; }
     bool tud_disconnect(void) { g_disconnect_calls++; return true; }
     bool tud_connect(void) { g_connect_calls++; return true; }
-    bool __real_tud_msc_start_stop_cb(uint8_t lun,
-                                      uint8_t power_condition,
-                                      bool start,
-                                      bool load_eject) {
-        (void)lun; (void)power_condition; (void)start; (void)load_eject;
-        return true;
-    }
-
     static usb_msc_ownership_event_t next_event(void) {
         return usb_msc_ownership_wait_event(0);
     }
 
     int main(void) {
         tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+        uint8_t inquiry[16] = {0x12u};
 
         CHECK(usb_msc_ownership_init() == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
         CHECK(g_device_cb != NULL);
         CHECK(g_storage_cb != NULL);
 
-        /* First configuration is deliberately abandoned before ownership work. */
+        /* ATTACHED runs inside tud_mount_cb before SET_CONFIGURATION status.
+         * It records provisional configuration only and must not disconnect. */
         g_device_cb(&attached, g_device_arg);
-        CHECK(g_disconnect_calls == 1);
+        CHECK(g_disconnect_calls == 0);
         CHECK(g_connect_calls == 0);
         CHECK(g_transfer_calls == 0);
         CHECK(g_mounted);
         CHECK(!g_nvs_has_value);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        /* SCSI completion occurs after command status and proves MSC class
+         * binding. Only then may the recorder coordinator begin prepare. */
+        tud_msc_scsi_complete_cb(0, inquiry);
         CHECK(next_event() == USB_MSC_EVENT_ATTACH);
+        CHECK(g_disconnect_calls == 0);
+        CHECK(usb_msc_ownership_begin_prepare() == ESP_OK);
+        CHECK(g_disconnect_calls == 1);
+        CHECK(!g_nvs_has_value);
 
         /* Model recorder USB_PREPARE completion, then publish while detached. */
         g_release_requested = true;
@@ -396,7 +394,7 @@ def test_two_phase_publication_reconnects_only_after_usb_owned_lun(tmp_path: Pat
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
-def test_mount_wrapper_is_not_used_for_publication() -> None:
+def test_usb_status_callbacks_are_not_linker_wrapped() -> None:
     cmake = MAIN_CMAKE.read_text(encoding="utf-8")
     assert "--wrap=tud_mount_cb" not in cmake
-    assert "--wrap=tud_msc_start_stop_cb" in cmake
+    assert "--wrap=tud_msc_start_stop_cb" not in cmake
