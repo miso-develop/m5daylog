@@ -343,7 +343,7 @@ HARNESS = r"""
         CHECK(g_transfer_calls == 1);
         CHECK(!g_mounted);
         CHECK(!usb_msc_ownership_is_host_owned());
-        CHECK(g_delay_ticks == 250u);
+        CHECK(g_delay_ticks == 1000u);
         CHECK(g_connect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
 
