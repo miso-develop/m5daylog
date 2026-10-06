@@ -5,7 +5,8 @@
 #include "shutdown_armed.h"
 
 // Task #50 supplies this symbol when integrated. The weak hook keeps Task #87
-// independent while preserving the required pending-RTC -> armed-clear order.
+// independent while preserving pending-RTC recovery before the durable
+// wake-recovery transition.
 extern esp_err_t rtc_correction_flush_pending_event(const char *events_path)
     __attribute__((weak));
 
@@ -55,6 +56,8 @@ esp_err_t task87_wake_recovery_complete_device_recovery(
 esp_err_t task87_wake_recovery_note_recording_started(
     task87_wake_recovery_t *recovery,
     bool fresh_recording_id_present) {
+    esp_err_t err;
+
     if (recovery == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -65,8 +68,9 @@ esp_err_t task87_wake_recovery_note_recording_started(
         !fresh_recording_id_present) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (shutdown_armed_complete_wake_recovery() != ESP_OK) {
-        return ESP_FAIL;
+    err = shutdown_armed_complete_wake_recovery();
+    if (err != ESP_OK) {
+        return err;
     }
 
     recovery->fresh_recording_started = true;
