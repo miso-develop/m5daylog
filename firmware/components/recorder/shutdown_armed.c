@@ -15,6 +15,7 @@ typedef enum {
     SHUTDOWN_LIFECYCLE_NORMAL = 0,
     SHUTDOWN_LIFECYCLE_ARMED = 1,
     SHUTDOWN_LIFECYCLE_HOST_UNRESOLVED = 2,
+    SHUTDOWN_LIFECYCLE_WAKE_RECOVERY_PENDING = 3,
 } shutdown_lifecycle_state_t;
 
 static esp_err_t shutdown_armed_finish_nvs(esp_err_t operation_err) {
@@ -82,7 +83,7 @@ static esp_err_t shutdown_armed_read_state(shutdown_lifecycle_state_t *state) {
     if (err != ESP_OK) {
         return shutdown_armed_finish_nvs(err);
     }
-    if (value > SHUTDOWN_LIFECYCLE_HOST_UNRESOLVED) {
+    if (value > SHUTDOWN_LIFECYCLE_WAKE_RECOVERY_PENDING) {
         return shutdown_armed_finish_nvs(ESP_FAIL);
     }
     *state = (shutdown_lifecycle_state_t)value;
@@ -104,7 +105,8 @@ esp_err_t shutdown_armed_read(bool *armed) {
     if (state == SHUTDOWN_LIFECYCLE_HOST_UNRESOLVED) {
         return ESP_ERR_INVALID_STATE;
     }
-    *armed = state == SHUTDOWN_LIFECYCLE_ARMED;
+    *armed = state == SHUTDOWN_LIFECYCLE_ARMED ||
+             state == SHUTDOWN_LIFECYCLE_WAKE_RECOVERY_PENDING;
     return ESP_OK;
 }
 
@@ -114,6 +116,33 @@ esp_err_t shutdown_armed_mark_host_unresolved(void) {
 
 esp_err_t shutdown_armed_commit(void) {
     return shutdown_armed_write(SHUTDOWN_LIFECYCLE_ARMED);
+}
+
+esp_err_t shutdown_armed_mark_wake_recovery_pending(void) {
+    shutdown_lifecycle_state_t state;
+    esp_err_t err = shutdown_armed_read_state(&state);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (state == SHUTDOWN_LIFECYCLE_WAKE_RECOVERY_PENDING) {
+        return ESP_OK;
+    }
+    if (state != SHUTDOWN_LIFECYCLE_ARMED) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return shutdown_armed_write(SHUTDOWN_LIFECYCLE_WAKE_RECOVERY_PENDING);
+}
+
+esp_err_t shutdown_armed_complete_wake_recovery(void) {
+    shutdown_lifecycle_state_t state;
+    esp_err_t err = shutdown_armed_read_state(&state);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (state != SHUTDOWN_LIFECYCLE_WAKE_RECOVERY_PENDING) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return shutdown_armed_write(SHUTDOWN_LIFECYCLE_NORMAL);
 }
 
 esp_err_t shutdown_armed_clear(void) {
@@ -143,7 +172,9 @@ esp_err_t shutdown_armed_boot_action(bool manual_wake,
     }
     if (state == SHUTDOWN_LIFECYCLE_NORMAL) {
         *action = SHUTDOWN_ARMED_BOOT_NORMAL;
-    } else if (state == SHUTDOWN_LIFECYCLE_ARMED && manual_wake) {
+    } else if ((state == SHUTDOWN_LIFECYCLE_ARMED ||
+                state == SHUTDOWN_LIFECYCLE_WAKE_RECOVERY_PENDING) &&
+               manual_wake) {
         *action = SHUTDOWN_ARMED_BOOT_MANUAL_RESUME;
     }
     return ESP_OK;
@@ -161,6 +192,14 @@ esp_err_t shutdown_armed_mark_host_unresolved(void) {
 }
 
 esp_err_t shutdown_armed_commit(void) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t shutdown_armed_mark_wake_recovery_pending(void) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t shutdown_armed_complete_wake_recovery(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
 
