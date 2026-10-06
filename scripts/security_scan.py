@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Dependency-free tracked-content leakage scanner for M5Daylog.
+"""Dependency-free repository and public-text leakage scanner for M5Daylog.
 
-The scanner fails closed when Git-tracked files cannot be enumerated/read and
+The scanner fails closed when required input cannot be enumerated/read and
 never includes a matched sensitive value in a Finding or diagnostic message.
 """
 
@@ -15,10 +15,11 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Iterable, TextIO
 
 ALLOWLIST_FILE = ".security-scan-allowlist.json"
 MAX_FILE_BYTES = 8 * 1024 * 1024
+PUBLIC_TEXT_LABEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 
 CODE_SUFFIXES = {
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".ino",
@@ -55,13 +56,68 @@ _SLACK = "x" + "ox[baprs]-"
 SIGNATURE_PATTERNS = {
     "github-token": re.compile(r"(?:" + _GITHUB_CLASSIC + r"[A-Za-z0-9]{20,}|" + re.escape(_GITHUB_FINE) + r"[A-Za-z0-9_]{20,})"),
     "huggingface-token": re.compile(re.escape(_HF) + r"[A-Za-z0-9]{20,}"),
-    "openai-token": re.compile(re.escape(_OPENAI) + r"[A-Za-z0-9_-]{20,}"),
+    "openai-token": re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(_OPENAI) + r"[A-Za-z0-9_-]{20,}"),
     "aws-access-key": re.compile(re.escape(_AWS) + r"[0-9A-Z]{16}"),
     "slack-token": re.compile(re.escape(_SLACK) + r"[A-Za-z0-9-]{16,}"),
     "private-key": re.compile(r"-{5}BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-{5}"),
     "bearer-token": re.compile(r"Authorization\s*[:=]\s*[\"']?Bearer\s+[A-Za-z0-9._~+\-/=]{20,}", re.IGNORECASE),
     "credential-uri": re.compile(r"[a-z][a-z0-9+.-]{1,20}://[^\s/:@]+:[^\s/@]{8,}@", re.IGNORECASE),
 }
+
+# Privacy markers are deliberately composed rather than embedded as a concrete
+# repository identifier. The rule recognizes the public naming convention only.
+_PRIVATE_REPO_MARKER = "-" + "private"
+_REPO_COMPONENT = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+_REPO_IDENTIFIER = (
+    r"(?:" + _REPO_COMPONENT + r"/)?"
+    + _REPO_COMPONENT
+    + re.escape(_PRIVATE_REPO_MARKER)
+)
+_REPO_URL_IDENTIFIER = (
+    r"https?://"
+    + _REPO_COMPONENT
+    + r"/"
+    + _REPO_COMPONENT
+    + r"/"
+    + _REPO_COMPONENT
+    + re.escape(_PRIVATE_REPO_MARKER)
+)
+
+PRIVACY_PATTERNS = {
+    "machine-path-windows": re.compile(
+        r"(?<![A-Za-z0-9])"
+        r"[A-Za-z]:[\\/]+Users[\\/]+"
+        r"[A-Za-z0-9._ -]+",
+        re.IGNORECASE,
+    ),
+    "machine-path-wsl": re.compile(
+        r"(?:\\\\|//)(?:wsl\$|wsl\.localhost)[\\/]+"
+        r"[A-Za-z0-9][A-Za-z0-9._-]*[\\/]+home[\\/]+"
+        r"[A-Za-z0-9._-]+",
+        re.IGNORECASE,
+    ),
+    "machine-path-posix-home": re.compile(
+        r"(?<![A-Za-z0-9:])/(?:home|Users)/"
+        r"(?=[A-Za-z0-9._-]*[A-Za-z0-9])[A-Za-z0-9._-]+"
+    ),
+    "private-repository-identifier": re.compile(
+        r"(?:"
+        r"(?<![A-Za-z0-9._/\\-])" + _REPO_IDENTIFIER
+        + r"(?=(?:$|[^A-Za-z0-9._/\\-]|\.(?![A-Za-z0-9._/\\-])))"
+        + r"|(?<![A-Za-z0-9])" + _REPO_URL_IDENTIFIER
+        + r"(?=(?:\.git)?(?:$|/|[^A-Za-z0-9._/\\-]|\.(?![A-Za-z0-9._/\\-])))"
+        + r")",
+        re.IGNORECASE,
+    ),
+}
+
+PRIVACY_MESSAGES = {
+    "machine-path-windows": "concrete Windows user-profile path",
+    "machine-path-wsl": "concrete WSL user-home path",
+    "machine-path-posix-home": "concrete POSIX/macOS user-home path",
+    "private-repository-identifier": "private repository identifier",
+}
+PRIVACY_RULES = frozenset(PRIVACY_PATTERNS)
 
 _CREDENTIAL_NAME = (
     r"(?:password|passwd|passphrase|secret|api[_-]?key|token|pat|"
@@ -87,9 +143,13 @@ LOG_SINK_PATTERN = re.compile(
 
 KNOWN_RULES = frozenset({
     "forbidden-path", "large-file", "audio-file", "env-template-value",
-    "credential-literal", "dangerous-log", *SIGNATURE_PATTERNS.keys(),
+    "credential-literal", "dangerous-log", *PRIVACY_RULES,
+    *SIGNATURE_PATTERNS.keys(),
 })
-ALLOWLISTABLE_RULES = KNOWN_RULES - {"forbidden-path", "large-file", "env-template-value"}
+NON_ALLOWLISTABLE_RULES = frozenset({
+    "forbidden-path", "large-file", "env-template-value", *PRIVACY_RULES,
+})
+ALLOWLISTABLE_RULES = KNOWN_RULES - NON_ALLOWLISTABLE_RULES
 
 
 class ScanError(RuntimeError):
@@ -116,8 +176,16 @@ class AllowEntry:
 def normalize_relative_path(raw: str) -> str:
     path = PurePosixPath(raw.replace("\\", "/"))
     if path.is_absolute() or ".." in path.parts or not path.parts:
-        raise ScanError(f"invalid repository-relative path: {raw!r}")
+        raise ScanError("invalid repository-relative path")
     return path.as_posix()
+
+
+def normalize_public_text_label(raw: str | None) -> str:
+    if raw is None or PUBLIC_TEXT_LABEL_PATTERN.fullmatch(raw) is None:
+        raise ScanError("invalid or missing public-text input label")
+    if scan_text("public-text-label", raw):
+        raise ScanError("public-text input label is not safe diagnostic metadata")
+    return raw
 
 
 def is_safe_fixture_path(path: str) -> bool:
@@ -130,9 +198,13 @@ def load_allowlist(root: Path) -> list[AllowEntry]:
         raise ScanError(f"required allowlist file is missing: {ALLOWLIST_FILE}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ScanError(f"cannot read {ALLOWLIST_FILE}: {exc}") from exc
-    if payload.get("version") != 1 or not isinstance(payload.get("entries"), list):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScanError(f"cannot read or parse {ALLOWLIST_FILE}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or not isinstance(payload.get("entries"), list)
+    ):
         raise ScanError(f"{ALLOWLIST_FILE} must contain version=1 and an entries array")
 
     entries: list[AllowEntry] = []
@@ -148,9 +220,9 @@ def load_allowlist(root: Path) -> list[AllowEntry]:
             reason=str(raw["reason"]).strip(),
         )
         if entry.rule not in ALLOWLISTABLE_RULES:
-            raise ScanError(f"allowlist entry {index} uses non-allowlistable rule: {entry.rule}")
+            raise ScanError(f"allowlist entry {index} uses non-allowlistable rule")
         if entry.kind not in {"synthetic-fixture", "public-test-vector"}:
-            raise ScanError(f"allowlist entry {index} has invalid kind: {entry.kind}")
+            raise ScanError(f"allowlist entry {index} has invalid kind")
         if not is_safe_fixture_path(entry.path):
             raise ScanError(f"allowlist entry {index} must target a designated fixture directory")
         if not re.fullmatch(r"[0-9a-f]{64}", entry.file_sha256):
@@ -172,7 +244,14 @@ def git_tracked_files(root: Path) -> list[str]:
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ScanError("cannot enumerate Git-tracked files; run inside a Git worktree") from exc
-    paths = [normalize_relative_path(item.decode("utf-8")) for item in result.stdout.split(b"\0") if item]
+    try:
+        paths = [
+            normalize_relative_path(item.decode("utf-8"))
+            for item in result.stdout.split(b"\0")
+            if item
+        ]
+    except UnicodeDecodeError as exc:
+        raise ScanError("cannot decode Git-tracked file list as UTF-8") from exc
     if not paths:
         raise ScanError("Git reported no tracked files")
     return paths
@@ -184,6 +263,10 @@ def file_sha256(data: bytes) -> str:
 
 def line_number(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
+
+
+def render_finding(finding: Finding) -> str:
+    return f"[security:scan] {finding.path}:{finding.line}: [{finding.rule}] {finding.message}"
 
 
 def scan_path(path: str) -> list[Finding]:
@@ -219,16 +302,26 @@ def scan_env_example(path: str, text: str) -> list[Finding]:
     return findings
 
 
+def scan_text(label: str, text: str) -> list[Finding]:
+    """Scan arbitrary candidate public text using non-echoing common rules."""
+    findings: list[Finding] = []
+    for rule, pattern in SIGNATURE_PATTERNS.items():
+        for match in pattern.finditer(text):
+            findings.append(Finding(label, line_number(text, match.start()), rule, "high-confidence credential/private-key signature"))
+
+    for rule, pattern in PRIVACY_PATTERNS.items():
+        for match in pattern.finditer(text):
+            findings.append(Finding(label, line_number(text, match.start()), rule, PRIVACY_MESSAGES[rule]))
+    return findings
+
+
 def scan_content(path: str, data: bytes) -> list[Finding]:
     if len(data) > MAX_FILE_BYTES:
         return [Finding(path, 1, "large-file", f"tracked file exceeds {MAX_FILE_BYTES} bytes and is not scanned")]
     text = data.decode("utf-8", errors="replace")
     suffix = PurePosixPath(path).suffix.lower()
-    findings = scan_env_example(path, text)
-
-    for rule, pattern in SIGNATURE_PATTERNS.items():
-        for match in pattern.finditer(text):
-            findings.append(Finding(path, line_number(text, match.start()), rule, "high-confidence credential/private-key signature"))
+    findings = scan_text(path, text)
+    findings.extend(scan_env_example(path, text))
 
     if suffix in CONFIG_SUFFIXES or PurePosixPath(path).name.startswith(".env"):
         for match in CREDENTIAL_LITERAL_PATTERN.finditer(text):
@@ -265,20 +358,80 @@ def scan_repository(root: Path) -> tuple[list[Finding], list[AllowEntry]]:
         try:
             data = full_path.read_bytes()
         except OSError as exc:
-            raise ScanError(f"cannot read tracked file {relative}: {exc}") from exc
+            raise ScanError(f"cannot read tracked file {relative}") from exc
         hashes[relative] = file_sha256(data)
         findings.extend(scan_content(relative, data))
     return apply_allowlist(findings, hashes, entries)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scan tracked repository files for credential/private-data leakage")
+    parser = argparse.ArgumentParser(description="Scan repository or candidate public text for credential/private-data leakage")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    public_input = parser.add_mutually_exclusive_group()
+    public_input.add_argument(
+        "--public-text-stdin",
+        action="store_true",
+        help="scan candidate public text read from stdin",
+    )
+    public_input.add_argument(
+        "--public-text-file",
+        type=Path,
+        help="scan candidate public text read from a UTF-8 file",
+    )
+    parser.add_argument(
+        "--label",
+        help="safe abstract label used only for public-text finding locations",
+    )
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
+def read_public_text(args: argparse.Namespace, stdin: TextIO | None) -> tuple[str, str]:
+    label = normalize_public_text_label(args.label)
+    if args.public_text_stdin:
+        stream = sys.stdin if stdin is None else stdin
+        try:
+            return label, stream.read()
+        except (OSError, UnicodeError) as exc:
+            raise ScanError("cannot read public-text input") from exc
+
+    if args.public_text_file is not None:
+        try:
+            return label, args.public_text_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ScanError("cannot read or decode public-text input file") from exc
+
+    raise ScanError("public-text input mode is not selected")
+
+
+def run_public_text_validation(args: argparse.Namespace, stdin: TextIO | None) -> int:
+    try:
+        label, text = read_public_text(args, stdin)
+        findings = scan_text(label, text)
+    except Exception as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        print("[security:scan] ERROR: public-text validation could not be completed", file=sys.stderr)
+        return 2
+
+    for finding in findings:
+        print(render_finding(finding), file=sys.stderr)
+    if findings:
+        print(f"[security:scan] FAILED: {len(findings)} finding(s)", file=sys.stderr)
+        return 1
+
+    print("[security:scan] OK: public text")
+    return 0
+
+
+def main(argv: list[str] | None = None, *, stdin: TextIO | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    public_mode = args.public_text_stdin or args.public_text_file is not None
+    if public_mode:
+        return run_public_text_validation(args, stdin)
+    if args.label is not None:
+        print("[security:scan] ERROR: public-text label requires a public-text input mode", file=sys.stderr)
+        return 2
+
     try:
         findings, stale = scan_repository(args.root.resolve())
     except ScanError as exc:
@@ -288,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     for entry in stale:
         print(f"[security:scan] ERROR: stale allowlist entry {entry.path} [{entry.rule}]", file=sys.stderr)
     for finding in findings:
-        print(f"[security:scan] {finding.path}:{finding.line}: [{finding.rule}] {finding.message}", file=sys.stderr)
+        print(render_finding(finding), file=sys.stderr)
 
     if findings or stale:
         print(f"[security:scan] FAILED: {len(findings)} finding(s), {len(stale)} stale allowlist entry/entries", file=sys.stderr)

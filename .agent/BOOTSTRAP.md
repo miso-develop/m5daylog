@@ -1,6 +1,6 @@
 # Agent Bootstrap Protocol
 
-version: 4
+version: 5
 
 Every Agent chat must perform this bootstrap before substantive repository work.
 
@@ -49,7 +49,9 @@ Read:
 3. `.agent/HANDOFF_PROTOCOL.md`
 4. relevant Map / Decision / Spec / Task records
 
-For long-running chats, re-read the Role Contract only after recovery, an explicit Role change, or when repository state indicates the contract changed.
+When the work involves planning, executing, interpreting, recording, or resuming a Human Gate, also read `.agent/HUMAN_GATE/README.md` and every required Human Gate rule file listed there **before** giving operator commands or interpreting Human Gate evidence.
+
+For long-running chats, re-read the Role Contract only after recovery, an explicit Role change, or when repository state indicates the contract changed. Human Gate rules should likewise be re-read when their version or required-file list changes.
 
 ## 3. Reconstruct context from a handoff
 
