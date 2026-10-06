@@ -245,9 +245,19 @@ void app_main(void) {
     }
     if (recorder_power_manual_wake_asserted(&manual_wake) != ESP_OK ||
         shutdown_armed_boot_action(manual_wake, &action) != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: power, result: boot-gate-error, action: fail-closed");
         recorder_shutdown_armed_now();
         return;
     }
+    ESP_LOGI(TAG,
+             "stage: power, result: boot-gate, manual_wake: %s, action: %s",
+             manual_wake ? "asserted" : "not-asserted",
+             action == SHUTDOWN_ARMED_BOOT_NORMAL
+                 ? "normal"
+                 : (action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME
+                        ? "manual-resume"
+                        : "stay-shutdown"));
     if (action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN) {
         recorder_shutdown_armed_now();
         return;
