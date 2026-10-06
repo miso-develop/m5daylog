@@ -55,6 +55,7 @@ def _build(tmp_path: Path) -> Path:
             typedef struct { tinyusb_event_id_t id; } tinyusb_event_t;
 
             #define USB_BIT_ATTACH (1u << 0)
+            #define USB_BIT_HOST_OWNED (1u << 2)
             #define USB_BIT_FAILED (1u << 5)
 
             typedef struct event_group {
@@ -66,6 +67,7 @@ def _build(tmp_path: Path) -> Path:
             static volatile bool s_initialized = true;
             static volatile bool s_started = true;
             static volatile bool s_starting = false;
+            static volatile bool s_storage_usb_owned = false;
             static volatile bool s_host_owned = false;
             static volatile bool s_release_pending = false;
             static volatile bool s_publish_triggered = false;
@@ -113,6 +115,7 @@ def _build(tmp_path: Path) -> Path:
                 s_initialized = true;
                 s_started = true;
                 s_starting = false;
+                s_storage_usb_owned = false;
                 s_host_owned = false;
                 s_release_pending = false;
                 s_publish_triggered = false;
@@ -145,11 +148,12 @@ def _build(tmp_path: Path) -> Path:
                     CHECK(g_mounted);
                 } else if (strcmp(argv[1], "prepared-reconnect") == 0) {
                     s_publish_triggered = true;
-                    s_host_owned = true;
+                    s_storage_usb_owned = true;
                     g_mounted = false;
                     usb_device_event_cb(&attached, NULL);
                     CHECK(g_disconnect_calls == 0);
                     CHECK((g_events.bits & USB_BIT_ATTACH) == 0);
+                    CHECK((g_events.bits & USB_BIT_HOST_OWNED) != 0);
                     CHECK((g_events.bits & USB_BIT_FAILED) == 0);
                     CHECK(s_host_owned);
                     CHECK(!g_mounted);
