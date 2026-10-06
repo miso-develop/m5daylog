@@ -15,15 +15,16 @@ WAKE_RECOVERY = REPO / "firmware/main/task87_wake_recovery.c"
 MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
 
 
-def test_only_explicit_eject_keeps_a_linker_wrap_seam():
+def test_usb_status_boundaries_use_completion_callbacks_not_linker_wraps():
     usb = USB_C.read_text(encoding="utf-8")
     cmake = MAIN_CMAKE.read_text(encoding="utf-8")
     assert "__wrap_tud_mount_cb" not in usb
     assert "__real_tud_mount_cb" not in usb
     assert "--wrap=tud_mount_cb" not in cmake
-    assert "__wrap_tud_msc_start_stop_cb" in usb
-    assert "__real_tud_msc_start_stop_cb" in usb
-    assert "--wrap=tud_msc_start_stop_cb" in cmake
+    assert "__wrap_tud_msc_start_stop_cb" not in usb
+    assert "__real_tud_msc_start_stop_cb" not in usb
+    assert "--wrap=tud_msc_start_stop_cb" not in cmake
+    assert "tud_msc_scsi_complete_cb" in usb
 
 
 def test_publish_persists_unresolved_before_storage_transfer_and_reconnect():
@@ -55,17 +56,25 @@ def test_storage_mount_start_is_detached_pre_authorized_validation_seam():
     assert "USB_BIT_ATTACH" not in region
 
 
-def test_initial_attach_disconnects_before_recorder_publication_event():
+def test_initial_attach_preserves_set_configuration_until_no_media_status():
     usb = USB_C.read_text(encoding="utf-8")
     cb_at = usb.index("static void usb_device_event_cb")
     attached_at = usb.index("TINYUSB_EVENT_ATTACHED", cb_at)
     suspend_at = usb.index("#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK", attached_at)
     region = usb[attached_at:suspend_at]
-    trigger_at = region.index("s_publish_triggered = true")
-    disconnect_at = region.index("tud_disconnect", trigger_at)
-    attach_event_at = region.index("USB_BIT_ATTACH", disconnect_at)
-    assert trigger_at < disconnect_at < attach_event_at
+    provisional_at = region.index("s_provisional_attached = true")
+    first_branch_end = region.index("if (!s_host_owned)", provisional_at)
+    provisional = region[:first_branch_end]
+    assert "tud_disconnect" not in provisional
+    assert "USB_BIT_ATTACH" not in provisional
+    assert "s_publish_triggered = true" not in provisional
     assert "sd_mount_transfer_to_usb" not in region
+
+    scsi_at = usb.index("void tud_msc_scsi_complete_cb")
+    init_at = usb.index("esp_err_t usb_msc_ownership_init", scsi_at)
+    scsi_region = usb[scsi_at:init_at]
+    assert "USB_SCSI_CMD_TEST_UNIT_READY" in scsi_region
+    assert "usb_note_initial_msc_command_complete" in scsi_region
 
 
 def test_release_quiesce_tears_down_usb_before_deferred_write_proof_and_durable_arm():
