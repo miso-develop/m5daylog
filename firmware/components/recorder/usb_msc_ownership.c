@@ -1,17 +1,18 @@
 // Tasks #49/#87: exclusive recorder microSD ownership with Strategy 2 eject.
 //
-// APP -> USB publication is gated before SetConfiguration completes. With
-// esp_tinyusb 2.2.1 and auto_mount_off=1, its synchronous ATTACHED device event
-// is the reliable entry point into the storage transfer barrier: MOUNT_START
-// wakes the recorder coordinator and blocks until recorder finalization,
-// durable manifest state, and Device-FS release are proven. ATTACHED may arrive
-// after driver installation begins but before tinyusb_driver_install() returns,
-// so that bounded STARTING window is a valid ownership state. The legacy linker
-// wraps remain compatible fallback seams but are not required for the real
-// TinyUSB callback ordering. Generic detach / suspend never authorizes Device
-// ownership. The only normal reverse trigger is SCSI START STOP UNIT
-// (load_eject=1,start=0), observed after command completion as well as by the
-// compatibility wrapper.
+// APP -> USB publication uses two host enumerations. With esp_tinyusb 2.2.1
+// and auto_mount_off=1, the first ATTACHED event is only a connection trigger:
+// it soft-disconnects immediately, then the recorder coordinator finalizes,
+// persists HOST_UNRESOLVED, and switches the storage APP -> USB while no host
+// configuration is active. A delayed reconnect starts a fresh enumeration with
+// an already USB-owned LUN. This avoids mutating MSC ownership re-entrantly
+// inside esp_tinyusb's strong tud_mount_cb, which physically produced a USB
+// device without a Windows USBSTOR interface. ATTACHED may arrive after driver
+// installation begins but before tinyusb_driver_install() returns, so that
+// bounded STARTING window remains valid. Generic detach / suspend never
+// authorizes Device ownership. The only normal reverse trigger is SCSI START
+// STOP UNIT (load_eject=1,start=0), observed after command completion and by
+// the compatibility wrapper.
 
 #include "usb_msc_ownership.h"
 
@@ -23,6 +24,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "sd_mount.h"
 #include "shutdown_armed.h"
 #include "tinyusb.h"
