@@ -181,11 +181,54 @@ HARNESS = r"""
         CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
     }
 
+    static void run_wake_recovery_pending_reset_gate(void) {
+        bool armed = false;
+        shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
+
+        CHECK(shutdown_armed_commit() == ESP_OK);
+        CHECK(g_value == 1);
+        CHECK(shutdown_armed_mark_wake_recovery_pending() == ESP_OK);
+        CHECK(g_value == 3);
+        CHECK(shutdown_armed_read(&armed) == ESP_OK);
+        CHECK(armed);
+
+        /* Reset/power reappearance before fresh-recording proof cannot become
+         * a normal automatic boot. Another physical WAKE is required. */
+        CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+        CHECK(g_value == 3);
+        CHECK(shutdown_armed_boot_action(true, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
+        CHECK(g_value == 3);
+
+        /* Re-running recovery after a reset is idempotent while pending. */
+        CHECK(shutdown_armed_mark_wake_recovery_pending() == ESP_OK);
+        CHECK(g_value == 3);
+        CHECK(shutdown_armed_complete_wake_recovery() == ESP_OK);
+        CHECK(g_value == 0);
+        CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_NORMAL);
+    }
+
+    static void run_wake_recovery_complete_failure(void) {
+        shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
+
+        CHECK(shutdown_armed_commit() == ESP_OK);
+        CHECK(shutdown_armed_mark_wake_recovery_pending() == ESP_OK);
+        CHECK(g_value == 3);
+        g_commit_result = ESP_FAIL;
+        CHECK(shutdown_armed_complete_wake_recovery() == ESP_FAIL);
+        CHECK(g_value == 3);
+        g_commit_result = ESP_OK;
+        CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
+        CHECK(action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN);
+    }
+
     static void run_corrupt_marker(void) {
         bool armed = false;
         shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_NORMAL;
         g_has_value = true;
-        g_value = 3;
+        g_value = 4;
         CHECK(shutdown_armed_read(&armed) == ESP_FAIL);
         CHECK(!armed);
         CHECK(shutdown_armed_boot_action(false, &action) == ESP_FAIL);
@@ -215,6 +258,8 @@ HARNESS = r"""
         else if (strcmp(argv[1], "boot-gate") == 0) run_boot_gate();
         else if (strcmp(argv[1], "unresolved-reset") == 0) run_unresolved_reset_gate();
         else if (strcmp(argv[1], "armed-transition-failure") == 0) run_armed_transition_failure();
+        else if (strcmp(argv[1], "wake-pending-reset") == 0) run_wake_recovery_pending_reset_gate();
+        else if (strcmp(argv[1], "wake-complete-failure") == 0) run_wake_recovery_complete_failure();
         else if (strcmp(argv[1], "corrupt") == 0) run_corrupt_marker();
         else if (strcmp(argv[1], "fail-closed") == 0) run_fail_closed();
         else CHECK(false);
@@ -262,6 +307,8 @@ def _build(tmp_path: Path) -> Path:
         "boot-gate",
         "unresolved-reset",
         "armed-transition-failure",
+        "wake-pending-reset",
+        "wake-complete-failure",
         "corrupt",
         "fail-closed",
     ],
