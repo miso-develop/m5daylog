@@ -1,8 +1,8 @@
 """Task #87 Strategy 2 source-order contracts.
 
-Behavioral host tests are the primary proof. These assertions lock the mount
-and explicit-eject linker seams, pre-configuration publication barrier, release
-ordering, durable ownership lifecycle, and absence of same-session APP remount.
+Behavioral host tests are the primary proof. These assertions lock two-phase
+MSC publication, the explicit-eject seam, durable ownership ordering, and the
+absence of same-session APP remount.
 """
 
 from pathlib import Path
@@ -15,44 +15,57 @@ WAKE_RECOVERY = REPO / "firmware/main/task87_wake_recovery.c"
 MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
 
 
-def test_tinyusb_callbacks_have_one_to_one_linker_wrap_seams():
+def test_only_explicit_eject_keeps_a_linker_wrap_seam():
     usb = USB_C.read_text(encoding="utf-8")
     cmake = MAIN_CMAKE.read_text(encoding="utf-8")
-    assert "__wrap_tud_mount_cb" in usb
-    assert "__real_tud_mount_cb" in usb
-    assert "--wrap=tud_mount_cb" in cmake
+    assert "__wrap_tud_mount_cb" not in usb
+    assert "__real_tud_mount_cb" not in usb
+    assert "--wrap=tud_mount_cb" not in cmake
     assert "__wrap_tud_msc_start_stop_cb" in usb
     assert "__real_tud_msc_start_stop_cb" in usb
     assert "--wrap=tud_msc_start_stop_cb" in cmake
 
 
-def test_publish_persists_unresolved_before_releasing_prepare_barrier():
+def test_publish_persists_unresolved_before_storage_transfer_and_reconnect():
     usb = USB_C.read_text(encoding="utf-8")
     publish_at = usb.index("static bool usb_msc_publish")
     unresolved_at = usb.index("shutdown_armed_mark_host_unresolved", publish_at)
-    prepare_at = usb.index("USB_BIT_PREPARE_OK", unresolved_at)
-    assert publish_at < unresolved_at < prepare_at
+    authorize_at = usb.index("s_transfer_authorized = true", unresolved_at)
+    transfer_at = usb.index("sd_mount_transfer_to_usb", authorize_at)
+    delay_at = usb.index("vTaskDelay", transfer_at)
+    reconnect_at = usb.index("tud_connect", delay_at)
+    assert publish_at < unresolved_at < authorize_at < transfer_at < delay_at < reconnect_at
 
 
-def test_storage_mount_start_is_preconfiguration_prepare_barrier():
+def test_storage_mount_start_is_detached_pre_authorized_validation_seam():
     usb = USB_C.read_text(encoding="utf-8")
     cb_at = usb.index("static void usb_storage_event_cb")
     start_at = usb.index("TINYUSB_MSC_EVENT_MOUNT_START", cb_at)
     complete_at = usb.index("TINYUSB_MSC_EVENT_MOUNT_COMPLETE", start_at)
     region = usb[start_at:complete_at]
-    attach_at = region.index("USB_BIT_ATTACH")
-    wait_at = region.index("xEventGroupWaitBits", attach_at)
-    prepare_at = region.index("USB_BIT_PREPARE_OK", wait_at)
-    assert attach_at < wait_at < prepare_at
+    for marker in (
+        "s_publish_triggered",
+        "s_transfer_authorized",
+        "s_wav_finalized",
+        "s_manifest_committed",
+        "s_device_fs_released",
+    ):
+        assert marker in region, marker
+    assert "xEventGroupWaitBits" not in region
+    assert "USB_BIT_ATTACH" not in region
 
 
-def test_wrapped_mount_transfers_storage_before_real_post_config_callback():
+def test_initial_attach_disconnects_before_recorder_publication_event():
     usb = USB_C.read_text(encoding="utf-8")
-    fn_at = usb.index("void __wrap_tud_mount_cb")
-    transfer_at = usb.index("sd_mount_transfer_to_usb", fn_at)
-    host_proof_at = usb.index("s_host_owned", transfer_at)
-    real_at = usb.index("__real_tud_mount_cb", host_proof_at)
-    assert fn_at < transfer_at < host_proof_at < real_at
+    cb_at = usb.index("static void usb_device_event_cb")
+    attached_at = usb.index("TINYUSB_EVENT_ATTACHED", cb_at)
+    suspend_at = usb.index("#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK", attached_at)
+    region = usb[attached_at:suspend_at]
+    trigger_at = region.index("s_publish_triggered = true")
+    disconnect_at = region.index("tud_disconnect", trigger_at)
+    attach_event_at = region.index("USB_BIT_ATTACH", disconnect_at)
+    assert trigger_at < disconnect_at < attach_event_at
+    assert "sd_mount_transfer_to_usb" not in region
 
 
 def test_release_quiesce_tears_down_usb_before_deferred_write_proof_and_durable_arm():
