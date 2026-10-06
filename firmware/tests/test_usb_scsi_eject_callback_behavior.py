@@ -1,9 +1,9 @@
-"""Task #87 regression for the real TinyUSB SCSI completion eject seam.
+"""Task #87 regression for TinyUSB's post-status SCSI completion seam.
 
-The linker START STOP wrapper is not a reliable observation point for a callback
-invoked from TinyUSB's own translation unit. The production completion callback
-must recognize only START STOP UNIT(load_eject=1,start=0), emit the Strategy 2
-release request once, and leave non-eject commands non-authoritative.
+Before publication, the first completed MSC command is class-binding proof and
+must only trigger recorder preparation. After USB ownership is established,
+only START STOP UNIT(load_eject=1,start=0) may authorize Strategy 2 release.
+Both decisions occur after the command status transaction has completed.
 """
 
 from pathlib import Path
@@ -19,11 +19,9 @@ USB_OWNERSHIP_C = REPO / "firmware/components/recorder/usb_msc_ownership.c"
 
 def _production_eject_functions() -> str:
     source = USB_OWNERSHIP_C.read_text(encoding="utf-8")
-    helper_start = source.index("static bool usb_request_explicit_eject(")
-    helper_end = source.index("\n// Compatibility seam for the original implementation.", helper_start)
-    cb_start = source.index("void tud_msc_scsi_complete_cb(", helper_end)
-    cb_end = source.index("\nesp_err_t usb_msc_ownership_init", cb_start)
-    return source[helper_start:helper_end] + "\n" + source[cb_start:cb_end]
+    helper_start = source.index("static bool usb_note_initial_msc_command_complete(")
+    cb_end = source.index("\nesp_err_t usb_msc_ownership_init", helper_start)
+    return source[helper_start:cb_end]
 
 
 def _build(tmp_path: Path) -> Path:
@@ -41,6 +39,7 @@ def _build(tmp_path: Path) -> Path:
             #include <stdlib.h>
             #include <string.h>
 
+            #define USB_BIT_ATTACH (1u << 0)
             #define USB_BIT_RELEASE_REQUESTED (1u << 3)
             #define USB_BIT_FAILED (1u << 5)
             #define USB_SCSI_CMD_START_STOP_UNIT 0x1bu
@@ -49,9 +48,13 @@ def _build(tmp_path: Path) -> Path:
             static struct event_group g_events;
             static EventGroupHandle_t s_usb_events = &g_events;
             static volatile bool s_initialized = true;
+            static volatile bool s_starting = false;
             static volatile bool s_started = true;
+            static volatile bool s_storage_usb_owned = true;
             static volatile bool s_host_owned = true;
             static volatile bool s_release_pending = false;
+            static volatile bool s_provisional_attached = false;
+            static volatile bool s_publish_triggered = true;
             static bool g_mounted = false;
             static int g_disconnect_calls;
 
@@ -83,9 +86,13 @@ def _build(tmp_path: Path) -> Path:
             static void reset_state(void) {
                 memset(&g_events, 0, sizeof(g_events));
                 s_initialized = true;
+                s_starting = false;
                 s_started = true;
+                s_storage_usb_owned = true;
                 s_host_owned = true;
                 s_release_pending = false;
+                s_provisional_attached = false;
+                s_publish_triggered = true;
                 g_mounted = false;
                 g_disconnect_calls = 0;
             }
@@ -95,7 +102,21 @@ def _build(tmp_path: Path) -> Path:
                 CHECK(argc == 2);
                 reset_state();
 
-                if (strcmp(argv[1], "eject") == 0) {
+                if (strcmp(argv[1], "probe") == 0) {
+                    s_storage_usb_owned = false;
+                    s_host_owned = false;
+                    s_provisional_attached = true;
+                    s_publish_triggered = false;
+                    g_mounted = true;
+                    cdb[0] = 0x12u; /* INQUIRY */
+                    tud_msc_scsi_complete_cb(0, cdb);
+                    CHECK(s_publish_triggered);
+                    CHECK((g_events.bits & USB_BIT_ATTACH) != 0);
+                    CHECK((g_events.bits & USB_BIT_RELEASE_REQUESTED) == 0);
+                    CHECK((g_events.bits & USB_BIT_FAILED) == 0);
+                    CHECK(!s_release_pending);
+                    CHECK(g_disconnect_calls == 0);
+                } else if (strcmp(argv[1], "eject") == 0) {
                     cdb[0] = USB_SCSI_CMD_START_STOP_UNIT;
                     cdb[4] = 0x02u; /* LOEJ=1, START=0 */
                     tud_msc_scsi_complete_cb(0, cdb);
@@ -140,8 +161,8 @@ def _build(tmp_path: Path) -> Path:
     return binary
 
 
-@pytest.mark.parametrize("scenario", ["eject", "start", "other"])
-def test_production_scsi_completion_authorizes_only_explicit_eject(
+@pytest.mark.parametrize("scenario", ["probe", "eject", "start", "other"])
+def test_production_scsi_completion_separates_probe_from_explicit_eject(
     tmp_path: Path, scenario: str
 ) -> None:
     binary = _build(tmp_path)
