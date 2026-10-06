@@ -184,21 +184,22 @@ static void recorder_handle_usb_release(void) {
         return;
     }
 
-    // Armed intent is already durable before HOLD is dropped. With USB still
+    // Armed intent is already durable before power shutdown. With USB still
     // present deep sleep is a functional shutdown; after cable removal HOLD=0
-    // permits the board's power circuit to switch off. This path never remounts
-    // SD or starts another recorder session.
-    if (recorder_power_release_hold() != ESP_OK) {
-        ESP_LOGE(TAG, "stage: power, result: error, reason: hold release");
+    // permits the board's power circuit to switch off. A HOLD/wakeup-disable
+    // failure must remain visible and fail-closed rather than entering an
+    // unwakeable sleep with an unproven power state.
+    if (recorder_power_shutdown() != ESP_OK) {
+        ESP_LOGE(TAG, "stage: power, result: error, reason: shutdown prepare");
+        recorder_enter_error(RECORDER_REASON_INTERNAL);
+        return;
     }
-    recorder_power_enter_shutdown_sleep();
 }
 
 static void recorder_shutdown_armed_now(void) {
-    if (recorder_power_release_hold() != ESP_OK) {
-        ESP_LOGE(TAG, "stage: power, result: error, reason: hold release");
+    if (recorder_power_shutdown() != ESP_OK) {
+        ESP_LOGE(TAG, "stage: power, result: error, reason: shutdown prepare");
     }
-    recorder_power_enter_shutdown_sleep();
 }
 
 static void recorder_usb_event_task(void *arg) {
