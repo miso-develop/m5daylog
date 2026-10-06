@@ -31,9 +31,9 @@ def test_usb_ownership_module_is_built_and_tinyusb_is_pinned():
     assert "esp_tinyusb" in manifest
     assert "==2.2.1" in manifest
     assert 'SRCS "task49_runtime.c"' in main_cmake
-    # Compatibility wrappers remain available, but correctness is separately
-    # locked to the real device/SCSI callbacks below.
-    assert "--wrap=tud_mount_cb" in main_cmake
+    # Publication no longer depends on intercepting esp_tinyusb's mount
+    # callback. Only the explicit-eject START STOP compatibility seam remains.
+    assert "--wrap=tud_mount_cb" not in main_cmake
     assert "--wrap=tud_msc_start_stop_cb" in main_cmake
     assert ".auto_mount_off = 1" in sd
 
@@ -56,42 +56,44 @@ def test_usb_publish_gate_requires_finalize_manifest_and_device_fs_release():
     for gate in ("wav_finalized", "manifest_committed", "device_fs_released"):
         assert gate in gate_region, gate
     unresolved_at = gate_region.index("shutdown_armed_mark_host_unresolved")
-    prepare_at = gate_region.index("USB_BIT_PREPARE_OK", unresolved_at)
-    assert unresolved_at < prepare_at
+    authorize_at = gate_region.index("s_transfer_authorized = true", unresolved_at)
+    transfer_at = gate_region.index("sd_mount_transfer_to_usb", authorize_at)
+    delay_at = gate_region.index("vTaskDelay", transfer_at)
+    reconnect_at = gate_region.index("tud_connect", delay_at)
+    assert unresolved_at < authorize_at < transfer_at < delay_at < reconnect_at
 
 
-def test_storage_mount_start_blocks_before_host_ownership_switch():
+def test_storage_mount_start_only_accepts_pre_authorized_detached_transfer():
     src = USB_C.read_text(encoding="utf-8")
     cb_at = src.index("static void usb_storage_event_cb")
     start_at = src.index("TINYUSB_MSC_EVENT_MOUNT_START", cb_at)
     complete_at = src.index("TINYUSB_MSC_EVENT_MOUNT_COMPLETE", start_at)
     region = src[start_at:complete_at]
 
-    attach_at = region.index("USB_BIT_ATTACH")
-    wait_at = region.index("xEventGroupWaitBits", attach_at)
-    prepare_at = region.index("USB_BIT_PREPARE_OK", wait_at)
-    assert attach_at < wait_at < prepare_at
-    assert "portMAX_DELAY" in region
+    for marker in (
+        "s_publish_triggered",
+        "s_transfer_authorized",
+        "s_wav_finalized",
+        "s_manifest_committed",
+        "s_device_fs_released",
+    ):
+        assert marker in region, marker
+    assert "xEventGroupWaitBits" not in region
+    assert "USB_BIT_ATTACH" not in region
 
 
-def test_real_attached_callback_enters_transfer_barrier_before_host_use():
+def test_real_attached_callback_disconnects_before_publication_work():
     src = USB_C.read_text(encoding="utf-8")
     device_cb_at = src.index("static void usb_device_event_cb")
     attached_at = src.index("TINYUSB_EVENT_ATTACHED", device_cb_at)
     suspend_at = src.index("#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK", attached_at)
     attached_region = src[attached_at:suspend_at]
 
-    transfer_at = attached_region.index("sd_mount_transfer_to_usb")
-    host_owned_at = attached_region.index("s_host_owned", transfer_at)
-    fail_at = attached_region.index("host ownership transfer", transfer_at)
-    assert transfer_at < host_owned_at < fail_at
-
-    # The existing wrapper is compatibility-only; it still routes through the
-    # same guarded transfer if a future linker/library layout reaches it.
-    wrapper_at = src.index("void __wrap_tud_mount_cb")
-    wrapper_transfer_at = src.index("sd_mount_transfer_to_usb", wrapper_at)
-    real_at = src.index("__real_tud_mount_cb", wrapper_transfer_at)
-    assert wrapper_at < wrapper_transfer_at < real_at
+    trigger_at = attached_region.index("s_publish_triggered = true")
+    disconnect_at = attached_region.index("tud_disconnect", trigger_at)
+    attach_at = attached_region.index("USB_BIT_ATTACH", disconnect_at)
+    assert trigger_at < disconnect_at < attach_at
+    assert "sd_mount_transfer_to_usb" not in attached_region
 
 
 def test_usb_event_coordinator_runs_before_tinyusb_driver_start():
