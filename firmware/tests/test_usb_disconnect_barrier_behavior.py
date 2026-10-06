@@ -374,7 +374,7 @@ HARNESS = r"""
         g_device_fs_released = true;
         CHECK(usb_msc_ownership_note_prepare_complete(true, true, true) == ESP_OK);
         CHECK(g_transfer_calls == 1);
-        CHECK(g_delay_ticks == 250u);
+        CHECK(g_delay_ticks == 1000u);
         CHECK(g_connect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         CHECK(!usb_msc_ownership_is_host_owned());
