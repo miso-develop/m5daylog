@@ -342,17 +342,18 @@ HARNESS = r"""
         CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
         CHECK(g_transfer_calls == 1);
         CHECK(!g_mounted);
-        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(!usb_msc_ownership_is_host_owned());
         CHECK(g_delay_ticks == 250u);
         CHECK(g_connect_calls == 1);
-        CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
 
-        /* Fresh enumeration sees an already USB-owned LUN and stays connected. */
+        /* Only fresh SetConfiguration promotes reserved storage to host-owned. */
         g_device_cb(&attached, g_device_arg);
         CHECK(g_disconnect_calls == 1);
         CHECK(g_connect_calls == 1);
         CHECK(g_transfer_calls == 1);
+        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         return 0;
     }
