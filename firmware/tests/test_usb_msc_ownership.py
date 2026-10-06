@@ -197,8 +197,10 @@ def test_ambiguous_suspend_and_detach_never_authorize_release():
 
     assert "CONFIG_TINYUSB_SUSPEND_CALLBACK=y" in sdkconfig
     callback_at = src.index("static void usb_device_event_cb")
-    eject_helper_at = src.index("static bool usb_request_explicit_eject", callback_at)
-    ambiguous_region = src[callback_at:eject_helper_at]
+    next_fn_at = src.index(
+        "static bool usb_note_initial_msc_command_complete", callback_at
+    )
+    ambiguous_region = src[callback_at:next_fn_at]
     assert "TINYUSB_EVENT_SUSPENDED" in ambiguous_region
     assert "TINYUSB_EVENT_DETACHED" in ambiguous_region
     suspend_region = ambiguous_region[ambiguous_region.index("TINYUSB_EVENT_SUSPENDED"):]
