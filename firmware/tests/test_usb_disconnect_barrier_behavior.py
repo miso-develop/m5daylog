@@ -183,25 +183,26 @@ STUB_HEADERS = {
     static void prove_ambiguous_events_do_not_release(void) {
         tinyusb_event_t suspended = { .id = TINYUSB_EVENT_SUSPENDED };
         tinyusb_event_t detached = { .id = TINYUSB_EVENT_DETACHED };
+        tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
 
         g_device_cb(&suspended, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
-        CHECK(g_disconnect_calls == 0);
+        CHECK(g_disconnect_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         assert_reboot_stays_fail_closed();
 
         /* Accidental pre-eject physical detach remains unresolved. */
         g_device_cb(&detached, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
-        CHECK(g_disconnect_calls == 0);
+        CHECK(g_disconnect_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         assert_reboot_stays_fail_closed();
 
-        /* Reconfiguration reuses the existing USB-owned storage; no stale APP proof. */
-        __wrap_tud_mount_cb();
+        /* Reconfiguration reuses the USB-owned storage without APP remount. */
+        g_device_cb(&attached, g_device_arg);
         CHECK(g_transfer_calls == 1);
-        CHECK(g_real_mount_calls == 2);
-        CHECK(g_disconnect_calls == 0);
+        CHECK(g_connect_calls == 1);
+        CHECK(g_disconnect_calls == 1);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
