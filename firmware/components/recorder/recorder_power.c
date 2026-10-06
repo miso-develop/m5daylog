@@ -48,9 +48,23 @@ static esp_err_t recorder_power_config_hold_output(void) {
 
 esp_err_t recorder_power_enable_hold(void) {
     esp_err_t err;
-    gpio_deep_sleep_hold_dis();
-    (void)gpio_hold_dis((gpio_num_t)RECORDER_POWER_HOLD_PIN);
+
+    // An armed USB-powered reset can restart while G46 is still retained low
+    // from the previous deep-sleep entry. ESP-IDF requires the pad to be put
+    // into a known output state before gpio_hold_dis(), otherwise releasing a
+    // retained pad can briefly expose its reset/default level. Preload HIGH
+    // while the latch is still effective, then release the hold and drive HIGH
+    // again. On a cold battery WAKE this is simply an idempotent early assert.
     err = recorder_power_config_hold_output();
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, 1);
+    if (err != ESP_OK) {
+        return err;
+    }
+    gpio_deep_sleep_hold_dis();
+    err = gpio_hold_dis((gpio_num_t)RECORDER_POWER_HOLD_PIN);
     if (err != ESP_OK) {
         return err;
     }
@@ -172,12 +186,34 @@ void recorder_power_deinit(void) {
     recorder_power_cleanup();
 }
 
-void recorder_power_enter_shutdown_sleep(void) {
+esp_err_t recorder_power_shutdown(void) {
+    esp_err_t err;
+
     recorder_power_cleanup();
-    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    esp_deep_sleep_start();
-    for (;;) {
+
+    // SHUTDOWN_ARMED must not become wakeable from stale ESP sleep sources.
+    // Do this before dropping battery HOLD so a configuration failure leaves
+    // the board powered and observable instead of entering an unrecoverable
+    // no-authority state.
+    err = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    if (err != ESP_OK) {
+        return err;
     }
+
+    // The durable SHUTDOWN_ARMED marker and USB/storage quiescence are proven
+    // by the caller before this point. If HOLD cannot be released, do not hide
+    // the fault inside deep sleep: remaining awake and fail-closed is safer and
+    // diagnosable, and still cannot remount or restart recording.
+    err = recorder_power_release_hold();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    esp_deep_sleep_start();
+
+    // Real ESP-IDF never returns from esp_deep_sleep_start(). Keeping a return
+    // value makes the production sequencing executable in host behavioral tests.
+    return ESP_OK;
 }
 
 #endif  // ESP_PLATFORM
