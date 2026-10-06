@@ -206,6 +206,8 @@ HARNESS = r"""
     static int g_connect_calls;
     static int g_transfer_calls;
     static TickType_t g_delay_ticks;
+    static bool g_connect_result = true;
+    static esp_err_t g_transfer_result = ESP_OK;
     static int g_real_start_stop_calls;
     static int g_uninstall_calls;
     static int g_release_storage_calls;
@@ -294,6 +296,7 @@ HARNESS = r"""
             .mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB,
         };
         g_transfer_calls++;
+        if (g_transfer_result != ESP_OK) return g_transfer_result;
         CHECK(g_storage_cb != NULL);
         g_storage_cb((void *)1, &start, g_storage_arg);
         if (!g_release_requested || !g_device_fs_released || !g_mounted) {
@@ -332,7 +335,7 @@ HARNESS = r"""
     }
     bool tud_connect(void) {
         g_connect_calls++;
-        return true;
+        return g_connect_result;
     }
     bool __real_tud_msc_start_stop_cb(uint8_t lun,
                                       uint8_t power_condition,
