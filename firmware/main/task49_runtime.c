@@ -1,8 +1,9 @@
 // Tasks #49/#87 runtime coordinator.
 //
 // The proven recorder implementation remains in main.c. Strategy 2 overlays
-// only USB ownership/shutdown orchestration and a recovery-completion hook so
-// SHUTDOWN_ARMED is cleared after pending recovery but before a fresh ID.
+// only USB ownership/shutdown orchestration and a recovery-completion hook.
+// After pending recovery, SHUTDOWN_ARMED is replaced by a durable fail-closed
+// wake-recovery marker that is cleared only after a fresh recording is proven.
 
 #include <string.h>
 
@@ -81,8 +82,9 @@ bool recorder_task87_manifest_sync_wav_dir(const char *recordings_dir,
 
     // main.c calls manifest sync only after Device FAT/VFS is mounted and the
     // recovery scan has completed. The production seam executes Task #50's
-    // pending RTC flush (when linked) before clearing SHUTDOWN_ARMED. It keeps
-    // this boot pending until a new recordingId has reached RECORDING.
+    // pending RTC flush (when linked) before replacing SHUTDOWN_ARMED with the
+    // durable wake-recovery gate. NORMAL is committed only after a new
+    // recordingId has reached RECORDING.
     return task87_wake_recovery_complete_device_recovery(
                &s_wake_recovery, RECORDER_EVENTS_PATH) == ESP_OK;
 }
