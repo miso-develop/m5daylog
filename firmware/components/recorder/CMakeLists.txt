@@ -16,6 +16,10 @@ idf_component_register(
         "sd_pcm_sink.c"
         "sd_mount.c"
         "usb_msc_ownership.c"
+        "usb_cdc_protocol_core.c"
+        "usb_cdc_session_gate.c"
+        "usb_cdc_tx.c"
+        "usb_cdc_protocol.c"
         "shutdown_armed.c"
     INCLUDE_DIRS
         "include"
@@ -25,6 +29,7 @@ idf_component_register(
         esp_driver_rmt
         esp_timer
         fatfs
+        json
         sdmmc
         nvs_flash
         esp_tinyusb
