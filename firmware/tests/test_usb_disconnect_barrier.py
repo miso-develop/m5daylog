@@ -13,18 +13,51 @@ SD_C = REPO / "firmware/components/recorder/sd_mount.c"
 RUNTIME = REPO / "firmware/main/task49_runtime.c"
 WAKE_RECOVERY = REPO / "firmware/main/task87_wake_recovery.c"
 MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
+RECORDER_CMAKE = REPO / "firmware/components/recorder/CMakeLists.txt"
 
 
-def test_usb_status_boundaries_use_completion_callbacks_not_linker_wraps():
+def test_usb_status_boundaries_preserve_control_callbacks_and_wrap_backend_io():
     usb = USB_C.read_text(encoding="utf-8")
-    cmake = MAIN_CMAKE.read_text(encoding="utf-8")
+    main_cmake = MAIN_CMAKE.read_text(encoding="utf-8")
+    recorder_cmake = RECORDER_CMAKE.read_text(encoding="utf-8")
     assert "__wrap_tud_mount_cb" not in usb
     assert "__real_tud_mount_cb" not in usb
-    assert "--wrap=tud_mount_cb" not in cmake
+    assert "--wrap=tud_mount_cb" not in main_cmake
+    assert "--wrap=tud_mount_cb" not in recorder_cmake
     assert "__wrap_tud_msc_start_stop_cb" not in usb
     assert "__real_tud_msc_start_stop_cb" not in usb
-    assert "--wrap=tud_msc_start_stop_cb" not in cmake
+    assert "--wrap=tud_msc_start_stop_cb" not in main_cmake
+    assert "--wrap=tud_msc_start_stop_cb" not in recorder_cmake
     assert "tud_msc_scsi_complete_cb" in usb
+
+    for callback in (
+        "tud_msc_test_unit_ready_cb",
+        "tud_msc_capacity_cb",
+        "tud_msc_read10_cb",
+        "tud_msc_write10_cb",
+    ):
+        assert f"__wrap_{callback}" in usb
+        assert f"__real_{callback}" in usb
+        assert f"--wrap={callback}" in recorder_cmake
+
+
+def test_explicit_eject_closes_backend_admission_before_async_teardown():
+    usb = USB_C.read_text(encoding="utf-8")
+    helper_at = usb.index("static bool usb_request_explicit_eject")
+    callback_at = usb.index("void tud_msc_scsi_complete_cb", helper_at)
+    helper = usb[helper_at:callback_at]
+    pending_at = helper.index("s_release_pending = true")
+    event_at = helper.index("USB_BIT_RELEASE_REQUESTED", pending_at)
+    assert pending_at < event_at
+    assert "tud_disconnect" not in helper
+
+    start_at = usb.index("bool __wrap_tud_msc_test_unit_ready_cb")
+    end_at = usb.index("esp_err_t usb_msc_ownership_start", start_at)
+    wrappers = usb[start_at:end_at]
+    assert wrappers.count("if (!s_release_pending)") == 4
+    assert "__real_tud_msc_read10_cb" in wrappers
+    assert "__real_tud_msc_write10_cb" in wrappers
+    assert "return -1;" in wrappers
 
 
 def test_publish_persists_unresolved_before_storage_transfer_and_reconnect():

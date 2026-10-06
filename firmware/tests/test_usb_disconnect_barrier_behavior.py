@@ -98,8 +98,21 @@ STUB_HEADERS = {
         #include <stdint.h>
         bool tud_disconnect(void);
         bool tud_connect(void);
+        bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key,
+                               uint8_t add_sense_code,
+                               uint8_t add_sense_qualifier);
         void tud_msc_scsi_complete_cb(uint8_t lun,
                                       uint8_t const scsi_cmd[16]);
+        bool __wrap_tud_msc_test_unit_ready_cb(uint8_t lun);
+        void __wrap_tud_msc_capacity_cb(uint8_t lun,
+                                        uint32_t *block_count,
+                                        uint16_t *block_size);
+        int32_t __wrap_tud_msc_read10_cb(uint8_t lun, uint32_t lba,
+                                         uint32_t offset, void *buffer,
+                                         uint32_t bufsize);
+        int32_t __wrap_tud_msc_write10_cb(uint8_t lun, uint32_t lba,
+                                          uint32_t offset, uint8_t *buffer,
+                                          uint32_t bufsize);
     """,
     "tinyusb_msc.h": r"""
         #pragma once
@@ -206,6 +219,11 @@ HARNESS = r"""
     static int g_release_storage_calls;
     static esp_err_t g_uninstall_result = ESP_OK;
     static esp_err_t g_release_storage_result = ESP_OK;
+    static int g_real_tur_calls;
+    static int g_real_capacity_calls;
+    static int g_real_read_calls;
+    static int g_real_write_calls;
+    static int g_sense_calls;
 
     /* Transactional NVS model: failed commit preserves the last durable value. */
     static bool g_nvs_has_value;
@@ -330,6 +348,49 @@ HARNESS = r"""
         g_connect_calls++;
         return g_connect_result;
     }
+    bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key,
+                           uint8_t add_sense_code,
+                           uint8_t add_sense_qualifier) {
+        (void)lun;
+        (void)sense_key;
+        (void)add_sense_code;
+        (void)add_sense_qualifier;
+        g_sense_calls++;
+        return true;
+    }
+    bool __real_tud_msc_test_unit_ready_cb(uint8_t lun) {
+        (void)lun;
+        g_real_tur_calls++;
+        return true;
+    }
+    void __real_tud_msc_capacity_cb(uint8_t lun,
+                                    uint32_t *block_count,
+                                    uint16_t *block_size) {
+        (void)lun;
+        g_real_capacity_calls++;
+        *block_count = 1024u;
+        *block_size = 512u;
+    }
+    int32_t __real_tud_msc_read10_cb(uint8_t lun, uint32_t lba,
+                                     uint32_t offset, void *buffer,
+                                     uint32_t bufsize) {
+        (void)lun;
+        (void)lba;
+        (void)offset;
+        (void)buffer;
+        g_real_read_calls++;
+        return (int32_t)bufsize;
+    }
+    int32_t __real_tud_msc_write10_cb(uint8_t lun, uint32_t lba,
+                                      uint32_t offset, uint8_t *buffer,
+                                      uint32_t bufsize) {
+        (void)lun;
+        (void)lba;
+        (void)offset;
+        (void)buffer;
+        g_real_write_calls++;
+        return (int32_t)bufsize;
+    }
     static usb_msc_ownership_event_t next_event(void) {
         return usb_msc_ownership_wait_event(0);
     }
@@ -419,6 +480,65 @@ HARNESS = r"""
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
         CHECK(g_nvs_value == LIFECYCLE_HOST_UNRESOLVED);
+    }
+
+    static void run_post_eject_io_gate(void) {
+        uint8_t buffer[512] = {0};
+        uint32_t block_count = 0;
+        uint16_t block_size = 0;
+        int tur_before;
+        int capacity_before;
+        int read_before;
+        int write_before;
+
+        enter_host_owned();
+
+        /* Before release authorization, wrappers are transparent. */
+        CHECK(__wrap_tud_msc_test_unit_ready_cb(0));
+        __wrap_tud_msc_capacity_cb(0, &block_count, &block_size);
+        CHECK(block_count == 1024u);
+        CHECK(block_size == 512u);
+        CHECK(__wrap_tud_msc_read10_cb(0, 1u, 0u, buffer,
+                                       sizeof(buffer)) == (int32_t)sizeof(buffer));
+        CHECK(__wrap_tud_msc_write10_cb(0, 1u, 0u, buffer,
+                                        sizeof(buffer)) == (int32_t)sizeof(buffer));
+        CHECK(g_real_tur_calls == 1);
+        CHECK(g_real_capacity_calls == 1);
+        CHECK(g_real_read_calls == 1);
+        CHECK(g_real_write_calls == 1);
+        CHECK(g_sense_calls == 0);
+
+        request_explicit_eject();
+        CHECK(g_uninstall_calls == 0);
+        CHECK(g_release_storage_calls == 0);
+
+        tur_before = g_real_tur_calls;
+        capacity_before = g_real_capacity_calls;
+        read_before = g_real_read_calls;
+        write_before = g_real_write_calls;
+        block_count = 99u;
+        block_size = 99u;
+
+        /* The coordinator has not run teardown yet. Nevertheless, no newly
+         * admitted media or block-I/O command may reach esp_tinyusb storage. */
+        CHECK(!__wrap_tud_msc_test_unit_ready_cb(0));
+        __wrap_tud_msc_capacity_cb(0, &block_count, &block_size);
+        CHECK(block_count == 0u);
+        CHECK(block_size == 0u);
+        CHECK(__wrap_tud_msc_read10_cb(0, 2u, 0u, buffer,
+                                       sizeof(buffer)) == -1);
+        CHECK(__wrap_tud_msc_write10_cb(0, 2u, 0u, buffer,
+                                        sizeof(buffer)) == -1);
+        CHECK(g_real_tur_calls == tur_before);
+        CHECK(g_real_capacity_calls == capacity_before);
+        CHECK(g_real_read_calls == read_before);
+        CHECK(g_real_write_calls == write_before);
+        CHECK(g_sense_calls == 4);
+        CHECK(g_disconnect_calls == 1);
+        CHECK(g_uninstall_calls == 0);
+        CHECK(g_release_storage_calls == 0);
+        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(!g_mounted);
     }
 
     static void run_success(void) {
@@ -576,6 +696,8 @@ HARNESS = r"""
             run_transfer_failure();
         else if (strcmp(argv[1], "reconnect-failure") == 0)
             run_reconnect_failure();
+        else if (strcmp(argv[1], "post-eject-io-gate") == 0)
+            run_post_eject_io_gate();
         else CHECK(false);
         return 0;
     }
@@ -627,6 +749,7 @@ def _build(tmp_path: Path) -> Path:
         "publish-persist-failure",
         "transfer-failure",
         "reconnect-failure",
+        "post-eject-io-gate",
     ],
 )
 def test_strategy2_explicit_eject_and_reboot_behavior(tmp_path: Path, scenario: str) -> None:

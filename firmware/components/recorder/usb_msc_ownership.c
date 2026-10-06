@@ -43,6 +43,27 @@ static const char *TAG = "recorder_usb";
 #define USB_SCSI_CMD_TEST_UNIT_READY   0x00u
 #define USB_SCSI_CMD_START_STOP_UNIT 0x1bu
 #define USB_REENUM_DISCONNECT_MS     1000u
+#define USB_SCSI_SENSE_NOT_READY      0x02u
+#define USB_SCSI_ASC_MEDIUM_NOT_PRESENT 0x3au
+#define USB_SCSI_ASCQ_NONE            0x00u
+
+// esp_tinyusb owns these callbacks. Linker wrapping lets Strategy 2 reject
+// newly admitted media/backend commands after post-status explicit eject while
+// preserving the original callbacks before release authorization.
+bool __real_tud_msc_test_unit_ready_cb(uint8_t lun);
+void __real_tud_msc_capacity_cb(uint8_t lun,
+                                uint32_t *block_count,
+                                uint16_t *block_size);
+int32_t __real_tud_msc_read10_cb(uint8_t lun,
+                                 uint32_t lba,
+                                 uint32_t offset,
+                                 void *buffer,
+                                 uint32_t bufsize);
+int32_t __real_tud_msc_write10_cb(uint8_t lun,
+                                  uint32_t lba,
+                                  uint32_t offset,
+                                  uint8_t *buffer,
+                                  uint32_t bufsize);
 
 static EventGroupHandle_t s_usb_events = NULL;
 static volatile bool s_initialized = false;
@@ -360,6 +381,61 @@ esp_err_t usb_msc_ownership_init(void) {
     s_transfer_authorized = false;
     s_initialized = true;
     return ESP_OK;
+}
+
+static void usb_msc_reject_post_eject_command(uint8_t lun) {
+    (void)tud_msc_set_sense(lun,
+                            USB_SCSI_SENSE_NOT_READY,
+                            USB_SCSI_ASC_MEDIUM_NOT_PRESENT,
+                            USB_SCSI_ASCQ_NONE);
+}
+
+bool __wrap_tud_msc_test_unit_ready_cb(uint8_t lun) {
+    if (!s_release_pending) {
+        return __real_tud_msc_test_unit_ready_cb(lun);
+    }
+    usb_msc_reject_post_eject_command(lun);
+    return false;
+}
+
+void __wrap_tud_msc_capacity_cb(uint8_t lun,
+                                uint32_t *block_count,
+                                uint16_t *block_size) {
+    if (!s_release_pending) {
+        __real_tud_msc_capacity_cb(lun, block_count, block_size);
+        return;
+    }
+    if (block_count != NULL) {
+        *block_count = 0;
+    }
+    if (block_size != NULL) {
+        *block_size = 0;
+    }
+    usb_msc_reject_post_eject_command(lun);
+}
+
+int32_t __wrap_tud_msc_read10_cb(uint8_t lun,
+                                 uint32_t lba,
+                                 uint32_t offset,
+                                 void *buffer,
+                                 uint32_t bufsize) {
+    if (!s_release_pending) {
+        return __real_tud_msc_read10_cb(lun, lba, offset, buffer, bufsize);
+    }
+    usb_msc_reject_post_eject_command(lun);
+    return -1;
+}
+
+int32_t __wrap_tud_msc_write10_cb(uint8_t lun,
+                                  uint32_t lba,
+                                  uint32_t offset,
+                                  uint8_t *buffer,
+                                  uint32_t bufsize) {
+    if (!s_release_pending) {
+        return __real_tud_msc_write10_cb(lun, lba, offset, buffer, bufsize);
+    }
+    usb_msc_reject_post_eject_command(lun);
+    return -1;
 }
 
 esp_err_t usb_msc_ownership_start(void) {

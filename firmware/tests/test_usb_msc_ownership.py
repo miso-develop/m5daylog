@@ -31,11 +31,20 @@ def test_usb_ownership_module_is_built_and_tinyusb_is_pinned():
     assert "esp_tinyusb" in manifest
     assert "==2.2.1" in manifest
     assert 'SRCS "task49_runtime.c"' in main_cmake
-    # Publication/eject ordering relies on TinyUSB's post-status completion
-    # callback. No linker wrapper may disconnect from SetConfiguration or
-    # START STOP command callbacks before their status phases complete.
+    # Publication/eject authority remains on TinyUSB's post-status completion
+    # callback. Only backend data/readiness callbacks are wrapped so a completed
+    # eject closes new storage admission before asynchronous driver teardown.
     assert "--wrap=tud_mount_cb" not in main_cmake
+    assert "--wrap=tud_mount_cb" not in cmake
     assert "--wrap=tud_msc_start_stop_cb" not in main_cmake
+    assert "--wrap=tud_msc_start_stop_cb" not in cmake
+    for callback in (
+        "tud_msc_test_unit_ready_cb",
+        "tud_msc_capacity_cb",
+        "tud_msc_read10_cb",
+        "tud_msc_write10_cb",
+    ):
+        assert f"--wrap={callback}" in cmake
     assert ".auto_mount_off = 1" in sd
 
 
