@@ -100,6 +100,9 @@ STUB_HEADERS = {
         #include <stdint.h>
         bool tud_disconnect(void);
         bool tud_connect(void);
+        bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key,
+                               uint8_t add_sense_code,
+                               uint8_t add_sense_qualifier);
         void tud_msc_scsi_complete_cb(uint8_t lun,
                                       uint8_t const scsi_cmd[16]);
     """,
@@ -300,6 +303,44 @@ HARNESS = r"""
     esp_err_t tinyusb_driver_uninstall(void) { return ESP_OK; }
     bool tud_disconnect(void) { g_disconnect_calls++; return true; }
     bool tud_connect(void) { g_connect_calls++; return true; }
+    bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key,
+                           uint8_t add_sense_code,
+                           uint8_t add_sense_qualifier) {
+        (void)lun;
+        (void)sense_key;
+        (void)add_sense_code;
+        (void)add_sense_qualifier;
+        return true;
+    }
+    bool __real_tud_msc_test_unit_ready_cb(uint8_t lun) {
+        (void)lun;
+        return true;
+    }
+    void __real_tud_msc_capacity_cb(uint8_t lun,
+                                    uint32_t *block_count,
+                                    uint16_t *block_size) {
+        (void)lun;
+        *block_count = 1024u;
+        *block_size = 512u;
+    }
+    int32_t __real_tud_msc_read10_cb(uint8_t lun, uint32_t lba,
+                                     uint32_t offset, void *buffer,
+                                     uint32_t bufsize) {
+        (void)lun;
+        (void)lba;
+        (void)offset;
+        (void)buffer;
+        return (int32_t)bufsize;
+    }
+    int32_t __real_tud_msc_write10_cb(uint8_t lun, uint32_t lba,
+                                      uint32_t offset, uint8_t *buffer,
+                                      uint32_t bufsize) {
+        (void)lun;
+        (void)lba;
+        (void)offset;
+        (void)buffer;
+        return (int32_t)bufsize;
+    }
     static usb_msc_ownership_event_t next_event(void) {
         return usb_msc_ownership_wait_event(0);
     }

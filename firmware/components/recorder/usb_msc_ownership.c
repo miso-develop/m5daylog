@@ -49,7 +49,7 @@ static const char *TAG = "recorder_usb";
 
 // esp_tinyusb owns these callbacks. Linker wrapping lets Strategy 2 reject
 // newly admitted media/backend commands after post-status explicit eject while
-// preserving the original callbacks before release authorization.
+// preserving the original callbacks before the release gate.
 bool __real_tud_msc_test_unit_ready_cb(uint8_t lun);
 void __real_tud_msc_capacity_cb(uint8_t lun,
                                 uint32_t *block_count,
