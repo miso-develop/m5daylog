@@ -23,6 +23,7 @@ static void recorder_task49_delete(TaskHandle_t task);
 
 #include "shutdown_armed.h"
 #include "task87_wake_recovery.h"
+#include "usb_cdc_protocol.h"
 #include "usb_msc_ownership.h"
 
 // The real manifest function remains in the recorder component; the macro
@@ -46,6 +47,38 @@ extern bool device_manifest_sync_wav_dir(const char *recordings_dir,
 
 static task87_wake_recovery_t s_wake_recovery;
 static TaskHandle_t s_usb_event_task = NULL;
+
+static usb_cdc_release_result_t recorder_cdc_release_accept(
+    const char *release_attempt_id,
+    void *ctx) {
+    usb_msc_release_storage_result_t result;
+    (void)ctx;
+
+    result = usb_msc_ownership_accept_release_storage(release_attempt_id);
+    switch (result) {
+        case USB_MSC_RELEASE_STORAGE_ACCEPTED:
+            return USB_CDC_RELEASE_ACCEPTED;
+        case USB_MSC_RELEASE_STORAGE_INVALID_ARGS:
+            return USB_CDC_RELEASE_INVALID_ARGS;
+        case USB_MSC_RELEASE_STORAGE_WRONG_STATE:
+            return USB_CDC_RELEASE_WRONG_STATE;
+        case USB_MSC_RELEASE_STORAGE_CONFLICT:
+        default:
+            return USB_CDC_RELEASE_CONFLICT;
+    }
+}
+
+static bool recorder_cdc_release_response_complete(
+    const char *release_attempt_id,
+    void *ctx) {
+    (void)ctx;
+    return usb_msc_ownership_release_response_complete(release_attempt_id);
+}
+
+static bool recorder_cdc_command_admission_open(void *ctx) {
+    (void)ctx;
+    return usb_msc_ownership_release_command_admission_open();
+}
 
 static void recorder_task49_delete(TaskHandle_t task) {
     const char *name = pcTaskGetName(NULL);
@@ -128,6 +161,10 @@ static bool recorder_wait_initial_recording(void) {
 static void recorder_handle_usb_attach(void) {
     EventBits_t done;
 
+    // Discard provisional/stale CDC state before this host session can become
+    // authoritative. Transport state never grants ownership release.
+    usb_cdc_protocol_reset_session();
+
     if (recorder_current_state() != RECORDER_STATE_RECORDING) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
@@ -190,6 +227,9 @@ static void recorder_handle_usb_host_owned(void) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
+
+    // D-031 command admission opens only after PC ownership / USB_SYNC.
+    usb_cdc_protocol_open_session();
     recorder_flush_usb_scsi_trace();
 }
 
@@ -200,6 +240,11 @@ static void recorder_handle_usb_release(void) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
+
+    // For normal RELEASE_STORAGE this event exists only after the accepted
+    // response completed. Close CDC framing/admission before TinyUSB teardown.
+    // Optional qualified SCSI eject converges on this same path.
+    usb_cdc_protocol_reset_session();
 
     // Persist diagnostic request/completion counters before teardown. This
     // observation cannot authorize release and a trace-write failure does not
@@ -267,6 +312,7 @@ static void recorder_usb_event_task(void *arg) {
 
 void app_main(void) {
     bool manual_wake = false;
+    usb_cdc_protocol_config_t cdc_config;
     shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN;
 
     // Maintain power before any persistent-state inspection. On an armed boot,
@@ -321,7 +367,15 @@ void app_main(void) {
         return;
     }
 
-    if (usb_msc_ownership_init() != ESP_OK) {
+    memset(&cdc_config, 0, sizeof(cdc_config));
+    cdc_config.release_accept = recorder_cdc_release_accept;
+    cdc_config.release_response_complete =
+        recorder_cdc_release_response_complete;
+    cdc_config.command_admission_open =
+        recorder_cdc_command_admission_open;
+
+    if (usb_msc_ownership_init() != ESP_OK ||
+        usb_cdc_protocol_init(&cdc_config) != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
@@ -339,6 +393,10 @@ void app_main(void) {
     if (usb_msc_ownership_start() != ESP_OK) {
         vTaskDelete(s_usb_event_task);
         s_usb_event_task = NULL;
+        recorder_enter_error(RECORDER_REASON_USB);
+        return;
+    }
+    if (usb_cdc_protocol_start() != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
