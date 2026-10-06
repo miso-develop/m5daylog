@@ -3,10 +3,10 @@
 // Tasks #49/#87: fail-closed USB MSC ownership handoff.
 //
 // APP -> USB publication requires finalized WAV + durable manifest + Device
-// filesystem release. The reverse direction is not an ownership return:
-// Strategy 2 accepts only an explicit MSC eject, quiesces host I/O, releases
-// the USB-owned storage object, and leaves the Device filesystem unmounted for
-// persistent shutdown.
+// filesystem release. D-031 normal release authority is canonical CDC
+// RELEASE_STORAGE after host quiescence; qualified post-status SCSI eject is an
+// optional compatibility trigger. Both converge on one atomic backend gate and
+// quiescence path, leaving the Device filesystem unmounted for shutdown.
 
 #include <stdbool.h>
 #include <stdint.h>
