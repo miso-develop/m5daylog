@@ -27,13 +27,14 @@ typedef enum {
 //   0 = normal Device-owned lifecycle
 //   1 = release quiesced and SHUTDOWN_ARMED
 //   2 = host ownership/release unresolved
+//   3 = manual-WAKE recovery completed but fresh recording is not yet proven
 // A missing key means a normal first/legacy boot. Invalid or unreadable state
-// fails closed. HOST_UNRESOLVED is never treated as an armed manual-resume
-// state because explicit eject + quiescence has not been proven yet.
+// fails closed. HOST_UNRESOLVED is never treated as a manual-resume state
+// because explicit eject + quiescence has not been proven yet.
 //
-// This compatibility read exposes only the ARMED boolean. HOST_UNRESOLVED
-// returns ESP_ERR_INVALID_STATE so a caller cannot accidentally collapse it
-// into the normal false state.
+// This compatibility read reports both ARMED and WAKE_RECOVERY_PENDING as
+// gated/armed=true. HOST_UNRESOLVED returns ESP_ERR_INVALID_STATE so a caller
+// cannot accidentally collapse unresolved host ownership into normal state.
 esp_err_t shutdown_armed_read(bool *armed);
 
 // Commit HOST_UNRESOLVED before APP -> USB publication is admitted. This state
@@ -45,13 +46,24 @@ esp_err_t shutdown_armed_mark_host_unresolved(void);
 // unreachable and deferred writes/storage release have completed.
 esp_err_t shutdown_armed_commit(void);
 
-// Clear SHUTDOWN_ARMED only after manual-WAKE Device ownership and pending
-// recovery complete durably. HOST_UNRESOLVED must never be cleared this way.
+// After a manual-WAKE boot has reacquired Device ownership and completed all
+// pending recovery, replace SHUTDOWN_ARMED with a durable fail-closed recovery
+// marker. This is idempotent across a reset while the marker is already pending.
+esp_err_t shutdown_armed_mark_wake_recovery_pending(void);
+
+// Clear the durable recovery gate only after this boot has proven a fresh
+// recording session. A reset before this succeeds remains fail-closed.
+esp_err_t shutdown_armed_complete_wake_recovery(void);
+
+// Legacy direct ARMED -> NORMAL transition. Strategy 2 manual-WAKE recovery
+// must use the two functions above so no reboot window becomes NORMAL before
+// fresh-recording proof.
 esp_err_t shutdown_armed_clear(void);
 
-// Classify this boot without mutating the persistent marker. An armed boot may
-// resume only when the physical WAKE button is asserted. HOST_UNRESOLVED,
-// RTC/reset/USB-power boots, corrupt state, and read failures stay fail-closed.
+// Classify this boot without mutating the persistent marker. ARMED and
+// WAKE_RECOVERY_PENDING may resume only when the physical WAKE button is
+// asserted. HOST_UNRESOLVED, non-manual reset/USB-power boots, corrupt state,
+// and read failures stay fail-closed.
 esp_err_t shutdown_armed_boot_action(bool manual_wake,
                                      shutdown_armed_boot_action_t *action);
 
