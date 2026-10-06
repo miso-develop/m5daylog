@@ -131,6 +131,14 @@ static void recorder_handle_usb_attach(void) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
     }
+    // USB_MSC_EVENT_ATTACH is emitted only after a provisional MSC SCSI
+    // command completed. Disconnect here, in the recorder coordinator, so the
+    // host's SET_CONFIGURATION and first MSC status transactions are already
+    // complete before the APP -> USB publication barrier starts.
+    if (usb_msc_ownership_begin_prepare() != ESP_OK) {
+        recorder_enter_error(RECORDER_REASON_USB);
+        return;
+    }
     if (!recorder_transition_state(RECORDER_STATE_USB_PREPARE,
                                    RECORDER_REASON_USB, 0)) {
         recorder_enter_error(RECORDER_REASON_USB);
@@ -207,10 +215,10 @@ static void recorder_shutdown_armed_now(void) {
 static void recorder_usb_event_task(void *arg) {
     (void)arg;
 
-    // This coordinator must already be runnable when TinyUSB starts. The driver
-    // can emit ATTACHED before tinyusb_driver_install() returns, and its storage
-    // MOUNT_START callback blocks until this task completes recorder finalization
-    // and publishes USB_BIT_PREPARE_OK through the ownership module.
+    // This coordinator is the only context allowed to perform the provisional
+    // publication disconnect. TinyUSB callbacks only record ATTACHED / completed
+    // SCSI evidence and signal this task; recorder finalization and APP -> USB
+    // ownership transfer remain outside the USB stack callback path.
     for (;;) {
         switch (usb_msc_ownership_wait_event(UINT32_MAX)) {
             case USB_MSC_EVENT_ATTACH:
