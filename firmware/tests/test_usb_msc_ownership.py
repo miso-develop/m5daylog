@@ -31,10 +31,11 @@ def test_usb_ownership_module_is_built_and_tinyusb_is_pinned():
     assert "esp_tinyusb" in manifest
     assert "==2.2.1" in manifest
     assert 'SRCS "task49_runtime.c"' in main_cmake
-    # Publication no longer depends on intercepting esp_tinyusb's mount
-    # callback. Only the explicit-eject START STOP compatibility seam remains.
+    # Publication/eject ordering relies on TinyUSB's post-status completion
+    # callback. No linker wrapper may disconnect from SetConfiguration or
+    # START STOP command callbacks before their status phases complete.
     assert "--wrap=tud_mount_cb" not in main_cmake
-    assert "--wrap=tud_msc_start_stop_cb" in main_cmake
+    assert "--wrap=tud_msc_start_stop_cb" not in main_cmake
     assert ".auto_mount_off = 1" in sd
 
 
@@ -44,6 +45,7 @@ def test_usb_publish_gate_requires_finalize_manifest_and_device_fs_release():
 
     for marker in (
         "usb_msc_ownership_init",
+        "usb_msc_ownership_begin_prepare",
         "usb_msc_ownership_note_prepare_complete",
         "usb_msc_ownership_is_host_owned",
         "USB_MSC_EVENT_ATTACH",
@@ -53,7 +55,14 @@ def test_usb_publish_gate_requires_finalize_manifest_and_device_fs_release():
 
     publish_at = src.index("usb_msc_publish")
     gate_region = src[publish_at : src.index("usb_storage_event_cb", publish_at)]
-    for gate in ("wav_finalized", "manifest_committed", "device_fs_released"):
+    for gate in (
+        "wav_finalized",
+        "manifest_committed",
+        "device_fs_released",
+        "s_provisional_attached",
+        "s_publish_triggered",
+        "s_prepare_disconnected",
+    ):
         assert gate in gate_region, gate
     unresolved_at = gate_region.index("shutdown_armed_mark_host_unresolved")
     authorize_at = gate_region.index("s_transfer_authorized = true", unresolved_at)
@@ -102,18 +111,40 @@ def test_host_owned_event_requires_fresh_configuration_after_storage_ready():
     assert storage_ready_at < host_owned_at < event_at
 
 
-def test_real_attached_callback_disconnects_before_publication_work():
+def test_real_attached_callback_never_disconnects_set_configuration():
     src = USB_C.read_text(encoding="utf-8")
     device_cb_at = src.index("static void usb_device_event_cb")
     attached_at = src.index("TINYUSB_EVENT_ATTACHED", device_cb_at)
     suspend_at = src.index("#ifdef CONFIG_TINYUSB_SUSPEND_CALLBACK", attached_at)
     attached_region = src[attached_at:suspend_at]
 
-    trigger_at = attached_region.index("s_publish_triggered = true")
-    disconnect_at = attached_region.index("tud_disconnect", trigger_at)
-    attach_at = attached_region.index("USB_BIT_ATTACH", disconnect_at)
-    assert trigger_at < disconnect_at < attach_at
+    provisional_at = attached_region.index("s_provisional_attached = true")
+    assert provisional_at >= 0
+    first_branch_end = attached_region.index("if (!s_host_owned)", provisional_at)
+    provisional_region = attached_region[:first_branch_end]
+    assert "tud_disconnect" not in provisional_region
+    assert "USB_BIT_ATTACH" not in provisional_region
+    assert "s_publish_triggered = true" not in provisional_region
     assert "sd_mount_transfer_to_usb" not in attached_region
+
+
+def test_completed_scsi_command_triggers_prepare_before_coordinator_disconnect():
+    src = USB_C.read_text(encoding="utf-8")
+
+    probe_at = src.index("static bool usb_note_initial_msc_command_complete")
+    eject_at = src.index("static bool usb_request_explicit_eject", probe_at)
+    probe_region = src[probe_at:eject_at]
+    assert "s_publish_triggered = true" in probe_region
+    assert "USB_BIT_ATTACH" in probe_region
+    assert "tud_disconnect" not in probe_region
+
+    begin_at = src.index("esp_err_t usb_msc_ownership_begin_prepare")
+    note_at = src.index("esp_err_t usb_msc_ownership_note_prepare_complete", begin_at)
+    begin_region = src[begin_at:note_at]
+    assert "s_publish_triggered" in begin_region
+    assert "s_provisional_attached" in begin_region
+    assert "tud_disconnect" in begin_region
+    assert "s_prepare_disconnected = true" in begin_region
 
 
 def test_usb_event_coordinator_runs_before_tinyusb_driver_start():
@@ -141,12 +172,13 @@ def test_usb_prepare_uses_usb_specific_stop_and_waits_for_writer_commit():
     runtime = RUNTIME.read_text(encoding="utf-8")
 
     fn_at = runtime.index("static void recorder_handle_usb_attach")
-    prepare_at = runtime.index("RECORDER_STATE_USB_PREPARE", fn_at)
+    disconnect_at = runtime.index("usb_msc_ownership_begin_prepare", fn_at)
+    prepare_at = runtime.index("RECORDER_STATE_USB_PREPARE", disconnect_at)
     release_at = runtime.index("sd_mount_release_for_usb", prepare_at)
     stop_at = runtime.index("recorder_request_usb_stop", release_at)
     finalized_at = runtime.index("REC_BIT_WRITER_FINALIZED", stop_at)
     publish_at = runtime.index("usb_msc_ownership_note_prepare_complete", finalized_at)
-    assert prepare_at < release_at < stop_at < finalized_at < publish_at
+    assert disconnect_at < prepare_at < release_at < stop_at < finalized_at < publish_at
 
 
 def test_ambiguous_suspend_and_detach_never_authorize_release():
@@ -172,13 +204,12 @@ def test_explicit_eject_is_observed_by_real_scsi_completion_seam():
     assert "USB_MSC_EVENT_RELEASE_REQUESTED" in hdr
 
     helper_at = src.index("static bool usb_request_explicit_eject")
-    wrapper_at = src.index("__wrap_tud_msc_start_stop_cb", helper_at)
-    helper_region = src[helper_at:wrapper_at]
+    callback_at = src.index("void tud_msc_scsi_complete_cb", helper_at)
+    helper_region = src[helper_at:callback_at]
     assert "USB_BIT_RELEASE_REQUESTED" in helper_region
     assert "tud_disconnect" in helper_region
     assert "s_release_pending" in helper_region
 
-    callback_at = src.index("void tud_msc_scsi_complete_cb", wrapper_at)
     next_fn = src.index("usb_msc_ownership_init", callback_at)
     callback_region = src[callback_at:next_fn]
     assert "USB_SCSI_CMD_START_STOP_UNIT" in callback_region
@@ -186,10 +217,8 @@ def test_explicit_eject_is_observed_by_real_scsi_completion_seam():
     assert "scsi_cmd[4] & 0x01u" in callback_region
     assert "usb_request_explicit_eject" in callback_region
 
-    wrapper_region = src[wrapper_at:callback_at]
-    assert "load_eject" in wrapper_region
-    assert "!start" in wrapper_region
-    assert "usb_request_explicit_eject" in wrapper_region
+    assert "__wrap_tud_msc_start_stop_cb" not in src
+    assert "__real_tud_msc_start_stop_cb" not in src
 
 
 def test_release_quiescence_stops_usb_before_storage_release_and_durable_arm():
