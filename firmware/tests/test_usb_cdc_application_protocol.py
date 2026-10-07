@@ -115,7 +115,8 @@ def test_boot_gate_has_no_rtc_transport_side_effects() -> None:
     init_at = rtc.index("esp_err_t rtc_correction_init(void)")
     pending_at = rtc.index("bool rtc_correction_is_pending(void)", init_at)
     init = rtc[init_at:pending_at]
-    assert "nvs_flash_init()" in init
+    assert "recorder_nvs_init()" in init
+    assert "recorder_nvs_lock()" in init
     assert "rtc_load_pending_locked()" in init
     assert "rtc_hw_init()" not in init
     assert "rtc_hw_read_epoch" not in init
