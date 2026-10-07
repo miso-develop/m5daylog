@@ -1,6 +1,6 @@
 #include "cJSON.h"
 
-#include <ctype.h>
+#include <ctype.h>\n#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
