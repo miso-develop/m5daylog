@@ -427,10 +427,13 @@ esp_err_t rtc_correction_init(void) {
         nvs_err = rtc_load_pending_locked();
     }
     xSemaphoreGive(s_rtc_lock);
-    // An invalid/unset RTC is recoverable by SET_TIME; transport failure is not.
-    if (hw_err != ESP_OK) {
-        return hw_err;
-    }
+
+    // Boot/recovery authority comes from the durable pending record, not from
+    // live RTC transport readiness. A missing/unset/unreachable RTC must not
+    // suppress MSC/CDC publication or prevent an already-durable pending event
+    // from being recovered on manual WAKE. SET_TIME retries hardware bring-up
+    // immediately before the mutation and reports INTERNAL_ERROR if that
+    // transport is still unavailable.
     return nvs_err;
 }
 
@@ -476,7 +479,7 @@ rtc_correction_result_t rtc_correction_apply(
         xSemaphoreGive(s_rtc_lock);
         return RTC_CORRECTION_BUSY;
     }
-    if (!s_hw_ready) {
+    if (!s_hw_ready && rtc_hw_init() != ESP_OK) {
         xSemaphoreGive(s_rtc_lock);
         return RTC_CORRECTION_INTERNAL_ERROR;
     }
