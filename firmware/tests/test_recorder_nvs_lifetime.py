@@ -98,6 +98,7 @@ def test_recorder_nvs_process_lifetime_and_serialization(tmp_path: Path) -> None
             static int g_deinit_calls;
             static bool g_rtc_inside;
             static bool g_release_rtc;
+            static bool g_trace_attempted;
             static bool g_trace_entered;
             static bool g_overlap;
 
@@ -148,6 +149,10 @@ def test_recorder_nvs_process_lifetime_and_serialization(tmp_path: Path) -> None
 
             static void *scsi_trace_flush(void *arg) {
                 (void)arg;
+                pthread_mutex_lock(&g_state_mutex);
+                g_trace_attempted = true;
+                pthread_cond_broadcast(&g_state_cv);
+                pthread_mutex_unlock(&g_state_mutex);
                 CHECK(recorder_nvs_lock() == ESP_OK);
                 pthread_mutex_lock(&g_state_mutex);
                 if (g_rtc_inside) {
@@ -193,9 +198,15 @@ def test_recorder_nvs_process_lifetime_and_serialization(tmp_path: Path) -> None
 
                 CHECK(pthread_create(&trace_thread, NULL,
                                      scsi_trace_flush, NULL) == 0);
+                pthread_mutex_lock(&g_state_mutex);
+                while (!g_trace_attempted) {
+                    pthread_cond_wait(&g_state_cv, &g_state_mutex);
+                }
+                pthread_mutex_unlock(&g_state_mutex);
                 nanosleep(&pause, NULL);
 
                 pthread_mutex_lock(&g_state_mutex);
+                CHECK(g_trace_attempted);
                 CHECK(!g_trace_entered);
                 g_release_rtc = true;
                 pthread_cond_broadcast(&g_state_cv);
@@ -224,6 +235,7 @@ def test_recorder_nvs_process_lifetime_and_serialization(tmp_path: Path) -> None
         [
             cc,
             "-std=c11",
+            "-D_POSIX_C_SOURCE=200809L",
             "-Wall",
             "-Wextra",
             "-Werror",
