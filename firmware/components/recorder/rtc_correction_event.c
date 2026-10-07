@@ -3,6 +3,7 @@
 #include "rtc_correction_event.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
