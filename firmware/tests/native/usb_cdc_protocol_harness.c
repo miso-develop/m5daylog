@@ -144,7 +144,7 @@ static void test_commands(const usb_cdc_protocol_config_t *cfg) {
     CHECK(s_release_calls == before_calls + 1u);
 }
 
-static void test_framing(void) {
+static void test_framing(const usb_cdc_protocol_config_t *cfg) {
     usb_cdc_protocol_framer_t framer;
     const uint8_t *line = NULL;
     size_t len = 0u;
@@ -165,6 +165,22 @@ static void test_framing(void) {
             &framer, (uint8_t)tail[i], &line, &len);
     }
     CHECK(result == USB_CDC_PROTOCOL_FRAME_LINE);
+
+    /* A tail received after a physical-session framer reset must never
+       complete or execute the stale SET_TIME prefix from the old cable
+       session. It may produce an ordinary parse error, but no mutation. */
+    {
+        char response[RESPONSE_BYTES] = {0};
+        usb_cdc_protocol_effect_t effect = {0};
+        unsigned before_calls = s_set_time_calls;
+        int n = usb_cdc_protocol_process_line(
+            line, len, response, sizeof(response), cfg, &effect);
+        CHECK(n > 0);
+        CHECK(strstr(response, "\"code\":\"INVALID_JSON\"") != NULL ||
+              strstr(response, "\"code\":\"INVALID_REQUEST\"") != NULL);
+        CHECK(s_set_time_calls == before_calls);
+        CHECK(!effect.release_accepted);
+    }
 
     usb_cdc_protocol_framer_reset(&framer);
     for (i = 0; i < USB_CDC_PROTOCOL_MAX_LINE_BYTES + 1u; ++i) {
@@ -187,7 +203,7 @@ int main(void) {
         .command_admission_open = admission_open,
     };
     test_commands(&cfg);
-    test_framing();
+    test_framing(&cfg);
     puts("cdc v1 application protocol production core: PASS");
     return 0;
 }
