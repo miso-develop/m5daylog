@@ -205,6 +205,7 @@ HARNESS = r"""
     static uint8_t g_nvs_value;
     static bool g_nvs_pending;
     static uint8_t g_nvs_pending_value;
+    static int g_cdc_cutoff_calls;
 
     esp_err_t nvs_flash_init(void) { return ESP_OK; }
     esp_err_t nvs_flash_deinit(void) { return ESP_OK; }
@@ -266,6 +267,11 @@ HARNESS = r"""
         return result;
     }
     void vTaskDelay(TickType_t ticks) { g_delay_ticks = ticks; }
+
+    static void cdc_session_cutoff(void *ctx) {
+        CHECK(ctx == (void *)0x50);
+        g_cdc_cutoff_calls++;
+    }
 
     bool sd_mount_is_mounted(void) { return g_mounted; }
     esp_err_t sd_mount_transfer_to_usb(void) {
@@ -360,6 +366,8 @@ HARNESS = r"""
         uint8_t test_unit_ready[16] = {0x00u};
 
         CHECK(usb_msc_ownership_init() == ESP_OK);
+        CHECK(usb_msc_ownership_set_physical_session_cutoff(
+                  cdc_session_cutoff, (void *)0x50) == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
         CHECK(g_device_cb != NULL);
         CHECK(g_storage_cb != NULL);
@@ -403,6 +411,31 @@ HARNESS = r"""
         CHECK(g_transfer_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        /* A physical loss while PC ownership is unresolved is transport-only:
+         * ownership remains host-side, but the CDC generation is cut off
+         * synchronously before any later reconnect can deliver RX/TX. */
+        tinyusb_event_t detached = { .id = TINYUSB_EVENT_DETACHED };
+        g_device_cb(&detached, g_device_arg);
+        CHECK(g_cdc_cutoff_calls == 1);
+        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(!g_mounted);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        /* Reconfiguration never grants Device storage ownership. It only asks
+         * the recorder coordinator to drain/reset and open a fresh CDC app
+         * session outside the TinyUSB callback. */
+        g_device_cb(&attached, g_device_arg);
+        CHECK(g_cdc_cutoff_calls == 1);
+        CHECK(usb_msc_ownership_is_host_owned());
+        CHECK(!g_mounted);
+        CHECK(next_event() == USB_MSC_EVENT_HOST_REATTACHED);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        /* Duplicate configuration without a fresh DETACHED boundary is not a
+         * second CDC session transition. */
+        g_device_cb(&attached, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         return 0;
     }
