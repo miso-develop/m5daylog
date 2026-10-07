@@ -449,17 +449,16 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
             return;
         }
 
-        // A later physical reconnect keeps unresolved MSC ownership host-side,
-        // but it is a new CDC application session. The DETACHED callback has
-        // already invalidated the old CDC generation synchronously; notify the
-        // recorder coordinator so it can finish the blocking reset/drain and
-        // explicitly reopen a fresh session outside TinyUSB callback context.
+        // A later physical reconnect keeps unresolved MSC ownership host-side.
+        // Do not reset/reopen CDC from ATTACHED: esp_tinyusb reports ATTACHED
+        // from tud_mount_cb before the SET_CONFIGURATION status stage has
+        // completed. Running CDC drain/read work here can race MSC class
+        // binding. Keep CDC generation closed until the first completed SCSI
+        // command proves the reconfigured MSC transport is operational.
         if (!s_release_pending && !sd_mount_is_mounted()) {
             if (s_host_session_detached) {
-                s_host_session_detached = false;
-                xEventGroupSetBits(s_usb_events, USB_BIT_HOST_REATTACHED);
                 ESP_LOGI(TAG,
-                         "stage: usb, result: reconfigured, owner: host, mount: usb, action: fresh-cdc-session");
+                         "stage: usb, result: reconfigured, owner: host, mount: usb, action: wait-msc-command");
             } else {
                 ESP_LOGI(TAG,
                          "stage: usb, result: duplicate-configured, owner: host, mount: usb");
@@ -636,7 +635,21 @@ void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
         return;
     }
 
-    // Post-status SCSI completion is observation-only after publication.
+    // A host-owned physical reconnect cuts CDC off immediately, but CDC must
+    // not be reopened from ATTACHED because that callback precedes completion
+    // of SET_CONFIGURATION. The first completed post-reconnect SCSI command is
+    // the class-binding proof that it is safe for the recorder coordinator to
+    // drain/reset CDC and publish a fresh application session.
+    if (s_host_owned && s_host_session_detached &&
+        !atomic_load_explicit(&s_release_pending, memory_order_acquire) &&
+        !sd_mount_is_mounted()) {
+        s_host_session_detached = false;
+        xEventGroupSetBits(s_usb_events, USB_BIT_HOST_REATTACHED);
+        ESP_LOGI(TAG,
+                 "stage: usb, result: reconnect-msc-command-complete, owner: host, action: fresh-cdc-session");
+    }
+
+    // Post-status SCSI completion is observation-only for storage ownership.
     // RELEASE_STORAGE acceptance is the sole normal release authority under
     // D-031; shell/taskbar safe-remove must therefore remain fail-closed.
     usb_scsi_trace_note_command_complete(scsi_cmd);
