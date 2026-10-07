@@ -23,7 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
-#include "nvs_flash.h"
+#include "recorder_nvs.h"
 #include "recorder_config.h"
 
 #define RTC_I2C_PORT 0
@@ -448,6 +448,10 @@ static void rtc_format_epoch(time_t epoch,
 esp_err_t rtc_correction_init(void) {
     esp_err_t nvs_err;
 
+    nvs_err = recorder_nvs_init();
+    if (nvs_err != ESP_OK) {
+        return nvs_err;
+    }
     if (s_rtc_lock == NULL) {
         s_rtc_lock = xSemaphoreCreateMutex();
         if (s_rtc_lock == NULL) {
@@ -463,9 +467,10 @@ esp_err_t rtc_correction_init(void) {
     // publication path; #87's proven TinyUSB startup must remain independent
     // of RTC hardware presence/readiness. SET_TIME performs the first RTC
     // transport access immediately before the requested mutation.
-    nvs_err = nvs_flash_init();
+    nvs_err = recorder_nvs_lock();
     if (nvs_err == ESP_OK) {
         nvs_err = rtc_load_pending_locked();
+        recorder_nvs_unlock();
     }
     xSemaphoreGive(s_rtc_lock);
     return nvs_err;
@@ -555,6 +560,13 @@ rtc_correction_result_t rtc_correction_apply(
 
     // Hardware time is already changed at this point. Any failure below is
     // deliberately INTERNAL_ERROR/indeterminate; callers must not retry blindly.
+    // Share the recorder-wide NVS transaction lock so diagnostic persistence
+    // cannot invalidate or overlap the durable pending commit.
+    err = recorder_nvs_lock();
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_rtc_lock);
+        return RTC_CORRECTION_INTERNAL_ERROR;
+    }
     err = nvs_open(RTC_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err == ESP_OK) {
         err = nvs_set_blob(handle, RTC_NVS_PENDING_KEY, &candidate,
@@ -566,6 +578,7 @@ rtc_correction_result_t rtc_correction_apply(
     if (handle != 0) {
         nvs_close(handle);
     }
+    recorder_nvs_unlock();
     if (err != ESP_OK) {
         xSemaphoreGive(s_rtc_lock);
         return RTC_CORRECTION_INTERNAL_ERROR;
@@ -582,6 +595,10 @@ static esp_err_t rtc_correction_clear_pending_nvs(void *ctx) {
     esp_err_t err;
     (void)ctx;
 
+    err = recorder_nvs_lock();
+    if (err != ESP_OK) {
+        return err;
+    }
     err = nvs_open(RTC_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err == ESP_OK) {
         err = nvs_erase_key(handle, RTC_NVS_PENDING_KEY);
@@ -595,6 +612,7 @@ static esp_err_t rtc_correction_clear_pending_nvs(void *ctx) {
     if (handle != 0) {
         nvs_close(handle);
     }
+    recorder_nvs_unlock();
     return err;
 }
 
