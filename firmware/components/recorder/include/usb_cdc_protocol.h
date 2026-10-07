@@ -97,6 +97,15 @@ typedef struct {
 } usb_cdc_protocol_config_t;
 
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config);
+
+// Callback-safe physical transport cutoff. This is protocol hygiene only: it
+// invalidates the current CDC generation and transport state without waiting
+// for in-flight commands and never grants storage-release authority.
+void usb_cdc_protocol_close_session(void);
+
+// Blocking lifecycle barrier used outside TinyUSB callbacks. It waits for any
+// command admitted before the cutoff to finish, drains stale RX, and leaves the
+// gate closed until the recorder coordinator explicitly reopens it.
 void usb_cdc_protocol_reset_session(void);
 void usb_cdc_protocol_open_session(void);
 esp_err_t usb_cdc_protocol_start(void);
