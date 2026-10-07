@@ -53,7 +53,7 @@ def test_manual_wake_uses_task87_recovery_hook_and_fresh_session_gate() -> None:
     assert "task87_wake_recovery_complete_device_recovery" in runtime
     assert "task87_wake_recovery_usb_rearm_allowed" in runtime
 
-    apply_at = rtc.index("rtc_correction_apply")
+    apply_at = rtc.index("rtc_correction_result_t rtc_correction_apply(")
     flush_at = rtc.index("rtc_correction_flush_pending_event", apply_at)
     apply = rtc[apply_at:flush_at]
     assert "nvs_set_blob" in apply and "nvs_commit" in apply
