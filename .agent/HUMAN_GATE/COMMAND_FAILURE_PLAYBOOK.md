@@ -1,6 +1,6 @@
 # Human Gate Command Failure Playbook
 
-version: 1
+version: 2
 
 ## 1. Purpose
 
@@ -410,7 +410,102 @@ Minimum summary fields are:
 
 If the failed command produced enough immutable evidence, summarize it manually or with a parser-only command. Do not repeat a physical action solely to obtain prettier wrapper output.
 
-## 18. Adding future entries
+## 18. Windows volume lock blocked before an authoritative release request
+
+### Symptom
+
+A lifecycle harness has a valid Device publication or interruption snapshot, but `FSCTL_LOCK_VOLUME` fails before the authoritative release request is sent.
+
+### Cause
+
+The Windows volume can still have an open host handle, commonly from a file browser, shell extension, indexing/inspection activity, or another process. The product release path has not yet been invoked.
+
+### Risk
+
+The operator may unnecessarily repeat a physical interruption, or may incorrectly classify the host-side lock failure as a Device release failure.
+
+### Prevention
+
+Record `request_sent` explicitly. Take any interruption/fail-closed snapshot before beginning the canonical release recovery phase. Keep known host consumers closed before lock/dismount.
+
+### Recovery
+
+When `request_sent=false` and the preserved Device/filesystem snapshot is still valid:
+
+1. classify the lock failure as host/harness `BLOCKED`;
+2. close or wait out the host consumer;
+3. revalidate the same target and preserved snapshot;
+4. retry only lock + dismount + the not-yet-sent release phase.
+
+Do not repeat an already-valid physical interruption solely because the later host volume lock was busy.
+
+## 19. Manual WAKE omitted or uncertain during a recovery sequence
+
+### Symptom
+
+Post-release publication or fresh recording is not observed, and the operator later reports that the required manual WAKE action may not have been performed.
+
+### Cause
+
+The physical precondition for the supported recovery path was not reliably completed.
+
+### Risk
+
+Fail-closed behavior after no WAKE can be misclassified as a product failure, even though the tested sequence did not satisfy its preconditions.
+
+### Prevention
+
+Give WAKE as its own physical step. State that USB must remain disconnected, specify the hold duration when the current test plan requires one, and require an operator acknowledgement only after the action is complete.
+
+### Recovery
+
+Do not attribute the missing recovery to product behavior. Mark the affected cycle `NOT_COUNTED` or `BLOCKED` according to whether the required phase was attempted with valid preconditions. Re-establish a fresh baseline with an explicit WAKE sequence, then rerun the cycle from the point required by the approved matrix.
+
+## 20. Fresh recording finalized as header-only or zero-duration
+
+### Symptom
+
+A recovery reaches a fresh recording identity, but the finalized WAV is only the container header size and has zero duration.
+
+### Cause
+
+USB reconnect can arrive after fresh recording state is entered but before enough PCM has been captured. Publication then finalizes the new recording too quickly for it to serve as non-empty recording evidence.
+
+### Risk
+
+A test-evidence timing condition is misclassified as a release, teardown, filesystem, or ownership product defect.
+
+### Prevention
+
+Use an evidence dwell long enough for the current device/recovery workload before reconnecting USB. Treat the dwell as a Human Gate evidence accommodation rather than a product latency requirement. Increase it conservatively as recovery work or the on-media file set grows.
+
+### Recovery
+
+Preserve any independently valid release/teardown evidence. Do not count the header-only recording as fresh-recording PASS evidence. Establish the next valid baseline and repeat only the acceptance scope whose proof is missing.
+
+## 21. Serial close/dispose races USB teardown after an accepted response
+
+### Symptom
+
+A matching accepted release response was captured and complete USB teardown is independently observed, but host serial `Close` or `Dispose` reports an error because the endpoint disappeared during Device teardown.
+
+### Cause
+
+The Device is intentionally destroying the USB/CDC endpoint while host cleanup is still running.
+
+### Risk
+
+A cleanup exception can overwrite a valid product `PASS` or encourage an unsafe duplicate release request.
+
+### Prevention
+
+Guard serial cleanup independently from the acceptance result. Record `response_accepted`, `teardown_observed`, and `serial_close_ok` as separate fields.
+
+### Recovery
+
+If the matching accepted response and required teardown observations are independently valid, preserve them. Treat the close/dispose error as harness cleanup behavior. Never resend the authoritative release command merely to make serial cleanup cleaner.
+
+## 22. Adding future entries
 
 Add a new entry when a command/harness defect either:
 
