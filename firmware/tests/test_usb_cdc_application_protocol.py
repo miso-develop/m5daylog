@@ -95,3 +95,38 @@ def test_physical_reconnect_wires_nonblocking_cutoff_then_blocking_reopen() -> N
     assert reset_call < open_call
     assert "usb_msc_ownership_is_host_owned()" in reconnect
     assert "sd_mount_is_mounted()" in reconnect
+
+def test_rtc_transport_failure_does_not_block_pending_state_boot_gate() -> None:
+    rtc = (COMP / "rtc_correction.c").read_text(encoding="utf-8")
+    runtime = (REPO / "firmware/main/task49_runtime.c").read_text(encoding="utf-8")
+
+    init_at = rtc.index("esp_err_t rtc_correction_init(void)")
+    pending_at = rtc.index("bool rtc_correction_is_pending(void)", init_at)
+    init = rtc[init_at:pending_at]
+    assert "return nvs_err;" in init
+    assert "return hw_err;" not in init
+
+    apply_at = rtc.index("rtc_correction_result_t rtc_correction_apply(")
+    clear_at = rtc.index("static esp_err_t rtc_correction_clear_pending_nvs", apply_at)
+    apply = rtc[apply_at:clear_at]
+    assert "if (!s_hw_ready && rtc_hw_init() != ESP_OK)" in apply
+
+    app_at = runtime.index("void app_main(void)")
+    app = runtime[app_at:]
+    assert (
+        "if (action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME &&\n"
+        "        rtc_correction_init() != ESP_OK)"
+    ) in app
+    assert (
+        "if (action == SHUTDOWN_ARMED_BOOT_NORMAL &&\n"
+        "        rtc_correction_init() != ESP_OK)"
+    ) in app
+
+    recording_wait = app.index("recorder_wait_initial_recording()")
+    normal_rtc_init = app.index(
+        "if (action == SHUTDOWN_ARMED_BOOT_NORMAL &&\n"
+        "        rtc_correction_init() != ESP_OK)"
+    )
+    usb_init = app.index("usb_msc_ownership_init()")
+    assert recording_wait < normal_rtc_init < usb_init
+
