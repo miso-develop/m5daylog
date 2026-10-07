@@ -9,6 +9,7 @@
 #ifdef ESP_PLATFORM
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
