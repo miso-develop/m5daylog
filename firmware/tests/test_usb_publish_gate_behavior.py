@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parents[2]
 RECORDER = REPO / "firmware/components/recorder"
 INCLUDE = RECORDER / "include"
 MAIN_CMAKE = REPO / "firmware/main/CMakeLists.txt"
+STUB_INCLUDE = REPO / "firmware/tests/native/include"
 
 STUB_HEADERS = {
     "esp_err.h": r"""
@@ -179,6 +180,8 @@ HARNESS = r"""
     #include "tinyusb_msc.h"
     #include "tusb.h"
     #include "usb_msc_ownership.h"
+    #include "usb_cdc_protocol_core.h"
+    #include "usb_cdc_session_gate.h"
 
     #define CHECK(expr) do { \
         if (!(expr)) { \
@@ -206,6 +209,9 @@ HARNESS = r"""
     static bool g_nvs_pending;
     static uint8_t g_nvs_pending_value;
     static int g_cdc_cutoff_calls;
+    static unsigned g_set_time_calls;
+    static usb_cdc_session_gate_t g_cdc_gate;
+    static usb_cdc_protocol_framer_t g_cdc_framer;
 
     esp_err_t nvs_flash_init(void) { return ESP_OK; }
     esp_err_t nvs_flash_deinit(void) { return ESP_OK; }
@@ -268,9 +274,56 @@ HARNESS = r"""
     }
     void vTaskDelay(TickType_t ticks) { g_delay_ticks = ticks; }
 
+    static bool cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
+        (void)ctx;
+        out->state = "USB_SYNC";
+        out->reason = "usb";
+        out->battery_mv = 3900;
+        out->battery_valid = true;
+        out->rtc_correction_pending = false;
+        return true;
+    }
+
+    static usb_cdc_set_time_result_t cdc_set_time(
+        const char *requested_time, char *normalized, size_t normalized_size,
+        void *ctx) {
+        (void)requested_time;
+        (void)ctx;
+        g_set_time_calls++;
+        if (normalized != NULL && normalized_size > 0u) {
+            normalized[0] = '\0';
+        }
+        return USB_CDC_SET_TIME_OK;
+    }
+
+    static usb_cdc_release_result_t cdc_release_accept(
+        const char *attempt_id, void *ctx) {
+        (void)attempt_id;
+        (void)ctx;
+        return USB_CDC_RELEASE_ACCEPTED;
+    }
+
+    static bool cdc_release_complete(const char *attempt_id, void *ctx) {
+        (void)attempt_id;
+        (void)ctx;
+        return true;
+    }
+
+    static bool cdc_admission_open(void *ctx) {
+        (void)ctx;
+        return true;
+    }
+
     static void cdc_session_cutoff(void *ctx) {
         CHECK(ctx == (void *)0x50);
         g_cdc_cutoff_calls++;
+
+        /* Production usb_cdc_protocol_close_session() performs the same
+         * generation cutoff synchronously; its worker resets framing before
+         * consuming any later RX notification. Model that worker-visible
+         * boundary here with the production gate/framer primitives. */
+        usb_cdc_session_gate_close(&g_cdc_gate);
+        usb_cdc_protocol_framer_reset(&g_cdc_framer);
     }
 
     bool sd_mount_is_mounted(void) { return g_mounted; }
@@ -364,6 +417,30 @@ HARNESS = r"""
     int main(void) {
         tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
         uint8_t test_unit_ready[16] = {0x00u};
+        usb_cdc_protocol_config_t cdc_config = {
+            .device_id = "01234567-89ab-4def-8123-456789abcdef",
+            .status_provider = cdc_status,
+            .set_time = cdc_set_time,
+            .release_accept = cdc_release_accept,
+            .release_response_complete = cdc_release_complete,
+            .command_admission_open = cdc_admission_open,
+        };
+        const char *partial =
+            "{\"id\":\"old\",\"cmd\":\"SET_TIME\",\"args\":{";
+        const char *tail =
+            "\"time\":\"2026-10-03T02:00:00Z\"}}\n";
+        const char *fresh_ping =
+            "{\"id\":\"new\",\"cmd\":\"PING\",\"args\":{}}\n";
+        const uint8_t *line = NULL;
+        size_t line_len = 0u;
+        size_t i;
+        char response[768] = {0};
+        usb_cdc_protocol_effect_t effect = {0};
+        uint32_t stale_generation;
+        uint32_t discard_epoch;
+
+        usb_cdc_session_gate_init(&g_cdc_gate);
+        usb_cdc_protocol_framer_init(&g_cdc_framer);
 
         CHECK(usb_msc_ownership_init() == ESP_OK);
         CHECK(usb_msc_ownership_set_physical_session_cutoff(
@@ -413,6 +490,16 @@ HARNESS = r"""
         CHECK(next_event() == USB_MSC_EVENT_HOST_OWNED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
 
+        /* Open the application gate at the lifecycle's USB_SYNC point and
+         * accumulate a mutating request prefix without a newline. */
+        CHECK(usb_cdc_session_gate_open(&g_cdc_gate));
+        stale_generation = usb_cdc_session_gate_generation(&g_cdc_gate);
+        for (i = 0u; partial[i] != '\0'; ++i) {
+            CHECK(usb_cdc_protocol_framer_feed(
+                      &g_cdc_framer, (uint8_t)partial[i],
+                      &line, &line_len) == USB_CDC_PROTOCOL_FRAME_NONE);
+        }
+
         /* A physical loss while PC ownership is unresolved is transport-only:
          * ownership remains host-side, but the CDC generation is cut off
          * synchronously before any later reconnect can deliver RX/TX. */
@@ -432,6 +519,57 @@ HARNESS = r"""
         CHECK(!g_mounted);
         CHECK(next_event() == USB_MSC_EVENT_HOST_REATTACHED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        /* Model the recorder coordinator's production reattach path:
+         * blocking reset/drain, then explicit fresh application-session open. */
+        usb_cdc_session_gate_reset(&g_cdc_gate, NULL, NULL);
+        discard_epoch =
+            usb_cdc_session_gate_rx_discard_epoch(&g_cdc_gate);
+        usb_cdc_session_gate_mark_rx_drained(
+            &g_cdc_gate, discard_epoch);
+        CHECK(usb_cdc_session_gate_open(&g_cdc_gate));
+        CHECK(usb_cdc_session_gate_generation(&g_cdc_gate) !=
+              stale_generation);
+
+        /* The old request tail cannot combine with the pre-detach prefix.
+         * It may yield an ordinary parse/envelope error, but SET_TIME must not
+         * execute. */
+        for (i = 0u; tail[i] != '\0'; ++i) {
+            usb_cdc_protocol_frame_result_t result =
+                usb_cdc_protocol_framer_feed(
+                    &g_cdc_framer, (uint8_t)tail[i],
+                    &line, &line_len);
+            if (tail[i] == '\n') {
+                CHECK(result == USB_CDC_PROTOCOL_FRAME_LINE);
+            } else {
+                CHECK(result == USB_CDC_PROTOCOL_FRAME_NONE);
+            }
+        }
+        CHECK(usb_cdc_protocol_process_line(
+                  line, line_len, response, sizeof(response),
+                  &cdc_config, &effect) > 0);
+        CHECK(g_set_time_calls == 0u);
+        CHECK(strstr(response, "\"ok\":false") != NULL);
+
+        /* A genuinely fresh complete request in the reconnected generation is
+         * processed normally after the rejected old tail. */
+        memset(response, 0, sizeof(response));
+        for (i = 0u; fresh_ping[i] != '\0'; ++i) {
+            usb_cdc_protocol_frame_result_t result =
+                usb_cdc_protocol_framer_feed(
+                    &g_cdc_framer, (uint8_t)fresh_ping[i],
+                    &line, &line_len);
+            if (fresh_ping[i] == '\n') {
+                CHECK(result == USB_CDC_PROTOCOL_FRAME_LINE);
+            } else {
+                CHECK(result == USB_CDC_PROTOCOL_FRAME_NONE);
+            }
+        }
+        CHECK(usb_cdc_protocol_process_line(
+                  line, line_len, response, sizeof(response),
+                  &cdc_config, &effect) > 0);
+        CHECK(strstr(response, "\"pong\":true") != NULL);
+        CHECK(g_set_time_calls == 0u);
 
         /* Duplicate configuration without a fresh DETACHED boundary is not a
          * second CDC session transition. */
@@ -464,10 +602,14 @@ def test_two_phase_publication_reconnects_only_after_usb_owned_lun(tmp_path: Pat
     subprocess.run(
         [
             cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-D_POSIX_C_SOURCE=200809L",
             "-DESP_PLATFORM", "-DCONFIG_TINYUSB_SUSPEND_CALLBACK=1",
-            "-I", str(stubs), "-I", str(INCLUDE),
+            "-I", str(stubs), "-I", str(STUB_INCLUDE), "-I", str(INCLUDE),
             str(RECORDER / "usb_msc_ownership.c"),
             str(RECORDER / "shutdown_armed.c"),
+            str(RECORDER / "usb_cdc_session_gate.c"),
+            str(RECORDER / "usb_cdc_protocol_core.c"),
+            str(REPO / "firmware/tests/native/cjson_stub.c"),
             str(harness),
             "-o", str(binary),
         ],
