@@ -1,6 +1,4 @@
-# M5Daylog recorder component — Tasks #44 (IM-007) through #49 (IM-012).
-# Portable recorder sources remain stdlib-testable; ESP-IDF wrappers add
-# PDM/SD/power/RGB and Task #49 USB MSC ownership.
+# M5Daylog recorder component — Tasks #44 (IM-007) through #49/#87.
 
 idf_component_register(
     SRCS
@@ -18,6 +16,11 @@ idf_component_register(
         "sd_pcm_sink.c"
         "sd_mount.c"
         "usb_msc_ownership.c"
+        "usb_cdc_protocol_core.c"
+        "usb_cdc_session_gate.c"
+        "usb_cdc_tx.c"
+        "usb_cdc_protocol.c"
+        "shutdown_armed.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -26,7 +29,21 @@ idf_component_register(
         esp_driver_rmt
         esp_timer
         fatfs
+        json
         sdmmc
         nvs_flash
         esp_tinyusb
+)
+
+# Task #87 / D-031: RELEASE_STORAGE acceptance sets the shared release gate
+# before its CDC success response, so no later MSC command can reach storage
+# while the response/teardown boundary is pending. SCSI START STOP request and
+# post-status completion are diagnostic-only because Windows shell safe-remove
+# may emit them without canonical RELEASE_STORAGE authority.
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=tud_msc_start_stop_cb"
+    "-Wl,--wrap=tud_msc_test_unit_ready_cb"
+    "-Wl,--wrap=tud_msc_capacity_cb"
+    "-Wl,--wrap=tud_msc_read10_cb"
+    "-Wl,--wrap=tud_msc_write10_cb"
 )
