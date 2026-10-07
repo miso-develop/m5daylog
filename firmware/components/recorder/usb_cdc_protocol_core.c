@@ -1,4 +1,5 @@
-// D-031 / Task #87: portable canonical CDC v1 parser/dispatcher.
+// Canonical CDC v1 portable parser/dispatcher: Task #87 lifecycle command
+// plus Task #50 application commands.
 
 #include "usb_cdc_protocol_core.h"
 
@@ -6,6 +7,7 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "recorder_config.h"
 
 static bool cdc_id_valid(const char *id) {
     size_t i;
@@ -75,6 +77,10 @@ static int cdc_error_response(char *out, size_t out_size, const char *id,
                     code, code);
 }
 
+static bool cdc_args_empty(const cJSON *args) {
+    return cJSON_IsObject(args) && cJSON_GetArraySize(args) == 0;
+}
+
 static const char *cdc_release_error_code(usb_cdc_release_result_t result) {
     switch (result) {
         case USB_CDC_RELEASE_INVALID_ARGS:
@@ -83,6 +89,20 @@ static const char *cdc_release_error_code(usb_cdc_release_result_t result) {
         case USB_CDC_RELEASE_CONFLICT:
             return USB_CDC_ERROR_BUSY;
         case USB_CDC_RELEASE_INTERNAL_ERROR:
+        default:
+            return USB_CDC_ERROR_INTERNAL_ERROR;
+    }
+}
+
+static const char *cdc_set_time_error_code(usb_cdc_set_time_result_t result) {
+    switch (result) {
+        case USB_CDC_SET_TIME_INVALID_ARGS:
+            return USB_CDC_ERROR_INVALID_ARGS;
+        case USB_CDC_SET_TIME_RANGE_ERROR:
+            return USB_CDC_ERROR_RANGE_ERROR;
+        case USB_CDC_SET_TIME_BUSY:
+            return USB_CDC_ERROR_BUSY;
+        case USB_CDC_SET_TIME_INTERNAL_ERROR:
         default:
             return USB_CDC_ERROR_INTERNAL_ERROR;
     }
@@ -230,6 +250,94 @@ int usb_cdc_protocol_process_line(
         if (effect != NULL) {
             effect->release_accepted = true;
             memcpy(effect->release_attempt_id, attempt, strlen(attempt) + 1u);
+        }
+    } else if (strcmp(cmd, "PING") == 0) {
+        if (!cdc_args_empty(args_item)) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INVALID_ARGS);
+        } else {
+            n = snprintf(out, out_size,
+                         "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                         "\"pong\":true}}",
+                         id);
+        }
+    } else if (strcmp(cmd, "GET_INFO") == 0) {
+        if (!cdc_args_empty(args_item)) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INVALID_ARGS);
+        } else if (config == NULL || config->device_id == NULL) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INTERNAL_ERROR);
+        } else {
+            n = snprintf(
+                out, out_size,
+                "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                "\"protocolMajor\":%u,\"schemaVersion\":%u,"
+                "\"deviceId\":\"%s\",\"model\":\"%s\","
+                "\"firmwareVersion\":\"%s\",\"audioCapabilities\":{"
+                "\"sampleRate\":%u,\"bitDepth\":%u,\"channels\":%u,"
+                "\"format\":\"pcm\"}}}",
+                id, (unsigned)USB_CDC_PROTOCOL_MAJOR,
+                (unsigned)RECORDER_METADATA_SCHEMA_VERSION, config->device_id,
+                RECORDER_MODEL, RECORDER_FIRMWARE_VERSION,
+                (unsigned)RECORDER_SAMPLE_RATE_HZ,
+                (unsigned)RECORDER_BITS_PER_SAMPLE,
+                (unsigned)RECORDER_CHANNELS);
+        }
+    } else if (strcmp(cmd, "GET_STATUS") == 0) {
+        usb_cdc_protocol_status_t status;
+        memset(&status, 0, sizeof(status));
+        if (!cdc_args_empty(args_item)) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INVALID_ARGS);
+        } else if (config == NULL || config->status_provider == NULL ||
+                   !config->status_provider(&status, config->status_ctx) ||
+                   status.state == NULL || status.reason == NULL) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INTERNAL_ERROR);
+        } else if (status.battery_valid) {
+            n = snprintf(
+                out, out_size,
+                "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                "\"state\":\"%s\",\"reason\":\"%s\","
+                "\"batteryMv\":%d,\"rtcCorrectionPending\":%s}}",
+                id, status.state, status.reason, status.battery_mv,
+                status.rtc_correction_pending ? "true" : "false");
+        } else {
+            n = snprintf(
+                out, out_size,
+                "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                "\"state\":\"%s\",\"reason\":\"%s\","
+                "\"batteryMv\":null,\"rtcCorrectionPending\":%s}}",
+                id, status.state, status.reason,
+                status.rtc_correction_pending ? "true" : "false");
+        }
+    } else if (strcmp(cmd, "SET_TIME") == 0) {
+        cJSON *time_item = cJSON_GetObjectItemCaseSensitive(args_item, "time");
+        char normalized[USB_CDC_PROTOCOL_TIME_BYTES];
+        usb_cdc_set_time_result_t result;
+
+        if (cJSON_GetArraySize(args_item) != 1 ||
+            !cJSON_IsString(time_item) || time_item->valuestring == NULL) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INVALID_ARGS);
+        } else if (config == NULL || config->set_time == NULL) {
+            n = cdc_error_response(out, out_size, id,
+                                   USB_CDC_ERROR_INTERNAL_ERROR);
+        } else {
+            memset(normalized, 0, sizeof(normalized));
+            result = config->set_time(time_item->valuestring, normalized,
+                                      sizeof(normalized),
+                                      config->set_time_ctx);
+            if (result != USB_CDC_SET_TIME_OK) {
+                n = cdc_error_response(out, out_size, id,
+                                       cdc_set_time_error_code(result));
+            } else {
+                n = snprintf(out, out_size,
+                             "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                             "\"time\":\"%s\",\"eventPending\":true}}",
+                             id, normalized);
+            }
         }
     } else {
         n = cdc_error_response(out, out_size, id,
