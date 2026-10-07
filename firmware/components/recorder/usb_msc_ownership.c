@@ -27,7 +27,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "nvs.h"
-#include "nvs_flash.h"
+#include "recorder_nvs.h"
 #include "sd_mount.h"
 #include "shutdown_armed.h"
 #include "tinyusb.h"
@@ -190,22 +190,6 @@ static void usb_scsi_trace_note_command_complete(
     usb_scsi_trace_mark_dirty();
 }
 
-static esp_err_t usb_scsi_trace_finish_nvs(esp_err_t operation_err) {
-    esp_err_t deinit_err = nvs_flash_deinit();
-    if (operation_err != ESP_OK) {
-        return operation_err;
-    }
-    if (deinit_err == ESP_OK) {
-        return ESP_OK;
-    }
-#ifdef ESP_ERR_NVS_NOT_INITIALIZED
-    if (deinit_err == ESP_ERR_NVS_NOT_INITIALIZED) {
-        return ESP_OK;
-    }
-#endif
-    return deinit_err;
-}
-
 esp_err_t usb_msc_ownership_flush_scsi_trace(void) {
     nvs_handle_t handle;
     esp_err_t err;
@@ -245,13 +229,17 @@ esp_err_t usb_msc_ownership_flush_scsi_trace(void) {
     last_b4 =
         __atomic_load_n(&s_trace_last_control_byte4, __ATOMIC_RELAXED);
 
-    err = nvs_flash_init();
+    // The default NVS partition is process-lifetime state shared with RTC
+    // correction and shutdown lifecycle persistence. Serialize this diagnostic
+    // write; never init/deinit the partition from the USB coordinator.
+    err = recorder_nvs_lock();
     if (err != ESP_OK) {
         return err;
     }
     err = nvs_open("m5daylog", NVS_READWRITE, &handle);
     if (err != ESP_OK) {
-        return usb_scsi_trace_finish_nvs(err);
+        recorder_nvs_unlock();
+        return err;
     }
 
 #define TRACE_SET_U8(key, value)                                      \
@@ -276,7 +264,7 @@ esp_err_t usb_msc_ownership_flush_scsi_trace(void) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
-    err = usb_scsi_trace_finish_nvs(err);
+    recorder_nvs_unlock();
     if (err != ESP_OK) {
         return err;
     }
