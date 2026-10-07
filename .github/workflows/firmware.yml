@@ -80,6 +80,13 @@ jobs:
               raise SystemExit("host-test gate failed")
           PY
 
+      - name: Run exact-head repository security scan
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_security_scan*.py'
+          python3 scripts/security_scan.py
+          printf 'Exact-head repository security scan: `PASS`\n' >> "$GITHUB_STEP_SUMMARY"
+
   esp-idf-build:
     name: firmware:esp-idf-v5.5.5-build
     runs-on: ubuntu-latest
