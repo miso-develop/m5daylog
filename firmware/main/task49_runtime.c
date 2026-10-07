@@ -385,7 +385,6 @@ static void recorder_usb_event_task(void *arg) {
 
 void app_main(void) {
     bool manual_wake = false;
-    esp_err_t rtc_preinit;
     usb_cdc_protocol_config_t cdc_config;
     shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN;
 
@@ -418,14 +417,14 @@ void app_main(void) {
         &s_wake_recovery,
         action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
 
-    // RTC pending state must be loaded before the base recorder reaches #87's
-    // manual-WAKE manifest/recovery seam. A manual-resume boot cannot proceed
-    // when that durable state is unreadable.
-    rtc_preinit = rtc_correction_init();
-    if (rtc_preinit != ESP_OK &&
-        task87_wake_recovery_pending(&s_wake_recovery)) {
+    // Manual-WAKE recovery needs the durable RTC pending record before
+    // main.c reaches the Device-owned manifest/recovery seam. Normal boot does
+    // not: keep #87's proven recorder startup path free of RTC/I2C bring-up and
+    // initialize the application protocol only after recording is established.
+    if (action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME &&
+        rtc_correction_init() != ESP_OK) {
         ESP_LOGE(TAG,
-                 "stage: rtc, result: init-error, action: manual-wake-fail-closed");
+                 "stage: rtc, result: pending-state-init-error, action: manual-wake-fail-closed");
         recorder_shutdown_armed_now();
         return;
     }
@@ -444,10 +443,13 @@ void app_main(void) {
         return;
     }
 
-    // A normal boot may retry RTC/NVS bring-up after the recorder's ordinary
-    // identity/storage initialization. CDC mutation never opens if this still
-    // fails. Manual-WAKE failures were already rejected above.
-    if (rtc_preinit != ESP_OK && rtc_correction_init() != ESP_OK) {
+    // On a normal boot, load durable pending state only after the recorder has
+    // reached its known-good RECORDING baseline. rtc_correction_init() treats
+    // live RTC transport as best-effort; only an unreadable durable pending
+    // state blocks CDC/MSC publication here. SET_TIME retries RTC hardware
+    // bring-up at mutation time.
+    if (action == SHUTDOWN_ARMED_BOOT_NORMAL &&
+        rtc_correction_init() != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_INTERNAL);
         return;
     }
