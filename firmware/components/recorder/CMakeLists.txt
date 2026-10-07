@@ -15,6 +15,7 @@ idf_component_register(
         "i2s_pdm_capture.c"
         "sd_pcm_sink.c"
         "sd_mount.c"
+        "recorder_nvs.c"
         "usb_msc_ownership.c"
         "usb_cdc_protocol_core.c"
         "usb_cdc_session_gate.c"
