@@ -404,9 +404,7 @@ static void rtc_format_epoch(time_t epoch,
 }
 
 esp_err_t rtc_correction_init(void) {
-    esp_err_t hw_err;
     esp_err_t nvs_err;
-    time_t rtc_epoch;
 
     if (s_rtc_lock == NULL) {
         s_rtc_lock = xSemaphoreCreateMutex();
@@ -417,23 +415,17 @@ esp_err_t rtc_correction_init(void) {
     if (xSemaphoreTake(s_rtc_lock, portMAX_DELAY) != pdTRUE) {
         return ESP_FAIL;
     }
-    hw_err = rtc_hw_init();
-    if (hw_err == ESP_OK && rtc_hw_read_epoch(&rtc_epoch) == ESP_OK) {
-        struct timeval tv = {.tv_sec = rtc_epoch, .tv_usec = 0};
-        (void)settimeofday(&tv, NULL);
-    }
+
+    // Boot/recovery initialization is deliberately durable-state only. Do not
+    // allocate or touch the BM8563/I2C transport on the recorder -> USB
+    // publication path; #87's proven TinyUSB startup must remain independent
+    // of RTC hardware presence/readiness. SET_TIME performs the first RTC
+    // transport access immediately before the requested mutation.
     nvs_err = nvs_flash_init();
     if (nvs_err == ESP_OK) {
         nvs_err = rtc_load_pending_locked();
     }
     xSemaphoreGive(s_rtc_lock);
-
-    // Boot/recovery authority comes from the durable pending record, not from
-    // live RTC transport readiness. A missing/unset/unreachable RTC must not
-    // suppress MSC/CDC publication or prevent an already-durable pending event
-    // from being recovered on manual WAKE. SET_TIME retries hardware bring-up
-    // immediately before the mutation and reports INTERNAL_ERROR if that
-    // transport is still unavailable.
     return nvs_err;
 }
 
@@ -455,8 +447,8 @@ rtc_correction_result_t rtc_correction_apply(
     char normalized_local[RECORDER_ISO8601_STR_LEN];
     rtc_pending_record_t candidate;
     rtc_correction_result_t parse_result;
-    struct timeval before_tv;
     struct timeval after_tv;
+    time_t before_epoch;
     time_t requested_epoch;
     nvs_handle_t handle = 0;
     esp_err_t err;
@@ -483,6 +475,10 @@ rtc_correction_result_t rtc_correction_apply(
         xSemaphoreGive(s_rtc_lock);
         return RTC_CORRECTION_INTERNAL_ERROR;
     }
+    if (rtc_hw_read_epoch(&before_epoch) != ESP_OK) {
+        xSemaphoreGive(s_rtc_lock);
+        return RTC_CORRECTION_INTERNAL_ERROR;
+    }
 
     memset(&candidate, 0, sizeof(candidate));
     candidate.magic = RTC_PENDING_MAGIC;
@@ -492,11 +488,7 @@ rtc_correction_result_t rtc_correction_apply(
         xSemaphoreGive(s_rtc_lock);
         return RTC_CORRECTION_INTERNAL_ERROR;
     }
-    if (gettimeofday(&before_tv, NULL) != 0) {
-        before_tv.tv_sec = 0;
-        before_tv.tv_usec = 0;
-    }
-    rtc_format_epoch(before_tv.tv_sec, candidate.before);
+    rtc_format_epoch(before_epoch, candidate.before);
     memcpy(candidate.after, normalized_local, sizeof(candidate.after));
 
     // Mutation begins only after the request has been fully validated.
