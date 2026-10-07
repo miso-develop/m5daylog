@@ -1,9 +1,8 @@
-// D-031 / Task #87: bounded sequential canonical CDC JSON transport.
+// Canonical bounded sequential USB CDC JSON transport.
 //
-// Lifecycle admission is external to TinyUSB callbacks. A valid
-// RELEASE_STORAGE request closes the shared Device/MSC gate from the production
-// dispatcher callback before its success response is written. Only after that
-// response flush completes is RELEASE_REQUESTED signalled to the coordinator.
+// Task #87 lifecycle admission remains authoritative. Task #50 application
+// commands execute inside the same session/command gate. RELEASE_STORAGE closes
+// shared Device/MSC admission before its success response is written.
 
 #include "usb_cdc_protocol.h"
 
@@ -12,6 +11,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "device_identity.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tinyusb_cdc_acm.h"
@@ -20,8 +20,8 @@
 #include "usb_cdc_tx.h"
 
 #define CDC_RX_CHUNK_BYTES 256u
-#define CDC_RESPONSE_BYTES 384u
-#define CDC_WORKER_STACK_BYTES 5120u
+#define CDC_RESPONSE_BYTES 768u
+#define CDC_WORKER_STACK_BYTES 6144u
 
 static usb_cdc_protocol_config_t s_config;
 static TaskHandle_t s_worker = NULL;
@@ -220,8 +220,8 @@ static void usb_cdc_worker_task(void *arg) {
                         effect.release_attempt_id, s_config.lifecycle_ctx);
                 }
 
-                // RELEASE_STORAGE acceptance closes lifecycle admission inside
-                // process_line(), before the success response above is emitted.
+                // Once RELEASE_STORAGE is accepted, no later SET_TIME or other
+                // command can execute in this publication session.
                 if (!cdc_lifecycle_admission_open()) {
                     usb_cdc_protocol_framer_reset(&framer);
                     break;
@@ -258,7 +258,10 @@ void usb_cdc_protocol_open_session(void) {
 }
 
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
-    if (config == NULL || config->release_accept == NULL ||
+    if (config == NULL || config->device_id == NULL ||
+        !device_identity_is_valid_uuid(config->device_id) ||
+        config->status_provider == NULL || config->set_time == NULL ||
+        config->release_accept == NULL ||
         config->release_response_complete == NULL ||
         config->command_admission_open == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -304,8 +307,7 @@ esp_err_t usb_cdc_protocol_start(void) {
     }
     s_started = true;
 
-    // HOST_OWNED can race ahead of this late interface start because the
-    // recorder coordinator is intentionally runnable during TinyUSB install.
+    // HOST_OWNED can race ahead of this late interface start.
     open_requested = s_open_requested;
     if (open_requested) {
         usb_cdc_protocol_open_session();
