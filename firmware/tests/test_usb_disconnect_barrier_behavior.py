@@ -466,6 +466,7 @@ HARNESS = r"""
         tinyusb_event_t suspended = { .id = TINYUSB_EVENT_SUSPENDED };
         tinyusb_event_t detached = { .id = TINYUSB_EVENT_DETACHED };
         tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+        uint8_t reconnect_test_unit_ready[16] = {0};
 
         g_device_cb(&suspended, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
@@ -484,6 +485,10 @@ HARNESS = r"""
         CHECK(g_transfer_calls == 1);
         CHECK(g_connect_calls == 1);
         CHECK(g_disconnect_calls == 1);
+        /* ATTACHED itself is too early to reopen CDC: it runs before the
+         * SET_CONFIGURATION status stage. */
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+        tud_msc_scsi_complete_cb(0, reconnect_test_unit_ready);
         CHECK(next_event() == USB_MSC_EVENT_HOST_REATTACHED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
         CHECK(g_cdc_cutoff_calls == 1);
