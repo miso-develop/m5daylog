@@ -81,6 +81,18 @@ def test_physical_reconnect_wires_nonblocking_cutoff_then_blocking_reopen() -> N
     assert "usb_cdc_session_gate_close" in close
     assert "usb_cdc_session_gate_reset" not in close
     assert "s_connected = false" in close
+    assert "xTaskNotifyGive" not in close
+
+    ownership = (COMP / "usb_msc_ownership.c").read_text(encoding="utf-8")
+    attached_at = ownership.index("if (event->id == TINYUSB_EVENT_ATTACHED)")
+    detached_at = ownership.index("if (event->id == TINYUSB_EVENT_DETACHED)", attached_at)
+    attached = ownership[attached_at:detached_at]
+    assert "USB_BIT_HOST_REATTACHED" not in attached
+    scsi_at = ownership.index("void tud_msc_scsi_complete_cb")
+    init_at = ownership.index("esp_err_t usb_msc_ownership_init", scsi_at)
+    scsi_complete = ownership[scsi_at:init_at]
+    assert "s_host_session_detached" in scsi_complete
+    assert "USB_BIT_HOST_REATTACHED" in scsi_complete
 
     callback_at = runtime.index("static void recorder_cdc_physical_session_cutoff")
     status_at = runtime.index("static bool recorder_cdc_status", callback_at)
