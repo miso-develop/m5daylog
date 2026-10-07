@@ -224,6 +224,7 @@ HARNESS = r"""
     static int g_real_read_calls;
     static int g_real_write_calls;
     static int g_sense_calls;
+    static int g_cdc_cutoff_calls;
 
     /* Transactional NVS model: failed commit preserves the last durable value. */
     static bool g_nvs_has_value;
@@ -295,6 +296,11 @@ HARNESS = r"""
         return result;
     }
     void vTaskDelay(TickType_t ticks) { g_delay_ticks = ticks; }
+
+    static void cdc_physical_session_cutoff(void *ctx) {
+        CHECK(ctx == (void *)0x50);
+        g_cdc_cutoff_calls++;
+    }
 
     bool sd_mount_is_mounted(void) { return g_mounted; }
     esp_err_t sd_mount_transfer_to_usb(void) {
@@ -419,6 +425,8 @@ HARNESS = r"""
         uint8_t test_unit_ready[16] = {0};
 
         CHECK(usb_msc_ownership_init() == ESP_OK);
+        CHECK(usb_msc_ownership_set_physical_session_cutoff(
+                  cdc_physical_session_cutoff, (void *)0x50) == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
         CHECK(g_device_cb != NULL);
         CHECK(g_storage_cb != NULL);
@@ -467,6 +475,7 @@ HARNESS = r"""
 
         g_device_cb(&detached, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(g_cdc_cutoff_calls == 1);
         CHECK(g_disconnect_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         assert_reboot_stays_fail_closed();
@@ -475,7 +484,9 @@ HARNESS = r"""
         CHECK(g_transfer_calls == 1);
         CHECK(g_connect_calls == 1);
         CHECK(g_disconnect_calls == 1);
+        CHECK(next_event() == USB_MSC_EVENT_HOST_REATTACHED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(g_cdc_cutoff_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
     }
