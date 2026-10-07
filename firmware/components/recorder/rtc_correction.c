@@ -244,6 +244,32 @@ static esp_err_t rtc_hw_init(void) {
     return ESP_OK;
 }
 
+static esp_err_t rtc_hw_deinit(void) {
+    esp_err_t first_err = ESP_OK;
+    esp_err_t err;
+
+    if (s_rtc_dev != NULL) {
+        err = i2c_master_bus_rm_device(s_rtc_dev);
+        if (err == ESP_OK) {
+            s_rtc_dev = NULL;
+        } else {
+            first_err = err;
+        }
+    }
+    if (s_rtc_bus != NULL && s_rtc_dev == NULL) {
+        err = i2c_del_master_bus(s_rtc_bus);
+        if (err == ESP_OK) {
+            s_rtc_bus = NULL;
+        } else if (first_err == ESP_OK) {
+            first_err = err;
+        }
+    }
+    if (s_rtc_dev == NULL && s_rtc_bus == NULL) {
+        s_hw_ready = false;
+    }
+    return first_err;
+}
+
 static esp_err_t rtc_hw_write_epoch(time_t epoch) {
     struct tm utc_tm;
     uint8_t stop[] = {BM8563_REG_CONTROL1, BM8563_CONTROL1_STOP};
@@ -389,6 +415,22 @@ static bool rtc_make_correction_id(char out[RECORDER_UUID_STR_LEN]) {
     return device_identity_format_uuid_v4(bytes, out);
 }
 
+static void rtc_sync_system_clock_best_effort_locked(void) {
+    time_t rtc_epoch;
+
+    if (rtc_hw_init() == ESP_OK &&
+        rtc_hw_read_epoch(&rtc_epoch) == ESP_OK) {
+        struct timeval tv = {.tv_sec = rtc_epoch, .tv_usec = 0};
+        (void)settimeofday(&tv, NULL);
+    }
+
+    // Manual-WAKE recovery must not leave a new I2C resource resident on the
+    // later recorder -> TinyUSB publication path. A deinit failure is not
+    // allowed to weaken durable pending-event recovery; SET_TIME will still
+    // fail closed if the surviving transport cannot be used.
+    (void)rtc_hw_deinit();
+}
+
 static void rtc_format_epoch(time_t epoch,
                              char out[RECORDER_ISO8601_STR_LEN]) {
     struct tm utc_tm;
@@ -447,6 +489,7 @@ rtc_correction_result_t rtc_correction_apply(
     char normalized_local[RECORDER_ISO8601_STR_LEN];
     rtc_pending_record_t candidate;
     rtc_correction_result_t parse_result;
+    struct timeval before_tv;
     struct timeval after_tv;
     time_t before_epoch;
     time_t requested_epoch;
@@ -476,8 +519,14 @@ rtc_correction_result_t rtc_correction_apply(
         return RTC_CORRECTION_INTERNAL_ERROR;
     }
     if (rtc_hw_read_epoch(&before_epoch) != ESP_OK) {
-        xSemaphoreGive(s_rtc_lock);
-        return RTC_CORRECTION_INTERNAL_ERROR;
+        // An unset/VL RTC must still be correctable. Fall back to the current
+        // system clock for the audit "before" value rather than rejecting the
+        // SET_TIME that can repair the hardware clock.
+        if (gettimeofday(&before_tv, NULL) != 0) {
+            before_tv.tv_sec = 0;
+            before_tv.tv_usec = 0;
+        }
+        before_epoch = before_tv.tv_sec;
     }
 
     memset(&candidate, 0, sizeof(candidate));
@@ -560,6 +609,13 @@ esp_err_t rtc_correction_flush_pending_event(const char *events_path) {
     if (xSemaphoreTake(s_rtc_lock, portMAX_DELAY) != pdTRUE) {
         return ESP_FAIL;
     }
+
+    // On supported manual WAKE, restore the process clock from the battery-
+    // backed BM8563 before the fresh recording begins. This is best-effort and
+    // transient: durable pending recovery remains authoritative, and the I2C
+    // transport is torn down again before later USB publication.
+    rtc_sync_system_clock_best_effort_locked();
+
     if (!s_pending) {
         xSemaphoreGive(s_rtc_lock);
         return ESP_OK;
