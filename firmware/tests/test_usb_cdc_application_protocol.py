@@ -69,3 +69,29 @@ def test_release_acceptance_closes_admission_before_any_later_command() -> None:
     gate_after = worker.index("if (!cdc_lifecycle_admission_open())", process_at)
     assert gate_after > process_at
     assert "usb_cdc_protocol_framer_reset" in worker[gate_after:]
+
+
+def test_physical_reconnect_wires_nonblocking_cutoff_then_blocking_reopen() -> None:
+    transport = (COMP / "usb_cdc_protocol.c").read_text(encoding="utf-8")
+    runtime = (REPO / "firmware/main/task49_runtime.c").read_text(encoding="utf-8")
+
+    close_at = transport.index("void usb_cdc_protocol_close_session(void)")
+    reset_at = transport.index("void usb_cdc_protocol_reset_session(void)", close_at)
+    close = transport[close_at:reset_at]
+    assert "usb_cdc_session_gate_close" in close
+    assert "usb_cdc_session_gate_reset" not in close
+    assert "s_connected = false" in close
+
+    callback_at = runtime.index("static void recorder_cdc_physical_session_cutoff")
+    status_at = runtime.index("static bool recorder_cdc_status", callback_at)
+    assert "usb_cdc_protocol_close_session();" in runtime[callback_at:status_at]
+    assert "usb_msc_ownership_set_physical_session_cutoff" in runtime
+
+    reconnect_at = runtime.index("static void recorder_handle_usb_host_reattached")
+    release_at = runtime.index("static void recorder_handle_usb_release", reconnect_at)
+    reconnect = runtime[reconnect_at:release_at]
+    reset_call = reconnect.index("usb_cdc_protocol_reset_session();")
+    open_call = reconnect.index("usb_cdc_protocol_open_session();")
+    assert reset_call < open_call
+    assert "usb_msc_ownership_is_host_owned()" in reconnect
+    assert "sd_mount_is_mounted()" in reconnect
