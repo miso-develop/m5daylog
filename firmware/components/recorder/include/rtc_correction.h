@@ -33,10 +33,9 @@ typedef enum {
     RTC_CORRECTION_INTERNAL_ERROR,
 } rtc_correction_result_t;
 
-// Initialize the M5Capsule v1.1 BM8563 transport and, when the RTC holds a
-// valid 2000-2099 value, seed the system clock from it. Safe to call again;
-// a later call also refreshes cached pending-NVS state after NVS becomes
-// available during normal recorder initialization.
+// Initialize/refresh only the durable pending-NVS state. This intentionally
+// performs no BM8563/I2C access so recorder -> TinyUSB publication remains
+// independent of live RTC transport readiness.
 esp_err_t rtc_correction_init(void);
 
 // True when one SET_TIME correction is waiting for durable events.jsonl
@@ -55,9 +54,11 @@ rtc_correction_result_t rtc_correction_apply(
     char *normalized,
     size_t normalized_size);
 
-// Manual-WAKE Device-owned filesystem recovery only. If a pending correction exists,
-// append exactly one durable rtc_correction JSONL event and only then clear
-// its NVS record. Replaying after a crash is duplicate-safe by correctionId.
+// Manual-WAKE Device-owned filesystem recovery only. Best-effort restore the
+// process clock from BM8563 using a transient I2C session before fresh
+// recording. If a pending correction exists, append exactly one durable
+// rtc_correction JSONL event and only then clear its NVS record. Replaying
+// after a crash is duplicate-safe by correctionId.
 esp_err_t rtc_correction_flush_pending_event(const char *events_path);
 
 #ifdef __cplusplus
