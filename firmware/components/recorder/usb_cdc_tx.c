@@ -65,5 +65,14 @@ bool usb_cdc_tx_write_response(const usb_cdc_tx_ops_t *ops,
     if (!ops->flush(ops->transport_ctx, ops->final_flush_timeout_ms)) {
         return false;
     }
-    return tx_is_current(ops, response_generation);
+
+    // A successful final flush is the response-completion boundary. The host
+    // may close its CDC handle immediately after receiving the response, which
+    // can drop DTR/RTS before this task executes again. Requiring transport
+    // state to remain current after a successful flush would let that
+    // non-authoritative line-state change retract an already delivered
+    // RELEASE_STORAGE response and strand the accepted release in
+    // HOST_UNRESOLVED. Disconnect/session invalidation before the final flush
+    // is still rejected by the check above.
+    return true;
 }
