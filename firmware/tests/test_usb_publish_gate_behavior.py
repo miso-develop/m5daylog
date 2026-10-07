@@ -602,6 +602,7 @@ def test_two_phase_publication_reconnects_only_after_usb_owned_lun(tmp_path: Pat
     subprocess.run(
         [
             cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-include", "stdio.h",
             "-D_POSIX_C_SOURCE=200809L",
             "-DESP_PLATFORM", "-DCONFIG_TINYUSB_SUSPEND_CALLBACK=1",
             "-I", str(stubs), "-I", str(STUB_INCLUDE), "-I", str(INCLUDE),
