@@ -116,7 +116,15 @@ def test_boot_gate_has_no_rtc_transport_side_effects() -> None:
     hw_read = apply.index("rtc_hw_read_epoch(&before_epoch)")
     hw_write = apply.index("rtc_hw_write_epoch(requested_epoch)")
     assert hw_init < hw_read < hw_write
+    assert "gettimeofday(&before_tv, NULL)" in apply
     assert "rtc_format_epoch(before_epoch, candidate.before)" in apply
+
+    flush_at = rtc.index("esp_err_t rtc_correction_flush_pending_event")
+    flush = rtc[flush_at:]
+    sync_call = flush.index("rtc_sync_system_clock_best_effort_locked();")
+    pending_check = flush.index("if (!s_pending)")
+    assert sync_call < pending_check
+    assert "rtc_hw_deinit()" in rtc
 
     app_at = runtime.index("void app_main(void)")
     app = runtime[app_at:]
