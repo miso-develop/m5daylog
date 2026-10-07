@@ -132,6 +132,22 @@ def test_recorder_nvs_process_lifetime_and_serialization(tmp_path: Path) -> None
                 return ESP_OK;
             }
 
+            static void host_owned_scsi_trace_flush(void) {
+                CHECK(recorder_nvs_lock() == ESP_OK);
+                CHECK(g_init_calls == 1);
+                CHECK(g_deinit_calls == 0);
+                recorder_nvs_unlock();
+            }
+
+            static void set_time_durable_pending_commit(void) {
+                CHECK(recorder_nvs_lock() == ESP_OK);
+                /* The pending commit must still see the same initialized
+                 * default-NVS lifetime after the host-owned trace flush. */
+                CHECK(g_init_calls == 1);
+                CHECK(g_deinit_calls == 0);
+                recorder_nvs_unlock();
+            }
+
             static void *rtc_pending_commit(void *arg) {
                 (void)arg;
                 CHECK(recorder_nvs_lock() == ESP_OK);
@@ -176,13 +192,10 @@ def test_recorder_nvs_process_lifetime_and_serialization(tmp_path: Path) -> None
                 CHECK(g_init_calls == 1);
                 CHECK(g_deinit_calls == 0);
 
-                /* Production ordering: a diagnostic transaction followed by
-                 * the later SET_TIME durable-pending transaction remains valid
-                 * in the same process-lifetime NVS instance. */
-                CHECK(recorder_nvs_lock() == ESP_OK);
-                recorder_nvs_unlock();
-                CHECK(recorder_nvs_lock() == ESP_OK);
-                recorder_nvs_unlock();
+                /* Production ordering under review:
+                 * HOST_OWNED -> SCSI trace flush -> SET_TIME pending commit. */
+                host_owned_scsi_trace_flush();
+                set_time_durable_pending_commit();
                 CHECK(g_init_calls == 1);
                 CHECK(g_deinit_calls == 0);
 
@@ -287,6 +300,15 @@ def test_recorder_nvs_clients_use_one_guard_without_deinit() -> None:
         assert "nvs_flash_deinit" not in source
         assert "recorder_nvs_lock()" in source
         assert "recorder_nvs_unlock()" in source
+
+    host_owned_at = runtime.index("static void recorder_handle_usb_host_owned")
+    host_reattached_at = runtime.index(
+        "static void recorder_handle_usb_host_reattached", host_owned_at
+    )
+    host_owned = runtime[host_owned_at:host_reattached_at]
+    assert host_owned.index("usb_cdc_protocol_open_session();") < host_owned.index(
+        "recorder_flush_usb_scsi_trace();"
+    )
 
     apply_at = rtc.index("rtc_correction_result_t rtc_correction_apply(")
     clear_at = rtc.index("static esp_err_t rtc_correction_clear_pending_nvs", apply_at)
