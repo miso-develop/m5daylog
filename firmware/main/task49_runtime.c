@@ -22,6 +22,7 @@ static void recorder_task49_delete(TaskHandle_t task);
 #undef app_main
 
 #include "shutdown_armed.h"
+#include "rtc_correction.h"
 #include "task87_wake_recovery.h"
 #include "usb_cdc_protocol.h"
 #include "usb_msc_ownership.h"
@@ -78,6 +79,53 @@ static bool recorder_cdc_release_response_complete(
 static bool recorder_cdc_command_admission_open(void *ctx) {
     (void)ctx;
     return usb_msc_ownership_release_command_admission_open();
+}
+
+static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
+    recorder_state_t state;
+    recorder_reason_t reason;
+    int battery_mv;
+    (void)ctx;
+
+    if (out == NULL || s_state_lock == NULL ||
+        xSemaphoreTake(s_state_lock, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    state = s_rec_state.state;
+    reason = s_rec_state.reason;
+    battery_mv = s_last_battery_mv;
+    xSemaphoreGive(s_state_lock);
+
+    out->state = recorder_state_str(state);
+    out->reason = recorder_reason_str(reason);
+    out->battery_mv = battery_mv;
+    out->battery_valid = battery_mv > 0;
+    out->rtc_correction_pending = rtc_correction_is_pending();
+    return out->state != NULL && out->reason != NULL;
+}
+
+static usb_cdc_set_time_result_t recorder_cdc_set_time(
+    const char *requested_time,
+    char *normalized,
+    size_t normalized_size,
+    void *ctx) {
+    rtc_correction_result_t result;
+    (void)ctx;
+
+    result = rtc_correction_apply(requested_time, normalized, normalized_size);
+    switch (result) {
+        case RTC_CORRECTION_OK:
+            return USB_CDC_SET_TIME_OK;
+        case RTC_CORRECTION_INVALID_ARGS:
+            return USB_CDC_SET_TIME_INVALID_ARGS;
+        case RTC_CORRECTION_RANGE_ERROR:
+            return USB_CDC_SET_TIME_RANGE_ERROR;
+        case RTC_CORRECTION_BUSY:
+            return USB_CDC_SET_TIME_BUSY;
+        case RTC_CORRECTION_INTERNAL_ERROR:
+        default:
+            return USB_CDC_SET_TIME_INTERNAL_ERROR;
+    }
 }
 
 static void recorder_task49_delete(TaskHandle_t task) {
@@ -312,6 +360,7 @@ static void recorder_usb_event_task(void *arg) {
 
 void app_main(void) {
     bool manual_wake = false;
+    esp_err_t rtc_preinit;
     usb_cdc_protocol_config_t cdc_config;
     shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN;
 
@@ -344,6 +393,18 @@ void app_main(void) {
         &s_wake_recovery,
         action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
 
+    // RTC pending state must be loaded before the base recorder reaches #87's
+    // manual-WAKE manifest/recovery seam. A manual-resume boot cannot proceed
+    // when that durable state is unreadable.
+    rtc_preinit = rtc_correction_init();
+    if (rtc_preinit != ESP_OK &&
+        task87_wake_recovery_pending(&s_wake_recovery)) {
+        ESP_LOGE(TAG,
+                 "stage: rtc, result: init-error, action: manual-wake-fail-closed");
+        recorder_shutdown_armed_now();
+        return;
+    }
+
     if (xTaskCreate(recorder_base_task, "rec_base", 6144, NULL, 2, NULL) !=
         pdPASS) {
         if (task87_wake_recovery_requires_shutdown(&s_wake_recovery)) {
@@ -358,6 +419,14 @@ void app_main(void) {
         return;
     }
 
+    // A normal boot may retry RTC/NVS bring-up after the recorder's ordinary
+    // identity/storage initialization. CDC mutation never opens if this still
+    // fails. Manual-WAKE failures were already rejected above.
+    if (rtc_preinit != ESP_OK && rtc_correction_init() != ESP_OK) {
+        recorder_enter_error(RECORDER_REASON_INTERNAL);
+        return;
+    }
+
     // Manual-WAKE USB publication is a fresh-session privilege: even if future
     // changes accidentally return from the recording wait early, the ownership
     // stack cannot be rearmed until the production recovery seam says complete.
@@ -368,6 +437,11 @@ void app_main(void) {
     }
 
     memset(&cdc_config, 0, sizeof(cdc_config));
+    cdc_config.device_id = s_device_id;
+    cdc_config.status_provider = recorder_cdc_status;
+    cdc_config.status_ctx = NULL;
+    cdc_config.set_time = recorder_cdc_set_time;
+    cdc_config.set_time_ctx = NULL;
     cdc_config.release_accept = recorder_cdc_release_accept;
     cdc_config.release_response_complete =
         recorder_cdc_release_response_complete;
