@@ -1,6 +1,6 @@
 # Human Gate Policy
 
-version: 3
+version: 4
 
 ## Purpose
 
@@ -26,6 +26,8 @@ When a task involves planning, executing, interpreting, recording, or resuming a
 `COMMAND_FAILURE_PLAYBOOK.md` records reusable command/harness failure modes, their diagnostic signatures, prevention rules, and safe recovery methods. When a new command-side defect causes or nearly causes an invalid Human Gate verdict, add a generalized public-safe entry there rather than leaving the lesson only in chat history.
 
 These rules apply in addition to the active Role Contract, approved specification / Acceptance Criteria, current Issue / PR state, and `.agent/HANDOFF_PROTOCOL.md`.
+
+For M5Daylog Device Human Gates, also read `.agent/HUMAN_GATE/M5DAYLOG_DEVICE_RUNBOOK.md`. It is the project-specific operational supplement for the known-good Windows / ESP-IDF setup path, D-031 release sequencing, lifecycle-cycle execution, evidence fields, and safe recovery patterns. It does not override this policy or current Acceptance Criteria.
 
 If a Human Gate rule conflicts with an approved product requirement or Role boundary, do not silently change the requirement. Escalate through the normal Specification / Implementation / Review / Integration / Human workflow as appropriate.
 
