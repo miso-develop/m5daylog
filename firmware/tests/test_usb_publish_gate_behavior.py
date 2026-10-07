@@ -510,13 +510,18 @@ HARNESS = r"""
         CHECK(!g_mounted);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
 
-        /* Reconfiguration never grants Device storage ownership. It only asks
-         * the recorder coordinator to drain/reset and open a fresh CDC app
-         * session outside the TinyUSB callback. */
+        /* Reconfiguration never grants Device storage ownership. ATTACHED is
+         * deliberately not allowed to trigger CDC drain/reopen because it runs
+         * before the SET_CONFIGURATION status stage. */
         g_device_cb(&attached, g_device_arg);
         CHECK(g_cdc_cutoff_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+
+        /* The first completed post-reconnect MSC command proves class binding.
+         * Only then may the coordinator reopen a fresh CDC application session. */
+        tud_msc_scsi_complete_cb(0, test_unit_ready);
         CHECK(next_event() == USB_MSC_EVENT_HOST_REATTACHED);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
 
