@@ -32,12 +32,24 @@ typedef enum {
     USB_MSC_EVENT_NONE = 0,
     USB_MSC_EVENT_ATTACH,
     USB_MSC_EVENT_HOST_OWNED,
+    USB_MSC_EVENT_HOST_REATTACHED,
     USB_MSC_EVENT_RELEASE_REQUESTED,
     USB_MSC_EVENT_RELEASE_QUIESCED,
     USB_MSC_EVENT_FAILED,
 } usb_msc_ownership_event_t;
 
+typedef void (*usb_msc_physical_session_cutoff_fn_t)(void *ctx);
+
 esp_err_t usb_msc_ownership_init(void);
+
+// Optional transport-hygiene hook invoked synchronously from the TinyUSB
+// host-owned DETACHED callback. The hook must be non-blocking/callback-safe and
+// must not authorize storage release. Production wires this to the CDC session
+// generation cutoff before USB start.
+esp_err_t usb_msc_ownership_set_physical_session_cutoff(
+    usb_msc_physical_session_cutoff_fn_t cutoff,
+    void *ctx);
+
 esp_err_t usb_msc_ownership_start(void);
 usb_msc_ownership_event_t usb_msc_ownership_wait_event(uint32_t timeout_ms);
 
