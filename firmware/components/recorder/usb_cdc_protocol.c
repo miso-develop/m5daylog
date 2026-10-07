@@ -231,6 +231,20 @@ static void usb_cdc_worker_task(void *arg) {
     }
 }
 
+void usb_cdc_protocol_close_session(void) {
+    // TinyUSB device callbacks must not block waiting for a command/TX task.
+    // Revoke transport visibility and invalidate the generation immediately;
+    // the recorder coordinator performs the later blocking reset before a
+    // physical reconnect is allowed to become a fresh application session.
+    s_open_requested = false;
+    s_connected = false;
+    s_reset_line = true;
+    usb_cdc_session_gate_close(&s_session_gate);
+    if (s_worker != NULL) {
+        xTaskNotifyGive(s_worker);
+    }
+}
+
 void usb_cdc_protocol_reset_session(void) {
     s_open_requested = false;
     s_connected = false;
@@ -321,6 +335,7 @@ esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
     (void)config;
     return ESP_ERR_NOT_SUPPORTED;
 }
+void usb_cdc_protocol_close_session(void) {}
 void usb_cdc_protocol_reset_session(void) {}
 void usb_cdc_protocol_open_session(void) {}
 esp_err_t usb_cdc_protocol_start(void) { return ESP_ERR_NOT_SUPPORTED; }
