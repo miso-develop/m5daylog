@@ -81,6 +81,11 @@ static bool recorder_cdc_command_admission_open(void *ctx) {
     return usb_msc_ownership_release_command_admission_open();
 }
 
+static void recorder_cdc_physical_session_cutoff(void *ctx) {
+    (void)ctx;
+    usb_cdc_protocol_close_session();
+}
+
 static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
     recorder_state_t state;
     recorder_reason_t reason;
@@ -281,6 +286,23 @@ static void recorder_handle_usb_host_owned(void) {
     recorder_flush_usb_scsi_trace();
 }
 
+static void recorder_handle_usb_host_reattached(void) {
+    if (recorder_current_state() != RECORDER_STATE_USB_SYNC ||
+        sd_mount_is_mounted() ||
+        !usb_msc_ownership_is_host_owned() ||
+        !usb_msc_ownership_release_command_admission_open()) {
+        recorder_enter_error(RECORDER_REASON_USB);
+        return;
+    }
+
+    // DETACHED already performed a callback-safe generation cutoff. Complete
+    // the blocking command/TX drain here, outside TinyUSB callback context,
+    // then publish a fresh CDC application session while leaving MSC ownership
+    // unchanged and unresolved on the host side.
+    usb_cdc_protocol_reset_session();
+    usb_cdc_protocol_open_session();
+}
+
 static void recorder_handle_usb_release(void) {
     if (recorder_current_state() != RECORDER_STATE_USB_SYNC ||
         sd_mount_is_mounted() ||
@@ -340,6 +362,9 @@ static void recorder_usb_event_task(void *arg) {
                 break;
             case USB_MSC_EVENT_HOST_OWNED:
                 recorder_handle_usb_host_owned();
+                break;
+            case USB_MSC_EVENT_HOST_REATTACHED:
+                recorder_handle_usb_host_reattached();
                 break;
             case USB_MSC_EVENT_RELEASE_REQUESTED:
                 recorder_handle_usb_release();
@@ -449,6 +474,8 @@ void app_main(void) {
         recorder_cdc_command_admission_open;
 
     if (usb_msc_ownership_init() != ESP_OK ||
+        usb_msc_ownership_set_physical_session_cutoff(
+            recorder_cdc_physical_session_cutoff, NULL) != ESP_OK ||
         usb_cdc_protocol_init(&cdc_config) != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;
