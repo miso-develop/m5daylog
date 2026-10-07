@@ -82,6 +82,7 @@ typedef struct {
     bool connected;
     bool current;
     bool close_during_final_flush;
+    bool invalidate_session_during_final_flush;
     bool close_before_final_flush;
     bool final_flush_result;
     unsigned flush_calls;
@@ -130,6 +131,9 @@ static bool flush_bytes(void *opaque, uint32_t timeout_ms) {
          */
         ctx->connected = false;
     }
+    if (timeout_ms == 250u && ctx->invalidate_session_during_final_flush) {
+        ctx->current = false;
+    }
     return timeout_ms == 250u ? ctx->final_flush_result : true;
 }
 
@@ -170,6 +174,23 @@ int main(void) {
     CHECK(!after_flush_close.connected);
     CHECK(after_flush_close.flush_calls == 1u);
     CHECK(strcmp(after_flush_close.output, "{\"accepted\":true}\n") == 0);
+
+    /*
+     * Session identity is still authoritative after a successful flush. A
+     * generation reset racing the flush must prevent stale-session teardown.
+     */
+    tx_ctx_t session_invalidated = {
+        .connected = true,
+        .current = true,
+        .invalidate_session_during_final_flush = true,
+        .final_flush_result = true,
+        .expected_generation = generation,
+    };
+    ops = make_ops(&session_invalidated);
+    CHECK(!usb_cdc_tx_write_response(
+        &ops, response, strlen(response), generation));
+    CHECK(session_invalidated.flush_calls == 1u);
+    CHECK(!session_invalidated.current);
 
     /*
      * Disconnect before the final flush remains fail-closed: no transport
