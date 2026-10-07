@@ -498,12 +498,9 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
             // however, an authoritative transport boundary for CDC framing and
             // response identity. Cut off the CDC generation synchronously so
             // old RX/TX cannot survive until a later reconfiguration.
-            if (!s_release_pending) {
-                s_host_session_detached = true;
-                if (s_physical_session_cutoff != NULL) {
-                    s_physical_session_cutoff(
-                        s_physical_session_cutoff_ctx);
-                }
+            s_host_session_detached = true;
+            if (s_physical_session_cutoff != NULL) {
+                s_physical_session_cutoff(s_physical_session_cutoff_ctx);
             }
             ESP_LOGW(TAG,
                      "stage: usb, result: ambiguous-detach, owner: host, action: cdc-cutoff-only");
