@@ -23,6 +23,7 @@ static void recorder_task49_delete(TaskHandle_t task);
 
 #include "shutdown_armed.h"
 #include "rtc_correction.h"
+#include "recorder_nvs.h"
 #include "task87_wake_recovery.h"
 #include "usb_cdc_protocol.h"
 #include "usb_msc_ownership.h"
@@ -392,6 +393,15 @@ void app_main(void) {
     // only the physical active-low WAKE button may authorize fresh recovery.
     // HOST_UNRESOLVED always classifies as STAY_SHUTDOWN, even with WAKE held.
     if (recorder_power_enable_hold() != ESP_OK) {
+        return;
+    }
+    // Establish the single default-NVS lifetime before any recorder worker
+    // task can run. Recorder-owned NVS users share recorder_nvs' mutex and no
+    // recorder path deinitializes the partition during this process lifetime.
+    if (recorder_nvs_init() != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: nvs, result: init-error, action: fail-closed");
+        recorder_shutdown_armed_now();
         return;
     }
     if (recorder_power_manual_wake_asserted(&manual_wake) != ESP_OK ||
