@@ -96,20 +96,27 @@ def test_physical_reconnect_wires_nonblocking_cutoff_then_blocking_reopen() -> N
     assert "usb_msc_ownership_is_host_owned()" in reconnect
     assert "sd_mount_is_mounted()" in reconnect
 
-def test_rtc_transport_failure_does_not_block_pending_state_boot_gate() -> None:
+def test_boot_gate_has_no_rtc_transport_side_effects() -> None:
     rtc = (COMP / "rtc_correction.c").read_text(encoding="utf-8")
     runtime = (REPO / "firmware/main/task49_runtime.c").read_text(encoding="utf-8")
 
     init_at = rtc.index("esp_err_t rtc_correction_init(void)")
     pending_at = rtc.index("bool rtc_correction_is_pending(void)", init_at)
     init = rtc[init_at:pending_at]
-    assert "return nvs_err;" in init
-    assert "return hw_err;" not in init
+    assert "nvs_flash_init()" in init
+    assert "rtc_load_pending_locked()" in init
+    assert "rtc_hw_init()" not in init
+    assert "rtc_hw_read_epoch" not in init
+    assert "settimeofday" not in init
 
     apply_at = rtc.index("rtc_correction_result_t rtc_correction_apply(")
     clear_at = rtc.index("static esp_err_t rtc_correction_clear_pending_nvs", apply_at)
     apply = rtc[apply_at:clear_at]
-    assert "if (!s_hw_ready && rtc_hw_init() != ESP_OK)" in apply
+    hw_init = apply.index("if (!s_hw_ready && rtc_hw_init() != ESP_OK)")
+    hw_read = apply.index("rtc_hw_read_epoch(&before_epoch)")
+    hw_write = apply.index("rtc_hw_write_epoch(requested_epoch)")
+    assert hw_init < hw_read < hw_write
+    assert "rtc_format_epoch(before_epoch, candidate.before)" in apply
 
     app_at = runtime.index("void app_main(void)")
     app = runtime[app_at:]
