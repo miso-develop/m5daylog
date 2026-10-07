@@ -303,6 +303,5 @@ def test_recorder_nvs_clients_use_one_guard_without_deinit() -> None:
     assert trace.index("recorder_nvs_lock()") < trace.index(
         'nvs_open("m5daylog"'
     )
-    assert trace.index("nvs_commit(handle)") < trace.index(
-        "recorder_nvs_unlock()"
-    )
+    commit_at = trace.index("nvs_commit(handle)")
+    assert trace.index("recorder_nvs_unlock()", commit_at) > commit_at
