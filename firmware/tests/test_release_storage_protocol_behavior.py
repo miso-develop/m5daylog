@@ -283,3 +283,194 @@ def test_release_acceptance_is_shared_atomic_msc_gate() -> None:
 
     quiesce_at = src.index("usb_msc_ownership_complete_release_quiesce")
     assert "s_release_waiting_response" in src[quiesce_at:]
+
+
+def test_physical_detach_during_tx_cannot_leak_response_after_reconnect(
+    tmp_path: Path,
+) -> None:
+    """REV-83-11: old-session TX is fenced from a later physical session."""
+
+    harness = tmp_path / "usb_cdc_tx_physical_reconnect.c"
+    harness.write_text(
+        r"""
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "usb_cdc_session_gate.h"
+#include "usb_cdc_tx.h"
+
+#define CHECK(expr) do { \
+    if (!(expr)) { \
+        fprintf(stderr, "CHECK failed %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+        exit(2); \
+    } \
+} while (0)
+
+typedef struct {
+    usb_cdc_session_gate_t *gate;
+    bool connected;
+    bool reconnected;
+    bool detach_on_first_queue;
+    unsigned queue_calls;
+    char old_session_bytes[128];
+    size_t old_session_len;
+    char new_session_bytes[128];
+    size_t new_session_len;
+} tx_ctx_t;
+
+static bool is_connected(void *opaque) {
+    return ((tx_ctx_t *)opaque)->connected;
+}
+
+static bool session_is_current(void *opaque, uint32_t generation) {
+    tx_ctx_t *ctx = opaque;
+    usb_cdc_session_snapshot_t snapshot = {
+        .generation = generation,
+        .admitted = true,
+    };
+    return usb_cdc_session_gate_snapshot_is_current(ctx->gate, snapshot);
+}
+
+static void append_bytes(tx_ctx_t *ctx, const uint8_t *data, size_t len) {
+    char *dst = ctx->reconnected ? ctx->new_session_bytes
+                                 : ctx->old_session_bytes;
+    size_t *used = ctx->reconnected ? &ctx->new_session_len
+                                    : &ctx->old_session_len;
+    CHECK(*used + len < 128u);
+    memcpy(dst + *used, data, len);
+    *used += len;
+    dst[*used] = '\0';
+}
+
+static size_t queue_bytes(void *opaque, const uint8_t *data, size_t len) {
+    tx_ctx_t *ctx = opaque;
+    size_t queued = len;
+
+    ctx->queue_calls++;
+    if (ctx->detach_on_first_queue && ctx->queue_calls == 1u) {
+        queued = len > 4u ? 4u : len;
+        append_bytes(ctx, data, queued);
+
+        /* Production DETACHED callback behavior: transport visibility drops
+           and the application generation is invalidated without waiting. */
+        ctx->connected = false;
+        usb_cdc_session_gate_close(ctx->gate);
+        return queued;
+    }
+
+    append_bytes(ctx, data, queued);
+    return queued;
+}
+
+static size_t queue_char(void *opaque, uint8_t value) {
+    tx_ctx_t *ctx = opaque;
+    append_bytes(ctx, &value, 1u);
+    return 1u;
+}
+
+static bool flush_bytes(void *opaque, uint32_t timeout_ms) {
+    (void)opaque;
+    (void)timeout_ms;
+    return true;
+}
+
+static void wait_once(void *opaque) {
+    (void)opaque;
+}
+
+static usb_cdc_tx_ops_t make_ops(tx_ctx_t *ctx) {
+    usb_cdc_tx_ops_t ops = {
+        .transport_ctx = ctx,
+        .session_ctx = ctx,
+        .is_connected = is_connected,
+        .session_is_current = session_is_current,
+        .queue = queue_bytes,
+        .queue_char = queue_char,
+        .flush = flush_bytes,
+        .wait = wait_once,
+        .retry_flush_timeout_ms = 20u,
+        .final_flush_timeout_ms = 250u,
+    };
+    return ops;
+}
+
+int main(void) {
+    usb_cdc_session_gate_t gate;
+    tx_ctx_t ctx = {0};
+    usb_cdc_tx_ops_t ops;
+    uint32_t old_generation;
+    uint32_t new_generation;
+    uint32_t discard_epoch;
+    const char *old_response = "{\"id\":\"old\",\"ok\":true}";
+    const char *new_response = "{\"id\":\"new\",\"ok\":true}";
+
+    usb_cdc_session_gate_init(&gate);
+    CHECK(usb_cdc_session_gate_open(&gate));
+    old_generation = usb_cdc_session_gate_generation(&gate);
+    CHECK(usb_cdc_session_gate_command_begin(&gate, old_generation));
+
+    ctx.gate = &gate;
+    ctx.connected = true;
+    ctx.detach_on_first_queue = true;
+    ops = make_ops(&ctx);
+
+    CHECK(!usb_cdc_tx_write_response(
+        &ops, old_response, strlen(old_response), old_generation));
+    CHECK(ctx.old_session_len > 0u);
+    CHECK(ctx.old_session_len < strlen(old_response));
+    CHECK(ctx.new_session_len == 0u);
+
+    usb_cdc_session_gate_command_end(&gate);
+
+    /* Recorder coordinator handles HOST_REATTACHED outside TinyUSB callback:
+       blocking reset/drain first, then explicit fresh-session open. */
+    usb_cdc_session_gate_reset(&gate, NULL, NULL);
+    discard_epoch = usb_cdc_session_gate_rx_discard_epoch(&gate);
+    usb_cdc_session_gate_mark_rx_drained(&gate, discard_epoch);
+    CHECK(usb_cdc_session_gate_open(&gate));
+    new_generation = usb_cdc_session_gate_generation(&gate);
+    CHECK(new_generation != old_generation);
+
+    ctx.connected = true;
+    ctx.reconnected = true;
+    ctx.detach_on_first_queue = false;
+    ctx.queue_calls = 0u;
+
+    /* Even if old TX code were retried after reconnect, its old generation
+       cannot enqueue one byte into the new physical session. */
+    CHECK(!usb_cdc_tx_write_response(
+        &ops, old_response, strlen(old_response), old_generation));
+    CHECK(ctx.new_session_len == 0u);
+
+    CHECK(usb_cdc_session_gate_command_begin(&gate, new_generation));
+    CHECK(usb_cdc_tx_write_response(
+        &ops, new_response, strlen(new_response), new_generation));
+    usb_cdc_session_gate_command_end(&gate);
+    CHECK(strcmp(ctx.new_session_bytes, "{\"id\":\"new\",\"ok\":true}\n") == 0);
+
+    puts("physical reconnect TX generation fence: PASS");
+    return 0;
+}
+""",
+        encoding="utf-8",
+    )
+
+    executable = tmp_path / "usb_cdc_tx_physical_reconnect"
+    result = subprocess.run(
+        [
+            "cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-I", str(INCLUDE),
+            str(TX), str(GATE), str(harness),
+            "-o", str(executable),
+        ],
+        cwd=REPO, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    run = subprocess.run(
+        [str(executable)], cwd=REPO, text=True, capture_output=True, check=False
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "physical reconnect TX generation fence: PASS" in run.stdout
