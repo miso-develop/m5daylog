@@ -23,6 +23,11 @@ typedef size_t (*usb_cdc_tx_queue_fn_t)(void *ctx, const uint8_t *data,
 typedef size_t (*usb_cdc_tx_queue_char_fn_t)(void *ctx, uint8_t value);
 typedef bool (*usb_cdc_tx_flush_fn_t)(void *ctx, uint32_t timeout_ms);
 typedef void (*usb_cdc_tx_wait_fn_t)(void *ctx);
+// Called after the final FIFO flush, before a release can authorize teardown.
+// Platform code must prove the last USB IN transfer completed, not merely
+// that TinyUSB moved bytes from its software FIFO into an endpoint buffer.
+typedef bool (*usb_cdc_tx_await_endpoint_fn_t)(void *ctx,
+                                               uint32_t timeout_ms);
 
 typedef struct {
     void *transport_ctx;
@@ -33,6 +38,8 @@ typedef struct {
     usb_cdc_tx_queue_char_fn_t queue_char;
     usb_cdc_tx_flush_fn_t flush;
     usb_cdc_tx_wait_fn_t wait;
+    usb_cdc_tx_await_endpoint_fn_t await_endpoint;
+    uint32_t endpoint_timeout_ms;
     uint32_t retry_flush_timeout_ms;
     uint32_t final_flush_timeout_ms;
 } usb_cdc_tx_ops_t;
