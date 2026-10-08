@@ -65,8 +65,16 @@ bool usb_cdc_tx_write_response(const usb_cdc_tx_ops_t *ops,
     if (!ops->flush(ops->transport_ctx, ops->final_flush_timeout_ms)) {
         return false;
     }
+    // A successful FIFO flush can still leave the final USB IN transaction
+    // outstanding. RELEASE_STORAGE supplies a transfer-completion barrier:
+    // fail closed, with no teardown request, if the endpoint does not finish.
+    if (ops->await_endpoint != NULL &&
+        !ops->await_endpoint(ops->transport_ctx, ops->endpoint_timeout_ms)) {
+        return false;
+    }
 
-    // A successful final flush is the transport response-completion boundary.
+    // A successful final flush, plus endpoint completion when required, is
+    // the Device transport boundary; neither proves PC application receipt.
     // The host may close its CDC handle immediately after receiving the
     // response, dropping DTR/RTS before this task executes again. That
     // non-authoritative line-state change must not retract an already delivered
