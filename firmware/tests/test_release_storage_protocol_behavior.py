@@ -474,3 +474,150 @@ int main(void) {
     )
     assert run.returncode == 0, run.stdout + run.stderr
     assert "physical reconnect TX generation fence: PASS" in run.stdout
+
+
+def test_release_requires_final_usb_in_completion(tmp_path: Path) -> None:
+    """FIFO-flush success is not the endpoint-completion gate for release."""
+
+    harness = tmp_path / "cdc_endpoint_completion.c"
+    harness.write_text(
+        r"""
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "usb_cdc_tx.h"
+
+#define CHECK(condition) do { if (!(condition)) { \\
+    fprintf(stderr, "CHECK failed %s:%d: %s\\n", __FILE__, __LINE__, #condition); \\
+    exit(2); \\
+} } while (0)
+
+typedef struct {
+    bool connected;
+    bool current;
+    bool fifo_flush_success;
+    bool endpoint_completed;
+    bool drop_dtr_at_flush;
+    int endpoint_wait_calls;
+    int flush_calls;
+    char output[256];
+    size_t used;
+} tx_ctx_t;
+
+static bool connected(void *p) { return ((tx_ctx_t *)p)->connected; }
+static bool current(void *p, uint32_t gen) {
+    return gen == 17u && ((tx_ctx_t *)p)->current;
+}
+static size_t queue(void *p, const uint8_t *data, size_t n) {
+    tx_ctx_t *c = p;
+    CHECK(c->used + n < sizeof(c->output));
+    memcpy(c->output + c->used, data, n);
+    c->used += n;
+    return n;
+}
+static size_t queue_char(void *p, uint8_t ch) {
+    return queue(p, &ch, 1u);
+}
+static bool flush(void *p, uint32_t timeout_ms) {
+    tx_ctx_t *c = p;
+    CHECK(timeout_ms == 250u);
+    c->flush_calls++;
+    if (c->drop_dtr_at_flush) c->connected = false;
+    return c->fifo_flush_success;
+}
+static bool endpoint(void *p, uint32_t timeout_ms) {
+    tx_ctx_t *c = p;
+    CHECK(timeout_ms == 500u);
+    c->endpoint_wait_calls++;
+    return c->endpoint_completed;
+}
+static usb_cdc_tx_ops_t ops(tx_ctx_t *c) {
+    usb_cdc_tx_ops_t o = {
+        .transport_ctx = c,
+        .session_ctx = c,
+        .is_connected = connected,
+        .session_is_current = current,
+        .queue = queue,
+        .queue_char = queue_char,
+        .flush = flush,
+        .await_endpoint = endpoint,
+        .endpoint_timeout_ms = 500u,
+        .final_flush_timeout_ms = 250u,
+    };
+    return o;
+}
+static bool write_response(tx_ctx_t *c) {
+    usb_cdc_tx_ops_t o = ops(c);
+    return usb_cdc_tx_write_response(&o,
+        "{\\\"id\\\":\\\"r\\\",\\\"ok\\\":true}",
+        strlen("{\\\"id\\\":\\\"r\\\",\\\"ok\\\":true}"), 17u);
+}
+int main(void) {
+    tx_ctx_t in_flight = {
+        .connected=true, .current=true, .fifo_flush_success=true
+    };
+    CHECK(!write_response(&in_flight));
+    CHECK(in_flight.flush_calls == 1);
+    CHECK(in_flight.endpoint_wait_calls == 1);
+    CHECK(in_flight.output[in_flight.used - 1] == '\\n');
+
+    tx_ctx_t complete = {
+        .connected=true, .current=true,
+        .fifo_flush_success=true, .endpoint_completed=true
+    };
+    CHECK(write_response(&complete));
+    CHECK(complete.endpoint_wait_calls == 1);
+
+    tx_ctx_t invalidated = {
+        .connected=true, .current=false,
+        .fifo_flush_success=true, .endpoint_completed=true
+    };
+    CHECK(!write_response(&invalidated));
+    CHECK(invalidated.endpoint_wait_calls == 0);
+
+    tx_ctx_t fifo_failed = {
+        .connected=true, .current=true,
+        .fifo_flush_success=false, .endpoint_completed=true
+    };
+    CHECK(!write_response(&fifo_failed));
+    CHECK(fifo_failed.endpoint_wait_calls == 0);
+
+    tx_ctx_t host_closed_after_flush = {
+        .connected=true, .current=true,
+        .fifo_flush_success=true, .endpoint_completed=true,
+        .drop_dtr_at_flush=true,
+    };
+    CHECK(write_response(&host_closed_after_flush));
+    CHECK(!host_closed_after_flush.connected);
+    puts("release endpoint completion gating: PASS");
+    return 0;
+}
+""",
+        encoding="utf-8",
+    )
+    exe = tmp_path / "cdc_endpoint_completion"
+    build = subprocess.run(
+        ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+         "-I", str(INCLUDE), str(TX), str(harness), "-o", str(exe)],
+        cwd=REPO, text=True, capture_output=True, check=False,
+    )
+    assert build.returncode == 0, build.stderr
+    run = subprocess.run(
+        [str(exe)], cwd=REPO, text=True, capture_output=True, check=False,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "release endpoint completion gating: PASS" in run.stdout
+
+
+def test_release_endpoint_completion_production_wiring() -> None:
+    """Only accepted release waits for CDC IN completion before teardown."""
+    src = TRANSPORT.read_text(encoding="utf-8")
+    assert "void tud_cdc_tx_complete_cb(uint8_t itf)" in src
+    assert "s_cdc_tx_completed" in src
+    assert ".await_endpoint = release_accepted" in src
+    assert "cdc_release_await_endpoint" in src
+    assert "effect.release_accepted" in src
+    tx = TX.read_text(encoding="utf-8")
+    assert "ops->await_endpoint(ops->transport_ctx" in tx
