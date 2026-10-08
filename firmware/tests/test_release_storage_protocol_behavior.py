@@ -621,3 +621,38 @@ def test_release_endpoint_completion_production_wiring() -> None:
     assert "effect.release_accepted" in src
     tx = TX.read_text(encoding="utf-8")
     assert "ops->await_endpoint(ops->transport_ctx" in tx
+
+
+def test_release_endpoint_completion_captures_baseline_before_queuing() -> None:
+    """Fast host completion during FIFO flush must not strand release admission.
+
+    Regression for real-device C01: Windows received the entire accepted=true
+    response, but the Device continued publishing CDC/MSC. Sampling the USB IN
+    completion counter after the final flush can miss an already-completed TX.
+    """
+    src = TRANSPORT.read_text(encoding="utf-8")
+    tx_start = src.index("static bool cdc_write_response(")
+    tx_end = src.index("static void usb_cdc_rx_callback", tx_start)
+    tx = src[tx_start:tx_end]
+    snapshot = tx.index(".tx_completed_before = release_accepted")
+    write = tx.index("usb_cdc_tx_write_response(")
+    assert snapshot < write
+    assert "&s_cdc_tx_completed" in tx[snapshot:write]
+    assert "memory_order_acquire" in tx[snapshot:write]
+
+    wait_start = src.index("static bool cdc_release_await_endpoint(")
+    wait_end = src.index("static bool cdc_write_response(", wait_start)
+    wait = src[wait_start:wait_end]
+    assert "const unsigned before = response_ctx->tx_completed_before;" in wait
+    assert "atomic_load_explicit(&s_cdc_tx_completed" in wait
+    assert "!= before" in wait
+    assert "CDC_RELEASE_TX_COMPLETE_TIMEOUT_MS" in src
+    assert "CDC_RELEASE_HOST_READ_GRACE_MS" in src
+    assert "cdc_tx_session_is_current(" in wait
+
+    # No completion notification still fails closed; admission is never
+    # converted into teardown permission based solely on a successful FIFO
+    # flush or the PC's later transport disappearance.
+    tx_file = TX.read_text(encoding="utf-8")
+    assert "if (ops->await_endpoint != NULL &&" in tx_file
+    assert "!ops->await_endpoint(ops->transport_ctx" in tx_file
