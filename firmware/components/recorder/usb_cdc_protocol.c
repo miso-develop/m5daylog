@@ -9,12 +9,14 @@
 #ifdef ESP_PLATFORM
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "device_identity.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tinyusb_cdc_acm.h"
+#include "tusb.h"
 #include "usb_cdc_protocol_core.h"
 #include "usb_cdc_session_gate.h"
 #include "usb_cdc_tx.h"
@@ -22,6 +24,8 @@
 #define CDC_RX_CHUNK_BYTES 256u
 #define CDC_RESPONSE_BYTES 768u
 #define CDC_WORKER_STACK_BYTES 6144u
+#define CDC_RELEASE_TX_COMPLETE_TIMEOUT_MS 500u
+#define CDC_RELEASE_HOST_READ_GRACE_MS 150u
 
 static usb_cdc_protocol_config_t s_config;
 static TaskHandle_t s_worker = NULL;
@@ -31,6 +35,21 @@ static volatile bool s_reset_line = false;
 static bool s_initialized = false;
 static bool s_started = false;
 static bool s_open_requested = false;
+static atomic_uint s_cdc_tx_completed = ATOMIC_VAR_INIT(0u);
+
+typedef struct {
+    uint32_t generation;
+} cdc_tx_context_t;
+
+// TinyUSB calls this after the host USB controller completes a CDC IN
+// transfer. The esp_tinyusb write_flush() success condition checks only the
+// software FIFO, which may be empty while the final IN transfer is in flight.
+void tud_cdc_tx_complete_cb(uint8_t itf) {
+    if (itf == 0u) {
+        (void)atomic_fetch_add_explicit(
+            &s_cdc_tx_completed, 1u, memory_order_release);
+    }
+}
 
 static bool cdc_tx_is_connected(void *ctx) {
     (void)ctx;
@@ -68,10 +87,44 @@ static void cdc_tx_wait(void *ctx) {
     vTaskDelay(1);
 }
 
+static bool cdc_release_await_endpoint(void *ctx, uint32_t timeout_ms) {
+    const cdc_tx_context_t *response_ctx = (const cdc_tx_context_t *)ctx;
+    const unsigned before = atomic_load_explicit(
+        &s_cdc_tx_completed, memory_order_acquire);
+    const TickType_t started = xTaskGetTickCount();
+    const TickType_t limit = pdMS_TO_TICKS(timeout_ms);
+
+    // This callback count is captured AFTER the final FIFO flush. A previous
+    // packet may have completed while the flush drained more data; it must
+    // not authorize teardown while the final packet is still in flight.
+    do {
+        if (!cdc_tx_session_is_current(
+                &s_session_gate, response_ctx->generation)) {
+            return false;
+        }
+        if (atomic_load_explicit(&s_cdc_tx_completed,
+                                 memory_order_acquire) != before) {
+            // Give the Windows CDC consumer a bounded interval to dequeue
+            // the now-transferred response before logical USB disconnect.
+            // This is NOT a PC application acknowledgement; the host must
+            // still observe the matching response under Decision #105.
+            vTaskDelay(pdMS_TO_TICKS(CDC_RELEASE_HOST_READ_GRACE_MS));
+            return cdc_tx_session_is_current(
+                &s_session_gate, response_ctx->generation);
+        }
+        vTaskDelay(1);
+    } while ((TickType_t)(xTaskGetTickCount() - started) < limit);
+    return false;
+}
+
 static bool cdc_write_response(const char *response, size_t len,
-                               uint32_t response_generation) {
+                               uint32_t response_generation,
+                               bool release_accepted) {
+    cdc_tx_context_t response_ctx = {
+        .generation = response_generation,
+    };
     usb_cdc_tx_ops_t ops = {
-        .transport_ctx = NULL,
+        .transport_ctx = &response_ctx,
         .session_ctx = &s_session_gate,
         .is_connected = cdc_tx_is_connected,
         .session_is_current = cdc_tx_session_is_current,
@@ -79,6 +132,9 @@ static bool cdc_write_response(const char *response, size_t len,
         .queue_char = cdc_tx_queue_char,
         .flush = cdc_tx_flush,
         .wait = cdc_tx_wait,
+        .await_endpoint = release_accepted
+                              ? cdc_release_await_endpoint : NULL,
+        .endpoint_timeout_ms = CDC_RELEASE_TX_COMPLETE_TIMEOUT_MS,
         .retry_flush_timeout_ms = 20u,
         .final_flush_timeout_ms = 250u,
     };
@@ -207,7 +263,8 @@ static void usb_cdc_worker_task(void *arg) {
                     &s_config, &effect);
                 if (response_len > 0 && s_connected) {
                     response_complete = cdc_write_response(
-                        response, (size_t)response_len, frame_generation);
+                        response, (size_t)response_len, frame_generation,
+                        effect.release_accepted);
                 }
 
                 // End the ordinary command before teardown may be signalled.
