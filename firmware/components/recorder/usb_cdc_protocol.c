@@ -39,6 +39,9 @@ static atomic_uint s_cdc_tx_completed = ATOMIC_VAR_INIT(0u);
 
 typedef struct {
     uint32_t generation;
+    // Snapshot before queueing any bytes: a host-completed last IN transfer
+    // may race the final FIFO flush and precede the wait routine.
+    unsigned tx_completed_before;
 } cdc_tx_context_t;
 
 // TinyUSB calls this after the host USB controller completes a CDC IN
@@ -89,14 +92,15 @@ static void cdc_tx_wait(void *ctx) {
 
 static bool cdc_release_await_endpoint(void *ctx, uint32_t timeout_ms) {
     const cdc_tx_context_t *response_ctx = (const cdc_tx_context_t *)ctx;
-    const unsigned before = atomic_load_explicit(
-        &s_cdc_tx_completed, memory_order_acquire);
+    const unsigned before = response_ctx->tx_completed_before;
     const TickType_t started = xTaskGetTickCount();
     const TickType_t limit = pdMS_TO_TICKS(timeout_ms);
 
-    // This callback count is captured AFTER the final FIFO flush. A previous
-    // packet may have completed while the flush drained more data; it must
-    // not authorize teardown while the final packet is still in flight.
+    // The counter baseline is sampled before this response is queued. The
+    // final CDC IN transfer can already be complete when the FIFO flush
+    // returns, so sampling here would miss it and suppress teardown even
+    // after the host received accepted=true. Keep the bounded host-read grace
+    // and the session-generation fence before signalling quiescence.
     do {
         if (!cdc_tx_session_is_current(
                 &s_session_gate, response_ctx->generation)) {
@@ -122,6 +126,11 @@ static bool cdc_write_response(const char *response, size_t len,
                                bool release_accepted) {
     cdc_tx_context_t response_ctx = {
         .generation = response_generation,
+        .tx_completed_before = release_accepted
+                                   ? atomic_load_explicit(
+                                         &s_cdc_tx_completed,
+                                         memory_order_acquire)
+                                   : 0u,
     };
     usb_cdc_tx_ops_t ops = {
         .transport_ctx = &response_ctx,
