@@ -489,9 +489,9 @@ def test_release_requires_final_usb_in_completion(tmp_path: Path) -> None:
 #include <string.h>
 #include "usb_cdc_tx.h"
 
-#define CHECK(condition) do { if (!(condition)) { \\
-    fprintf(stderr, "CHECK failed %s:%d: %s\\n", __FILE__, __LINE__, #condition); \\
-    exit(2); \\
+#define CHECK(condition) do { if (!(condition)) { \
+    fprintf(stderr, "CHECK failed %s:%d: %s\n", __FILE__, __LINE__, #condition); \
+    exit(2); \
 } } while (0)
 
 typedef struct {
@@ -551,8 +551,8 @@ static usb_cdc_tx_ops_t ops(tx_ctx_t *c) {
 static bool write_response(tx_ctx_t *c) {
     usb_cdc_tx_ops_t o = ops(c);
     return usb_cdc_tx_write_response(&o,
-        "{\\\"id\\\":\\\"r\\\",\\\"ok\\\":true}",
-        strlen("{\\\"id\\\":\\\"r\\\",\\\"ok\\\":true}"), 17u);
+        "{\"id\":\"r\",\"ok\":true}",
+        strlen("{\"id\":\"r\",\"ok\":true}"), 17u);
 }
 int main(void) {
     tx_ctx_t in_flight = {
@@ -561,7 +561,7 @@ int main(void) {
     CHECK(!write_response(&in_flight));
     CHECK(in_flight.flush_calls == 1);
     CHECK(in_flight.endpoint_wait_calls == 1);
-    CHECK(in_flight.output[in_flight.used - 1] == '\\n');
+    CHECK(in_flight.output[in_flight.used - 1] == '\n');
 
     tx_ctx_t complete = {
         .connected=true, .current=true,
