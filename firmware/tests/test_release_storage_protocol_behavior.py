@@ -643,12 +643,21 @@ def test_release_endpoint_completion_captures_baseline_before_queuing() -> None:
     wait_start = src.index("static bool cdc_release_await_endpoint(")
     wait_end = src.index("static bool cdc_write_response(", wait_start)
     wait = src[wait_start:wait_end]
-    assert "const unsigned before = response_ctx->tx_completed_before;" in wait
-    assert "atomic_load_explicit(&s_cdc_tx_completed" in wait
-    assert "!= before" in wait
+    proof_start = src.index("static bool cdc_release_final_in_proven(")
+    proof_end = src.index("static bool cdc_release_await_endpoint(", proof_start)
+    proof = src[proof_start:proof_end]
+    # Fast completion is still counted from before queueing, but a callback
+    # from an older response or a preceding release fragment cannot pass
+    # without a drained software FIFO and an idle physical CDC IN endpoint.
+    assert "response_ctx->tx_completed_before" in proof
+    assert "atomic_load_explicit(" in proof
+    assert "usb_cdc_tx_final_in_complete(" in proof
+    assert "tud_cdc_n_write_available(" in proof
+    assert "usbd_edpt_busy(" in proof
     assert "CDC_RELEASE_TX_COMPLETE_TIMEOUT_MS" in src
     assert "CDC_RELEASE_HOST_READ_GRACE_MS" in src
     assert "cdc_tx_session_is_current(" in wait
+    assert "cdc_release_final_in_proven(response_ctx, ep_in)" in wait
 
     # No completion notification still fails closed; admission is never
     # converted into teardown permission based solely on a successful FIFO
