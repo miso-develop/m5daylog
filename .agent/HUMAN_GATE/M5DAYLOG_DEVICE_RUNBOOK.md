@@ -226,6 +226,7 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
             PlanHash=(Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
             ImageHash=$imageSetDigest; Count=$images.Count
             Flags=$flags; Pairs=$filePairs
+            ImagePaths=@($images | ForEach-Object { $_.Path })
             Before=[string]$p.extra_esptool_args.before
             After=[string]$p.extra_esptool_args.after
             Stub=[bool]$p.extra_esptool_args.stub
@@ -364,7 +365,7 @@ Retain the passing exact HEAD plus defaults_sha256, effective_sdkconfig_sha256, 
 
 ## 4. Flash and runtime baseline
 
-For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defaults, effective sdkconfig, app, generated plan, complete image set) into this standalone packet. It revalidates every image and the complete flash plan **before** touching the Device. It then invokes the managed Python's `esptool write_flash` directly, using only verified plan entries. Do **not** substitute `idf.py flash`: that action may automatically rebuild before writing. No concurrent editor, build or flashing process may mutate the qualification output. A successful flash still requires an independently verified runtime baseline. Hash agreement alone does not prove the target was programmed correctly; a fresh Device baseline remains mandatory.
+For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defaults, effective sdkconfig, app, generated plan, complete image set) into this standalone packet. It revalidates every image and the complete flash plan **before** touching the Device. It then invokes the managed Python's `esptool write_flash` directly, using only verified plan entries. Do **not** substitute `idf.py flash`: that action may automatically rebuild before writing. No concurrent editor, build or flashing process may mutate the qualification output. The flash packet holds Windows read-only sharing locks on the verified plan/configuration/images and repeats all five hash checks under those locks before invoking esptool; lock acquisition or drift is BLOCKED without attempting to write. A successful flash still requires an independently verified runtime baseline. Hash agreement alone does not prove the target was programmed correctly; a fresh Device baseline remains mandatory.
 
 ~~~powershell
 & {
@@ -403,6 +404,7 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
     $beforeImageHash = "NOT_RUN"
     $afterImageHash = "NOT_RUN"
     $imageCount = "NOT_RUN"
+    $readLocks = @()
     $enteredFirmware = $false
     $diagnosis = "UNEXPECTED_FLASH_ERROR"
     $disposition = "BLOCKED"
@@ -490,6 +492,7 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
             PlanHash=(Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
             ImageHash=$imageSetDigest; Count=$images.Count
             Flags=$flags; Pairs=$filePairs
+            ImagePaths=@($images | ForEach-Object { $_.Path })
             Before=[string]$p.extra_esptool_args.before
             After=[string]$p.extra_esptool_args.after
             Stub=[bool]$p.extra_esptool_args.stub
@@ -555,6 +558,27 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
             $diagnosis = "FLASH_PLAN_OR_IMAGE_MISMATCH_BEFORE_FLASH"
             throw $diagnosis
         }
+        # On Windows, Read sharing without Write/Delete sharing prevents
+        # concurrent modifications while esptool opens these same files.
+        # Re-hash after acquiring every lock, before ANY Device mutation.
+        $diagnosis = "FLASH_SNAPSHOT_LOCK_FAILED"
+        $lockCandidates = @($defaults, $qualifiedSdkconfig, $app,
+                            (Join-Path $qualifiedBuildDir "flasher_args.json")) +
+                          @($qualifiedPlan.ImagePaths)
+        foreach ($filePath in @($lockCandidates | Select-Object -Unique)) {
+            $readLocks += [IO.File]::Open($filePath, [IO.FileMode]::Open,
+                                         [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        }
+        $diagnosis = "FLASH_SNAPSHOT_DRIFT_BEFORE_WRITE"
+        $lockedPlan = Get-QualifiedFlashPlan $qualifiedBuildDir
+        if ($lockedPlan.PlanHash -ne $expectedPlanSha256.ToLowerInvariant() -or
+            $lockedPlan.ImageHash -ne $expectedImageSetSha256.ToLowerInvariant() -or
+            (Get-FileHash -LiteralPath $defaults -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() -ne $expectedDefaultsSha256.ToLowerInvariant() -or
+            (Get-FileHash -LiteralPath $qualifiedSdkconfig -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() -ne $expectedConfigSha256.ToLowerInvariant() -or
+            (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() -ne $expectedAppSha256.ToLowerInvariant()) {
+            throw $diagnosis
+        }
+        $qualifiedPlan = $lockedPlan
 
         $env:IDF_PATH = $idfRoot
         $env:IDF_TOOLS_PATH = $idfTools
@@ -610,6 +634,10 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         # A failed or ambiguous flash is BLOCKED; requalify Device before any cycle.
     }
     finally {
+        foreach ($stream in $readLocks) {
+            try { $stream.Dispose() }
+            catch { $diagnosis = "FLASH_LOCK_CLEANUP_FAILED"; $disposition = "BLOCKED" }
+        }
         if ($enteredFirmware) {
             try { Pop-Location -ErrorAction Stop }
             catch { $diagnosis = "LOCATION_RESTORE_FAILED"; $disposition = "BLOCKED" }
