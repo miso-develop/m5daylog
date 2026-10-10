@@ -27,7 +27,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "nvs.h"
-#include "nvs_flash.h"
+#include "recorder_nvs.h"
 #include "sd_mount.h"
 #include "shutdown_armed.h"
 #include "tinyusb.h"
@@ -42,7 +42,9 @@ static const char *TAG = "recorder_usb";
 #define USB_BIT_RELEASE_REQUESTED   (1u << 3)
 #define USB_BIT_RELEASE_QUIESCED    (1u << 4)
 #define USB_BIT_FAILED              (1u << 5)
+#define USB_BIT_HOST_REATTACHED     (1u << 6)
 #define USB_PUBLIC_BITS             (USB_BIT_ATTACH | USB_BIT_HOST_OWNED | \
+                                     USB_BIT_HOST_REATTACHED | \
                                      USB_BIT_RELEASE_REQUESTED | \
                                      USB_BIT_RELEASE_QUIESCED | USB_BIT_FAILED)
 #define USB_SCSI_CMD_TEST_UNIT_READY      0x00u
@@ -92,6 +94,9 @@ static volatile bool s_provisional_attached = false;
 static volatile bool s_publish_triggered = false;
 static volatile bool s_prepare_disconnected = false;
 static volatile bool s_transfer_authorized = false;
+static volatile bool s_host_session_detached = false;
+static usb_msc_physical_session_cutoff_fn_t s_physical_session_cutoff = NULL;
+static void *s_physical_session_cutoff_ctx = NULL;
 static bool s_wav_finalized = false;
 static bool s_manifest_committed = false;
 static bool s_device_fs_released = false;
@@ -185,22 +190,6 @@ static void usb_scsi_trace_note_command_complete(
     usb_scsi_trace_mark_dirty();
 }
 
-static esp_err_t usb_scsi_trace_finish_nvs(esp_err_t operation_err) {
-    esp_err_t deinit_err = nvs_flash_deinit();
-    if (operation_err != ESP_OK) {
-        return operation_err;
-    }
-    if (deinit_err == ESP_OK) {
-        return ESP_OK;
-    }
-#ifdef ESP_ERR_NVS_NOT_INITIALIZED
-    if (deinit_err == ESP_ERR_NVS_NOT_INITIALIZED) {
-        return ESP_OK;
-    }
-#endif
-    return deinit_err;
-}
-
 esp_err_t usb_msc_ownership_flush_scsi_trace(void) {
     nvs_handle_t handle;
     esp_err_t err;
@@ -240,13 +229,17 @@ esp_err_t usb_msc_ownership_flush_scsi_trace(void) {
     last_b4 =
         __atomic_load_n(&s_trace_last_control_byte4, __ATOMIC_RELAXED);
 
-    err = nvs_flash_init();
+    // The default NVS partition is process-lifetime state shared with RTC
+    // correction and shutdown lifecycle persistence. Serialize this diagnostic
+    // write; never init/deinit the partition from the USB coordinator.
+    err = recorder_nvs_lock();
     if (err != ESP_OK) {
         return err;
     }
     err = nvs_open("m5daylog", NVS_READWRITE, &handle);
     if (err != ESP_OK) {
-        return usb_scsi_trace_finish_nvs(err);
+        recorder_nvs_unlock();
+        return err;
     }
 
 #define TRACE_SET_U8(key, value)                                      \
@@ -271,7 +264,7 @@ esp_err_t usb_msc_ownership_flush_scsi_trace(void) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
-    err = usb_scsi_trace_finish_nvs(err);
+    recorder_nvs_unlock();
     if (err != ESP_OK) {
         return err;
     }
@@ -444,11 +437,20 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
             return;
         }
 
-        // A later physical reconnect may reuse the same unresolved host-owned
-        // session so the PC can still perform the required explicit eject.
+        // A later physical reconnect keeps unresolved MSC ownership host-side.
+        // Do not reset/reopen CDC from ATTACHED: esp_tinyusb reports ATTACHED
+        // from tud_mount_cb before the SET_CONFIGURATION status stage has
+        // completed. Running CDC drain/read work here can race MSC class
+        // binding. Keep CDC generation closed until the first completed SCSI
+        // command proves the reconfigured MSC transport is operational.
         if (!s_release_pending && !sd_mount_is_mounted()) {
-            ESP_LOGI(TAG,
-                     "stage: usb, result: reconfigured, owner: host, mount: usb");
+            if (s_host_session_detached) {
+                ESP_LOGI(TAG,
+                         "stage: usb, result: reconfigured, owner: host, mount: usb, action: wait-msc-command");
+            } else {
+                ESP_LOGI(TAG,
+                         "stage: usb, result: duplicate-configured, owner: host, mount: usb");
+            }
             return;
         }
         (void)tud_disconnect();
@@ -479,8 +481,16 @@ static void usb_device_event_cb(tinyusb_event_t *event, void *arg) {
             return;
         }
         if (s_host_owned) {
+            // Physical detach is never storage-release authority. It is,
+            // however, an authoritative transport boundary for CDC framing and
+            // response identity. Cut off the CDC generation synchronously so
+            // old RX/TX cannot survive until a later reconfiguration.
+            s_host_session_detached = true;
+            if (s_physical_session_cutoff != NULL) {
+                s_physical_session_cutoff(s_physical_session_cutoff_ctx);
+            }
             ESP_LOGW(TAG,
-                     "stage: usb, result: ambiguous-detach, owner: host, action: none");
+                     "stage: usb, result: ambiguous-detach, owner: host, action: cdc-cutoff-only");
         }
     }
 }
@@ -613,7 +623,21 @@ void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]) {
         return;
     }
 
-    // Post-status SCSI completion is observation-only after publication.
+    // A host-owned physical reconnect cuts CDC off immediately, but CDC must
+    // not be reopened from ATTACHED because that callback precedes completion
+    // of SET_CONFIGURATION. The first completed post-reconnect SCSI command is
+    // the class-binding proof that it is safe for the recorder coordinator to
+    // drain/reset CDC and publish a fresh application session.
+    if (s_host_owned && s_host_session_detached &&
+        !atomic_load_explicit(&s_release_pending, memory_order_acquire) &&
+        !sd_mount_is_mounted()) {
+        s_host_session_detached = false;
+        xEventGroupSetBits(s_usb_events, USB_BIT_HOST_REATTACHED);
+        ESP_LOGI(TAG,
+                 "stage: usb, result: reconnect-msc-command-complete, owner: host, action: fresh-cdc-session");
+    }
+
+    // Post-status SCSI completion is observation-only for storage ownership.
     // RELEASE_STORAGE acceptance is the sole normal release authority under
     // D-031; shell/taskbar safe-remove must therefore remain fail-closed.
     usb_scsi_trace_note_command_complete(scsi_cmd);
@@ -649,7 +673,24 @@ esp_err_t usb_msc_ownership_init(void) {
     s_publish_triggered = false;
     s_prepare_disconnected = false;
     s_transfer_authorized = false;
+    s_host_session_detached = false;
+    s_physical_session_cutoff = NULL;
+    s_physical_session_cutoff_ctx = NULL;
     s_initialized = true;
+    return ESP_OK;
+}
+
+esp_err_t usb_msc_ownership_set_physical_session_cutoff(
+    usb_msc_physical_session_cutoff_fn_t cutoff,
+    void *ctx) {
+    if (cutoff == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_initialized || s_started || s_starting) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_physical_session_cutoff = cutoff;
+    s_physical_session_cutoff_ctx = ctx;
     return ESP_OK;
 }
 
@@ -760,6 +801,9 @@ usb_msc_ownership_event_t usb_msc_ownership_wait_event(uint32_t timeout_ms) {
     } else if ((bits & USB_BIT_HOST_OWNED) != 0) {
         selected = USB_BIT_HOST_OWNED;
         event = USB_MSC_EVENT_HOST_OWNED;
+    } else if ((bits & USB_BIT_HOST_REATTACHED) != 0) {
+        selected = USB_BIT_HOST_REATTACHED;
+        event = USB_MSC_EVENT_HOST_REATTACHED;
     } else if ((bits & USB_BIT_RELEASE_REQUESTED) != 0) {
         selected = USB_BIT_RELEASE_REQUESTED;
         event = USB_MSC_EVENT_RELEASE_REQUESTED;
@@ -860,8 +904,10 @@ esp_err_t usb_msc_ownership_complete_release_quiesce(void) {
     s_publish_triggered = false;
     s_prepare_disconnected = false;
     s_transfer_authorized = false;
+    s_host_session_detached = false;
     xEventGroupClearBits(s_usb_events,
                          USB_BIT_ATTACH | USB_BIT_HOST_OWNED |
+                             USB_BIT_HOST_REATTACHED |
                              USB_BIT_RELEASE_REQUESTED);
     xEventGroupSetBits(s_usb_events, USB_BIT_RELEASE_QUIESCED);
     ESP_LOGI(TAG,
@@ -876,6 +922,13 @@ bool usb_msc_ownership_is_host_owned(void) {
 #else
 
 esp_err_t usb_msc_ownership_init(void) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t usb_msc_ownership_set_physical_session_cutoff(
+    usb_msc_physical_session_cutoff_fn_t cutoff,
+    void *ctx) {
+    (void)cutoff;
+    (void)ctx;
+    return ESP_ERR_NOT_SUPPORTED;
+}
 esp_err_t usb_msc_ownership_start(void) { return ESP_ERR_NOT_SUPPORTED; }
 usb_msc_ownership_event_t usb_msc_ownership_wait_event(uint32_t timeout_ms) {
     (void)timeout_ms;

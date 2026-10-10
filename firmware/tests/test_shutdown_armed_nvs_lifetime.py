@@ -1,4 +1,4 @@
-"""Task #87 regression: early shutdown boot-gate NVS lifecycle semantics."""
+"""Task #87/#50 regression: shutdown lifecycle shares process-lifetime NVS."""
 
 from pathlib import Path
 import shutil
@@ -19,9 +19,7 @@ STUB_HEADERS = {
         #define ESP_FAIL 1
         #define ESP_ERR_INVALID_ARG 2
         #define ESP_ERR_INVALID_STATE 3
-        #define ESP_ERR_NOT_SUPPORTED 5
         #define ESP_ERR_NVS_NOT_FOUND 10
-        #define ESP_ERR_NVS_NOT_INITIALIZED 11
     """,
     "nvs.h": r"""
         #pragma once
@@ -36,12 +34,6 @@ STUB_HEADERS = {
         esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value);
         esp_err_t nvs_commit(nvs_handle_t handle);
     """,
-    "nvs_flash.h": r"""
-        #pragma once
-        #include "esp_err.h"
-        esp_err_t nvs_flash_init(void);
-        esp_err_t nvs_flash_deinit(void);
-    """,
 }
 
 HARNESS = r"""
@@ -53,6 +45,7 @@ HARNESS = r"""
 
     #include "esp_err.h"
     #include "nvs.h"
+    #include "recorder_nvs.h"
     #include "shutdown_armed.h"
 
     #define CHECK(expr) do { \
@@ -63,38 +56,57 @@ HARNESS = r"""
     } while (0)
 
     static bool g_initialized;
+    static bool g_locked;
     static bool g_has_value;
     static uint8_t g_value;
     static uint8_t g_pending_value;
     static int g_init_calls;
-    static int g_deinit_calls;
-    static esp_err_t g_deinit_result = ESP_OK;
+    static int g_lock_calls;
+    static int g_unlock_calls;
+    static esp_err_t g_lock_result = ESP_OK;
 
-    esp_err_t nvs_flash_init(void) {
-        g_initialized = true;
-        g_init_calls++;
+    esp_err_t recorder_nvs_init(void) {
+        if (!g_initialized) {
+            g_initialized = true;
+            g_init_calls++;
+        }
         return ESP_OK;
     }
 
-    esp_err_t nvs_flash_deinit(void) {
+    esp_err_t recorder_nvs_lock(void) {
+        esp_err_t err = recorder_nvs_init();
+        if (err != ESP_OK) return err;
+        g_lock_calls++;
+        if (g_lock_result != ESP_OK) return g_lock_result;
+        CHECK(!g_locked);
+        g_locked = true;
+        return ESP_OK;
+    }
+
+    void recorder_nvs_unlock(void) {
         CHECK(g_initialized);
-        g_initialized = false;
-        g_deinit_calls++;
-        return g_deinit_result;
+        CHECK(g_locked);
+        g_locked = false;
+        g_unlock_calls++;
     }
 
     esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle) {
         CHECK(g_initialized);
+        CHECK(g_locked);
         CHECK(strcmp(name, "m5daylog") == 0);
         (void)mode;
         *handle = 7;
         return ESP_OK;
     }
 
-    void nvs_close(nvs_handle_t handle) { CHECK(handle == 7); }
+    void nvs_close(nvs_handle_t handle) {
+        CHECK(handle == 7);
+        CHECK(g_locked);
+    }
 
     esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *value) {
         CHECK(handle == 7);
+        CHECK(g_locked);
         CHECK(strcmp(key, "shutdown_armed") == 0);
         if (!g_has_value) return ESP_ERR_NVS_NOT_FOUND;
         *value = g_value;
@@ -103,6 +115,7 @@ HARNESS = r"""
 
     esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value) {
         CHECK(handle == 7);
+        CHECK(g_locked);
         CHECK(strcmp(key, "shutdown_armed") == 0);
         g_pending_value = value;
         return ESP_OK;
@@ -110,6 +123,7 @@ HARNESS = r"""
 
     esp_err_t nvs_commit(nvs_handle_t handle) {
         CHECK(handle == 7);
+        CHECK(g_locked);
         g_has_value = true;
         g_value = g_pending_value;
         return ESP_OK;
@@ -119,49 +133,51 @@ HARNESS = r"""
         shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN;
         bool armed = false;
 
-        /*
-         * ESP-IDF documents ESP_ERR_NVS_NOT_INITIALIZED as the only non-OK
-         * nvs_flash_deinit() disposition. It already means the desired cleanup
-         * postcondition holds, so a successful NORMAL boot-state read must not
-         * turn that cleanup status into a shutdown authorization failure.
-         */
-        g_deinit_result = ESP_ERR_NVS_NOT_INITIALIZED;
+        /* Boot-state inspection initializes the shared service once and leaves
+         * it alive after the transaction completes. */
         CHECK(shutdown_armed_boot_action(false, &action) == ESP_OK);
         CHECK(action == SHUTDOWN_ARMED_BOOT_NORMAL);
-        CHECK(!g_initialized);
+        CHECK(g_initialized);
+        CHECK(!g_locked);
         CHECK(g_init_calls == 1);
-        CHECK(g_deinit_calls == 1);
+        CHECK(g_lock_calls == 1);
+        CHECK(g_unlock_calls == 1);
 
-        /* Durable writes still release NVS after their commit completes. */
-        g_deinit_result = ESP_OK;
+        /* Durable lifecycle writes reuse the same initialized NVS lifetime. */
         CHECK(shutdown_armed_commit() == ESP_OK);
         CHECK(g_has_value && g_value == 1);
-        CHECK(!g_initialized);
-        CHECK(g_init_calls == 2);
-        CHECK(g_deinit_calls == 2);
+        CHECK(g_initialized);
+        CHECK(!g_locked);
+        CHECK(g_init_calls == 1);
+        CHECK(g_lock_calls == 2);
+        CHECK(g_unlock_calls == 2);
 
-        /* Unexpected cleanup errors remain fail-closed. */
-        g_deinit_result = ESP_FAIL;
+        /* A shared-guard failure remains fail closed without changing the
+         * process-lifetime initialization state. */
+        g_lock_result = ESP_FAIL;
         CHECK(shutdown_armed_read(&armed) == ESP_FAIL);
-        CHECK(!g_initialized);
-        CHECK(g_init_calls == 3);
-        CHECK(g_deinit_calls == 3);
+        CHECK(g_initialized);
+        CHECK(!g_locked);
+        CHECK(g_init_calls == 1);
+        CHECK(g_lock_calls == 3);
+        CHECK(g_unlock_calls == 2);
 
         return 0;
     }
 """
 
 
-def test_shutdown_gate_handles_nvs_cleanup_without_false_shutdown(tmp_path: Path) -> None:
+def test_shutdown_gate_uses_shared_process_lifetime_nvs(tmp_path: Path) -> None:
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if cc is None:
         pytest.skip("host C compiler is unavailable")
 
     stubs = tmp_path / "stubs"
     stubs.mkdir()
-    for rel, content in STUB_HEADERS.items():
-        path = stubs / rel
-        path.write_text(textwrap.dedent(content), encoding="utf-8")
+    for rel, header in STUB_HEADERS.items():
+        target = stubs / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(textwrap.dedent(header), encoding="utf-8")
 
     harness = tmp_path / "harness.c"
     harness.write_text(textwrap.dedent(HARNESS), encoding="utf-8")

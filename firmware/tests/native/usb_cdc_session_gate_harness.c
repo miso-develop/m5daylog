@@ -216,6 +216,50 @@ static void test_acquired_batch_snapshot_is_invalid_after_reset_and_reopen(void)
     }
 }
 
+static void test_callback_close_invalidates_generation_before_reconnect(void) {
+    uint32_t old_generation;
+    uint32_t discard_epoch;
+    usb_cdc_session_snapshot_t old_snapshot;
+
+    usb_cdc_session_gate_init(&s_gate);
+    if (!usb_cdc_session_gate_open(&s_gate)) {
+        fail("initial session did not open");
+    }
+    old_generation = usb_cdc_session_gate_generation(&s_gate);
+    old_snapshot = usb_cdc_session_gate_snapshot(&s_gate);
+    if (!usb_cdc_session_gate_command_begin(&s_gate, old_generation)) {
+        fail("old-session command was not admitted");
+    }
+
+    /* This is the callback-safe DETACHED seam used by production: close must
+       return immediately even with an active command, while invalidating both
+       RX snapshots and TX generation identity before physical reconnect. */
+    usb_cdc_session_gate_close(&s_gate);
+    if (usb_cdc_session_gate_is_open(&s_gate)) {
+        fail("callback close left CDC admission open");
+    }
+    if (usb_cdc_session_gate_snapshot_is_current(&s_gate, old_snapshot)) {
+        fail("old RX snapshot survived physical detach cutoff");
+    }
+    if (usb_cdc_session_gate_generation(&s_gate) == old_generation) {
+        fail("physical detach did not invalidate CDC generation");
+    }
+
+    usb_cdc_session_gate_command_end(&s_gate);
+    usb_cdc_session_gate_reset(&s_gate, NULL, NULL);
+
+    /* Drain the synthetic stale boundary before the coordinator may reopen. */
+    discard_epoch = usb_cdc_session_gate_rx_discard_epoch(&s_gate);
+    usb_cdc_session_gate_mark_rx_drained(&s_gate, discard_epoch);
+    if (!usb_cdc_session_gate_open(&s_gate)) {
+        fail("fresh session did not reopen after stale RX drain");
+    }
+    if (usb_cdc_session_gate_command_begin(&s_gate, old_generation)) {
+        usb_cdc_session_gate_command_end(&s_gate);
+        fail("pre-detach generation executed after reconnect");
+    }
+}
+
 static void test_lifecycle_open_waits_for_stale_rx_drain_before_new_request(void) {
     uint32_t discard_epoch;
     uint32_t current_generation;
@@ -268,6 +312,7 @@ int main(void) {
     test_reset_cancels_an_open_publication_reserved_before_cutoff();
     test_pre_reset_frame_cannot_execute_after_new_session_opens();
     test_acquired_batch_snapshot_is_invalid_after_reset_and_reopen();
+    test_callback_close_invalidates_generation_before_reconnect();
     test_lifecycle_open_waits_for_stale_rx_drain_before_new_request();
     puts("production session gate lifecycle overlap: PASS");
     return 0;

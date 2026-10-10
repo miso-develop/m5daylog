@@ -102,7 +102,7 @@ int main(void) {
     n = process("{\"id\":\"u1\",\"cmd\":\"PING\",\"args\":{}}",
                 &config, response, sizeof(response), &effect);
     CHECK(n > 0);
-    CHECK(strstr(response, "\"code\":\"UNKNOWN_COMMAND\"") != NULL);
+    CHECK(strstr(response, "\"pong\":true") != NULL);
 
     usb_cdc_protocol_framer_init(&framer);
     {
