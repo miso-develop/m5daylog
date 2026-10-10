@@ -258,7 +258,8 @@ def test_transport_orders_gate_response_then_teardown_signal() -> None:
     )
     assert process_at < tx_at < command_end_at < response_complete_at
     assert "cdc_lifecycle_admission_open" in worker
-    assert "effect.release_accepted && response_complete" in worker
+    assert "usb_cdc_tx_complete_accepted_release(" in worker
+    assert "effect.release_accepted, response_complete" in worker
 
     line_at = src.index("static void usb_cdc_line_state_callback")
     wait_at = src.index("static void cdc_session_gate_wait", line_at)
