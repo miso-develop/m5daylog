@@ -603,7 +603,7 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         $flashArgs += @($qualifiedPlan.Pairs)
         Push-Location -LiteralPath $qualifiedBuildDir -ErrorAction Stop
         try {
-            & $python -m esptool @args
+            & $python -m esptool @flashArgs
             $flashExit = $LASTEXITCODE
         }
         finally { Pop-Location -ErrorAction Stop }
