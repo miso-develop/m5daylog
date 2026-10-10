@@ -137,54 +137,58 @@ static uint8_t cdc_bulk_in_endpoint(void) {
     return 0u;
 }
 
-static bool cdc_release_final_in_proven(
-    const cdc_tx_context_t *response_ctx, uint8_t ep_in) {
-    unsigned completed = atomic_load_explicit(
-        &s_cdc_tx_completed, memory_order_acquire);
-    bool fifo_drained =
-        tud_cdc_n_write_available(TINYUSB_CDC_ACM_0) ==
-        CFG_TUD_CDC_TX_BUFSIZE;
-    // FIFO-empty means all response bytes have left the software buffer.
-    // The IN endpoint additionally must not have a scheduled USB transfer.
-    // Neither observation alone proves that the final transfer is complete.
-    bool endpoint_busy = usbd_edpt_busy(0u, ep_in);
-    return usb_cdc_tx_final_in_complete(
-        response_ctx->tx_completed_before, completed, fifo_drained,
-        endpoint_busy);
+typedef struct {
+    const cdc_tx_context_t *response;
+    uint8_t ep_in;
+} cdc_release_wait_ctx_t;
+
+static bool cdc_release_wait_current(void *ctx) {
+    const cdc_release_wait_ctx_t *wait = ctx;
+    return cdc_tx_session_is_current(
+        &s_session_gate, wait->response->generation);
+}
+
+static bool cdc_release_wait_sample(void *ctx, unsigned *after,
+                                     bool *drained, bool *busy) {
+    const cdc_release_wait_ctx_t *wait = ctx;
+    *after = atomic_load_explicit(&s_cdc_tx_completed, memory_order_acquire);
+    *drained = tud_cdc_n_write_available(TINYUSB_CDC_ACM_0) ==
+               CFG_TUD_CDC_TX_BUFSIZE;
+    *busy = usbd_edpt_busy(0u, wait->ep_in);
+    return true;
+}
+
+static uint32_t cdc_release_now_ticks(void *ctx) {
+    (void)ctx;
+    return (uint32_t)xTaskGetTickCount();
+}
+
+static void cdc_release_delay_ticks(void *ctx, uint32_t ticks) {
+    (void)ctx;
+    vTaskDelay((TickType_t)ticks);
 }
 
 static bool cdc_release_await_endpoint(void *ctx, uint32_t timeout_ms) {
-    const cdc_tx_context_t *response_ctx = (const cdc_tx_context_t *)ctx;
-    const TickType_t started = xTaskGetTickCount();
-    const TickType_t limit = pdMS_TO_TICKS(timeout_ms);
+    const cdc_tx_context_t *response = ctx;
     const uint8_t ep_in = cdc_bulk_in_endpoint();
-
+    cdc_release_wait_ctx_t wait_ctx = {
+        .response = response,
+        .ep_in = ep_in,
+    };
+    const usb_cdc_tx_final_wait_ops_t wait_ops = {
+        .ctx = &wait_ctx,
+        .session_current = cdc_release_wait_current,
+        .sample = cdc_release_wait_sample,
+        .now_ticks = cdc_release_now_ticks,
+        .delay_ticks = cdc_release_delay_ticks,
+        .callbacks_before = response->tx_completed_before,
+        .timeout_ticks = pdMS_TO_TICKS(timeout_ms),
+        .host_grace_ticks = pdMS_TO_TICKS(CDC_RELEASE_HOST_READ_GRACE_MS),
+    };
     if (ep_in == 0u) {
         return false; // Unknown endpoint: never authorize teardown.
     }
-    do {
-        if (!cdc_tx_session_is_current(
-                &s_session_gate, response_ctx->generation)) {
-            return false;
-        }
-        if (cdc_release_final_in_proven(response_ctx, ep_in)) {
-            // Recheck on the next scheduler turn: a class-completion callback
-            // can run just before TinyUSB schedules the next FIFO segment.
-            vTaskDelay(1);
-            if (!cdc_tx_session_is_current(
-                    &s_session_gate, response_ctx->generation) ||
-                !cdc_release_final_in_proven(response_ctx, ep_in)) {
-                continue;
-            }
-            // Host receive grace is not PC application acknowledgement.
-            vTaskDelay(pdMS_TO_TICKS(CDC_RELEASE_HOST_READ_GRACE_MS));
-            return cdc_tx_session_is_current(
-                       &s_session_gate, response_ctx->generation) &&
-                   cdc_release_final_in_proven(response_ctx, ep_in);
-        }
-        vTaskDelay(1);
-    } while ((TickType_t)(xTaskGetTickCount() - started) < limit);
-    return false;
+    return usb_cdc_tx_wait_final_in(&wait_ops);
 }
 
 static bool cdc_write_response(const char *response, size_t len,
@@ -346,11 +350,13 @@ static void usb_cdc_worker_task(void *arg) {
                 // The accepted ownership gate remains closed independently.
                 usb_cdc_session_gate_command_end(&s_session_gate);
 
-                if (effect.release_accepted && response_complete &&
-                    s_config.release_response_complete != NULL) {
-                    (void)s_config.release_response_complete(
-                        effect.release_attempt_id, s_config.lifecycle_ctx);
-                }
+                // The production post-command authorization gate is also
+                // executed by the native final-IN/teardown regression.
+                (void)usb_cdc_tx_complete_accepted_release(
+                    effect.release_accepted, response_complete,
+                    effect.release_attempt_id,
+                    s_config.release_response_complete,
+                    s_config.lifecycle_ctx);
 
                 // Once RELEASE_STORAGE is accepted, no later SET_TIME or other
                 // command can execute in this publication session.

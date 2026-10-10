@@ -643,21 +643,19 @@ def test_release_endpoint_completion_captures_baseline_before_queuing() -> None:
     wait_start = src.index("static bool cdc_release_await_endpoint(")
     wait_end = src.index("static bool cdc_write_response(", wait_start)
     wait = src[wait_start:wait_end]
-    proof_start = src.index("static bool cdc_release_final_in_proven(")
-    proof_end = src.index("static bool cdc_release_await_endpoint(", proof_start)
-    proof = src[proof_start:proof_end]
-    # Fast completion is still counted from before queueing, but a callback
-    # from an older response or a preceding release fragment cannot pass
-    # without a drained software FIFO and an idle physical CDC IN endpoint.
-    assert "response_ctx->tx_completed_before" in proof
-    assert "atomic_load_explicit(" in proof
-    assert "usb_cdc_tx_final_in_complete(" in proof
-    assert "tud_cdc_n_write_available(" in proof
-    assert "usbd_edpt_busy(" in proof
+    sample_start = src.index("static bool cdc_release_wait_sample(")
+    sample_end = src.index("static uint32_t cdc_release_now_ticks(", sample_start)
+    sample = src[sample_start:sample_end]
+    # The exact production wait now runs in portable C with an injected
+    # TinyUSB snapshot seam, exercised by a dynamic release coordinator test.
+    assert "atomic_load_explicit(&s_cdc_tx_completed" in sample
+    assert "tud_cdc_n_write_available(" in sample
+    assert "usbd_edpt_busy(" in sample
+    assert "response->tx_completed_before" in wait
+    assert "usb_cdc_tx_wait_final_in(&wait_ops)" in wait
     assert "CDC_RELEASE_TX_COMPLETE_TIMEOUT_MS" in src
     assert "CDC_RELEASE_HOST_READ_GRACE_MS" in src
-    assert "cdc_tx_session_is_current(" in wait
-    assert "cdc_release_final_in_proven(response_ctx, ep_in)" in wait
+    assert "cdc_release_wait_current" in wait
 
     # No completion notification still fails closed; admission is never
     # converted into teardown permission based solely on a successful FIFO
@@ -746,9 +744,26 @@ def test_release_proof_wired_to_active_bulk_in_and_session_fence() -> None:
     src = TRANSPORT.read_text(encoding="utf-8")
     assert "tud_descriptor_configuration_cb(0u)" in src
     assert "TUSB_CLASS_CDC_DATA" in src
-    assert "usbd_edpt_busy(0u, ep_in)" in src
+    assert "usbd_edpt_busy(0u, wait->ep_in)" in src
     assert "tud_cdc_n_write_available(TINYUSB_CDC_ACM_0)" in src
-    assert "usb_cdc_tx_final_in_complete(" in src
     assert "cdc_tx_session_is_current(" in src
-    assert "cdc_release_final_in_proven(response_ctx, ep_in)" in src
+    assert "usb_cdc_tx_wait_final_in(&wait_ops)" in src
+    assert "usb_cdc_tx_complete_accepted_release(" in src
     assert "CDC_RELEASE_HOST_READ_GRACE_MS" in src
+
+
+def test_production_final_in_wait_and_release_authorization(tmp_path: Path) -> None:
+    """REV-83-14: execute real wait + writer + coordinator gate, not mocks."""
+    executable = tmp_path / "usb_cdc_release_wait"
+    harness = REPO / "firmware/tests/native/usb_cdc_release_wait_harness.c"
+    build = subprocess.run(
+        ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+         "-I", str(INCLUDE), str(TX), str(harness), "-o", str(executable)],
+        cwd=REPO, text=True, capture_output=True, check=False,
+    )
+    assert build.returncode == 0, build.stderr
+    run = subprocess.run(
+        [str(executable)], cwd=REPO, text=True, capture_output=True, check=False,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "production final-IN wait and release authorization: PASS" in run.stdout
