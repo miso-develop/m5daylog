@@ -136,9 +136,101 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
     $configHash = "NOT_RUN"
     $buildExit = "NOT_RUN"
     $appHash = "NOT_RUN"
+    $planHash = "NOT_RUN"
+    $imageSetHash = "NOT_RUN"
+    $imageCount = "NOT_RUN"
     $enteredFirmware = $false
     $diagnosis = "UNEXPECTED_BUILD_ERROR"
     $disposition = "BLOCKED"
+
+
+    # Derive the entire immutable qualification identity from the generated
+    # flasher plan. Do not rely on the application binary hash alone.
+    function Get-QualifiedFlashPlan([string]$root) {
+        $jsonPath = Join-Path $root "flasher_args.json"
+        $p = [IO.File]::ReadAllText($jsonPath) | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $p.flash_files -or $null -eq $p.write_flash_args -or
+            $null -eq $p.extra_esptool_args -or $null -eq $p.flash_settings -or
+            [string]$p.extra_esptool_args.chip -cne "esp32s3" -or
+            [string]$p.flash_settings.flash_size -cne "8MB" -or
+            $p.extra_esptool_args.stub -isnot [bool]) {
+            throw "INVALID_FLASH_PLAN"
+        }
+        $flags = @($p.write_flash_args | ForEach-Object { [string]$_ })
+        if ($flags.Count -ne 6) { throw "INVALID_FLASH_FLAGS" }
+        $opts = @{}
+        for ($i = 0; $i -lt $flags.Count; $i += 2) {
+            if ($flags[$i] -cnotin @("--flash_mode","--flash_size","--flash_freq") -or
+                $opts.ContainsKey($flags[$i])) { throw "INVALID_FLASH_FLAGS" }
+            $opts[$flags[$i]] = $flags[$i+1]
+        }
+        if ($opts.Count -ne 3 -or $opts["--flash_size"] -cne "8MB" -or
+            $opts["--flash_mode"] -cnotin @("dio","dout","qio","qout") -or
+            $opts["--flash_freq"] -cnotmatch '^[0-9]{1,3}m$' -or
+            $opts["--flash_mode"] -cne [string]$p.flash_settings.flash_mode -or
+            $opts["--flash_freq"] -cne [string]$p.flash_settings.flash_freq -or
+            [string]$p.extra_esptool_args.before -cnotmatch '^[a-z_]+$' -or
+            [string]$p.extra_esptool_args.after -cnotmatch '^[a-z_]+$') {
+            throw "INVALID_FLASH_FLAGS"
+        }
+        $images = @()
+        foreach ($entry in $p.flash_files.PSObject.Properties) {
+            $offset = [string]$entry.Name
+            $relative = [string]$entry.Value
+            if ($offset -cnotmatch '^0x[0-9a-fA-F]+$' -or
+                $relative -cnotmatch '^(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+[.]bin$') {
+                throw "INVALID_FLASH_ENTRY"
+            }
+            $number = [Convert]::ToInt64($offset.Substring(2),16)
+            $full = Join-Path $root $relative.Replace('/', '\')
+            $file = Get-Item -LiteralPath $full -ErrorAction Stop
+            if ($file.PSIsContainer -or $file.Length -le 0 -or
+                ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "INVALID_FLASH_IMAGE"
+            }
+            $images += [pscustomobject]@{
+                Offset=$number; OffsetText=("0x{0:x}" -f $number)
+                Relative=$relative; Path=$full; Size=$file.Length
+                Sha=(Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            }
+        }
+        $images = @($images | Sort-Object Offset)
+        if ($images.Count -lt 3 -or
+            @($images | Where-Object Relative -eq "bootloader/bootloader.bin").Count -ne 1 -or
+            @($images | Where-Object Relative -eq "partition_table/partition-table.bin").Count -ne 1 -or
+            @($images | Where-Object Relative -eq "m5daylog.bin").Count -ne 1) {
+            throw "REQUIRED_FLASH_IMAGE_MISSING"
+        }
+        $end = [int64]0
+        $rows = @()
+        $filePairs = @()
+        foreach ($image in $images) {
+            if ($image.Offset -lt $end -or
+                ($image.Offset + $image.Size) -gt (8*1024*1024)) {
+                throw "FLASH_OFFSETS_INVALID"
+            }
+            $end = $image.Offset + $image.Size
+            $rows += ("{0}|{1}|{2}" -f $image.OffsetText,$image.Relative,$image.Sha)
+            $filePairs += $image.OffsetText
+            $filePairs += $image.Path
+        }
+        # Canonical identity: sorted offset|relative-file|sha256, LF terminated.
+        $canonical = ($rows -join [char]10) + [char]10
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))
+            $imageSetDigest = ([BitConverter]::ToString($bytes)).Replace("-","").ToLowerInvariant()
+        }
+        finally { $sha256.Dispose() }
+        [pscustomobject]@{
+            PlanHash=(Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            ImageHash=$imageSetDigest; Count=$images.Count
+            Flags=$flags; Pairs=$filePairs
+            Before=[string]$p.extra_esptool_args.before
+            After=[string]$p.extra_esptool_args.after
+            Stub=[bool]$p.extra_esptool_args.stub
+        }
+    }
 
     try {
         foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $firmwareRoot,
@@ -230,6 +322,11 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
         }
         $configHash = (Get-FileHash -LiteralPath $qualifiedSdkconfig -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         $appHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $diagnosis = "FLASH_PLAN_INVALID_AFTER_BUILD"
+        $qualifiedPlan = Get-QualifiedFlashPlan $qualifiedBuildDir
+        $planHash = $qualifiedPlan.PlanHash
+        $imageSetHash = $qualifiedPlan.ImageHash
+        $imageCount = $qualifiedPlan.Count
         $diagnosis = "OK"
         $disposition = "PASS"
     }
@@ -252,6 +349,9 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
         Write-Host ("effective_sdkconfig_sha256={0}" -f $configHash)
         Write-Host ("build_exit={0}" -f $buildExit)
         Write-Host ("app_sha256={0}" -f $appHash)
+        Write-Host ("flasher_args_sha256={0}" -f $planHash)
+        Write-Host ("flash_image_set_sha256={0}" -f $imageSetHash)
+        Write-Host ("flash_image_count={0}" -f $imageCount)
         Write-Host ("diagnosis={0}" -f $diagnosis)
         Write-Host ("disposition={0}" -f $disposition)
         Write-Host ("SUMMARY phase={0} diagnosis={1} disposition={2}" -f $phase, $diagnosis, $disposition)
@@ -260,11 +360,11 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
 }
 ~~~
 
-Retain the passing exact HEAD plus defaults_sha256, effective_sdkconfig_sha256, and app_sha256 as the build-to-flash identity. Never reuse them across a revision/toolchain change. A partial isolated build is not requalified by fullclean; preserve evidence and use a newly controlled checkout/output path. The hash is not itself proof of what is running on the physical target; qualification still requires an observed flash result and a fresh Device baseline. Use the build-generated flash plan. Do not guess partition offsets. Do not erase NVS unless the approved setup explicitly requires a fixture reset. Fixture repair/reset is setup and counts as zero acceptance cycles.
+Retain the passing exact HEAD plus defaults_sha256, effective_sdkconfig_sha256, app_sha256, flasher_args_sha256 and flash_image_set_sha256 as the build-to-flash identity. The image-set SHA-256 covers every generated flash image as sorted LF-terminated UTF-8 `0xoffset|build-relative-image.bin|sha256` records. Together with the generated JSON plan digest, this binds offsets, tool flags, bootloader, partition table, application, and any additional flash image. Keep the generated plan and original per-image digests in local evidence. Do not build again or change this qualified output between qualification and flashing. Never reuse them across a revision/toolchain change. A partial isolated build is not requalified by fullclean; preserve evidence and use a newly controlled checkout/output path. The hash is not itself proof of what is running on the physical target; qualification still requires an observed flash result and a fresh Device baseline. Use the build-generated flash plan. Do not guess partition offsets. Do not erase NVS unless the approved setup explicitly requires a fixture reset. Fixture repair/reset is setup and counts as zero acceptance cycles.
 
 ## 4. Flash and runtime baseline
 
-For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults, effective sdkconfig, app) into this standalone packet. It uses the same qualified output directory and refuses to flash when any input changed. Hash agreement alone does not prove the target was programmed correctly; a fresh Device baseline remains mandatory.
+For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defaults, effective sdkconfig, app, generated plan, complete image set) into this standalone packet. It revalidates every image and the complete flash plan **before** touching the Device. It then invokes the managed Python's `esptool write_flash` directly, using only verified plan entries. Do **not** substitute `idf.py flash`: that action may automatically rebuild before writing. No concurrent editor, build or flashing process may mutate the qualification output. A successful flash still requires an independently verified runtime baseline. Hash agreement alone does not prove the target was programmed correctly; a fresh Device baseline remains mandatory.
 
 ~~~powershell
 & {
@@ -273,6 +373,8 @@ For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults
     $expectedDefaultsSha256 = "<defaults-sha256-from-HG-BUILD>"
     $expectedConfigSha256 = "<effective-sdkconfig-sha256-from-HG-BUILD>"
     $expectedAppSha256 = "<app-sha256-from-HG-BUILD>"
+    $expectedPlanSha256 = "<flasher-args-sha256-from-HG-BUILD>"
+    $expectedImageSetSha256 = "<flash-image-set-sha256-from-HG-BUILD>"
     $repoRoot = "<repo-root>"
     $idfRoot = "<esp-idf-root>"
     $idfTools = "<idf-tools-root>"
@@ -296,9 +398,103 @@ For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults
     $afterConfigHash = "NOT_RUN"
     $beforeDefaultsHash = "NOT_RUN"
     $afterDefaultsHash = "NOT_RUN"
+    $beforePlanHash = "NOT_RUN"
+    $afterPlanHash = "NOT_RUN"
+    $beforeImageHash = "NOT_RUN"
+    $afterImageHash = "NOT_RUN"
+    $imageCount = "NOT_RUN"
     $enteredFirmware = $false
     $diagnosis = "UNEXPECTED_FLASH_ERROR"
     $disposition = "BLOCKED"
+
+
+    # Derive the entire immutable qualification identity from the generated
+    # flasher plan. Do not rely on the application binary hash alone.
+    function Get-QualifiedFlashPlan([string]$root) {
+        $jsonPath = Join-Path $root "flasher_args.json"
+        $p = [IO.File]::ReadAllText($jsonPath) | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $p.flash_files -or $null -eq $p.write_flash_args -or
+            $null -eq $p.extra_esptool_args -or $null -eq $p.flash_settings -or
+            [string]$p.extra_esptool_args.chip -cne "esp32s3" -or
+            [string]$p.flash_settings.flash_size -cne "8MB" -or
+            $p.extra_esptool_args.stub -isnot [bool]) {
+            throw "INVALID_FLASH_PLAN"
+        }
+        $flags = @($p.write_flash_args | ForEach-Object { [string]$_ })
+        if ($flags.Count -ne 6) { throw "INVALID_FLASH_FLAGS" }
+        $opts = @{}
+        for ($i = 0; $i -lt $flags.Count; $i += 2) {
+            if ($flags[$i] -cnotin @("--flash_mode","--flash_size","--flash_freq") -or
+                $opts.ContainsKey($flags[$i])) { throw "INVALID_FLASH_FLAGS" }
+            $opts[$flags[$i]] = $flags[$i+1]
+        }
+        if ($opts.Count -ne 3 -or $opts["--flash_size"] -cne "8MB" -or
+            $opts["--flash_mode"] -cnotin @("dio","dout","qio","qout") -or
+            $opts["--flash_freq"] -cnotmatch '^[0-9]{1,3}m$' -or
+            $opts["--flash_mode"] -cne [string]$p.flash_settings.flash_mode -or
+            $opts["--flash_freq"] -cne [string]$p.flash_settings.flash_freq -or
+            [string]$p.extra_esptool_args.before -cnotmatch '^[a-z_]+$' -or
+            [string]$p.extra_esptool_args.after -cnotmatch '^[a-z_]+$') {
+            throw "INVALID_FLASH_FLAGS"
+        }
+        $images = @()
+        foreach ($entry in $p.flash_files.PSObject.Properties) {
+            $offset = [string]$entry.Name
+            $relative = [string]$entry.Value
+            if ($offset -cnotmatch '^0x[0-9a-fA-F]+$' -or
+                $relative -cnotmatch '^(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+[.]bin$') {
+                throw "INVALID_FLASH_ENTRY"
+            }
+            $number = [Convert]::ToInt64($offset.Substring(2),16)
+            $full = Join-Path $root $relative.Replace('/', '\')
+            $file = Get-Item -LiteralPath $full -ErrorAction Stop
+            if ($file.PSIsContainer -or $file.Length -le 0 -or
+                ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "INVALID_FLASH_IMAGE"
+            }
+            $images += [pscustomobject]@{
+                Offset=$number; OffsetText=("0x{0:x}" -f $number)
+                Relative=$relative; Path=$full; Size=$file.Length
+                Sha=(Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            }
+        }
+        $images = @($images | Sort-Object Offset)
+        if ($images.Count -lt 3 -or
+            @($images | Where-Object Relative -eq "bootloader/bootloader.bin").Count -ne 1 -or
+            @($images | Where-Object Relative -eq "partition_table/partition-table.bin").Count -ne 1 -or
+            @($images | Where-Object Relative -eq "m5daylog.bin").Count -ne 1) {
+            throw "REQUIRED_FLASH_IMAGE_MISSING"
+        }
+        $end = [int64]0
+        $rows = @()
+        $filePairs = @()
+        foreach ($image in $images) {
+            if ($image.Offset -lt $end -or
+                ($image.Offset + $image.Size) -gt (8*1024*1024)) {
+                throw "FLASH_OFFSETS_INVALID"
+            }
+            $end = $image.Offset + $image.Size
+            $rows += ("{0}|{1}|{2}" -f $image.OffsetText,$image.Relative,$image.Sha)
+            $filePairs += $image.OffsetText
+            $filePairs += $image.Path
+        }
+        # Canonical identity: sorted offset|relative-file|sha256, LF terminated.
+        $canonical = ($rows -join [char]10) + [char]10
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))
+            $imageSetDigest = ([BitConverter]::ToString($bytes)).Replace("-","").ToLowerInvariant()
+        }
+        finally { $sha256.Dispose() }
+        [pscustomobject]@{
+            PlanHash=(Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            ImageHash=$imageSetDigest; Count=$images.Count
+            Flags=$flags; Pairs=$filePairs
+            Before=[string]$p.extra_esptool_args.before
+            After=[string]$p.extra_esptool_args.after
+            Stub=[bool]$p.extra_esptool_args.stub
+        }
+    }
 
     try {
         foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $firmwareRoot,
@@ -309,7 +505,7 @@ For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults
             }
         }
         $invalidHash = $false
-        foreach ($digest in @($expectedDefaultsSha256, $expectedConfigSha256, $expectedAppSha256)) {
+        foreach ($digest in @($expectedDefaultsSha256, $expectedConfigSha256, $expectedAppSha256, $expectedPlanSha256, $expectedImageSetSha256)) {
             if ($digest -notmatch '^[a-fA-F0-9]{64}$') { $invalidHash = $true }
         }
         if ($invalidHash -or $serialPort -eq "<serial-port>") {
@@ -349,6 +545,16 @@ For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults
             $diagnosis = "APP_HASH_MISMATCH_BEFORE_FLASH"
             throw $diagnosis
         }
+        $diagnosis = "FLASH_PLAN_INVALID_BEFORE_FLASH"
+        $qualifiedPlan = Get-QualifiedFlashPlan $qualifiedBuildDir
+        $beforePlanHash = $qualifiedPlan.PlanHash
+        $beforeImageHash = $qualifiedPlan.ImageHash
+        $imageCount = $qualifiedPlan.Count
+        if ($beforePlanHash -ne $expectedPlanSha256.ToLowerInvariant() -or
+            $beforeImageHash -ne $expectedImageSetSha256.ToLowerInvariant()) {
+            $diagnosis = "FLASH_PLAN_OR_IMAGE_MISMATCH_BEFORE_FLASH"
+            throw $diagnosis
+        }
 
         $env:IDF_PATH = $idfRoot
         $env:IDF_TOOLS_PATH = $idfTools
@@ -364,7 +570,19 @@ For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults
 
         Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
         $enteredFirmware = $true
-        & $python $idfPy -B $qualifiedBuildDir "-DSDKCONFIG=$qualifiedSdkconfig" "-DSDKCONFIG_DEFAULTS=$defaults" "-DIDF_TARGET=esp32s3" -p $serialPort flash
+        # No implicit build, and no unchecked @flash_args file.
+        $args = @("--chip","esp32s3","-p",$serialPort,
+                  "--before",$qualifiedPlan.Before,"--after",$qualifiedPlan.After)
+        if (-not $qualifiedPlan.Stub) { $args += "--no-stub" }
+        $args += "write_flash"
+        $args += @($qualifiedPlan.Flags)
+        $args += @($qualifiedPlan.Pairs)
+        Push-Location -LiteralPath $qualifiedBuildDir -ErrorAction Stop
+        try {
+            & $python -m esptool @args
+            $flashExit = $LASTEXITCODE
+        }
+        finally { Pop-Location -ErrorAction Stop }
         $flashExit = $LASTEXITCODE
         if ($flashExit -ne 0) {
             $diagnosis = "FLASH_FAILED"
@@ -373,8 +591,14 @@ For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults
         $afterHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         $afterConfigHash = (Get-FileHash -LiteralPath $qualifiedSdkconfig -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         $afterDefaultsHash = (Get-FileHash -LiteralPath $defaults -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $diagnosis = "FLASH_PLAN_INVALID_AFTER_FLASH"
+        $postPlan = Get-QualifiedFlashPlan $qualifiedBuildDir
+        $afterPlanHash = $postPlan.PlanHash
+        $afterImageHash = $postPlan.ImageHash
         if ($afterHash -ne $beforeHash -or $afterConfigHash -ne $beforeConfigHash -or
-            $afterDefaultsHash -ne $beforeDefaultsHash) {
+            $afterDefaultsHash -ne $beforeDefaultsHash -or
+            $afterPlanHash -ne $beforePlanHash -or
+            $afterImageHash -ne $beforeImageHash) {
             $diagnosis = "QUALIFIED_ARTIFACT_CHANGED_DURING_FLASH"
             throw $diagnosis
         }
@@ -401,12 +625,19 @@ For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults
         Write-Host ("expected_defaults_sha256={0}" -f $expectedDefaultsSha256)
         Write-Host ("expected_effective_sdkconfig_sha256={0}" -f $expectedConfigSha256)
         Write-Host ("expected_app_sha256={0}" -f $expectedAppSha256)
+        Write-Host ("expected_flasher_args_sha256={0}" -f $expectedPlanSha256)
+        Write-Host ("expected_flash_image_set_sha256={0}" -f $expectedImageSetSha256)
         Write-Host ("before_defaults_sha256={0}" -f $beforeDefaultsHash)
         Write-Host ("before_effective_sdkconfig_sha256={0}" -f $beforeConfigHash)
         Write-Host ("after_defaults_sha256={0}" -f $afterDefaultsHash)
         Write-Host ("after_effective_sdkconfig_sha256={0}" -f $afterConfigHash)
         Write-Host ("before_app_sha256={0}" -f $beforeHash)
         Write-Host ("after_app_sha256={0}" -f $afterHash)
+        Write-Host ("before_flasher_args_sha256={0}" -f $beforePlanHash)
+        Write-Host ("after_flasher_args_sha256={0}" -f $afterPlanHash)
+        Write-Host ("before_flash_image_set_sha256={0}" -f $beforeImageHash)
+        Write-Host ("after_flash_image_set_sha256={0}" -f $afterImageHash)
+        Write-Host ("flash_image_count={0}" -f $imageCount)
         Write-Host ("diagnosis={0}" -f $diagnosis)
         Write-Host ("disposition={0}" -f $disposition)
         Write-Host ("SUMMARY phase={0} diagnosis={1} disposition={2}" -f $phase, $diagnosis, $disposition)
@@ -420,6 +651,8 @@ Negative verification (host-only disposable worktree, no connected Device):
 1. Place an intentionally stale ignored firmware/sdkconfig containing CONFIG_TINYUSB_MSC_ENABLED=n. HG-BUILD must use only the isolated build/hg-qualified/sdkconfig generated from tracked defaults, prove CONFIG_TINYUSB_MSC_ENABLED=y and leave the stale root sdkconfig untouched. A default-directory fullclean/build is not qualified.
 2. Re-run HG-BUILD without retiring the isolated output. Expected: QUALIFICATION_OUTPUT_ALREADY_EXISTS; build_exit=NOT_RUN; disposition=BLOCKED; no overwrite of existing output.
 3. Alter the isolated effective sdkconfig after a passing HG-BUILD; evaluate HG-FLASH prerequisites without connecting the target. Expected: CONFIG_HASH_MISMATCH_BEFORE_FLASH; flash_exit=NOT_RUN; disposition=BLOCKED. Do not force a flash to complete a negative test.
+4. In a disposable qualified build, modify `partition_table/partition-table.bin` or `bootloader/bootloader.bin` but leave the app/default/configuration hashes unchanged. HG-FLASH preflight must report `FLASH_PLAN_OR_IMAGE_MISMATCH_BEFORE_FLASH`, `flash_exit=NOT_RUN`, and `disposition=BLOCKED`. Never attach the target for this negative check.
+5. Modify `flasher_args.json` offset/options with all binaries intact: the plan digest must fail before any write. Independently verify by inspection that the flash packet invokes only `python -m esptool ... write_flash` and **never** calls the implicit-build `idf.py flash` action. These are specified host-only tests, not claims of executed physical acceptance.
 
 Do not use erase-flash as a convenience step in a Human Gate. A flash failure, rebuild/hash mismatch, or missing accepted flash result is **not** evidence that the intended firmware is running. Do not count an acceptance cycle until the exact runtime identity and baseline are re-established.
 
