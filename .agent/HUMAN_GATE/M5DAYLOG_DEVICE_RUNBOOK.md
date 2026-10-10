@@ -571,12 +571,12 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
         $enteredFirmware = $true
         # No implicit build, and no unchecked @flash_args file.
-        $args = @("--chip","esp32s3","-p",$serialPort,
+        $flashArgs = @("--chip","esp32s3","-p",$serialPort,
                   "--before",$qualifiedPlan.Before,"--after",$qualifiedPlan.After)
-        if (-not $qualifiedPlan.Stub) { $args += "--no-stub" }
-        $args += "write_flash"
-        $args += @($qualifiedPlan.Flags)
-        $args += @($qualifiedPlan.Pairs)
+        if (-not $qualifiedPlan.Stub) { $flashArgs += "--no-stub" }
+        $flashArgs += "write_flash"
+        $flashArgs += @($qualifiedPlan.Flags)
+        $flashArgs += @($qualifiedPlan.Pairs)
         Push-Location -LiteralPath $qualifiedBuildDir -ErrorAction Stop
         try {
             & $python -m esptool @args
