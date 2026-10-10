@@ -44,6 +44,14 @@ typedef struct {
     uint32_t final_flush_timeout_ms;
 } usb_cdc_tx_ops_t;
 
+// Proof for the final response USB-IN transaction, not merely any earlier
+// completion callback. Call only after the final software FIFO flush completed.
+// Caller must also fence the originating CDC generation while evaluating it.
+bool usb_cdc_tx_final_in_complete(unsigned callbacks_before,
+                                  unsigned callbacks_after,
+                                  bool fifo_drained,
+                                  bool endpoint_busy);
+
 // Queue response bytes + LF and flush them while the originating session is
 // still current. Returns false as soon as disconnect/generation invalidation or
 // a final flush failure makes completion impossible. The caller must keep this

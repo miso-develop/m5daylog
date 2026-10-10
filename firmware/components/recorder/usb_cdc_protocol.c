@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "tinyusb_cdc_acm.h"
 #include "tusb.h"
+#include "device/usbd_pvt.h"
 #include "usb_cdc_protocol_core.h"
 #include "usb_cdc_session_gate.h"
 #include "usb_cdc_tx.h"
@@ -90,31 +91,96 @@ static void cdc_tx_wait(void *ctx) {
     vTaskDelay(1);
 }
 
+// Identify the actual CDC-ACM #0 bulk-IN endpoint from the active USB
+// configuration. Do not guess an endpoint address from an MSC/CDC layout:
+// esp_tinyusb may change endpoint allocation with configuration changes.
+static uint8_t cdc_bulk_in_endpoint(void) {
+    const uint8_t *desc = tud_descriptor_configuration_cb(0u);
+    bool cdc_data_interface = false;
+    unsigned total;
+    unsigned offset;
+
+    if (desc == NULL || desc[0] < 9u ||
+        desc[1] != TUSB_DESC_CONFIGURATION) {
+        return 0u;
+    }
+    total = (unsigned)desc[2] | ((unsigned)desc[3] << 8u);
+    if (total < 9u || total > 1024u) {
+        return 0u;
+    }
+
+    for (offset = 0u; offset < total;) {
+        unsigned size = desc[offset];
+        uint8_t type;
+        if (size < 2u || size > total - offset) {
+            return 0u;
+        }
+        type = desc[offset + 1u];
+        if (type == TUSB_DESC_INTERFACE) {
+            if (size < 9u) {
+                return 0u;
+            }
+            cdc_data_interface =
+                desc[offset + 5u] == TUSB_CLASS_CDC_DATA &&
+                desc[offset + 3u] == 0u;
+        } else if (cdc_data_interface && type == TUSB_DESC_ENDPOINT) {
+            if (size < 7u) {
+                return 0u;
+            }
+            if ((desc[offset + 2u] & 0x80u) != 0u &&
+                (desc[offset + 3u] & 0x03u) == TUSB_XFER_BULK) {
+                return desc[offset + 2u];
+            }
+        }
+        offset += size;
+    }
+    return 0u;
+}
+
+static bool cdc_release_final_in_proven(
+    const cdc_tx_context_t *response_ctx, uint8_t ep_in) {
+    unsigned completed = atomic_load_explicit(
+        &s_cdc_tx_completed, memory_order_acquire);
+    bool fifo_drained =
+        tud_cdc_n_write_available(TINYUSB_CDC_ACM_0) ==
+        CFG_TUD_CDC_TX_BUFSIZE;
+    // FIFO-empty means all response bytes have left the software buffer.
+    // The IN endpoint additionally must not have a scheduled USB transfer.
+    // Neither observation alone proves that the final transfer is complete.
+    bool endpoint_busy = usbd_edpt_busy(0u, ep_in);
+    return usb_cdc_tx_final_in_complete(
+        response_ctx->tx_completed_before, completed, fifo_drained,
+        endpoint_busy);
+}
+
 static bool cdc_release_await_endpoint(void *ctx, uint32_t timeout_ms) {
     const cdc_tx_context_t *response_ctx = (const cdc_tx_context_t *)ctx;
-    const unsigned before = response_ctx->tx_completed_before;
     const TickType_t started = xTaskGetTickCount();
     const TickType_t limit = pdMS_TO_TICKS(timeout_ms);
+    const uint8_t ep_in = cdc_bulk_in_endpoint();
 
-    // The counter baseline is sampled before this response is queued. The
-    // final CDC IN transfer can already be complete when the FIFO flush
-    // returns, so sampling here would miss it and suppress teardown even
-    // after the host received accepted=true. Keep the bounded host-read grace
-    // and the session-generation fence before signalling quiescence.
+    if (ep_in == 0u) {
+        return false; // Unknown endpoint: never authorize teardown.
+    }
     do {
         if (!cdc_tx_session_is_current(
                 &s_session_gate, response_ctx->generation)) {
             return false;
         }
-        if (atomic_load_explicit(&s_cdc_tx_completed,
-                                 memory_order_acquire) != before) {
-            // Give the Windows CDC consumer a bounded interval to dequeue
-            // the now-transferred response before logical USB disconnect.
-            // This is NOT a PC application acknowledgement; the host must
-            // still observe the matching response under Decision #105.
+        if (cdc_release_final_in_proven(response_ctx, ep_in)) {
+            // Recheck on the next scheduler turn: a class-completion callback
+            // can run just before TinyUSB schedules the next FIFO segment.
+            vTaskDelay(1);
+            if (!cdc_tx_session_is_current(
+                    &s_session_gate, response_ctx->generation) ||
+                !cdc_release_final_in_proven(response_ctx, ep_in)) {
+                continue;
+            }
+            // Host receive grace is not PC application acknowledgement.
             vTaskDelay(pdMS_TO_TICKS(CDC_RELEASE_HOST_READ_GRACE_MS));
             return cdc_tx_session_is_current(
-                &s_session_gate, response_ctx->generation);
+                       &s_session_gate, response_ctx->generation) &&
+                   cdc_release_final_in_proven(response_ctx, ep_in);
         }
         vTaskDelay(1);
     } while ((TickType_t)(xTaskGetTickCount() - started) < limit);

@@ -10,6 +10,18 @@ static bool tx_is_current(const usb_cdc_tx_ops_t *ops,
            ops->session_is_current(ops->session_ctx, response_generation);
 }
 
+bool usb_cdc_tx_final_in_complete(unsigned callbacks_before,
+                                  unsigned callbacks_after,
+                                  bool fifo_drained,
+                                  bool endpoint_busy) {
+    // Completion of a *previous* packet does not establish that a later,
+    // multi-packet response has reached the host. Both class FIFO and physical
+    // endpoint must have drained, and a TX callback must have occurred since
+    // this response began queueing. Generation validity is checked by caller.
+    return callbacks_after != callbacks_before &&
+           fifo_drained && !endpoint_busy;
+}
+
 bool usb_cdc_tx_write_response(const usb_cdc_tx_ops_t *ops,
                                const char *response, size_t len,
                                uint32_t response_generation) {

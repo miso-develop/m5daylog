@@ -656,3 +656,90 @@ def test_release_endpoint_completion_captures_baseline_before_queuing() -> None:
     tx_file = TX.read_text(encoding="utf-8")
     assert "if (ops->await_endpoint != NULL &&" in tx_file
     assert "!ops->await_endpoint(ops->transport_ctx" in tx_file
+
+
+def test_release_final_in_proof_rejects_old_and_partial_completions(
+    tmp_path: Path,
+) -> None:
+    """REV-83-13: execute the production completion predicate against races."""
+    harness = tmp_path / "cdc_final_endpoint_proof.c"
+    harness.write_text(
+        r"""
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "usb_cdc_tx.h"
+
+#define CHECK(v) do { if (!(v)) { \
+    fprintf(stderr, "failed at %d\n", __LINE__); exit(2); \
+} } while (0)
+
+int main(void) {
+    const unsigned before = 20u;
+    unsigned after = before;
+    bool fifo_drained = false;
+    bool endpoint_busy = true;
+
+    /* Queue accepted=true while an older response remains in flight. */
+    CHECK(!usb_cdc_tx_final_in_complete(
+        before, after, fifo_drained, endpoint_busy));
+    after++; /* The old response completes, but RELEASE_STORAGE remains IN-flight. */
+    fifo_drained = true;
+    CHECK(!usb_cdc_tx_final_in_complete(
+        before, after, fifo_drained, endpoint_busy));
+
+    /* First chunk of a split release response completes; tail still queued. */
+    fifo_drained = false;
+    endpoint_busy = false;
+    after++;
+    CHECK(!usb_cdc_tx_final_in_complete(
+        before, after, fifo_drained, endpoint_busy));
+
+    /* Tail was scheduled and FIFO drained but the final IN never completes. */
+    fifo_drained = true;
+    endpoint_busy = true;
+    CHECK(!usb_cdc_tx_final_in_complete(
+        before, after, fifo_drained, endpoint_busy));
+
+    /* Final packet completion plus drained FIFO and idle endpoint: success. */
+    endpoint_busy = false;
+    after++;
+    CHECK(usb_cdc_tx_final_in_complete(
+        before, after, fifo_drained, endpoint_busy));
+
+    /* No TX completion, even with empty FIFO/idle endpoint: fail closed. */
+    CHECK(!usb_cdc_tx_final_in_complete(
+        before, before, true, false));
+    /* A session-invalidated release is rejected by the transport's
+       session_is_current gate before this predicate can authorize teardown. */
+    puts("CDC final IN completion proof: PASS");
+    return 0;
+}
+""",
+        encoding="utf-8",
+    )
+    exe = tmp_path / "cdc_final_endpoint_proof"
+    build = subprocess.run(
+        ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+         "-I", str(INCLUDE), str(TX), str(harness), "-o", str(exe)],
+        cwd=REPO, text=True, capture_output=True, check=False,
+    )
+    assert build.returncode == 0, build.stderr
+    run = subprocess.run(
+        [str(exe)], cwd=REPO, text=True, capture_output=True, check=False,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "CDC final IN completion proof: PASS" in run.stdout
+
+
+def test_release_proof_wired_to_active_bulk_in_and_session_fence() -> None:
+    """Production wiring must check both hardware endpoint and class FIFO."""
+    src = TRANSPORT.read_text(encoding="utf-8")
+    assert "tud_descriptor_configuration_cb(0u)" in src
+    assert "TUSB_CLASS_CDC_DATA" in src
+    assert "usbd_edpt_busy(0u, ep_in)" in src
+    assert "tud_cdc_n_write_available(TINYUSB_CDC_ACM_0)" in src
+    assert "usb_cdc_tx_final_in_complete(" in src
+    assert "cdc_tx_session_is_current(" in src
+    assert "cdc_release_final_in_proven(response_ctx, ep_in)" in src
+    assert "CDC_RELEASE_HOST_READ_GRACE_MS" in src
