@@ -459,7 +459,7 @@ Give WAKE as its own physical step. State that USB must remain disconnected, spe
 
 ### Recovery
 
-Do not attribute the missing recovery to product behavior. Mark the affected cycle `NOT_COUNTED` or `BLOCKED` according to whether the required phase was attempted with valid preconditions. Re-establish a fresh baseline with an explicit WAKE sequence, then rerun the cycle from the point required by the approved matrix.
+Do not attribute the missing recovery to product behavior. Record `counted=false` separately from the Human Gate disposition. Use `BLOCKED` if a recovery phase was attempted without a verifiable manual WAKE precondition, or `NOT_RUN` if that required phase was never attempted. Neither case is a product `FAIL`. Re-establish a fresh baseline with an explicit WAKE sequence, then rerun the cycle from the point required by the approved matrix.
 
 ## 20. Fresh recording finalized as header-only or zero-duration
 
