@@ -310,7 +310,9 @@ For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults
         }
         $invalidHash = $false
         foreach ($digest in @($expectedDefaultsSha256, $expectedConfigSha256, $expectedAppSha256)) {
-            if ($digest -notmatch '^[a-fA-F0-9]{64}
+            if ($digest -notmatch '^[a-fA-F0-9]{64}$') { $invalidHash = $true }
+        }
+        if ($invalidHash -or $serialPort -eq "<serial-port>") {
             $diagnosis = "FLASH_IDENTITY_INPUT_MISSING"
             throw $diagnosis
         }
@@ -373,7 +375,7 @@ For normal exact-head flashing, copy all three passing HG-BUILD hashes (defaults
         $afterDefaultsHash = (Get-FileHash -LiteralPath $defaults -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         if ($afterHash -ne $beforeHash -or $afterConfigHash -ne $beforeConfigHash -or
             $afterDefaultsHash -ne $beforeDefaultsHash) {
-            $diagnosis = "APP_HASH_CHANGED_DURING_FLASH"
+            $diagnosis = "QUALIFIED_ARTIFACT_CHANGED_DURING_FLASH"
             throw $diagnosis
         }
 
@@ -418,102 +420,6 @@ Negative verification (host-only disposable worktree, no connected Device):
 1. Place an intentionally stale ignored firmware/sdkconfig containing CONFIG_TINYUSB_MSC_ENABLED=n. HG-BUILD must use only the isolated build/hg-qualified/sdkconfig generated from tracked defaults, prove CONFIG_TINYUSB_MSC_ENABLED=y and leave the stale root sdkconfig untouched. A default-directory fullclean/build is not qualified.
 2. Re-run HG-BUILD without retiring the isolated output. Expected: QUALIFICATION_OUTPUT_ALREADY_EXISTS; build_exit=NOT_RUN; disposition=BLOCKED; no overwrite of existing output.
 3. Alter the isolated effective sdkconfig after a passing HG-BUILD; evaluate HG-FLASH prerequisites without connecting the target. Expected: CONFIG_HASH_MISMATCH_BEFORE_FLASH; flash_exit=NOT_RUN; disposition=BLOCKED. Do not force a flash to complete a negative test.
-
-Do not use erase-flash as a convenience step in a Human Gate. A flash failure, rebuild/hash mismatch, or missing accepted flash result is **not** evidence that the intended firmware is running. Do not count an acceptance cycle until the exact runtime identity and baseline are re-established.
-
-After flash, fixture restore, ROM-mode diagnostic, NVS read, host reboot, or any operation that can reset/re-enumerate the Device, establish a fresh runtime baseline before counting a cycle.
-
-A qualified USB publication baseline should prove all applicable items:
-
-- exactly one intended USB mass-storage target;
-- FAT32 filesystem;
-- expected M5DAYLOG directory structure and manifest are readable;
-- exactly one intended CDC interface;
-- manifest state is internally consistent;
-- no stale .part file relevant to the cycle;
-- current exact revision/build identity is already established.
-
-Do not identify the target only by a reused drive letter or by the appearance of a new PnP identity.
-
-) { $invalidHash = $true }
-        }
-        if ($invalidHash -or $serialPort -eq "<serial-port>") {
-            $diagnosis = "FLASH_IDENTITY_INPUT_MISSING"
-            throw $diagnosis
-        }
-        $head = ([string](& git -C $repoRoot rev-parse HEAD)).Trim()
-        $gitExit = $LASTEXITCODE
-        if ($gitExit -ne 0 -or $head -ne $expectedHead) {
-            $diagnosis = "HEAD_MISMATCH_OR_GIT_FAILURE"
-            throw $diagnosis
-        }
-        $tracked = @(& git -C $repoRoot status --porcelain --untracked-files=no)
-        $gitExit = $LASTEXITCODE
-        if ($gitExit -ne 0 -or $tracked.Count -ne 0) {
-            $diagnosis = "TRACKED_WORKTREE_NOT_CLEAN"
-            throw $diagnosis
-        }
-        $beforeHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-        if ($beforeHash -ne $expectedAppSha256.ToLowerInvariant()) {
-            $diagnosis = "APP_HASH_MISMATCH_BEFORE_FLASH"
-            throw $diagnosis
-        }
-
-        $env:IDF_PATH = $idfRoot
-        $env:IDF_TOOLS_PATH = $idfTools
-        $env:PATH = "$(Split-Path -Parent $python);$env:PATH"
-        . (Join-Path $idfRoot "export.ps1")
-        $versionLines = @(& $python $idfPy --version)
-        $idfExit = $LASTEXITCODE
-        $idfVersion = ($versionLines -join " ").Trim()
-        if ($idfExit -ne 0 -or $idfVersion -ne "ESP-IDF v5.5.5") {
-            $diagnosis = "UNSUPPORTED_OR_UNRESOLVED_ESP_IDF"
-            throw $diagnosis
-        }
-
-        Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
-        $enteredFirmware = $true
-        & $python $idfPy -p $serialPort flash
-        $flashExit = $LASTEXITCODE
-        if ($flashExit -ne 0) {
-            $diagnosis = "FLASH_FAILED"
-            throw $diagnosis
-        }
-        $afterHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-        if ($afterHash -ne $beforeHash) {
-            $diagnosis = "APP_HASH_CHANGED_DURING_FLASH"
-            throw $diagnosis
-        }
-
-        $diagnosis = "OK"
-        $disposition = "PASS"
-    }
-    catch {
-        # A failed or ambiguous flash is BLOCKED; requalify Device before any cycle.
-    }
-    finally {
-        if ($enteredFirmware) {
-            try { Pop-Location -ErrorAction Stop }
-            catch { $diagnosis = "LOCATION_RESTORE_FAILED"; $disposition = "BLOCKED" }
-        }
-        Write-Host ""
-        Write-Host "==== $phase ===="
-        Write-Host ("expected_head={0}" -f $expectedHead)
-        Write-Host ("head={0}" -f $head)
-        Write-Host ("git_exit={0}" -f $gitExit)
-        Write-Host ("idf_exit={0}" -f $idfExit)
-        Write-Host ("idf_version={0}" -f $idfVersion)
-        Write-Host ("flash_exit={0}" -f $flashExit)
-        Write-Host ("expected_app_sha256={0}" -f $expectedAppSha256)
-        Write-Host ("before_app_sha256={0}" -f $beforeHash)
-        Write-Host ("after_app_sha256={0}" -f $afterHash)
-        Write-Host ("diagnosis={0}" -f $diagnosis)
-        Write-Host ("disposition={0}" -f $disposition)
-        Write-Host ("SUMMARY phase={0} diagnosis={1} disposition={2}" -f $phase, $diagnosis, $disposition)
-        Write-Host ""
-    }
-}
-~~~
 
 Do not use erase-flash as a convenience step in a Human Gate. A flash failure, rebuild/hash mismatch, or missing accepted flash result is **not** evidence that the intended firmware is running. Do not count an acceptance cycle until the exact runtime identity and baseline are re-established.
 
