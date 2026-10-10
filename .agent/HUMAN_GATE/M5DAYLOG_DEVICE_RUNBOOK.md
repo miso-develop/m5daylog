@@ -24,56 +24,79 @@ This file does not replace Acceptance Criteria. When it conflicts with the curre
 
 ## 2. Known-good Windows / ESP-IDF preparation
 
-Use placeholders in durable documentation. Resolve concrete paths only in the local shell.
+Use placeholders in durable documentation and resolve concrete paths only in the operator's local shell. The **preflight, build, and flash packets below are independent**: each resolves its own paths, Git revision, managed Python, and canonical idf.py rather than relying on PowerShell variables left by an earlier & { ... } block. The firmware requires **ESP-IDF v5.5.5**.
 
 Recommended PowerShell preflight:
 
 ~~~powershell
 & {
+    $phase = "HG-PREFLIGHT"
     $expectedHead = "<revision>"
-    $repoRoot = Resolve-Path "<repo-root>"
+    $repoRoot = "<repo-root>"
     $idfRoot = "<esp-idf-root>"
     $idfTools = "<idf-tools-root>"
     $python = "<idf-managed-python>"
     $idfPy = Join-Path $idfRoot "tools\idf.py"
 
-    Set-Location $repoRoot
+    $head = "UNRESOLVED"
+    $gitExit = "NOT_RUN"
+    $idfExit = "NOT_RUN"
+    $idfVersion = "NOT_RUN"
+    $diagnosis = "UNEXPECTED_PREFLIGHT_ERROR"
+    $disposition = "BLOCKED"
 
-    $head = ([string](git rev-parse HEAD)).Trim()
-    if ($LASTEXITCODE -ne 0 -or $head -ne $expectedHead) {
-        throw "HEAD mismatch"
-    }
-
-    $tracked = @(git status --porcelain --untracked-files=no)
-    if ($LASTEXITCODE -ne 0 -or $tracked.Count -ne 0) {
-        throw "Tracked worktree is not clean"
-    }
-
-    foreach ($required in @($idfRoot, $idfTools, $python, $idfPy)) {
-        if (-not (Test-Path -LiteralPath $required)) {
-            throw "Required ESP-IDF path is unavailable"
+    try {
+        foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy)) {
+            if (-not (Test-Path -LiteralPath $required)) {
+                $diagnosis = "REQUIRED_PATH_MISSING"
+                throw $diagnosis
+            }
         }
+        $head = ([string](& git -C $repoRoot rev-parse HEAD)).Trim()
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $head -ne $expectedHead) {
+            $diagnosis = "HEAD_MISMATCH_OR_GIT_FAILURE"
+            throw $diagnosis
+        }
+        $tracked = @(& git -C $repoRoot status --porcelain --untracked-files=no)
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $tracked.Count -ne 0) {
+            $diagnosis = "TRACKED_WORKTREE_NOT_CLEAN"
+            throw $diagnosis
+        }
+
+        $env:IDF_PATH = $idfRoot
+        $env:IDF_TOOLS_PATH = $idfTools
+        $env:PATH = "$(Split-Path -Parent $python);$env:PATH"
+        . (Join-Path $idfRoot "export.ps1")
+
+        $versionLines = @(& $python $idfPy --version)
+        $idfExit = $LASTEXITCODE
+        $idfVersion = ($versionLines -join " ").Trim()
+        if ($idfExit -ne 0 -or $idfVersion -ne "ESP-IDF v5.5.5") {
+            $diagnosis = "UNSUPPORTED_OR_UNRESOLVED_ESP_IDF"
+            throw $diagnosis
+        }
+
+        $diagnosis = "OK"
+        $disposition = "PASS"
     }
-
-    $env:IDF_PATH = $idfRoot
-    $env:IDF_TOOLS_PATH = $idfTools
-    $env:PATH = "$(Split-Path -Parent $python);$env:PATH"
-
-    . (Join-Path $idfRoot "export.ps1")
-
-    & $python $idfPy --version
-    if ($LASTEXITCODE -ne 0) {
-        throw "Canonical ESP-IDF version check failed"
+    catch {
+        # Preserve the specific safe diagnosis above; do not print local paths.
     }
-
-    Write-Host ""
-    Write-Host "==== HG-PREFLIGHT ===="
-    Write-Host ("head={0}" -f $head)
-    Write-Host ("tracked_dirty={0}" -f ($tracked.Count -ne 0))
-    Write-Host ("idf_python={0}" -f $python)
-    Write-Host ("idf_script={0}" -f $idfPy)
-    Write-Host "SUMMARY phase=HG-PREFLIGHT diagnosis=OK disposition=PASS"
-    Write-Host ""
+    finally {
+        Write-Host ""
+        Write-Host "==== $phase ===="
+        Write-Host ("expected_head={0}" -f $expectedHead)
+        Write-Host ("head={0}" -f $head)
+        Write-Host ("git_exit={0}" -f $gitExit)
+        Write-Host ("idf_exit={0}" -f $idfExit)
+        Write-Host ("idf_version={0}" -f $idfVersion)
+        Write-Host ("diagnosis={0}" -f $diagnosis)
+        Write-Host ("disposition={0}" -f $disposition)
+        Write-Host ("SUMMARY phase={0} diagnosis={1} disposition={2}" -f $phase, $diagnosis, $disposition)
+        Write-Host ""
+    }
 }
 ~~~
 
@@ -83,56 +106,235 @@ Important lessons:
 - An idf.py.exe helper/shim can report its own wrapper version rather than the actual ESP-IDF version.
 - For acceptance-relevant commands, invoke the managed Python plus the canonical tools/idf.py path directly.
 - Source export.ps1 only after IDF_PATH, IDF_TOOLS_PATH, and the managed Python directory are set.
+- A nonzero native exit or a version other than ESP-IDF v5.5.5 is BLOCKED, never qualified PASS.
 - A host reboot normally requires environment reactivation and a fresh Device baseline; it does not by itself require reflashing unchanged exact-head firmware.
 
 ## 3. Exact build identity
 
-For a clean exact-head firmware qualification:
+For a clean exact-head firmware qualification, use a **standalone** packet that verifies the repository, toolchain, and firmware project directory before modifying generated build outputs:
 
 ~~~powershell
 & {
-    $repoRoot = Resolve-Path "<repo-root>"
+    $phase = "HG-BUILD"
+    $expectedHead = "<revision>"
+    $repoRoot = "<repo-root>"
     $idfRoot = "<esp-idf-root>"
+    $idfTools = "<idf-tools-root>"
     $python = "<idf-managed-python>"
     $idfPy = Join-Path $idfRoot "tools\idf.py"
     $firmwareRoot = Join-Path $repoRoot "firmware"
+    $app = Join-Path $firmwareRoot "build\m5daylog.bin"
 
-    Push-Location $firmwareRoot
+    $head = "UNRESOLVED"
+    $gitExit = "NOT_RUN"
+    $idfExit = "NOT_RUN"
+    $idfVersion = "NOT_RUN"
+    $fullcleanExit = "NOT_RUN"
+    $buildExit = "NOT_RUN"
+    $appHash = "NOT_RUN"
+    $enteredFirmware = $false
+    $diagnosis = "UNEXPECTED_BUILD_ERROR"
+    $disposition = "BLOCKED"
+
     try {
+        foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $firmwareRoot,
+                                (Join-Path $firmwareRoot "CMakeLists.txt"))) {
+            if (-not (Test-Path -LiteralPath $required)) {
+                $diagnosis = "REQUIRED_PATH_MISSING"
+                throw $diagnosis
+            }
+        }
+        $head = ([string](& git -C $repoRoot rev-parse HEAD)).Trim()
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $head -ne $expectedHead) {
+            $diagnosis = "HEAD_MISMATCH_OR_GIT_FAILURE"
+            throw $diagnosis
+        }
+        $tracked = @(& git -C $repoRoot status --porcelain --untracked-files=no)
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $tracked.Count -ne 0) {
+            $diagnosis = "TRACKED_WORKTREE_NOT_CLEAN"
+            throw $diagnosis
+        }
+
+        $env:IDF_PATH = $idfRoot
+        $env:IDF_TOOLS_PATH = $idfTools
+        $env:PATH = "$(Split-Path -Parent $python);$env:PATH"
+        . (Join-Path $idfRoot "export.ps1")
+        $versionLines = @(& $python $idfPy --version)
+        $idfExit = $LASTEXITCODE
+        $idfVersion = ($versionLines -join " ").Trim()
+        if ($idfExit -ne 0 -or $idfVersion -ne "ESP-IDF v5.5.5") {
+            $diagnosis = "UNSUPPORTED_OR_UNRESOLVED_ESP_IDF"
+            throw $diagnosis
+        }
+
+        Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
+        $enteredFirmware = $true
         & $python $idfPy fullclean
-        if ($LASTEXITCODE -ne 0) { throw "fullclean failed" }
-
+        $fullcleanExit = $LASTEXITCODE
+        if ($fullcleanExit -ne 0) {
+            $diagnosis = "FULLCLEAN_FAILED"
+            throw $diagnosis
+        }
         & $python $idfPy build
-        if ($LASTEXITCODE -ne 0) { throw "build failed" }
-
-        $app = Join-Path $firmwareRoot "build\m5daylog.bin"
-        if (-not (Test-Path -LiteralPath $app)) { throw "app binary missing" }
-
-        $appHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256).Hash.ToLowerInvariant()
-
-        Write-Host ""
-        Write-Host "==== HG-BUILD ===="
-        Write-Host ("app_sha256={0}" -f $appHash)
-        Write-Host "SUMMARY phase=HG-BUILD diagnosis=OK disposition=PASS"
-        Write-Host ""
+        $buildExit = $LASTEXITCODE
+        if ($buildExit -ne 0) {
+            $diagnosis = "BUILD_FAILED"
+            throw $diagnosis
+        }
+        if (-not (Test-Path -LiteralPath $app -PathType Leaf)) {
+            $diagnosis = "APP_BINARY_MISSING"
+            throw $diagnosis
+        }
+        $appHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $diagnosis = "OK"
+        $disposition = "PASS"
+    }
+    catch {
+        # Failure is captured as BLOCKED; no acceptance cycle is counted.
     }
     finally {
-        Pop-Location
+        if ($enteredFirmware) {
+            try { Pop-Location -ErrorAction Stop }
+            catch { $diagnosis = "LOCATION_RESTORE_FAILED"; $disposition = "BLOCKED" }
+        }
+        Write-Host ""
+        Write-Host "==== $phase ===="
+        Write-Host ("expected_head={0}" -f $expectedHead)
+        Write-Host ("head={0}" -f $head)
+        Write-Host ("git_exit={0}" -f $gitExit)
+        Write-Host ("idf_exit={0}" -f $idfExit)
+        Write-Host ("idf_version={0}" -f $idfVersion)
+        Write-Host ("fullclean_exit={0}" -f $fullcleanExit)
+        Write-Host ("build_exit={0}" -f $buildExit)
+        Write-Host ("app_sha256={0}" -f $appHash)
+        Write-Host ("diagnosis={0}" -f $diagnosis)
+        Write-Host ("disposition={0}" -f $disposition)
+        Write-Host ("SUMMARY phase={0} diagnosis={1} disposition={2}" -f $phase, $diagnosis, $disposition)
+        Write-Host ""
     }
 }
 ~~~
 
-Use the build-generated flash plan. Do not guess partition offsets. Do not erase NVS unless the approved setup explicitly requires a fixture reset. Fixture repair/reset is setup and counts as zero acceptance cycles.
+Retain the passing exact HEAD and app_sha256 as the build-to-flash identity. The hash is not itself proof of what is running on the physical target; qualification still requires an observed flash result and a fresh Device baseline. Use the build-generated flash plan. Do not guess partition offsets. Do not erase NVS unless the approved setup explicitly requires a fixture reset. Fixture repair/reset is setup and counts as zero acceptance cycles.
 
 ## 4. Flash and runtime baseline
 
-For normal exact-head flashing, use the canonical managed Python + idf.py invocation and the intended serial port:
+For normal exact-head flashing, copy the prior **HG-BUILD PASS app_sha256** into the following standalone packet. It validates the build artifact both before and after idf.py flash; do not infer identity from a flash success message alone.
 
 ~~~powershell
-& $python $idfPy -p "<serial-port>" flash
+& {
+    $phase = "HG-FLASH"
+    $expectedHead = "<revision>"
+    $expectedAppSha256 = "<app-sha256-from-HG-BUILD>"
+    $repoRoot = "<repo-root>"
+    $idfRoot = "<esp-idf-root>"
+    $idfTools = "<idf-tools-root>"
+    $python = "<idf-managed-python>"
+    $idfPy = Join-Path $idfRoot "tools\idf.py"
+    $serialPort = "<serial-port>"
+    $firmwareRoot = Join-Path $repoRoot "firmware"
+    $app = Join-Path $firmwareRoot "build\m5daylog.bin"
+
+    $head = "UNRESOLVED"
+    $gitExit = "NOT_RUN"
+    $idfExit = "NOT_RUN"
+    $idfVersion = "NOT_RUN"
+    $flashExit = "NOT_RUN"
+    $beforeHash = "NOT_RUN"
+    $afterHash = "NOT_RUN"
+    $enteredFirmware = $false
+    $diagnosis = "UNEXPECTED_FLASH_ERROR"
+    $disposition = "BLOCKED"
+
+    try {
+        foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $firmwareRoot,
+                                (Join-Path $firmwareRoot "CMakeLists.txt"), $app)) {
+            if (-not (Test-Path -LiteralPath $required)) {
+                $diagnosis = "REQUIRED_PATH_MISSING"
+                throw $diagnosis
+            }
+        }
+        if ($expectedAppSha256 -notmatch '^[a-fA-F0-9]{64}$' -or $serialPort -eq "<serial-port>") {
+            $diagnosis = "FLASH_IDENTITY_INPUT_MISSING"
+            throw $diagnosis
+        }
+        $head = ([string](& git -C $repoRoot rev-parse HEAD)).Trim()
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $head -ne $expectedHead) {
+            $diagnosis = "HEAD_MISMATCH_OR_GIT_FAILURE"
+            throw $diagnosis
+        }
+        $tracked = @(& git -C $repoRoot status --porcelain --untracked-files=no)
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $tracked.Count -ne 0) {
+            $diagnosis = "TRACKED_WORKTREE_NOT_CLEAN"
+            throw $diagnosis
+        }
+        $beforeHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        if ($beforeHash -ne $expectedAppSha256.ToLowerInvariant()) {
+            $diagnosis = "APP_HASH_MISMATCH_BEFORE_FLASH"
+            throw $diagnosis
+        }
+
+        $env:IDF_PATH = $idfRoot
+        $env:IDF_TOOLS_PATH = $idfTools
+        $env:PATH = "$(Split-Path -Parent $python);$env:PATH"
+        . (Join-Path $idfRoot "export.ps1")
+        $versionLines = @(& $python $idfPy --version)
+        $idfExit = $LASTEXITCODE
+        $idfVersion = ($versionLines -join " ").Trim()
+        if ($idfExit -ne 0 -or $idfVersion -ne "ESP-IDF v5.5.5") {
+            $diagnosis = "UNSUPPORTED_OR_UNRESOLVED_ESP_IDF"
+            throw $diagnosis
+        }
+
+        Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
+        $enteredFirmware = $true
+        & $python $idfPy -p $serialPort flash
+        $flashExit = $LASTEXITCODE
+        if ($flashExit -ne 0) {
+            $diagnosis = "FLASH_FAILED"
+            throw $diagnosis
+        }
+        $afterHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        if ($afterHash -ne $beforeHash) {
+            $diagnosis = "APP_HASH_CHANGED_DURING_FLASH"
+            throw $diagnosis
+        }
+
+        $diagnosis = "OK"
+        $disposition = "PASS"
+    }
+    catch {
+        # A failed or ambiguous flash is BLOCKED; requalify Device before any cycle.
+    }
+    finally {
+        if ($enteredFirmware) {
+            try { Pop-Location -ErrorAction Stop }
+            catch { $diagnosis = "LOCATION_RESTORE_FAILED"; $disposition = "BLOCKED" }
+        }
+        Write-Host ""
+        Write-Host "==== $phase ===="
+        Write-Host ("expected_head={0}" -f $expectedHead)
+        Write-Host ("head={0}" -f $head)
+        Write-Host ("git_exit={0}" -f $gitExit)
+        Write-Host ("idf_exit={0}" -f $idfExit)
+        Write-Host ("idf_version={0}" -f $idfVersion)
+        Write-Host ("flash_exit={0}" -f $flashExit)
+        Write-Host ("expected_app_sha256={0}" -f $expectedAppSha256)
+        Write-Host ("before_app_sha256={0}" -f $beforeHash)
+        Write-Host ("after_app_sha256={0}" -f $afterHash)
+        Write-Host ("diagnosis={0}" -f $diagnosis)
+        Write-Host ("disposition={0}" -f $disposition)
+        Write-Host ("SUMMARY phase={0} diagnosis={1} disposition={2}" -f $phase, $diagnosis, $disposition)
+        Write-Host ""
+    }
+}
 ~~~
 
-Do not use erase-flash as a convenience step in a Human Gate.
+Do not use erase-flash as a convenience step in a Human Gate. A flash failure, rebuild/hash mismatch, or missing accepted flash result is **not** evidence that the intended firmware is running. Do not count an acceptance cycle until the exact runtime identity and baseline are re-established.
 
 After flash, fixture restore, ROM-mode diagnostic, NVS read, host reboot, or any operation that can reset/re-enumerate the Device, establish a fresh runtime baseline before counting a cycle.
 
@@ -288,7 +490,7 @@ If volume lock fails before RELEASE_STORAGE is sent, preserve the already-valid 
 | RELEASE_STORAGE may have been sent | Never resend in that attempt |
 | Matching accepted response + complete teardown, but serial close fails | Serial cleanup issue; do not overturn independently valid product evidence |
 | Accepted response but teardown does not complete during a valid full observation window | Product failure for the required teardown path; no release retry |
-| Manual WAKE was omitted or operator is unsure it occurred | Required physical sequence is invalid; mark the affected cycle NOT_COUNTED / BLOCKED as appropriate, not product FAIL |
+| Manual WAKE was omitted or operator is unsure it occurred | Required sequence not proven: counted=false; disposition=BLOCKED if attempted without valid preconditions, or NOT_RUN if the required phase was never attempted; not product FAIL |
 | Fresh WAV is 44 bytes / 0 ms after otherwise valid recovery | Fresh-recording evidence insufficient; do not infer release failure; use a longer approved evidence dwell |
 | Read-only NVS/flash diagnostic was run | Runtime continuity is broken; establish a fresh application baseline before continuing |
 | Wrapper/parser verdict contradicts immutable raw observations | Correct the harness verdict from preserved evidence; do not repeat physical actions solely for formatting |
