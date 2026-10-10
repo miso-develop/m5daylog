@@ -111,7 +111,7 @@ Important lessons:
 
 ## 3. Exact build identity
 
-For a clean exact-head firmware qualification, use a **standalone** packet that verifies the repository, toolchain, and firmware project directory before modifying generated build outputs:
+For a clean exact-head firmware qualification, use a standalone packet that generates the effective SDKCONFIG from the tracked sdkconfig.defaults in a fresh isolated build directory. Git ignores firmware/sdkconfig and fullclean preserves it; neither a clean tracked worktree nor fullclean is sufficient to qualify that ambient file. Existing project configuration, output and Device state must never be silently deleted or reset. If unmanaged components, untracked firmware inputs, ambient build overrides or old isolated output exist, stop and use an explicitly provisioned fresh worktree rather than deleting them:
 
 ~~~powershell
 & {
@@ -123,13 +123,17 @@ For a clean exact-head firmware qualification, use a **standalone** packet that 
     $python = "<idf-managed-python>"
     $idfPy = Join-Path $idfRoot "tools\idf.py"
     $firmwareRoot = Join-Path $repoRoot "firmware"
-    $app = Join-Path $firmwareRoot "build\m5daylog.bin"
+    $defaults = Join-Path $firmwareRoot "sdkconfig.defaults"
+    $qualifiedBuildDir = Join-Path $firmwareRoot "build\hg-qualified"
+    $qualifiedSdkconfig = Join-Path $qualifiedBuildDir "sdkconfig"
+    $app = Join-Path $qualifiedBuildDir "m5daylog.bin"
 
     $head = "UNRESOLVED"
     $gitExit = "NOT_RUN"
     $idfExit = "NOT_RUN"
     $idfVersion = "NOT_RUN"
-    $fullcleanExit = "NOT_RUN"
+    $defaultsHash = "NOT_RUN"
+    $configHash = "NOT_RUN"
     $buildExit = "NOT_RUN"
     $appHash = "NOT_RUN"
     $enteredFirmware = $false
@@ -138,7 +142,7 @@ For a clean exact-head firmware qualification, use a **standalone** packet that 
 
     try {
         foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $firmwareRoot,
-                                (Join-Path $firmwareRoot "CMakeLists.txt"))) {
+                                (Join-Path $firmwareRoot "CMakeLists.txt"), $defaults)) {
             if (-not (Test-Path -LiteralPath $required)) {
                 $diagnosis = "REQUIRED_PATH_MISSING"
                 throw $diagnosis
@@ -157,6 +161,28 @@ For a clean exact-head firmware qualification, use a **standalone** packet that 
             throw $diagnosis
         }
 
+        $untrackedFirmware = @(& git -C $firmwareRoot ls-files --others --exclude-standard)
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $untrackedFirmware.Count -ne 0) {
+            $diagnosis = "UNTRACKED_FIRMWARE_INPUT"
+            throw $diagnosis
+        }
+        if (Test-Path -LiteralPath (Join-Path $firmwareRoot "managed_components")) {
+            $diagnosis = "UNQUALIFIED_LOCAL_MANAGED_COMPONENTS"
+            throw $diagnosis
+        }
+        if (Test-Path -LiteralPath $qualifiedBuildDir) {
+            $diagnosis = "QUALIFICATION_OUTPUT_ALREADY_EXISTS"
+            throw $diagnosis
+        }
+        foreach ($name in @("SDKCONFIG", "SDKCONFIG_DEFAULTS", "IDF_TARGET", "IDF_PRESET", "EXTRA_COMPONENT_DIRS")) {
+            if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name))) {
+                $diagnosis = "AMBIENT_BUILD_OVERRIDE"
+                throw $diagnosis
+            }
+        }
+        $defaultsHash = (Get-FileHash -LiteralPath $defaults -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+
         $env:IDF_PATH = $idfRoot
         $env:IDF_TOOLS_PATH = $idfTools
         $env:PATH = "$(Split-Path -Parent $python);$env:PATH"
@@ -171,13 +197,7 @@ For a clean exact-head firmware qualification, use a **standalone** packet that 
 
         Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
         $enteredFirmware = $true
-        & $python $idfPy fullclean
-        $fullcleanExit = $LASTEXITCODE
-        if ($fullcleanExit -ne 0) {
-            $diagnosis = "FULLCLEAN_FAILED"
-            throw $diagnosis
-        }
-        & $python $idfPy build
+        & $python $idfPy -B $qualifiedBuildDir "-DSDKCONFIG=$qualifiedSdkconfig" "-DSDKCONFIG_DEFAULTS=$defaults" "-DIDF_TARGET=esp32s3" build
         $buildExit = $LASTEXITCODE
         if ($buildExit -ne 0) {
             $diagnosis = "BUILD_FAILED"
@@ -187,6 +207,28 @@ For a clean exact-head firmware qualification, use a **standalone** packet that 
             $diagnosis = "APP_BINARY_MISSING"
             throw $diagnosis
         }
+        if (-not (Test-Path -LiteralPath $qualifiedSdkconfig -PathType Leaf)) {
+            $diagnosis = "EFFECTIVE_SDKCONFIG_MISSING"
+            throw $diagnosis
+        }
+        $effectiveLines = @([System.IO.File]::ReadAllLines($qualifiedSdkconfig))
+        $defaultLines = @([System.IO.File]::ReadAllLines($defaults) |
+            Where-Object { $_ -match '^CONFIG_[A-Za-z0-9_]+=' })
+        if ($defaultLines.Count -eq 0) {
+            $diagnosis = "EMPTY_APPROVED_DEFAULTS"
+            throw $diagnosis
+        }
+        foreach ($line in $defaultLines) {
+            if ($effectiveLines -cnotcontains $line) {
+                $diagnosis = "EFFECTIVE_CONFIG_DEFAULT_MISMATCH"
+                throw $diagnosis
+            }
+        }
+        if ((Get-FileHash -LiteralPath $defaults -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() -ne $defaultsHash) {
+            $diagnosis = "DEFAULTS_CHANGED_DURING_BUILD"
+            throw $diagnosis
+        }
+        $configHash = (Get-FileHash -LiteralPath $qualifiedSdkconfig -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         $appHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         $diagnosis = "OK"
         $disposition = "PASS"
@@ -206,7 +248,8 @@ For a clean exact-head firmware qualification, use a **standalone** packet that 
         Write-Host ("git_exit={0}" -f $gitExit)
         Write-Host ("idf_exit={0}" -f $idfExit)
         Write-Host ("idf_version={0}" -f $idfVersion)
-        Write-Host ("fullclean_exit={0}" -f $fullcleanExit)
+        Write-Host ("defaults_sha256={0}" -f $defaultsHash)
+        Write-Host ("effective_sdkconfig_sha256={0}" -f $configHash)
         Write-Host ("build_exit={0}" -f $buildExit)
         Write-Host ("app_sha256={0}" -f $appHash)
         Write-Host ("diagnosis={0}" -f $diagnosis)
@@ -217,7 +260,7 @@ For a clean exact-head firmware qualification, use a **standalone** packet that 
 }
 ~~~
 
-Retain the passing exact HEAD and app_sha256 as the build-to-flash identity. The hash is not itself proof of what is running on the physical target; qualification still requires an observed flash result and a fresh Device baseline. Use the build-generated flash plan. Do not guess partition offsets. Do not erase NVS unless the approved setup explicitly requires a fixture reset. Fixture repair/reset is setup and counts as zero acceptance cycles.
+Retain the passing exact HEAD plus defaults_sha256, effective_sdkconfig_sha256, and app_sha256 as the build-to-flash identity. Never reuse them across a revision/toolchain change. A partial isolated build is not requalified by fullclean; preserve evidence and use a newly controlled checkout/output path. The hash is not itself proof of what is running on the physical target; qualification still requires an observed flash result and a fresh Device baseline. Use the build-generated flash plan. Do not guess partition offsets. Do not erase NVS unless the approved setup explicitly requires a fixture reset. Fixture repair/reset is setup and counts as zero acceptance cycles.
 
 ## 4. Flash and runtime baseline
 
