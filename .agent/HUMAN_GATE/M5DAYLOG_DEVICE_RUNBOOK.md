@@ -139,6 +139,11 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
     $buildDeadlineSeconds=3600
     $buildTimedOut=$false
     $buildTreeStopped="NOT_RUN"
+    $buildStarted="NOT_RUN"
+    $buildPid="NOT_RUN"
+    $buildStatus="NOT_RUN"
+    $buildRootStopped="NOT_RUN"
+    $buildCleanupStatus="NOT_RUN"
     $appHash = "NOT_RUN"
     $planHash = "NOT_RUN"
     $imageSetHash = "NOT_RUN"
@@ -160,7 +165,13 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
     }
     # Bounded native child. Separate asynchronous output drains avoid pipe deadlock.
     function Invoke-BoundedPython([string[]]$argv,[string]$workDir,[int]$seconds) {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $result=[pscustomobject]@{
+            Started=$false; Pid="NOT_RUN"; ExitCode="NOT_RUN"
+            TimedOut=$false; RootStopped="NOT_RUN"; TreeStopped="NOT_RUN"
+            Status="NOT_RUN"; CleanupStatus="NOT_REQUIRED"
+            Stdout=""; Stderr=""
+        }
+        $psi=New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName=$python
         $psi.Arguments=(@($argv | ForEach-Object { Quote-NativeArgument ([string]$_) }) -join ' ')
         $psi.WorkingDirectory=$workDir
@@ -170,47 +181,95 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
         $psi.RedirectStandardError=$true
         $proc=New-Object System.Diagnostics.Process
         $proc.StartInfo=$psi
+        $outTask=$null
+        $errTask=$null
+        $needsCleanup=$false
         try {
-            if (-not $proc.Start()) { throw "NATIVE_START_FAILED" }
-            $outTask=$proc.StandardOutput.ReadToEndAsync()
-            $errTask=$proc.StandardError.ReadToEndAsync()
-            if (-not $proc.WaitForExit($seconds*1000)) {
-                $treeStopped=$false
-                $kill=New-Object System.Diagnostics.Process
-                $kpsi=New-Object System.Diagnostics.ProcessStartInfo
-                $kpsi.FileName=Join-Path $env:SystemRoot 'System32\taskkill.exe'
-                $kpsi.Arguments="/PID $($proc.Id) /T /F"
-                $kpsi.UseShellExecute=$false
-                $kpsi.CreateNoWindow=$true
-                $kill.StartInfo=$kpsi
-                try {
-                    if ($kill.Start()) {
-                        if ($kill.WaitForExit(15000)) {
-                            $treeStopped=($kill.ExitCode -eq 0)
-                        } else {
-                            try { $kill.Kill() } catch {}
-                            [void]$kill.WaitForExit(5000)
-                        }
-                    }
-                } finally { $kill.Dispose() }
-                $rootStopped=$proc.WaitForExit(15000)
-                $partialOut="";$partialErr=""
-                try { if ($outTask.Wait(5000)) { $partialOut=[string]$outTask.Result } } catch {}
-                try { if ($errTask.Wait(5000)) { $partialErr=[string]$errTask.Result } } catch {}
-                return [pscustomobject]@{
-                    ExitCode="UNKNOWN";TimedOut=$true
-                    TreeStopped=($treeStopped -and $rootStopped)
-                    Stdout=$partialOut;Stderr=$partialErr
+            if (-not $proc.Start()) {
+                $result.Status="START_REJECTED"
+            } else {
+                $result.Started=$true
+                $result.Pid=$proc.Id
+                $result.ExitCode="UNKNOWN"
+                $result.Status="RUNNING"
+                $outTask=$proc.StandardOutput.ReadToEndAsync()
+                $errTask=$proc.StandardError.ReadToEndAsync()
+                if (-not $proc.WaitForExit($seconds*1000)) {
+                    $result.TimedOut=$true
+                    $result.Status="TIMEOUT"
+                    $needsCleanup=$true
+                } elseif (-not $outTask.Wait(10000) -or -not $errTask.Wait(10000)) {
+                    $result.Status="OUTPUT_DRAIN_TIMEOUT"
+                    $needsCleanup=$true
+                } else {
+                    $result.RootStopped=$true
+                    $result.ExitCode=$proc.ExitCode
+                    $result.Status="EXITED"
                 }
             }
-            if (-not $outTask.Wait(10000) -or -not $errTask.Wait(10000)) {
-                throw "NATIVE_OUTPUT_DRAIN_TIMEOUT"
+        }
+        catch {
+            # Do not let a post-start exception escape without PID/child state.
+            $result.Status=if ($result.Started) { "POST_START_EXCEPTION" } else { "START_EXCEPTION" }
+            $needsCleanup=[bool]$result.Started
+        }
+        finally {
+            if ($result.Started -and $needsCleanup) {
+                # Best effort only; taskkill failure never proves that a child stopped.
+                $result.CleanupStatus="TREE_STOP_UNVERIFIED"
+                $killSucceeded=$false
+                $kill=$null
+                try {
+                    $kpsi=New-Object System.Diagnostics.ProcessStartInfo
+                    $kpsi.FileName=Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                    $kpsi.Arguments="/PID $($result.Pid) /T /F"
+                    $kpsi.UseShellExecute=$false
+                    $kpsi.CreateNoWindow=$true
+                    $kill=New-Object System.Diagnostics.Process
+                    $kill.StartInfo=$kpsi
+                    if ($kill.Start()) {
+                        if ($kill.WaitForExit(15000)) {
+                            $killSucceeded=($kill.ExitCode -eq 0)
+                            if (-not $killSucceeded) { $result.CleanupStatus="TASKKILL_NONZERO_EXIT" }
+                        } else {
+                            $result.CleanupStatus="TASKKILL_TIMEOUT"
+                            try { $kill.Kill() } catch {}
+                            try { [void]$kill.WaitForExit(5000) } catch {}
+                        }
+                    } else { $result.CleanupStatus="TASKKILL_NOT_STARTED" }
+                }
+                catch { $result.CleanupStatus="TASKKILL_EXCEPTION" }
+                finally { if ($null -ne $kill) { try { $kill.Dispose() } catch {} } }
+
+                $rootExited=$false
+                try { $rootExited=$proc.WaitForExit(15000) }
+                catch { $result.CleanupStatus="ROOT_WAIT_EXCEPTION" }
+                $result.RootStopped=$rootExited
+                $result.TreeStopped=($killSucceeded -and $rootExited)
+                if ($result.TreeStopped) { $result.CleanupStatus="TREE_STOP_REPORTED" }
             }
-            return [pscustomobject]@{
-                ExitCode=$proc.ExitCode;TimedOut=$false;TreeStopped=$true
-                Stdout=[string]$outTask.Result;Stderr=[string]$errTask.Result
+            if ($result.Started -and $result.RootStopped -eq "NOT_RUN") {
+                try { $result.RootStopped=$proc.HasExited }
+                catch { $result.RootStopped="UNKNOWN" }
             }
-        } finally { $proc.Dispose() }
+            # Capture may fail independently of process completion. Never call it PASS.
+            if ($null -ne $outTask) {
+                try {
+                    if ($outTask.Wait(5000)) { $result.Stdout=[string]$outTask.Result }
+                    elseif ($result.Status -eq "EXITED") { $result.Status="OUTPUT_CAPTURE_TIMEOUT" }
+                }
+                catch { if ($result.Status -eq "EXITED") { $result.Status="OUTPUT_CAPTURE_EXCEPTION" } }
+            }
+            if ($null -ne $errTask) {
+                try {
+                    if ($errTask.Wait(5000)) { $result.Stderr=[string]$errTask.Result }
+                    elseif ($result.Status -eq "EXITED") { $result.Status="OUTPUT_CAPTURE_TIMEOUT" }
+                }
+                catch { if ($result.Status -eq "EXITED") { $result.Status="OUTPUT_CAPTURE_EXCEPTION" } }
+            }
+            try { $proc.Dispose() } catch {}
+        }
+        return $result
     }
 
     # Every process's raw stdout/stderr and exit metadata stay on the operator host.
@@ -225,8 +284,9 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
         [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.stderr.txt"),
             [string]$result.Stderr,[Text.Encoding]::UTF8)
         [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.status.txt"),
-            ("exit={0};timeout={1};tree_stopped={2}" -f
-                $result.ExitCode,$result.TimedOut,$result.TreeStopped),[Text.Encoding]::UTF8)
+            ("started={0};pid={1};status={2};exit={3};timeout={4};root_stopped={5};tree_stopped={6};cleanup={7}" -f
+                $result.Started,$result.Pid,$result.Status,$result.ExitCode,
+                $result.TimedOut,$result.RootStopped,$result.TreeStopped,$result.CleanupStatus),[Text.Encoding]::UTF8)
     }
 
     # Derive the entire immutable qualification identity from the generated
@@ -375,16 +435,32 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
 
         Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
         $enteredFirmware = $true
+        $buildStarted="UNKNOWN"
+        $buildPid="UNKNOWN"
+        $buildStatus="UNKNOWN"
+        $buildRootStopped="UNKNOWN"
+        $buildCleanupStatus="UNKNOWN"
+        $diagnosis="BUILD_WRAPPER_EXCEPTION_CHILD_STATE_UNKNOWN"
         $buildResult=Invoke-BoundedPython @($idfPy,"-B",$qualifiedBuildDir,
             "-DSDKCONFIG=$qualifiedSdkconfig","-DSDKCONFIG_DEFAULTS=$defaults",
             "-DIDF_TARGET=esp32s3","build") $firmwareRoot $buildDeadlineSeconds
+        $buildStarted=$buildResult.Started
+        $buildPid=$buildResult.Pid
+        $buildStatus=$buildResult.Status
+        $buildRootStopped=$buildResult.RootStopped
+        $buildCleanupStatus=$buildResult.CleanupStatus
         $buildExit=$buildResult.ExitCode
         $buildTimedOut=$buildResult.TimedOut
         $buildTreeStopped=$buildResult.TreeStopped
+        $diagnosis="BUILD_PRIVATE_EVIDENCE_SAVE_FAILED"
         Save-PrivateProcessEvidence "build" $buildResult
         if ($buildTimedOut) { $diagnosis="BUILD_TIMEOUT_NO_AUTOMATIC_RETRY"; throw $diagnosis }
+        if ($buildStatus -ne "EXITED") {
+            $diagnosis="BUILD_CHILD_INDETERMINATE_NO_AUTOMATIC_RETRY"
+            throw $diagnosis
+        }
         if ($buildExit -ne 0) {
-            $diagnosis = "BUILD_FAILED"
+            $diagnosis="BUILD_FAILED"
             throw $diagnosis
         }
         if (-not (Test-Path -LiteralPath $app -PathType Leaf)) {
@@ -443,6 +519,11 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
         Write-Host ("build_deadline_seconds={0}" -f $buildDeadlineSeconds)
         Write-Host ("build_timed_out={0}" -f $buildTimedOut)
         Write-Host ("build_tree_stopped={0}" -f $buildTreeStopped)
+        Write-Host ("build_child_started={0}" -f $buildStarted)
+        Write-Host ("build_child_pid={0}" -f $buildPid)
+        Write-Host ("build_child_status={0}" -f $buildStatus)
+        Write-Host ("build_root_stopped={0}" -f $buildRootStopped)
+        Write-Host ("build_cleanup_status={0}" -f $buildCleanupStatus)
         Write-Host ("app_sha256={0}" -f $appHash)
         Write-Host ("flasher_args_sha256={0}" -f $planHash)
         Write-Host ("flash_image_set_sha256={0}" -f $imageSetHash)
@@ -463,7 +544,7 @@ Before a write, bind the selected COM port to an independently operator-qualifie
 
 Place the intended board in approved ROM Download Mode, then establish its re-enumerated COM and PnP mapping. The read-only esptool read_mac operation does not program flash but may change runtime state or USB enumeration. Recheck the port after MAC probing and immediately before the writer; any absent, changed, duplicate or unexpected identity is BLOCKED with no write. No cable swap is permitted between check and write: independent esptool processes cannot cryptographically prevent a last-moment physical substitution.
 
-Process deadlines: build 3600 seconds, read_mac 120 seconds, flash 900 seconds. Timeout triggers a bounded best-effort taskkill /T /F process-tree stop. Before any retry an operator must independently confirm that no child remains. After flash launch, exit failure, timeout, or wrapper error means WRITE_STATE_UNKNOWN regardless of process cleanup: no automatic retry, erase, acceptance cycle, or assumed firmware success. Re-establish Device runtime state and keep raw process logs/identifiers local.
+Process deadlines: build 3600 seconds, read_mac 120 seconds, flash 900 seconds. Timeout and post-start invocation/output exceptions trigger bounded best-effort taskkill /T /F process-tree stop. Each child operation records whether it actually started, its local PID, concrete exit code or UNKNOWN, timeout, root-exit observation, process-tree cleanup result, and status separately; taskkill launch failure is never a successful stop. A process exited by itself does not prove that its descendants exited. Before any retry an operator must independently confirm that no child remains; a reported process-tree cleanup success alone is not permission to retry. After flash launch, exit failure, timeout, wrapper or evidence-save error means WRITE_STATE_UNKNOWN regardless of process cleanup: no automatic retry, erase, acceptance cycle, or assumed firmware success. Re-establish Device runtime state and keep raw process logs/identifiers local; public evidence must omit PIDs and machine-local details.
 
 For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defaults, effective sdkconfig, app, generated plan, complete image set) into this standalone packet. It revalidates every image and the complete flash plan **before** touching the Device. It then invokes the managed Python's `esptool write_flash` directly, using only verified plan entries. Do **not** substitute `idf.py flash`: that action may automatically rebuild before writing. No concurrent editor, build or flashing process may mutate the qualification output. The flash packet holds Windows read-only sharing locks on the verified plan/configuration/images and repeats all five hash checks under those locks before invoking esptool; lock acquisition or drift is BLOCKED without attempting to write. A successful flash still requires an independently verified runtime baseline. Hash agreement alone does not prove the target was programmed correctly; a fresh Device baseline remains mandatory.
 
@@ -505,6 +586,16 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
     $flashDeadlineSeconds=900
     $flashTimedOut=$false
     $flashTreeStopped="NOT_RUN"
+    $flashStarted="NOT_RUN"
+    $flashPid="NOT_RUN"
+    $flashStatus="NOT_RUN"
+    $flashRootStopped="NOT_RUN"
+    $flashCleanupStatus="NOT_RUN"
+    $identityStarted="NOT_RUN"
+    $identityPid="NOT_RUN"
+    $identityStatus="NOT_RUN"
+    $identityRootStopped="NOT_RUN"
+    $identityCleanupStatus="NOT_RUN"
     $beforeHash = "NOT_RUN"
     $afterHash = "NOT_RUN"
     $beforeConfigHash = "NOT_RUN"
@@ -534,7 +625,13 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
     }
     # Bounded native child. Separate asynchronous output drains avoid pipe deadlock.
     function Invoke-BoundedPython([string[]]$argv,[string]$workDir,[int]$seconds) {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $result=[pscustomobject]@{
+            Started=$false; Pid="NOT_RUN"; ExitCode="NOT_RUN"
+            TimedOut=$false; RootStopped="NOT_RUN"; TreeStopped="NOT_RUN"
+            Status="NOT_RUN"; CleanupStatus="NOT_REQUIRED"
+            Stdout=""; Stderr=""
+        }
+        $psi=New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName=$python
         $psi.Arguments=(@($argv | ForEach-Object { Quote-NativeArgument ([string]$_) }) -join ' ')
         $psi.WorkingDirectory=$workDir
@@ -544,47 +641,95 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         $psi.RedirectStandardError=$true
         $proc=New-Object System.Diagnostics.Process
         $proc.StartInfo=$psi
+        $outTask=$null
+        $errTask=$null
+        $needsCleanup=$false
         try {
-            if (-not $proc.Start()) { throw "NATIVE_START_FAILED" }
-            $outTask=$proc.StandardOutput.ReadToEndAsync()
-            $errTask=$proc.StandardError.ReadToEndAsync()
-            if (-not $proc.WaitForExit($seconds*1000)) {
-                $treeStopped=$false
-                $kill=New-Object System.Diagnostics.Process
-                $kpsi=New-Object System.Diagnostics.ProcessStartInfo
-                $kpsi.FileName=Join-Path $env:SystemRoot 'System32\taskkill.exe'
-                $kpsi.Arguments="/PID $($proc.Id) /T /F"
-                $kpsi.UseShellExecute=$false
-                $kpsi.CreateNoWindow=$true
-                $kill.StartInfo=$kpsi
-                try {
-                    if ($kill.Start()) {
-                        if ($kill.WaitForExit(15000)) {
-                            $treeStopped=($kill.ExitCode -eq 0)
-                        } else {
-                            try { $kill.Kill() } catch {}
-                            [void]$kill.WaitForExit(5000)
-                        }
-                    }
-                } finally { $kill.Dispose() }
-                $rootStopped=$proc.WaitForExit(15000)
-                $partialOut="";$partialErr=""
-                try { if ($outTask.Wait(5000)) { $partialOut=[string]$outTask.Result } } catch {}
-                try { if ($errTask.Wait(5000)) { $partialErr=[string]$errTask.Result } } catch {}
-                return [pscustomobject]@{
-                    ExitCode="UNKNOWN";TimedOut=$true
-                    TreeStopped=($treeStopped -and $rootStopped)
-                    Stdout=$partialOut;Stderr=$partialErr
+            if (-not $proc.Start()) {
+                $result.Status="START_REJECTED"
+            } else {
+                $result.Started=$true
+                $result.Pid=$proc.Id
+                $result.ExitCode="UNKNOWN"
+                $result.Status="RUNNING"
+                $outTask=$proc.StandardOutput.ReadToEndAsync()
+                $errTask=$proc.StandardError.ReadToEndAsync()
+                if (-not $proc.WaitForExit($seconds*1000)) {
+                    $result.TimedOut=$true
+                    $result.Status="TIMEOUT"
+                    $needsCleanup=$true
+                } elseif (-not $outTask.Wait(10000) -or -not $errTask.Wait(10000)) {
+                    $result.Status="OUTPUT_DRAIN_TIMEOUT"
+                    $needsCleanup=$true
+                } else {
+                    $result.RootStopped=$true
+                    $result.ExitCode=$proc.ExitCode
+                    $result.Status="EXITED"
                 }
             }
-            if (-not $outTask.Wait(10000) -or -not $errTask.Wait(10000)) {
-                throw "NATIVE_OUTPUT_DRAIN_TIMEOUT"
+        }
+        catch {
+            # Do not let a post-start exception escape without PID/child state.
+            $result.Status=if ($result.Started) { "POST_START_EXCEPTION" } else { "START_EXCEPTION" }
+            $needsCleanup=[bool]$result.Started
+        }
+        finally {
+            if ($result.Started -and $needsCleanup) {
+                # Best effort only; taskkill failure never proves that a child stopped.
+                $result.CleanupStatus="TREE_STOP_UNVERIFIED"
+                $killSucceeded=$false
+                $kill=$null
+                try {
+                    $kpsi=New-Object System.Diagnostics.ProcessStartInfo
+                    $kpsi.FileName=Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                    $kpsi.Arguments="/PID $($result.Pid) /T /F"
+                    $kpsi.UseShellExecute=$false
+                    $kpsi.CreateNoWindow=$true
+                    $kill=New-Object System.Diagnostics.Process
+                    $kill.StartInfo=$kpsi
+                    if ($kill.Start()) {
+                        if ($kill.WaitForExit(15000)) {
+                            $killSucceeded=($kill.ExitCode -eq 0)
+                            if (-not $killSucceeded) { $result.CleanupStatus="TASKKILL_NONZERO_EXIT" }
+                        } else {
+                            $result.CleanupStatus="TASKKILL_TIMEOUT"
+                            try { $kill.Kill() } catch {}
+                            try { [void]$kill.WaitForExit(5000) } catch {}
+                        }
+                    } else { $result.CleanupStatus="TASKKILL_NOT_STARTED" }
+                }
+                catch { $result.CleanupStatus="TASKKILL_EXCEPTION" }
+                finally { if ($null -ne $kill) { try { $kill.Dispose() } catch {} } }
+
+                $rootExited=$false
+                try { $rootExited=$proc.WaitForExit(15000) }
+                catch { $result.CleanupStatus="ROOT_WAIT_EXCEPTION" }
+                $result.RootStopped=$rootExited
+                $result.TreeStopped=($killSucceeded -and $rootExited)
+                if ($result.TreeStopped) { $result.CleanupStatus="TREE_STOP_REPORTED" }
             }
-            return [pscustomobject]@{
-                ExitCode=$proc.ExitCode;TimedOut=$false;TreeStopped=$true
-                Stdout=[string]$outTask.Result;Stderr=[string]$errTask.Result
+            if ($result.Started -and $result.RootStopped -eq "NOT_RUN") {
+                try { $result.RootStopped=$proc.HasExited }
+                catch { $result.RootStopped="UNKNOWN" }
             }
-        } finally { $proc.Dispose() }
+            # Capture may fail independently of process completion. Never call it PASS.
+            if ($null -ne $outTask) {
+                try {
+                    if ($outTask.Wait(5000)) { $result.Stdout=[string]$outTask.Result }
+                    elseif ($result.Status -eq "EXITED") { $result.Status="OUTPUT_CAPTURE_TIMEOUT" }
+                }
+                catch { if ($result.Status -eq "EXITED") { $result.Status="OUTPUT_CAPTURE_EXCEPTION" } }
+            }
+            if ($null -ne $errTask) {
+                try {
+                    if ($errTask.Wait(5000)) { $result.Stderr=[string]$errTask.Result }
+                    elseif ($result.Status -eq "EXITED") { $result.Status="OUTPUT_CAPTURE_TIMEOUT" }
+                }
+                catch { if ($result.Status -eq "EXITED") { $result.Status="OUTPUT_CAPTURE_EXCEPTION" } }
+            }
+            try { $proc.Dispose() } catch {}
+        }
+        return $result
     }
 
     # Every process's raw stdout/stderr and exit metadata stay on the operator host.
@@ -599,8 +744,9 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.stderr.txt"),
             [string]$result.Stderr,[Text.Encoding]::UTF8)
         [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.status.txt"),
-            ("exit={0};timeout={1};tree_stopped={2}" -f
-                $result.ExitCode,$result.TimedOut,$result.TreeStopped),[Text.Encoding]::UTF8)
+            ("started={0};pid={1};status={2};exit={3};timeout={4};root_stopped={5};tree_stopped={6};cleanup={7}" -f
+                $result.Started,$result.Pid,$result.Status,$result.ExitCode,
+                $result.TimedOut,$result.RootStopped,$result.TreeStopped,$result.CleanupStatus),[Text.Encoding]::UTF8)
     }
 
     # Derive the entire immutable qualification identity from the generated
@@ -803,12 +949,26 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         Assert-QualifiedPort
         $pnpMatch=$true
         $diagnosis="DEVICE_MAC_READ_FAILED"
+        $identityStarted="UNKNOWN"
+        $identityPid="UNKNOWN"
+        $identityStatus="UNKNOWN"
+        $diagnosis="DEVICE_IDENTITY_WRAPPER_EXCEPTION_NO_FLASH"
         $idResult=Invoke-BoundedPython @("-m","esptool","--chip","esp32s3",
             "-p",$serialPort,"--before","no_reset","--after","no_reset","read_mac") $qualifiedBuildDir $identityDeadlineSeconds
+        $identityStarted=$idResult.Started
+        $identityPid=$idResult.Pid
+        $identityStatus=$idResult.Status
+        $identityRootStopped=$idResult.RootStopped
+        $identityCleanupStatus=$idResult.CleanupStatus
         $identityExit=$idResult.ExitCode
+        $diagnosis="DEVICE_IDENTITY_EVIDENCE_SAVE_FAILED_NO_FLASH"
         Save-PrivateProcessEvidence "identity" $idResult
         if ($idResult.TimedOut) { $diagnosis="DEVICE_IDENTITY_TIMEOUT_NO_FLASH";throw $diagnosis }
-        if ($identityExit -ne 0) { throw $diagnosis }
+        if ($identityStatus -ne "EXITED") {
+            $diagnosis="DEVICE_IDENTITY_PROCESS_INDETERMINATE_NO_FLASH"
+            throw $diagnosis
+        }
+        if ($identityExit -ne 0) { $diagnosis="DEVICE_MAC_READ_FAILED";throw $diagnosis }
         # esptool may print one MAC both during connect and read_mac.
         $observed=@([regex]::Matches($idResult.Stdout,
             '(?im)^\s*MAC:\s*((?:[a-f0-9]{2}:){5}[a-f0-9]{2})\s*$') |
@@ -836,14 +996,35 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         try {
             $flashAttempted=$true
             $flashWriteState="WRITE_STATE_UNKNOWN"
+            $flashStarted="UNKNOWN"
+            $flashPid="UNKNOWN"
+            $flashStatus="UNKNOWN"
+            $flashRootStopped="UNKNOWN"
+            $flashCleanupStatus="UNKNOWN"
+            $diagnosis="FLASH_WRAPPER_EXCEPTION_WRITE_STATE_UNKNOWN_NO_RETRY"
             $flashResult=Invoke-BoundedPython (@("-m","esptool") + $flashArgs) $qualifiedBuildDir $flashDeadlineSeconds
+            $flashStarted=$flashResult.Started
+            $flashPid=$flashResult.Pid
+            $flashStatus=$flashResult.Status
+            $flashRootStopped=$flashResult.RootStopped
+            $flashCleanupStatus=$flashResult.CleanupStatus
             $flashExit=$flashResult.ExitCode
             $flashTimedOut=$flashResult.TimedOut
             $flashTreeStopped=$flashResult.TreeStopped
+            $diagnosis="FLASH_PRIVATE_EVIDENCE_SAVE_FAILED_WRITE_STATE_UNKNOWN_NO_RETRY"
             Save-PrivateProcessEvidence "flash" $flashResult
         } finally { Pop-Location -ErrorAction Stop }
+        if (-not $flashStarted) {
+            $flashWriteState="NOT_STARTED"
+            $diagnosis="FLASH_PROCESS_NOT_STARTED_NO_WRITE"
+            throw $diagnosis
+        }
         if ($flashTimedOut) {
             $diagnosis="FLASH_TIMEOUT_WRITE_STATE_UNKNOWN_NO_RETRY";throw $diagnosis
+        }
+        if ($flashStatus -ne "EXITED") {
+            $diagnosis="FLASH_CHILD_INDETERMINATE_WRITE_STATE_UNKNOWN_NO_RETRY"
+            throw $diagnosis
         }
         if ($flashExit -ne 0) {
             $diagnosis="FLASH_FAILED_WRITE_STATE_UNKNOWN_NO_RETRY";throw $diagnosis
@@ -888,6 +1069,11 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         Write-Host ("idf_version={0}" -f $idfVersion)
         Write-Host ("flash_exit={0}" -f $flashExit)
         Write-Host ("identity_exit={0}" -f $identityExit)
+        Write-Host ("identity_child_started={0}" -f $identityStarted)
+        Write-Host ("identity_child_pid={0}" -f $identityPid)
+        Write-Host ("identity_child_status={0}" -f $identityStatus)
+        Write-Host ("identity_root_stopped={0}" -f $identityRootStopped)
+        Write-Host ("identity_cleanup_status={0}" -f $identityCleanupStatus)
         Write-Host ("qualified_pnp_match={0}" -f $pnpMatch)
         Write-Host ("qualified_mac_match={0}" -f $macMatch)
         Write-Host ("identity_deadline_seconds={0}" -f $identityDeadlineSeconds)
@@ -895,6 +1081,11 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         Write-Host ("flash_attempted={0}" -f $flashAttempted)
         Write-Host ("flash_timed_out={0}" -f $flashTimedOut)
         Write-Host ("flash_tree_stopped={0}" -f $flashTreeStopped)
+        Write-Host ("flash_child_started={0}" -f $flashStarted)
+        Write-Host ("flash_child_pid={0}" -f $flashPid)
+        Write-Host ("flash_child_status={0}" -f $flashStatus)
+        Write-Host ("flash_root_stopped={0}" -f $flashRootStopped)
+        Write-Host ("flash_cleanup_status={0}" -f $flashCleanupStatus)
         Write-Host ("flash_write_state={0}" -f $flashWriteState)
         Write-Host ("expected_defaults_sha256={0}" -f $expectedDefaultsSha256)
         Write-Host ("expected_effective_sdkconfig_sha256={0}" -f $expectedConfigSha256)
@@ -922,7 +1113,7 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
 
 Negative verification (host-only disposable worktree, no connected Device):
 
-I-05 host-only parser tests: feed simulated absent, duplicate, mismatched PnP records and missing/ambiguous/mismatched MAC lines. Verify every case stops before launching the writer. Never claim a real physical MAC check was performed by this test. I-06 host-only mock-child tests: use shortened deadlines with a non-mutating process that hangs and fills stdout/stderr pipes; require BLOCKED, UNKNOWN child result and zero writer retries. These are test instructions only, not executed test evidence.
+I-05 host-only parser tests: feed simulated absent, duplicate, mismatched PnP records and missing/ambiguous/mismatched MAC lines. Verify every case stops before launching the writer. Never claim a real physical MAC check was performed by this test. I-06/I-06R host-only mock-child tests (no connected Device): use a non-mutating child with a shortened deadline and separately redirected high-volume stdout/stderr. Assert STARTED/PID, TIMEOUT, UNKNOWN exit, bounded cleanup, BLOCKED and zero writer retries. Inject failure to start taskkill after a child has started and timed out; require TIMEOUT, TASKKILL_EXCEPTION (or equivalent), tree_stopped=false, retained PID and explicit independent-absence verification before another attempt. Inject failure in ReadToEndAsync / WaitForExit or output-drain completion after a successful child start; require POST_START_EXCEPTION / OUTPUT_DRAIN_TIMEOUT, UNKNOWN exit unless reliably observed, and a truthful BLOCKED diagnosis. Finally, deliberately reject local evidence-file saving after a completed mock child; no PASS may be claimed for the resulting flash-equivalent phase. These are negative-test instructions, not executed test results.
 
 
 
