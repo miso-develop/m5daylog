@@ -135,6 +135,9 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
     $defaultsHash = "NOT_RUN"
     $configHash = "NOT_RUN"
     $buildExit = "NOT_RUN"
+    $buildDeadlineSeconds=3600
+    $buildTimedOut=$false
+    $buildTreeStopped="NOT_RUN"
     $appHash = "NOT_RUN"
     $planHash = "NOT_RUN"
     $imageSetHash = "NOT_RUN"
@@ -143,6 +146,67 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
     $diagnosis = "UNEXPECTED_BUILD_ERROR"
     $disposition = "BLOCKED"
 
+    # Exact argv quoting for Windows PowerShell 5.1 / .NET Framework.
+    function Quote-NativeArgument([string]$value) {
+        if ($value -match '^[^\s"]+$') { return $value }
+        $q = '"'; $slashes = 0
+        foreach ($ch in $value.ToCharArray()) {
+            if ($ch -eq '\') { $slashes++; continue }
+            if ($ch -eq '"') { $q += ('\' * (2*$slashes+1)) + '"'; $slashes=0; continue }
+            $q += ('\' * $slashes) + $ch; $slashes=0
+        }
+        return $q + ('\' * (2*$slashes)) + '"'
+    }
+    # Bounded native child. Separate asynchronous output drains avoid pipe deadlock.
+    function Invoke-BoundedPython([string[]]$argv,[string]$workDir,[int]$seconds) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName=$python
+        $psi.Arguments=(@($argv | ForEach-Object { Quote-NativeArgument ([string]$_) }) -join ' ')
+        $psi.WorkingDirectory=$workDir
+        $psi.UseShellExecute=$false
+        $psi.CreateNoWindow=$true
+        $psi.RedirectStandardOutput=$true
+        $psi.RedirectStandardError=$true
+        $proc=New-Object System.Diagnostics.Process
+        $proc.StartInfo=$psi
+        try {
+            if (-not $proc.Start()) { throw "NATIVE_START_FAILED" }
+            $outTask=$proc.StandardOutput.ReadToEndAsync()
+            $errTask=$proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit($seconds*1000)) {
+                $treeStopped=$false
+                $kill=New-Object System.Diagnostics.Process
+                $kpsi=New-Object System.Diagnostics.ProcessStartInfo
+                $kpsi.FileName=Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                $kpsi.Arguments="/PID $($proc.Id) /T /F"
+                $kpsi.UseShellExecute=$false
+                $kpsi.CreateNoWindow=$true
+                $kill.StartInfo=$kpsi
+                try {
+                    if ($kill.Start()) {
+                        if ($kill.WaitForExit(15000)) {
+                            $treeStopped=($kill.ExitCode -eq 0)
+                        } else {
+                            try { $kill.Kill() } catch {}
+                            [void]$kill.WaitForExit(5000)
+                        }
+                    }
+                } finally { $kill.Dispose() }
+                $rootStopped=$proc.WaitForExit(15000)
+                return [pscustomobject]@{
+                    ExitCode="UNKNOWN";TimedOut=$true
+                    TreeStopped=($treeStopped -and $rootStopped);Stdout="";Stderr=""
+                }
+            }
+            if (-not $outTask.Wait(10000) -or -not $errTask.Wait(10000)) {
+                throw "NATIVE_OUTPUT_DRAIN_TIMEOUT"
+            }
+            return [pscustomobject]@{
+                ExitCode=$proc.ExitCode;TimedOut=$false;TreeStopped=$true
+                Stdout=[string]$outTask.Result;Stderr=[string]$errTask.Result
+            }
+        } finally { $proc.Dispose() }
+    }
 
     # Derive the entire immutable qualification identity from the generated
     # flasher plan. Do not rely on the application binary hash alone.
@@ -290,8 +354,13 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
 
         Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
         $enteredFirmware = $true
-        & $python $idfPy -B $qualifiedBuildDir "-DSDKCONFIG=$qualifiedSdkconfig" "-DSDKCONFIG_DEFAULTS=$defaults" "-DIDF_TARGET=esp32s3" build
-        $buildExit = $LASTEXITCODE
+        $buildResult=Invoke-BoundedPython @($idfPy,"-B",$qualifiedBuildDir,
+            "-DSDKCONFIG=$qualifiedSdkconfig","-DSDKCONFIG_DEFAULTS=$defaults",
+            "-DIDF_TARGET=esp32s3","build") $firmwareRoot $buildDeadlineSeconds
+        $buildExit=$buildResult.ExitCode
+        $buildTimedOut=$buildResult.TimedOut
+        $buildTreeStopped=$buildResult.TreeStopped
+        if ($buildTimedOut) { $diagnosis="BUILD_TIMEOUT_NO_AUTOMATIC_RETRY"; throw $diagnosis }
         if ($buildExit -ne 0) {
             $diagnosis = "BUILD_FAILED"
             throw $diagnosis
@@ -349,6 +418,9 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
         Write-Host ("defaults_sha256={0}" -f $defaultsHash)
         Write-Host ("effective_sdkconfig_sha256={0}" -f $configHash)
         Write-Host ("build_exit={0}" -f $buildExit)
+        Write-Host ("build_deadline_seconds={0}" -f $buildDeadlineSeconds)
+        Write-Host ("build_timed_out={0}" -f $buildTimedOut)
+        Write-Host ("build_tree_stopped={0}" -f $buildTreeStopped)
         Write-Host ("app_sha256={0}" -f $appHash)
         Write-Host ("flasher_args_sha256={0}" -f $planHash)
         Write-Host ("flash_image_set_sha256={0}" -f $imageSetHash)
@@ -364,6 +436,12 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
 Retain the passing exact HEAD plus defaults_sha256, effective_sdkconfig_sha256, app_sha256, flasher_args_sha256 and flash_image_set_sha256 as the build-to-flash identity. The image-set SHA-256 covers every generated flash image as sorted LF-terminated UTF-8 `0xoffset|build-relative-image.bin|sha256` records. Together with the generated JSON plan digest, this binds offsets, tool flags, bootloader, partition table, application, and any additional flash image. Keep the generated plan and original per-image digests in local evidence. Do not build again or change this qualified output between qualification and flashing. Never reuse them across a revision/toolchain change. A partial isolated build is not requalified by fullclean; preserve evidence and use a newly controlled checkout/output path. The hash is not itself proof of what is running on the physical target; qualification still requires an observed flash result and a fresh Device baseline. Use the build-generated flash plan. Do not guess partition offsets. Do not erase NVS unless the approved setup explicitly requires a fixture reset. Fixture repair/reset is setup and counts as zero acceptance cycles.
 
 ## 4. Flash and runtime baseline
+
+Before a write, bind the selected COM port to an independently operator-qualified physical board. Privately record the trusted factory/eFuse MAC and the Ports-class Windows PnP InstanceId. Neither value may be learned solely from the candidate COM in this same attempt. Do not publish either value. A COM number, ESP32-S3 chip family, or VID/PID alone cannot identify the intended unit.
+
+Place the intended board in approved ROM Download Mode, then establish its re-enumerated COM and PnP mapping. The read-only esptool read_mac operation does not program flash but may change runtime state or USB enumeration. Recheck the port after MAC probing and immediately before the writer; any absent, changed, duplicate or unexpected identity is BLOCKED with no write. No cable swap is permitted between check and write: independent esptool processes cannot cryptographically prevent a last-moment physical substitution.
+
+Process deadlines: build 3600 seconds, read_mac 120 seconds, flash 900 seconds. Timeout triggers a bounded best-effort taskkill /T /F process-tree stop. Before any retry an operator must independently confirm that no child remains. After flash launch, exit failure, timeout, or wrapper error means WRITE_STATE_UNKNOWN regardless of process cleanup: no automatic retry, erase, acceptance cycle, or assumed firmware success. Re-establish Device runtime state and keep raw process logs/identifiers local.
 
 For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defaults, effective sdkconfig, app, generated plan, complete image set) into this standalone packet. It revalidates every image and the complete flash plan **before** touching the Device. It then invokes the managed Python's `esptool write_flash` directly, using only verified plan entries. Do **not** substitute `idf.py flash`: that action may automatically rebuild before writing. No concurrent editor, build or flashing process may mutate the qualification output. The flash packet holds Windows read-only sharing locks on the verified plan/configuration/images and repeats all five hash checks under those locks before invoking esptool; lock acquisition or drift is BLOCKED without attempting to write. A successful flash still requires an independently verified runtime baseline. Hash agreement alone does not prove the target was programmed correctly; a fresh Device baseline remains mandatory.
 
@@ -382,6 +460,8 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
     $python = "<idf-managed-python>"
     $idfPy = Join-Path $idfRoot "tools\idf.py"
     $serialPort = "<serial-port>"
+    $expectedDeviceMac = "<locally-qualified-device-mac>"
+    $expectedPortInstanceId = "<locally-qualified-pnp-instance-id>"
     $firmwareRoot = Join-Path $repoRoot "firmware"
     $defaults = Join-Path $firmwareRoot "sdkconfig.defaults"
     $qualifiedBuildDir = Join-Path $firmwareRoot "build\hg-qualified"
@@ -393,6 +473,15 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
     $idfExit = "NOT_RUN"
     $idfVersion = "NOT_RUN"
     $flashExit = "NOT_RUN"
+    $identityExit="NOT_RUN"
+    $pnpMatch=$false
+    $macMatch=$false
+    $flashAttempted=$false
+    $flashWriteState="NOT_STARTED"
+    $identityDeadlineSeconds=120
+    $flashDeadlineSeconds=900
+    $flashTimedOut=$false
+    $flashTreeStopped="NOT_RUN"
     $beforeHash = "NOT_RUN"
     $afterHash = "NOT_RUN"
     $beforeConfigHash = "NOT_RUN"
@@ -409,6 +498,67 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
     $diagnosis = "UNEXPECTED_FLASH_ERROR"
     $disposition = "BLOCKED"
 
+    # Exact argv quoting for Windows PowerShell 5.1 / .NET Framework.
+    function Quote-NativeArgument([string]$value) {
+        if ($value -match '^[^\s"]+$') { return $value }
+        $q = '"'; $slashes = 0
+        foreach ($ch in $value.ToCharArray()) {
+            if ($ch -eq '\') { $slashes++; continue }
+            if ($ch -eq '"') { $q += ('\' * (2*$slashes+1)) + '"'; $slashes=0; continue }
+            $q += ('\' * $slashes) + $ch; $slashes=0
+        }
+        return $q + ('\' * (2*$slashes)) + '"'
+    }
+    # Bounded native child. Separate asynchronous output drains avoid pipe deadlock.
+    function Invoke-BoundedPython([string[]]$argv,[string]$workDir,[int]$seconds) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName=$python
+        $psi.Arguments=(@($argv | ForEach-Object { Quote-NativeArgument ([string]$_) }) -join ' ')
+        $psi.WorkingDirectory=$workDir
+        $psi.UseShellExecute=$false
+        $psi.CreateNoWindow=$true
+        $psi.RedirectStandardOutput=$true
+        $psi.RedirectStandardError=$true
+        $proc=New-Object System.Diagnostics.Process
+        $proc.StartInfo=$psi
+        try {
+            if (-not $proc.Start()) { throw "NATIVE_START_FAILED" }
+            $outTask=$proc.StandardOutput.ReadToEndAsync()
+            $errTask=$proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit($seconds*1000)) {
+                $treeStopped=$false
+                $kill=New-Object System.Diagnostics.Process
+                $kpsi=New-Object System.Diagnostics.ProcessStartInfo
+                $kpsi.FileName=Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                $kpsi.Arguments="/PID $($proc.Id) /T /F"
+                $kpsi.UseShellExecute=$false
+                $kpsi.CreateNoWindow=$true
+                $kill.StartInfo=$kpsi
+                try {
+                    if ($kill.Start()) {
+                        if ($kill.WaitForExit(15000)) {
+                            $treeStopped=($kill.ExitCode -eq 0)
+                        } else {
+                            try { $kill.Kill() } catch {}
+                            [void]$kill.WaitForExit(5000)
+                        }
+                    }
+                } finally { $kill.Dispose() }
+                $rootStopped=$proc.WaitForExit(15000)
+                return [pscustomobject]@{
+                    ExitCode="UNKNOWN";TimedOut=$true
+                    TreeStopped=($treeStopped -and $rootStopped);Stdout="";Stderr=""
+                }
+            }
+            if (-not $outTask.Wait(10000) -or -not $errTask.Wait(10000)) {
+                throw "NATIVE_OUTPUT_DRAIN_TIMEOUT"
+            }
+            return [pscustomobject]@{
+                ExitCode=$proc.ExitCode;TimedOut=$false;TreeStopped=$true
+                Stdout=[string]$outTask.Result;Stderr=[string]$errTask.Result
+            }
+        } finally { $proc.Dispose() }
+    }
 
     # Derive the entire immutable qualification identity from the generated
     # flasher plan. Do not rely on the application binary hash alone.
@@ -499,6 +649,16 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         }
     }
 
+    function Assert-QualifiedPort {
+        $ports=@(Get-PnpDevice -Class Ports -PresentOnly -ErrorAction Stop |
+            Where-Object { [string]$_.FriendlyName -match ('\(' + [regex]::Escape($serialPort) + '\)$') })
+        if ($ports.Count -ne 1 -or
+            -not ([string]$ports[0].InstanceId).Equals($expectedPortInstanceId,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "PORT_IDENTITY_MISSING_MISMATCH_OR_AMBIGUOUS"
+        }
+    }
+
     try {
         foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $firmwareRoot,
                                 (Join-Path $firmwareRoot "CMakeLists.txt"), $defaults, $qualifiedSdkconfig, $app)) {
@@ -511,7 +671,10 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         foreach ($digest in @($expectedDefaultsSha256, $expectedConfigSha256, $expectedAppSha256, $expectedPlanSha256, $expectedImageSetSha256)) {
             if ($digest -notmatch '^[a-fA-F0-9]{64}$') { $invalidHash = $true }
         }
-        if ($invalidHash -or $serialPort -eq "<serial-port>") {
+        if ($invalidHash -or $serialPort -notmatch '^COM[1-9][0-9]*$' -or
+            $expectedDeviceMac -notmatch '^(?:[a-fA-F0-9]{2}:){5}[a-fA-F0-9]{2}$' -or
+            [string]::IsNullOrWhiteSpace($expectedPortInstanceId) -or
+            $expectedPortInstanceId.StartsWith("<")) {
             $diagnosis = "FLASH_IDENTITY_INPUT_MISSING"
             throw $diagnosis
         }
@@ -592,6 +755,30 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
             throw $diagnosis
         }
 
+        # Match independent operator-local identity before any mutating write.
+        $diagnosis="PORT_IDENTITY_MISSING_MISMATCH_OR_AMBIGUOUS"
+        Assert-QualifiedPort
+        $pnpMatch=$true
+        $diagnosis="DEVICE_MAC_READ_FAILED"
+        $idResult=Invoke-BoundedPython @("-m","esptool","--chip","esp32s3",
+            "-p",$serialPort,"--before","no_reset","--after","no_reset","read_mac") $qualifiedBuildDir $identityDeadlineSeconds
+        $identityExit=$idResult.ExitCode
+        if ($idResult.TimedOut) { $diagnosis="DEVICE_IDENTITY_TIMEOUT_NO_FLASH";throw $diagnosis }
+        if ($identityExit -ne 0) { throw $diagnosis }
+        # esptool may print one MAC both during connect and read_mac.
+        $observed=@([regex]::Matches($idResult.Stdout,
+            '(?im)^\s*MAC:\s*((?:[a-f0-9]{2}:){5}[a-f0-9]{2})\s*$') |
+            ForEach-Object { $_.Groups[1].Value.ToLowerInvariant() } | Select-Object -Unique)
+        if ($observed.Count -ne 1 -or
+            $observed[0] -ne $expectedDeviceMac.ToLowerInvariant()) {
+            $diagnosis="DEVICE_MAC_MISSING_MISMATCH_OR_AMBIGUOUS";throw $diagnosis
+        }
+        $macMatch=$true
+        $diagnosis="PORT_IDENTITY_CHANGED_AFTER_READ"
+        Assert-QualifiedPort
+        $diagnosis="PORT_IDENTITY_CHANGED_BEFORE_WRITE"
+        Assert-QualifiedPort
+
         Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
         $enteredFirmware = $true
         # No implicit build, and no unchecked @flash_args file.
@@ -603,15 +790,20 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         $flashArgs += @($qualifiedPlan.Pairs)
         Push-Location -LiteralPath $qualifiedBuildDir -ErrorAction Stop
         try {
-            & $python -m esptool @flashArgs
-            $flashExit = $LASTEXITCODE
+            $flashAttempted=$true
+            $flashWriteState="WRITE_STATE_UNKNOWN"
+            $flashResult=Invoke-BoundedPython (@("-m","esptool") + $flashArgs) $qualifiedBuildDir $flashDeadlineSeconds
+            $flashExit=$flashResult.ExitCode
+            $flashTimedOut=$flashResult.TimedOut
+            $flashTreeStopped=$flashResult.TreeStopped
+        } finally { Pop-Location -ErrorAction Stop }
+        if ($flashTimedOut) {
+            $diagnosis="FLASH_TIMEOUT_WRITE_STATE_UNKNOWN_NO_RETRY";throw $diagnosis
         }
-        finally { Pop-Location -ErrorAction Stop }
-        $flashExit = $LASTEXITCODE
         if ($flashExit -ne 0) {
-            $diagnosis = "FLASH_FAILED"
-            throw $diagnosis
+            $diagnosis="FLASH_FAILED_WRITE_STATE_UNKNOWN_NO_RETRY";throw $diagnosis
         }
+        $flashWriteState="WRITE_COMMAND_COMPLETED"
         $afterHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         $afterConfigHash = (Get-FileHash -LiteralPath $qualifiedSdkconfig -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
         $afterDefaultsHash = (Get-FileHash -LiteralPath $defaults -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
@@ -650,6 +842,15 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         Write-Host ("idf_exit={0}" -f $idfExit)
         Write-Host ("idf_version={0}" -f $idfVersion)
         Write-Host ("flash_exit={0}" -f $flashExit)
+        Write-Host ("identity_exit={0}" -f $identityExit)
+        Write-Host ("qualified_pnp_match={0}" -f $pnpMatch)
+        Write-Host ("qualified_mac_match={0}" -f $macMatch)
+        Write-Host ("identity_deadline_seconds={0}" -f $identityDeadlineSeconds)
+        Write-Host ("flash_deadline_seconds={0}" -f $flashDeadlineSeconds)
+        Write-Host ("flash_attempted={0}" -f $flashAttempted)
+        Write-Host ("flash_timed_out={0}" -f $flashTimedOut)
+        Write-Host ("flash_tree_stopped={0}" -f $flashTreeStopped)
+        Write-Host ("flash_write_state={0}" -f $flashWriteState)
         Write-Host ("expected_defaults_sha256={0}" -f $expectedDefaultsSha256)
         Write-Host ("expected_effective_sdkconfig_sha256={0}" -f $expectedConfigSha256)
         Write-Host ("expected_app_sha256={0}" -f $expectedAppSha256)
@@ -675,6 +876,10 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
 ~~~
 
 Negative verification (host-only disposable worktree, no connected Device):
+
+I-05 host-only parser tests: feed simulated absent, duplicate, mismatched PnP records and missing/ambiguous/mismatched MAC lines. Verify every case stops before launching the writer. Never claim a real physical MAC check was performed by this test. I-06 host-only mock-child tests: use shortened deadlines with a non-mutating process that hangs and fills stdout/stderr pipes; require BLOCKED, UNKNOWN child result and zero writer retries. These are test instructions only, not executed test evidence.
+
+
 
 1. Place an intentionally stale ignored firmware/sdkconfig containing CONFIG_TINYUSB_MSC_ENABLED=n. HG-BUILD must use only the isolated build/hg-qualified/sdkconfig generated from tracked defaults, prove CONFIG_TINYUSB_MSC_ENABLED=y and leave the stale root sdkconfig untouched. A default-directory fullclean/build is not qualified.
 2. Re-run HG-BUILD without retiring the isolated output. Expected: QUALIFICATION_OUTPUT_ALREADY_EXISTS; build_exit=NOT_RUN; disposition=BLOCKED; no overwrite of existing output.
