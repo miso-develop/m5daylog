@@ -196,7 +196,21 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
                 $result.Status="RUNNING"
                 $outTask=$proc.StandardOutput.ReadToEndAsync()
                 $errTask=$proc.StandardError.ReadToEndAsync()
-                if (-not $proc.WaitForExit($seconds*1000)) {
+                $watch=[Diagnostics.Stopwatch]::StartNew()
+                $nextProgress=15
+                $completed=$false
+                Write-Host ("PROGRESS phase={0} elapsed_seconds=0 status=RUNNING" -f $phase)
+                while ($true) {
+                    if ($proc.WaitForExit(1000)) { $completed=$true; break }
+                    $elapsed=[int]$watch.Elapsed.TotalSeconds
+                    if ($elapsed -ge $nextProgress) {
+                        Write-Host ("PROGRESS phase={0} elapsed_seconds={1} status=RUNNING" -f $phase,$elapsed)
+                        $nextProgress=$elapsed+15
+                    }
+                    if ($watch.Elapsed.TotalSeconds -ge $seconds) { break }
+                }
+                $watch.Stop()
+                if (-not $completed) {
                     $result.TimedOut=$true
                     $result.Status="TIMEOUT"
                     $needsCleanup=$true
@@ -658,7 +672,21 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
                 $result.Status="RUNNING"
                 $outTask=$proc.StandardOutput.ReadToEndAsync()
                 $errTask=$proc.StandardError.ReadToEndAsync()
-                if (-not $proc.WaitForExit($seconds*1000)) {
+                $watch=[Diagnostics.Stopwatch]::StartNew()
+                $nextProgress=15
+                $completed=$false
+                Write-Host ("PROGRESS phase={0} elapsed_seconds=0 status=RUNNING" -f $phase)
+                while ($true) {
+                    if ($proc.WaitForExit(1000)) { $completed=$true; break }
+                    $elapsed=[int]$watch.Elapsed.TotalSeconds
+                    if ($elapsed -ge $nextProgress) {
+                        Write-Host ("PROGRESS phase={0} elapsed_seconds={1} status=RUNNING" -f $phase,$elapsed)
+                        $nextProgress=$elapsed+15
+                    }
+                    if ($watch.Elapsed.TotalSeconds -ge $seconds) { break }
+                }
+                $watch.Stop()
+                if (-not $completed) {
                     $result.TimedOut=$true
                     $result.Status="TIMEOUT"
                     $needsCleanup=$true
