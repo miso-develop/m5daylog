@@ -135,7 +135,8 @@ function Invoke-HgNative([string]$exe,[string[]]$argv,[string]$workingDir,
             }
         }
     } catch {
-        $result.Status=if ($result.Started) { "POST_START_EXCEPTION" } else { "START_EXCEPTION" }
+        if ($result.Started) { $result.Status="POST_START_EXCEPTION" }
+        else { $result.Status="START_EXCEPTION" }
         $needsCleanup=$result.Started
     } finally {
         if ($needsCleanup -and $result.Started) {
