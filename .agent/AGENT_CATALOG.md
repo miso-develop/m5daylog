@@ -36,6 +36,8 @@ A higher-priority source may clarify or supersede a lower-priority source, but i
 - Material project information must be persisted to durable repository state and must not exist only in a chat handoff.
 - Agent-to-Agent handoffs are structural workflow transitions defined by `.agent/HANDOFF_PROTOCOL.md`; they are not substitutes for Issue / PR / Spec evidence.
 - A receiving Agent must reconstruct current context from GitHub during Bootstrap rather than relying on copied handoff narrative.
+- Any Agent planning, executing, interpreting, recording, or resuming a Human Gate must read and follow `.agent/HUMAN_GATE/README.md` and its required rule files before giving operator commands or interpreting Human Gate evidence.
+- Human Gate harness/tooling failures and product failures must be classified separately; a command-wrapper failure is not by itself proof of a product Acceptance Criterion failure.
 - A role declaration is a policy boundary, not merely a descriptive label.
 
 ## Domain model

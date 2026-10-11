@@ -41,4 +41,4 @@ Account credential、token、secret、private key、session credential の漏洩
 
 ## Provenance
 
-Loop Engineering の構成は `miso-develop/loop-boilerplate-private` の current framework（2026-09-10 時点 r78）を consumer repository 向けに整理し、Verifier surface を除外しています。Verifierless consumer / security pattern は `miso-develop/m5authenticator` も参照しています。
+Loop Engineering の構成は internal framework reference を consumer repository 向けに整理し、Verifier surface を除外しています。Private source repository の名称・URL・revision・branch・path は public repository に記録しません。Verifierless consumer / security pattern は `miso-develop/m5authenticator` も参照しています。

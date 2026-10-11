@@ -121,17 +121,29 @@ The repository security scanner allowlist may only exempt exact hashed files und
 - Do not use `git remote -v` or similar output as evidence if a remote URL may contain credentials; redact the entire credential-bearing component.
 - Do not paste full HTTP request/response headers from authenticated traffic.
 
-## 8. Security scanner policy
+## 8. Security scanner and public-text publication policy
 
-`scripts/security_scan.py` is a repository-owned, dependency-free leakage guard. It scans Git-tracked files and fails closed when it cannot enumerate/read them.
+`scripts/security_scan.py` is the repository-owned, dependency-free leakage guard. One detection engine serves both Git-tracked content scanning and arbitrary candidate public-text validation.
 
-It checks high-confidence credential signatures, private-key markers, credential-bearing literal assignments, value-bearing `.env` templates, dangerous logging patterns, credential/key/dump paths, and tracked audio files unless an exact synthetic/public fixture hash is allowlisted.
+For tracked repository content, the scanner fails closed when it cannot enumerate/read required files. It checks high-confidence credential signatures, private-key markers, credential-bearing literal assignments, value-bearing `.env` templates, dangerous logging patterns, credential/key/dump paths, protected machine-local path classes, repository-like private identifiers covered by the public naming rule, and tracked audio files unless an exact synthetic/public fixture hash is allowlisted.
 
-The scanner must never print the matched secret value. Findings contain only path, line, rule, and generic message.
+For controlled public-text publication, candidate text is supplied through stdin or an explicitly supplied file, never as a candidate-text command-line argument. The caller supplies only a short public-safe abstract label for diagnostics. Public-text findings use the same common detection engine as tracked-content findings.
 
-`.security-scan-allowlist.json` is expected to remain empty in normal development. Exceptions require exact file SHA-256, designated fixture location, rule, kind, and reason. Stale exceptions fail the scan.
+Public-text validation is fail closed:
 
-Security scan failure is a blocking defect. Do not weaken regex/rules, broaden allowlists, or delete tests merely to make CI pass.
+- exit `0`: no finding; publication may proceed if every other requirement is satisfied;
+- exit `1`: finding detected; the controlled publication attempt must stop;
+- exit `2`: input/scanning could not be completed; the controlled publication attempt must stop.
+
+The scanner must never print the matched sensitive value. Findings contain only a public-safe path/input label, line number, rule identifier, and generic message. Public-text errors additionally must not expose the candidate-file path, candidate text, source excerpt, match capture, or parser input.
+
+When repository/runtime tooling controls publication of generated Human Gate instructions or durable Human Gate evidence, it must validate the exact final serialized public text before invoking the publication action. `.agent/HUMAN_GATE/PUBLICATION_RULES.md` defines the mandatory serialization and publication boundary. Structured/sanitized evidence fields are preferred over redaction of raw terminal output; richer machine-local logs remain local by default.
+
+This controlled pre-publication gate is distinct from policy and from reactive GitHub-surface scanning. Repository policy cannot hard-block arbitrary text entered directly through the native GitHub UI. A GitHub event scanner may detect already-published Issue/PR/review/comment content as defense in depth, but must not be described as having prevented the original publication.
+
+`.security-scan-allowlist.json` is expected to remain empty in normal development. Exceptions require exact file SHA-256, designated fixture location, rule, kind, and reason. Stale exceptions fail the scan. Privacy rules defined as non-allowlistable remain non-allowlistable for public-text validation as well.
+
+Security scan failure is a blocking defect. Do not weaken regex/rules, broaden allowlists, bypass public-text validation, or delete tests merely to make CI pass.
 
 ## 9. Security-sensitive changes
 

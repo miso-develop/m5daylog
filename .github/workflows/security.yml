@@ -25,7 +25,7 @@ jobs:
         run: python3 --version
 
       - name: Test repository security scanner
-        run: python3 -m unittest discover -s tests -p 'test_security_scan.py'
+        run: python3 -m unittest discover -s tests -p 'test_security_scan*.py'
 
       - name: Scan tracked repository content
         run: python3 scripts/security_scan.py

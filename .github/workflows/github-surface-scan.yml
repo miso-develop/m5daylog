@@ -1,0 +1,45 @@
+name: GitHub Public Surface Scan
+
+on:
+  issues:
+    types: [opened, edited, transferred, reopened]
+  pull_request_target:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  scan-public-surface:
+    name: security:github-surface
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout trusted PR base scanner code
+        if: ${{ github.event_name == 'pull_request_target' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Checkout trusted default-branch scanner code
+        if: ${{ github.event_name != 'pull_request_target' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Scan event public text
+        env:
+          GITHUB_EVENT_NAME_SAFE: ${{ github.event_name }}
+        run: >-
+          python3 scripts/github_surface_scan.py event
+          --event-name "$GITHUB_EVENT_NAME_SAFE"
+          --event-path "$GITHUB_EVENT_PATH"
