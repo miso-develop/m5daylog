@@ -11,7 +11,7 @@
         Import-HgEnv $root
         $fields.head=Assert-HgHead $root
         Assert-HgPort;$fields.port_identity_match=$true
-        $port=New-Object System.IO.Ports.SerialPort($env:HG_SERIAL_PORT,115200)
+        $port=New-Object -TypeName System.IO.Ports.SerialPort -ArgumentList @($env:HG_SERIAL_PORT,115200)
         $port.NewLine=[string][char]10
         $port.ReadTimeout=5000;$port.WriteTimeout=5000
         $port.Open();$fields.cdc_opened=$true
