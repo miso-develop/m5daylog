@@ -20,6 +20,7 @@ Private output is under ignored <worktree>/.local/HumanGate/. Device/host identi
 | --- | --- | --- |
 | init.ps1 | Create ignored .env skeleton | Host only |
 | check-head.ps1 | Exact HEAD, tracked-tree and interpreter preflight | Host only |
+| rom-flash-id.ps1 | Bounded ROM flash_id link check | Persistently read-only; may reset/re-enumerate |
 | cdc-readonly.ps1 | GET_STATUS, PING, GET_INFO, GET_STATUS | Read-only CDC commands |
 | nvs-read.ps1 | Qualified read_flash + SHA256 local capture | Persistent flash read only; may reset the runtime |
 
