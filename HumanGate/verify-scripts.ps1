@@ -11,8 +11,9 @@
             $tokens=$null;$parseErrors=$null
             [void][System.Management.Automation.Language.Parser]::ParseFile(
                 $file.FullName,[ref]$tokens,[ref]$parseErrors)
-            if (@($parseErrors).Count -gt 0) {
-                $errorCount+=@($parseErrors).Count
+            $actualErrors=@($parseErrors | Where-Object { $null -ne $_ })
+            if ($actualErrors.Count -gt 0) {
+                $errorCount+=$actualErrors.Count
                 $invalidFiles+=([string]$file.Name)
             } else { $parsed++ }
         }
