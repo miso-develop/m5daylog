@@ -135,6 +135,9 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
     $defaultsHash = "NOT_RUN"
     $configHash = "NOT_RUN"
     $buildExit = "NOT_RUN"
+    $buildDeadlineSeconds = 3600
+    $buildTimedOut = $false
+    $buildTreeStopped = "NOT_RUN"
     $appHash = "NOT_RUN"
     $planHash = "NOT_RUN"
     $imageSetHash = "NOT_RUN"
@@ -143,6 +146,306 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
     $diagnosis = "UNEXPECTED_BUILD_ERROR"
     $disposition = "BLOCKED"
 
+    # PS 5.1/.NET Framework: quote argv for the native CommandLineToArgvW parser.
+    function Quote-NativeArgument([string]$value) {
+        if ($value -match '^[^\s"]+ the entire immutable qualification identity from the generated
+    # flasher plan. Do not rely on the application binary hash alone.
+    function Get-QualifiedFlashPlan([string]$root) {
+        $jsonPath = Join-Path $root "flasher_args.json"
+        $p = [IO.File]::ReadAllText($jsonPath) | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $p.flash_files -or $null -eq $p.write_flash_args -or
+            $null -eq $p.extra_esptool_args -or $null -eq $p.flash_settings -or
+            [string]$p.extra_esptool_args.chip -cne "esp32s3" -or
+            [string]$p.flash_settings.flash_size -cne "8MB" -or
+            $p.extra_esptool_args.stub -isnot [bool]) {
+            throw "INVALID_FLASH_PLAN"
+        }
+        $flags = @($p.write_flash_args | ForEach-Object { [string]$_ })
+        if ($flags.Count -ne 6) { throw "INVALID_FLASH_FLAGS" }
+        $opts = @{}
+        for ($i = 0; $i -lt $flags.Count; $i += 2) {
+            if ($flags[$i] -cnotin @("--flash_mode","--flash_size","--flash_freq") -or
+                $opts.ContainsKey($flags[$i])) { throw "INVALID_FLASH_FLAGS" }
+            $opts[$flags[$i]] = $flags[$i+1]
+        }
+        if ($opts.Count -ne 3 -or $opts["--flash_size"] -cne "8MB" -or
+            $opts["--flash_mode"] -cnotin @("dio","dout","qio","qout") -or
+            $opts["--flash_freq"] -cnotmatch '^[0-9]{1,3}m$' -or
+            $opts["--flash_mode"] -cne [string]$p.flash_settings.flash_mode -or
+            $opts["--flash_freq"] -cne [string]$p.flash_settings.flash_freq -or
+            [string]$p.extra_esptool_args.before -cnotmatch '^[a-z_]+$' -or
+            [string]$p.extra_esptool_args.after -cnotmatch '^[a-z_]+$') {
+            throw "INVALID_FLASH_FLAGS"
+        }
+        $images = @()
+        foreach ($entry in $p.flash_files.PSObject.Properties) {
+            $offset = [string]$entry.Name
+            $relative = [string]$entry.Value
+            if ($offset -cnotmatch '^0x[0-9a-fA-F]+$' -or
+                $relative -cnotmatch '^(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+[.]bin$') {
+                throw "INVALID_FLASH_ENTRY"
+            }
+            $number = [Convert]::ToInt64($offset.Substring(2),16)
+            $full = Join-Path $root $relative.Replace('/', '\')
+            $file = Get-Item -LiteralPath $full -ErrorAction Stop
+            if ($file.PSIsContainer -or $file.Length -le 0 -or
+                ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "INVALID_FLASH_IMAGE"
+            }
+            $images += [pscustomobject]@{
+                Offset=$number; OffsetText=("0x{0:x}" -f $number)
+                Relative=$relative; Path=$full; Size=$file.Length
+                Sha=(Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            }
+        }
+        $images = @($images | Sort-Object Offset)
+        if ($images.Count -lt 3 -or
+            @($images | Where-Object Relative -eq "bootloader/bootloader.bin").Count -ne 1 -or
+            @($images | Where-Object Relative -eq "partition_table/partition-table.bin").Count -ne 1 -or
+            @($images | Where-Object Relative -eq "m5daylog.bin").Count -ne 1) {
+            throw "REQUIRED_FLASH_IMAGE_MISSING"
+        }
+        $end = [int64]0
+        $rows = @()
+        $filePairs = @()
+        foreach ($image in $images) {
+            if ($image.Offset -lt $end -or
+                ($image.Offset + $image.Size) -gt (8*1024*1024)) {
+                throw "FLASH_OFFSETS_INVALID"
+            }
+            $end = $image.Offset + $image.Size
+            $rows += ("{0}|{1}|{2}" -f $image.OffsetText,$image.Relative,$image.Sha)
+            $filePairs += $image.OffsetText
+            $filePairs += $image.Path
+        }
+        # Canonical identity: sorted offset|relative-file|sha256, LF terminated.
+        $canonical = ($rows -join [char]10) + [char]10
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))
+            $imageSetDigest = ([BitConverter]::ToString($bytes)).Replace("-","").ToLowerInvariant()
+        }
+        finally { $sha256.Dispose() }
+        [pscustomobject]@{
+            PlanHash=(Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            ImageHash=$imageSetDigest; Count=$images.Count
+            Flags=$flags; Pairs=$filePairs
+            ImagePaths=@($images | ForEach-Object { $_.Path })
+            Before=[string]$p.extra_esptool_args.before
+            After=[string]$p.extra_esptool_args.after
+            Stub=[bool]$p.extra_esptool_args.stub
+        }
+    }
+
+    try {
+        foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $firmwareRoot,
+                                (Join-Path $firmwareRoot "CMakeLists.txt"), $defaults)) {
+            if (-not (Test-Path -LiteralPath $required)) {
+                $diagnosis = "REQUIRED_PATH_MISSING"
+                throw $diagnosis
+            }
+        }
+        $head = ([string](& git -C $repoRoot rev-parse HEAD)).Trim()
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $head -ne $expectedHead) {
+            $diagnosis = "HEAD_MISMATCH_OR_GIT_FAILURE"
+            throw $diagnosis
+        }
+        $tracked = @(& git -C $repoRoot status --porcelain --untracked-files=no)
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $tracked.Count -ne 0) {
+            $diagnosis = "TRACKED_WORKTREE_NOT_CLEAN"
+            throw $diagnosis
+        }
+
+        $untrackedFirmware = @(& git -C $firmwareRoot ls-files --others --exclude-standard)
+        $gitExit = $LASTEXITCODE
+        if ($gitExit -ne 0 -or $untrackedFirmware.Count -ne 0) {
+            $diagnosis = "UNTRACKED_FIRMWARE_INPUT"
+            throw $diagnosis
+        }
+        if (Test-Path -LiteralPath (Join-Path $firmwareRoot "managed_components")) {
+            $diagnosis = "UNQUALIFIED_LOCAL_MANAGED_COMPONENTS"
+            throw $diagnosis
+        }
+        if (Test-Path -LiteralPath $qualifiedBuildDir) {
+            $diagnosis = "QUALIFICATION_OUTPUT_ALREADY_EXISTS"
+            throw $diagnosis
+        }
+        foreach ($name in @("SDKCONFIG", "SDKCONFIG_DEFAULTS", "IDF_TARGET", "IDF_PRESET", "EXTRA_COMPONENT_DIRS")) {
+            if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name))) {
+                $diagnosis = "AMBIENT_BUILD_OVERRIDE"
+                throw $diagnosis
+            }
+        }
+        $defaultsHash = (Get-FileHash -LiteralPath $defaults -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+
+        $env:IDF_PATH = $idfRoot
+        $env:IDF_TOOLS_PATH = $idfTools
+        $env:PATH = "$(Split-Path -Parent $python);$env:PATH"
+        . (Join-Path $idfRoot "export.ps1")
+        $versionLines = @(& $python $idfPy --version)
+        $idfExit = $LASTEXITCODE
+        $idfVersion = ($versionLines -join " ").Trim()
+        if ($idfExit -ne 0 -or $idfVersion -ne "ESP-IDF v5.5.5") {
+            $diagnosis = "UNSUPPORTED_OR_UNRESOLVED_ESP_IDF"
+            throw $diagnosis
+        }
+
+        Push-Location -LiteralPath $firmwareRoot -ErrorAction Stop
+        $enteredFirmware = $true
+        $buildResult = Invoke-BoundedPython @($idfPy, "-B", $qualifiedBuildDir,
+            "-DSDKCONFIG=$qualifiedSdkconfig", "-DSDKCONFIG_DEFAULTS=$defaults",
+            "-DIDF_TARGET=esp32s3", "build") $firmwareRoot $buildDeadlineSeconds
+        $buildExit = $buildResult.ExitCode
+        $buildTimedOut = $buildResult.TimedOut
+        $buildTreeStopped = $buildResult.TreeStopped
+        if ($buildTimedOut) {
+            $diagnosis = "BUILD_TIMEOUT_NO_AUTOMATIC_RETRY"
+            throw $diagnosis
+        }
+        if ($buildExit -ne 0) {
+            $diagnosis = "BUILD_FAILED"
+            throw $diagnosis
+        }
+        if (-not (Test-Path -LiteralPath $app -PathType Leaf)) {
+            $diagnosis = "APP_BINARY_MISSING"
+            throw $diagnosis
+        }
+        if (-not (Test-Path -LiteralPath $qualifiedSdkconfig -PathType Leaf)) {
+            $diagnosis = "EFFECTIVE_SDKCONFIG_MISSING"
+            throw $diagnosis
+        }
+        $effectiveLines = @([System.IO.File]::ReadAllLines($qualifiedSdkconfig))
+        $defaultLines = @([System.IO.File]::ReadAllLines($defaults) |
+            Where-Object { $_ -match '^CONFIG_[A-Za-z0-9_]+=' })
+        if ($defaultLines.Count -eq 0) {
+            $diagnosis = "EMPTY_APPROVED_DEFAULTS"
+            throw $diagnosis
+        }
+        foreach ($line in $defaultLines) {
+            if ($effectiveLines -cnotcontains $line) {
+                $diagnosis = "EFFECTIVE_CONFIG_DEFAULT_MISMATCH"
+                throw $diagnosis
+            }
+        }
+        if ((Get-FileHash -LiteralPath $defaults -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() -ne $defaultsHash) {
+            $diagnosis = "DEFAULTS_CHANGED_DURING_BUILD"
+            throw $diagnosis
+        }
+        $configHash = (Get-FileHash -LiteralPath $qualifiedSdkconfig -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $appHash = (Get-FileHash -LiteralPath $app -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $diagnosis = "FLASH_PLAN_INVALID_AFTER_BUILD"
+        $qualifiedPlan = Get-QualifiedFlashPlan $qualifiedBuildDir
+        $planHash = $qualifiedPlan.PlanHash
+        $imageSetHash = $qualifiedPlan.ImageHash
+        $imageCount = $qualifiedPlan.Count
+        $diagnosis = "OK"
+        $disposition = "PASS"
+    }
+    catch {
+        # Failure is captured as BLOCKED; no acceptance cycle is counted.
+    }
+    finally {
+        if ($enteredFirmware) {
+            try { Pop-Location -ErrorAction Stop }
+            catch { $diagnosis = "LOCATION_RESTORE_FAILED"; $disposition = "BLOCKED" }
+        }
+        Write-Host ""
+        Write-Host "==== $phase ===="
+        Write-Host ("expected_head={0}" -f $expectedHead)
+        Write-Host ("head={0}" -f $head)
+        Write-Host ("git_exit={0}" -f $gitExit)
+        Write-Host ("idf_exit={0}" -f $idfExit)
+        Write-Host ("idf_version={0}" -f $idfVersion)
+        Write-Host ("defaults_sha256={0}" -f $defaultsHash)
+        Write-Host ("effective_sdkconfig_sha256={0}" -f $configHash)
+        Write-Host ("build_exit={0}" -f $buildExit)
+        Write-Host ("build_timeout_seconds={0}" -f $buildDeadlineSeconds)
+        Write-Host ("build_timed_out={0}" -f $buildTimedOut)
+        Write-Host ("build_tree_stopped={0}" -f $buildTreeStopped)
+        Write-Host ("app_sha256={0}" -f $appHash)
+        Write-Host ("flasher_args_sha256={0}" -f $planHash)
+        Write-Host ("flash_image_set_sha256={0}" -f $imageSetHash)
+        Write-Host ("flash_image_count={0}" -f $imageCount)
+        Write-Host ("diagnosis={0}" -f $diagnosis)
+        Write-Host ("disposition={0}" -f $disposition)
+        Write-Host ("SUMMARY phase={0} diagnosis={1} disposition={2}" -f $phase, $diagnosis, $disposition)
+        Write-Host ""
+    }
+}
+~~~
+
+Retain the passing exact HEAD plus defaults_sha256, effective_sdkconfig_sha256, app_sha256, flasher_args_sha256 and flash_image_set_sha256 as the build-to-flash identity. The image-set SHA-256 covers every generated flash image as sorted LF-terminated UTF-8 `0xoffset|build-relative-image.bin|sha256` records. Together with the generated JSON plan digest, this binds offsets, tool flags, bootloader, partition table, application, and any additional flash image. Keep the generated plan and original per-image digests in local evidence. Do not build again or change this qualified output between qualification and flashing. Never reuse them across a revision/toolchain change. A partial isolated build is not requalified by fullclean; preserve evidence and use a newly controlled checkout/output path. The hash is not itself proof of what is running on the physical target; qualification still requires an observed flash result and a fresh Device baseline. Use the build-generated flash plan. Do not guess partition offsets. Do not erase NVS unless the approved setup explicitly requires a fixture reset. Fixture repair/reset is setup and counts as zero acceptance cycles.
+
+) { return $value }
+        $quoted = '"'
+        $slashes = 0
+        foreach ($character in $value.ToCharArray()) {
+            if ($character -eq '\') { $slashes++; continue }
+            if ($character -eq '"') {
+                $quoted += ('\' * (2*$slashes+1)) + '"'
+                $slashes = 0
+                continue
+            }
+            $quoted += ('\' * $slashes) + $character
+            $slashes = 0
+        }
+        return $quoted + ('\' * (2*$slashes)) + '"'
+    }
+
+    # Bounded child and asynchronous stdout/stderr drain; no indefinite wait.
+    function Invoke-BoundedPython([string[]]$argv, [string]$workDir, [int]$seconds) {
+        $info = New-Object System.Diagnostics.ProcessStartInfo
+        $info.FileName = $python
+        $info.Arguments = (@($argv | ForEach-Object { Quote-NativeArgument ([string]$_) }) -join ' ')
+        $info.WorkingDirectory = $workDir
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $info
+        try {
+            if (-not $proc.Start()) { throw "PROCESS_START_FAILED" }
+            $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+            $stderrTask = $proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit($seconds * 1000)) {
+                $treeStopped = $false
+                $killer = New-Object System.Diagnostics.Process
+                $killInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $killInfo.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                $killInfo.Arguments = "/PID $($proc.Id) /T /F"
+                $killInfo.UseShellExecute = $false
+                $killInfo.CreateNoWindow = $true
+                $killer.StartInfo = $killInfo
+                try {
+                    if ($killer.Start()) {
+                        if ($killer.WaitForExit(15000)) {
+                            $treeStopped = ($killer.ExitCode -eq 0)
+                        } else {
+                            try { $killer.Kill() } catch {}
+                            [void]$killer.WaitForExit(5000)
+                        }
+                    }
+                } finally { $killer.Dispose() }
+                $rootStopped = $proc.WaitForExit(15000)
+                return [pscustomobject]@{
+                    ExitCode="UNKNOWN"; TimedOut=$true
+                    TreeStopped=($treeStopped -and $rootStopped)
+                    Stdout=""; Stderr=""
+                }
+            }
+            if (-not $stdoutTask.Wait(10000) -or -not $stderrTask.Wait(10000)) {
+                throw "OUTPUT_DRAIN_TIMEOUT"
+            }
+            return [pscustomobject]@{
+                ExitCode=$proc.ExitCode; TimedOut=$false; TreeStopped=$true
+                Stdout=[string]$stdoutTask.Result; Stderr=[string]$stderrTask.Result
+            }
+        }
+        finally { $proc.Dispose() }
+    }
 
     # Derive the entire immutable qualification identity from the generated
     # flasher plan. Do not rely on the application binary hash alone.
