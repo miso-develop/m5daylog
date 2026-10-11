@@ -3,7 +3,7 @@
     $commonLoaded=$false; $port=$null
     $fields=[ordered]@{head="UNRESOLVED";port_identity_match=$false;cdc_opened=$false;
         get_status_before_pass=$false;ping_pass=$false;get_info_pass=$false;
-        get_status_after_pass=$false;cdc_cleanup="NOT_RUN";mutation_attempted=$false;cycles_counted=0}
+        get_status_after_pass=$false;rtc_pending_unchanged="NOT_RUN";protocol_major_match=$false;cdc_cleanup="NOT_RUN";mutation_attempted=$false;cycles_counted=0}
     try {
         . (Join-Path $PSScriptRoot "common.ps1");$commonLoaded=$true
         $root=Get-HgRoot $PSScriptRoot
@@ -16,6 +16,8 @@
         $port.ReadTimeout=5000;$port.WriteTimeout=5000
         $port.Open();$fields.cdc_opened=$true
         $commands=@("GET_STATUS","PING","GET_INFO","GET_STATUS")
+        $pendingBefore=$null
+        $pendingAfter=$null
         for($i=0;$i -lt $commands.Count;$i++) {
             $command=$commands[$i]
             $requestId="hg-readonly-"+[guid]::NewGuid().ToString("N")
@@ -29,8 +31,19 @@
             if($command -eq "PING" -and $obj.result.pong -ne $true) {
                 $diagnosis="PING_RESULT_INVALID";throw $diagnosis
             }
-            if($command -eq "GET_STATUS" -and [string]$obj.result.state -cne "USB_SYNC") {
-                $diagnosis="CDC_UNEXPECTED_LIFECYCLE";throw $diagnosis
+            if($command -eq "GET_STATUS") {
+                if ([string]$obj.result.state -cne "USB_SYNC" -or
+                    $obj.result.rtcCorrectionPending -isnot [bool]) {
+                    $diagnosis="CDC_UNEXPECTED_LIFECYCLE_OR_PENDING";throw $diagnosis
+                }
+                if ($i -eq 0) { $pendingBefore=$obj.result.rtcCorrectionPending }
+                if ($i -eq 3) { $pendingAfter=$obj.result.rtcCorrectionPending }
+            }
+            if($command -eq "GET_INFO") {
+                if ([string]$obj.result.protocolMajor -cne "1") {
+                    $diagnosis="GET_INFO_PROTOCOL_MISMATCH";throw $diagnosis
+                }
+                $fields.protocol_major_match=$true
             }
             switch($i) {
                 0 {$fields.get_status_before_pass=$true}
@@ -38,6 +51,10 @@
                 2 {$fields.get_info_pass=$true}
                 3 {$fields.get_status_after_pass=$true}
             }
+        }
+        $fields.rtc_pending_unchanged=($pendingBefore -ceq $pendingAfter)
+        if (-not $fields.rtc_pending_unchanged) {
+            $diagnosis="RTC_PENDING_CHANGED_DURING_READONLY_PROBES";throw $diagnosis
         }
         $diagnosis="FOUR_READONLY_OBSERVATIONS_COMPLETE";$disposition="PASS"
     } catch {if ($_.Exception.Message -match '^[A-Z_]+$') {$diagnosis=$_.Exception.Message}}
