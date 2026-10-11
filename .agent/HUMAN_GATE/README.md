@@ -27,7 +27,7 @@ When a task involves planning, executing, interpreting, recording, or resuming a
 
 These rules apply in addition to the active Role Contract, approved specification / Acceptance Criteria, current Issue / PR state, and `.agent/HANDOFF_PROTOCOL.md`.
 
-For M5Daylog Device Human Gates, also read `.agent/HUMAN_GATE/M5DAYLOG_DEVICE_RUNBOOK.md`. It is the project-specific operational supplement for the known-good Windows / ESP-IDF setup path, D-031 release sequencing, lifecycle-cycle execution, evidence fields, and safe recovery patterns. It does not override this policy or current Acceptance Criteria.
+For M5Daylog Device Human Gates, also read `.agent/HUMAN_GATE/M5DAYLOG_DEVICE_RUNBOOK.md`. The versioned, sanitized operator scripts and reusable troubleshooting lessons are maintained in `HumanGate/README.md` and `HumanGate/KNOWHOW.md`; use their worktree-root ignored `.env` initialization before invoking scripts and do not treat these new wrappers as already physically qualified. It is the project-specific operational supplement for the known-good Windows / ESP-IDF setup path, D-031 release sequencing, lifecycle-cycle execution, evidence fields, and safe recovery patterns. It does not override this policy or current Acceptance Criteria.
 
 If a Human Gate rule conflicts with an approved product requirement or Role boundary, do not silently change the requirement. Escalate through the normal Specification / Implementation / Review / Integration / Human workflow as appropriate.
 
