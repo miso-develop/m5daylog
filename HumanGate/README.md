@@ -10,7 +10,9 @@ From Windows PowerShell 5.1 in the target worktree:
 
 Creates the worktree-root ignored .env from HumanGate/.env.example using create-new/no-overwrite semantics. Fill it locally; never paste local values into GitHub/chat/log output. Every device script also creates the empty skeleton if needed then stops with ENV_CREATED_NEEDS_CONFIGURATION. Initialization performs no Device access.
 
-Allowlisted HG_* fields are loaded into the current PowerShell process without evaluating code or expanding expressions. Required for Device observations: HG_EXPECTED_HEAD (40-digit SHA), HG_PYTHON (activated managed interpreter), HG_SERIAL_PORT; HG_NVS_OFFSET/HG_NVS_SIZE must be separately qualified from the exact-head partition table. Do not assume NVS offsets or override existing Device identity. MAC and PnP fields are reserved for destructive-target checks; they do not alone authorize flashing.
+Allowlisted HG_* fields are loaded without evaluating code. Every key in .env.example must exist (blank optional values are allowed); missing/duplicate/unknown keys block the command. Import clears all allowlisted HG_* Process variables before parsing so old worktree/shell values cannot fill an omitted field. Older ignored .env files must be updated manually with the two new blank NVS digest keys; init.ps1 never overwrites them.
+
+Required for observations: HG_EXPECTED_HEAD (full SHA), HG_PYTHON and HG_SERIAL_PORT. For nvs-read.ps1, configure HG_NVS_OFFSET and HG_NVS_SIZE **and** two digests copied only from the **same exact-HEAD passing HG-BUILD**: HG_NVS_PLAN_SHA256 (flasher_args_sha256) and HG_NVS_PARTITION_SHA256 (SHA-256 of its generated partition_table/partition-table.bin, verified against the approved flash image set). The helper verifies the fixed worktree-relative firmware/build/hg-qualified plan/table, the plan's partition image reference, unique binary type=data/subtype=nvs/label=nvs, and exact NVS offset/size before touching a Device. Hashes or plan from another revision are not acceptable. A local artifact match is not itself proof of which image the Device runs; independently qualify the Device baseline. MAC/PnP fields alone do not authorize flashing.
 
 Private output is under ignored <worktree>/.local/HumanGate/. Device/host identifiers, full NVS bytes, local absolute paths, and raw audio are not printed.
 
@@ -20,6 +22,7 @@ Private output is under ignored <worktree>/.local/HumanGate/. Device/host identi
 | --- | --- | --- |
 | init.ps1 | Create ignored .env skeleton | Host only |
 | verify-scripts.ps1 | Parse every saved PowerShell script with the Windows PowerShell parser | Host only |
+| test-safety.ps1 | Same-shell env, partition and mock-child negative fixtures | Host only |
 | check-head.ps1 | Exact HEAD, tracked-tree and interpreter preflight | Host only |
 | rom-flash-id.ps1 | Bounded ROM flash_id link check | Persistently read-only; may reset/re-enumerate |
 | cdc-readonly.ps1 | GET_STATUS, PING, GET_INFO, GET_STATUS | Read-only CDC commands |
@@ -33,9 +36,11 @@ No saved script sends SET_TIME, RELEASE_STORAGE, erases flash, writes NVS or cou
 
 1. Reconstruct current exact Issue/PR/Spec/Decision. Run verify-scripts.ps1 to catch syntax errors without Device access; run init.ps1, fill .env, then run check-head.ps1.
 2. Confirm Device mode, exact target and no competing CDC consumer before cdc-readonly.ps1. Do not probe after RELEASE_STORAGE accepted or on an ambiguous session.
-3. For nvs-read.ps1, establish an approved ROM-mode baseline and exact NVS partition layout. After any esptool diagnostic, re-establish runtime baseline before acceptance.
-4. Preserve .local/HumanGate evidence on an error; distinguish harness BLOCKED from product FAIL.
-5. Follow KNOWHOW.md, SUCCESS_REGISTRY.md and .agent/HUMAN_GATE/M5DAYLOG_DEVICE_RUNBOOK.md. Public evidence must be sanitized and validated before publication.
+3. For nvs-read.ps1, verify exact-head HG-BUILD plan + partition image digests and the correct ROM baseline before invoking the read. A missing/mismatched hash or wrong in-bounds region blocks before Device access. Re-establish runtime baseline afterward.
+4. After a timeout, cleanup error or unknown child state, preserve the private .local/HumanGate/*.status.txt receipt (PID, deadline, root-exit and tree state). Independently prove process-tree absence before any operator-approved retry; never automatically retry or publish local PIDs.
+5. Run test-safety.ps1 on Windows PowerShell 5.1 without a Device; its host-only negatives are NOT physical acceptance.
+6. Preserve .local/HumanGate evidence on an error; distinguish harness BLOCKED from product FAIL.
+7. Follow KNOWHOW.md, SUCCESS_REGISTRY.md and .agent/HUMAN_GATE/M5DAYLOG_DEVICE_RUNBOOK.md. Public evidence must be sanitized and validated before publication.
 
 ## Traceability
 

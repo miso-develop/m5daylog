@@ -4,7 +4,8 @@
     $fields=[ordered]@{head="UNRESOLVED";port_identity_match=$false;
         nvs_offset_qualified=$false;nvs_size_qualified=$false;child_started="NOT_RUN";
         child_status="NOT_RUN";native_exit="NOT_RUN";timed_out="NOT_RUN";
-        tree_stopped="NOT_RUN";local_hash_recorded=$false;bytes_read=0;
+        tree_stopped="NOT_RUN";root_exited="NOT_RUN";partition_plan_matched=$false;
+        partition_image_matched=$false;local_hash_recorded=$false;bytes_read=0;
         runtime_baseline_must_be_requalified=$false;flash_write_attempted=$false;cycles_counted=0}
     try {
         . (Join-Path $PSScriptRoot "common.ps1");$commonLoaded=$true
@@ -25,6 +26,10 @@
         if ($offset -lt 0 -or $size -le 0 -or ($offset+$size) -gt (8*1024*1024)) {
             $diagnosis="NVS_PARTITION_BOUNDS_INVALID";throw $diagnosis
         }
+        $diagnosis="NVS_PARTITION_NOT_QUALIFIED"
+        $partition=Assert-HgNvsPartition $root $offset $size
+        $fields.partition_plan_matched=$partition.PlanMatched
+        $fields.partition_image_matched=$partition.TableMatched
         $fields.nvs_offset_qualified=$true;$fields.nvs_size_qualified=$true
         $dir=Join-Path $root ".local\HumanGate"
         [void][IO.Directory]::CreateDirectory($dir)
@@ -37,6 +42,7 @@
             "read_flash",$env:HG_NVS_OFFSET,$env:HG_NVS_SIZE,$dump) $root 240 $phase
         $fields.child_started=$run.Started;$fields.child_status=$run.Status
         $fields.native_exit=$run.ExitCode;$fields.timed_out=$run.TimedOut;$fields.tree_stopped=$run.TreeStopped
+        $fields.root_exited=$run.RootExited
         $diagnosis="NVS_PRIVATE_EVIDENCE_SAVE_FAILED"
         Save-HgPrivate $root $phase $run
         if ($run.Status -ne "EXITED" -or $run.ExitCode -ne 0) {

@@ -8,7 +8,7 @@ Non-normative. See Issue #87, #50, #51, Decision #105 and .agent/HUMAN_GATE/*.
 - Initialize phase/result, use try/catch/finally, and avoid early return before the footer.
 - While a long operation executes, print bounded PROGRESS messages so operators can distinguish slow work from a hang; do not treat progress as completion.
 - At the END print a blank line, exact ==== $phase ==== heading, all decision-relevant fields, one SUMMARY phase=... diagnosis=... disposition=..., then a blank line.
-- Preserve exact native process exit or UNKNOWN/NOT_RUN; a cleanup failure after child start is never proof the whole tree exited.
+- Preserve exact native process exit or UNKNOWN/NOT_RUN; a cleanup failure after child start is never proof the whole tree exited. Ignored private status receipts record child PID, deadline, independent root exit and tree stop. With unknown children, confirm the process tree is absent before a human-approved retry; do not publish PID/paths.
 
 ## First-use setup and target identity
 
@@ -22,7 +22,7 @@ Non-normative. See Issue #87, #50, #51, Decision #105 and .agent/HUMAN_GATE/*.
 Do NOT clear NVS unconditionally at start. A blanket erase can remove device_id, SHUTDOWN_ARMED, HOST_UNRESOLVED, RTC pending and evidence required by the test. #87 had a HOST_UNRESOLVED baseline: the operator performed a *specifically authorized* Device-ID-only fixture restoration, verified NVS read-back and then requalified NORMAL. This was setup/repair and counted ZERO cycles. Other AC intentionally require SHUTDOWN_ARMED or RTC pending persistence.
 
 Safe sequence:
-1. Confirm exact HEAD, approved matrix and NVS partition offset/size from its qualified partition table.
+1. Confirm exact HEAD and NVS offset/size from a same-HEAD passing HG-BUILD flash-plan and partition-table image. Supply both independently qualified SHA-256 digests. nvs-read.ps1 parses the binary nvs entry and blocks wrong (even in-range) offsets, missing/different plan or table, and stale revision evidence before read_flash.
 2. Read/preserve NVS before changing it. Inspect lifecycle (NORMAL/SHUTDOWN_ARMED/HOST_UNRESOLVED/AMBIGUOUS), the fixture identity and required baseline.
 3. If and only if approved setup requires reset, obtain explicit Human authorization for an exact image and target, retain prior evidence, write only the approved fixture and verify exact read-back hash.
 4. Re-enter normal boot using the verified hardware procedure, establish new MSC/CDC baseline, record cycles_counted=0. Never auto-clear NVS as error recovery or to make a product FAIL pass.

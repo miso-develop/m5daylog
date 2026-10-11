@@ -24,30 +24,40 @@ function Initialize-HgEnv([string]$root) {
 }
 
 function Import-HgEnv([string]$root) {
-    $allowed = @(
-        "HG_EXPECTED_HEAD", "HG_PYTHON", "HG_SERIAL_PORT", "HG_DEVICE_MAC",
-        "HG_PNP_INSTANCE_ID", "HG_NVS_OFFSET", "HG_NVS_SIZE"
-    )
-    $seen = @{}
-    $path = Join-Path $root ".env"
-    foreach ($line in [IO.File]::ReadAllLines($path)) {
-        $trim = $line.Trim()
+    $allowed = @("HG_EXPECTED_HEAD","HG_PYTHON","HG_SERIAL_PORT",
+        "HG_DEVICE_MAC","HG_PNP_INSTANCE_ID","HG_NVS_OFFSET","HG_NVS_SIZE",
+        "HG_NVS_PLAN_SHA256","HG_NVS_PARTITION_SHA256")
+    # Invalidate every earlier worktree/shell value BEFORE trying to parse.
+    foreach ($key in $allowed) {
+        [Environment]::SetEnvironmentVariable($key,$null,"Process")
+    }
+    $seen=@{}; $values=@{}
+    foreach ($line in [IO.File]::ReadAllLines((Join-Path $root ".env"))) {
+        $trim=$line.Trim()
         if (-not $trim -or $trim.StartsWith("#")) { continue }
-        $index = $trim.IndexOf("=")
+        $index=$trim.IndexOf("=")
         if ($index -lt 1) { throw "INVALID_ENV_LINE" }
-        $key = $trim.Substring(0, $index).Trim()
+        $key=$trim.Substring(0,$index).Trim()
         if ($key -cnotin $allowed -or $seen.ContainsKey($key)) {
             throw "UNKNOWN_OR_DUPLICATE_ENV_KEY"
         }
-        $seen[$key] = $true
-        $value = $trim.Substring($index+1).Trim()
+        $seen[$key]=$true
+        $value=$trim.Substring($index+1).Trim()
         if ($value.Length -ge 2 -and
             (($value[0] -eq '"' -and $value[$value.Length-1] -eq '"') -or
              ($value[0] -eq "'" -and $value[$value.Length-1] -eq "'"))) {
-            $value = $value.Substring(1, $value.Length-2)
+            $value=$value.Substring(1,$value.Length-2)
         }
         if ($value.IndexOf([char]0) -ge 0) { throw "INVALID_ENV_VALUE" }
-        [Environment]::SetEnvironmentVariable($key, $value, "Process")
+        $values[$key]=$value
+    }
+    foreach ($key in $allowed) {
+        if (-not $seen.ContainsKey($key)) { throw "MISSING_ENV_KEY" }
+    }
+    foreach ($key in $allowed) {
+        $value=[string]$values[$key]
+        if ([string]::IsNullOrEmpty($value)) { $value=$null }
+        [Environment]::SetEnvironmentVariable($key,$value,"Process")
     }
 }
 
@@ -70,6 +80,70 @@ function Assert-HgPort {
             [StringComparison]::OrdinalIgnoreCase)) { throw "PORT_IDENTITY_MISMATCH" }
 }
 
+# Only the exact-HEAD HG-BUILD qualification receipt may supply these hashes.
+# This checks local build evidence; runtime/Device identity remains a separate gate.
+function Assert-HgNvsPartition([string]$root,[long]$offset,[long]$size) {
+    $expectedPlan=[string]$env:HG_NVS_PLAN_SHA256
+    $expectedTable=[string]$env:HG_NVS_PARTITION_SHA256
+    if ($expectedPlan -cnotmatch '^[a-fA-F0-9]{64}$' -or
+        $expectedTable -cnotmatch '^[a-fA-F0-9]{64}$') {
+        throw "QUALIFIED_PARTITION_EVIDENCE_REQUIRED"
+    }
+    $build=Join-Path $root "firmware\build\hg-qualified"
+    $planPath=Join-Path $build "flasher_args.json"
+    $tablePath=Join-Path $build "partition_table\partition-table.bin"
+    if (-not [IO.File]::Exists($planPath) -or
+        -not [IO.File]::Exists($tablePath)) {
+        throw "QUALIFIED_PARTITION_FILES_MISSING"
+    }
+    $planHash=(Get-FileHash -LiteralPath $planPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    $tableHash=(Get-FileHash -LiteralPath $tablePath -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($planHash -cne $expectedPlan.ToUpperInvariant() -or
+        $tableHash -cne $expectedTable.ToUpperInvariant()) {
+        throw "QUALIFIED_PARTITION_HASH_MISMATCH"
+    }
+    $plan=[IO.File]::ReadAllText($planPath) | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $plan.flash_files) { throw "PARTITION_FLASH_PLAN_INVALID" }
+    $members=@($plan.flash_files.PSObject.Properties | Where-Object {
+        ([string]$_.Value).Replace('\','/') -ceq "partition_table/partition-table.bin"
+    })
+    if ($members.Count -ne 1 -or
+        ([string]$members[0].Name) -cnotmatch '^0x[0-9a-fA-F]+$') {
+        throw "PARTITION_FLASH_PLAN_INVALID"
+    }
+    $planOffset=[Convert]::ToInt64(([string]$members[0].Name).Substring(2),16)
+    if ($planOffset -lt 0 -or $planOffset -ge 8388608 -or
+        $planOffset % 4096 -ne 0) { throw "PARTITION_FLASH_PLAN_INVALID" }
+    $bytes=[IO.File]::ReadAllBytes($tablePath)
+    if ($bytes.Length -lt 32 -or $bytes.Length -gt 4096 -or
+        $bytes.Length % 32 -ne 0) { throw "PARTITION_BINARY_INVALID" }
+    $found=@()
+    for ($pos=0; $pos -le $bytes.Length-32; $pos+=32) {
+        $magic=[BitConverter]::ToUInt16($bytes,$pos)
+        if ($magic -eq 0xFFFF) { break }
+        if ($magic -eq 0xEBEB) { continue }
+        if ($magic -ne 0x50AA) { throw "PARTITION_BINARY_INVALID" }
+        $label=[Text.Encoding]::ASCII.GetString($bytes,$pos+12,16).Split([char]0)[0]
+        if ($label -ceq "nvs") {
+            if ($bytes[$pos+2] -ne 1 -or $bytes[$pos+3] -ne 2) {
+                throw "NVS_PARTITION_TYPE_MISMATCH"
+            }
+            $found += [pscustomobject]@{
+                Offset=[long][BitConverter]::ToUInt32($bytes,$pos+4)
+                Size=[long][BitConverter]::ToUInt32($bytes,$pos+8)
+            }
+        }
+    }
+    if ($found.Count -ne 1) { throw "NVS_PARTITION_NOT_UNIQUE" }
+    if ($found[0].Offset -ne $offset -or $found[0].Size -ne $size) {
+        throw "NVS_PARTITION_OFFSET_SIZE_MISMATCH"
+    }
+    if ($size -le 0 -or $offset -lt 0 -or ($offset+$size) -gt 8388608) {
+        throw "NVS_PARTITION_BOUNDS_INVALID"
+    }
+    return [pscustomobject]@{PlanMatched=$true;TableMatched=$true}
+}
+
 function Quote-HgArg([string]$value) {
     if ($value -match '^[^\s"]+$') { return $value }
     $text = '"'; $slashes = 0
@@ -82,10 +156,11 @@ function Quote-HgArg([string]$value) {
 }
 
 function Invoke-HgNative([string]$exe,[string[]]$argv,[string]$workingDir,
-                         [int]$deadlineSeconds,[string]$phase) {
+                         [int]$deadlineSeconds,[string]$phase,[string]$cleanupExecutable="") {
     $result=[pscustomobject]@{
         Started=$false; Pid="NOT_RUN"; ExitCode="NOT_RUN"; Status="NOT_RUN"
-        TimedOut=$false; TreeStopped="NOT_RUN"; Cleanup="NOT_REQUIRED"
+        TimedOut=$false; DeadlineSeconds=$deadlineSeconds; RootExited="NOT_RUN"
+        TreeStopped="NOT_RUN"; Cleanup="NOT_REQUIRED"
         Stdout=""; Stderr=""
     }
     $proc=New-Object System.Diagnostics.Process
@@ -111,7 +186,7 @@ function Invoke-HgNative([string]$exe,[string[]]$argv,[string]$workingDir,
         $stderrTask=$proc.StandardError.ReadToEndAsync()
         Write-Host ("PROGRESS phase={0} elapsed_seconds=0 status=RUNNING" -f $phase)
         while ($true) {
-            if ($proc.WaitForExit(1000)) { break }
+            if ($proc.WaitForExit(1000)) { $result.RootExited=$true; break }
             $elapsed=[int]$watch.Elapsed.TotalSeconds
             if ($elapsed -ge $nextProgress) {
                 Write-Host ("PROGRESS phase={0} elapsed_seconds={1} status=RUNNING" -f $phase,$elapsed)
@@ -144,7 +219,9 @@ function Invoke-HgNative([string]$exe,[string[]]$argv,[string]$workingDir,
             $killer=$null; $killSuccess=$false
             try {
                 $killInfo=New-Object System.Diagnostics.ProcessStartInfo
-                $killInfo.FileName=Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                $killInfo.FileName=if ([string]::IsNullOrEmpty($cleanupExecutable)) {
+                    Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                } else { $cleanupExecutable }
                 $killInfo.Arguments="/PID $($result.Pid) /T /F"
                 $killInfo.UseShellExecute=$false
                 $killInfo.CreateNoWindow=$true
@@ -163,9 +240,14 @@ function Invoke-HgNative([string]$exe,[string[]]$argv,[string]$workingDir,
             } catch { $result.Cleanup="TASKKILL_EXCEPTION" }
             finally { if ($null -ne $killer) { try { $killer.Dispose() } catch {} } }
             $rootStopped=$false
-            try { $rootStopped=$proc.WaitForExit(15000) } catch {}
+            try { $rootStopped=$proc.WaitForExit(15000); $result.RootExited=$rootStopped }
+            catch { $result.RootExited="UNKNOWN" }
             $result.TreeStopped=($killSuccess -and $rootStopped)
             if ($result.TreeStopped) { $result.Cleanup="TREE_STOP_REPORTED" }
+        }
+        if ($result.Started -and [string]$result.RootExited -ceq "NOT_RUN") {
+            try { $result.RootExited=[bool]$proc.HasExited }
+            catch { $result.RootExited="UNKNOWN" }
         }
         if ($null -ne $stdoutTask) {
             try { if ($stdoutTask.Wait(5000)) { $result.Stdout=[string]$stdoutTask.Result } } catch {}
@@ -183,14 +265,16 @@ function Save-HgPrivate([string]$root,[string]$phase,[object]$result) {
     $dir=Join-Path $root ".local\HumanGate"
     [void][IO.Directory]::CreateDirectory($dir)
     $name=("{0}-{1}" -f $phase,([guid]::NewGuid().ToString("N")))
+    # Write process identity first; output capture may itself fail.
+    [IO.File]::WriteAllText((Join-Path $dir ($name+".status.txt")),
+        ("started={0};pid={1};deadline_seconds={2};root_exited={3};status={4};exit={5};timeout={6};tree_stopped={7};cleanup={8}" -f
+        $result.Started,$result.Pid,$result.DeadlineSeconds,$result.RootExited,
+        $result.Status,$result.ExitCode,$result.TimedOut,$result.TreeStopped,
+        $result.Cleanup),[Text.Encoding]::UTF8)
     [IO.File]::WriteAllText((Join-Path $dir ($name+".stdout.txt")),
         [string]$result.Stdout,[Text.Encoding]::UTF8)
     [IO.File]::WriteAllText((Join-Path $dir ($name+".stderr.txt")),
         [string]$result.Stderr,[Text.Encoding]::UTF8)
-    [IO.File]::WriteAllText((Join-Path $dir ($name+".status.txt")),
-        ("started={0};status={1};exit={2};timeout={3};tree_stopped={4};cleanup={5}" -f
-        $result.Started,$result.Status,$result.ExitCode,$result.TimedOut,
-        $result.TreeStopped,$result.Cleanup),[Text.Encoding]::UTF8)
 }
 
 function Write-HgResult([string]$phase,[System.Collections.IDictionary]$fields,
