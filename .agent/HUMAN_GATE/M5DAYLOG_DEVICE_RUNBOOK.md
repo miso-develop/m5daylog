@@ -24,6 +24,8 @@ This file does not replace Acceptance Criteria. When it conflicts with the curre
 
 ## 2. Known-good Windows / ESP-IDF preparation
 
+The source-backed, reusable non-mutating operator packets are now versioned under `HumanGate/`. Start with `& { & .\HumanGate\init.ps1 }` in the current worktree to create an ignored worktree-root `.env` from `HumanGate/.env.example`, then fill its allowlisted `HG_*` fields locally and run `HumanGate/check-head.ps1`. Executable script packets are candidates until individually proven on Windows/the intended device; historical #87/#50 evidence is not automatically portable to their current source HEAD. For #51 interrupted-sync evidence, the PC domain remains authoritative over its sync implementation; the device runbook records the observation/recovery boundary only. See `HumanGate/KNOWHOW.md` for NVS, D-031, CDC, and incremental sync lessons.
+
 Use placeholders in durable documentation and resolve concrete paths only in the operator's local shell. The **preflight, build, and flash packets below are independent**: each resolves its own paths, Git revision, managed Python, and canonical idf.py rather than relying on PowerShell variables left by an earlier & { ... } block. The firmware requires **ESP-IDF v5.5.5**.
 
 Recommended PowerShell preflight:
@@ -1144,6 +1146,8 @@ A qualified USB publication baseline should prove all applicable items:
 Do not identify the target only by a reused drive letter or by the appearance of a new PnP identity.
 
 ## 5. PowerShell packet pattern
+
+For every emitted PowerShell Human Gate instruction, use one outer `& { ... }` block. Gather all decision-relevant output in one final section **after the work**, preceded and followed by an empty line. The first result line must be exactly `==== $phase ====`. Long-running operations should emit bounded `PROGRESS phase=...` lines while the operation is active, without confusing progress with acceptance. The final result must contain meaningful keyed observations plus a single `SUMMARY`. Never print the worktree `.env` contents, raw NVS, private paths, PIDs, serial or Device identifiers into public evidence.
 
 Every acceptance phase should follow this structure:
 
