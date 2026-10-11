@@ -205,12 +205,14 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
                     $result.RootStopped=$true
                     $result.ExitCode=$proc.ExitCode
                     $result.Status="EXITED"
+                    $result.TreeStopped="NOT_REQUIRED"
                 }
             }
         }
         catch {
             # Do not let a post-start exception escape without PID/child state.
-            $result.Status=if ($result.Started) { "POST_START_EXCEPTION" } else { "START_EXCEPTION" }
+            if ($result.Started) { $result.Status="POST_START_EXCEPTION" }
+            else { $result.Status="START_EXCEPTION" }
             $needsCleanup=[bool]$result.Started
         }
         finally {
@@ -248,7 +250,7 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
                 $result.TreeStopped=($killSucceeded -and $rootExited)
                 if ($result.TreeStopped) { $result.CleanupStatus="TREE_STOP_REPORTED" }
             }
-            if ($result.Started -and $result.RootStopped -eq "NOT_RUN") {
+            if ($result.Started -and [string]$result.RootStopped -ceq "NOT_RUN") {
                 try { $result.RootStopped=$proc.HasExited }
                 catch { $result.RootStopped="UNKNOWN" }
             }
@@ -665,12 +667,14 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
                     $result.RootStopped=$true
                     $result.ExitCode=$proc.ExitCode
                     $result.Status="EXITED"
+                    $result.TreeStopped="NOT_REQUIRED"
                 }
             }
         }
         catch {
             # Do not let a post-start exception escape without PID/child state.
-            $result.Status=if ($result.Started) { "POST_START_EXCEPTION" } else { "START_EXCEPTION" }
+            if ($result.Started) { $result.Status="POST_START_EXCEPTION" }
+            else { $result.Status="START_EXCEPTION" }
             $needsCleanup=[bool]$result.Started
         }
         finally {
@@ -708,7 +712,7 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
                 $result.TreeStopped=($killSucceeded -and $rootExited)
                 if ($result.TreeStopped) { $result.CleanupStatus="TREE_STOP_REPORTED" }
             }
-            if ($result.Started -and $result.RootStopped -eq "NOT_RUN") {
+            if ($result.Started -and [string]$result.RootStopped -ceq "NOT_RUN") {
                 try { $result.RootStopped=$proc.HasExited }
                 catch { $result.RootStopped="UNKNOWN" }
             }
