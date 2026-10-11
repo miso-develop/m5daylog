@@ -19,6 +19,7 @@ Private output is under ignored <worktree>/.local/HumanGate/. Device/host identi
 | Script | Purpose | Mutation |
 | --- | --- | --- |
 | init.ps1 | Create ignored .env skeleton | Host only |
+| verify-scripts.ps1 | Parse every saved PowerShell script with the Windows PowerShell parser | Host only |
 | check-head.ps1 | Exact HEAD, tracked-tree and interpreter preflight | Host only |
 | rom-flash-id.ps1 | Bounded ROM flash_id link check | Persistently read-only; may reset/re-enumerate |
 | cdc-readonly.ps1 | GET_STATUS, PING, GET_INFO, GET_STATUS | Read-only CDC commands |
