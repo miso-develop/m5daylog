@@ -121,6 +121,7 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
     $idfRoot = "<esp-idf-root>"
     $idfTools = "<idf-tools-root>"
     $python = "<idf-managed-python>"
+    $privateLogDir = "<local-private-evidence-dir>"
     $idfPy = Join-Path $idfRoot "tools\idf.py"
     $firmwareRoot = Join-Path $repoRoot "firmware"
     $defaults = Join-Path $firmwareRoot "sdkconfig.defaults"
@@ -193,9 +194,13 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
                     }
                 } finally { $kill.Dispose() }
                 $rootStopped=$proc.WaitForExit(15000)
+                $partialOut="";$partialErr=""
+                try { if ($outTask.Wait(5000)) { $partialOut=[string]$outTask.Result } } catch {}
+                try { if ($errTask.Wait(5000)) { $partialErr=[string]$errTask.Result } } catch {}
                 return [pscustomobject]@{
                     ExitCode="UNKNOWN";TimedOut=$true
-                    TreeStopped=($treeStopped -and $rootStopped);Stdout="";Stderr=""
+                    TreeStopped=($treeStopped -and $rootStopped)
+                    Stdout=$partialOut;Stderr=$partialErr
                 }
             }
             if (-not $outTask.Wait(10000) -or -not $errTask.Wait(10000)) {
@@ -206,6 +211,22 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
                 Stdout=[string]$outTask.Result;Stderr=[string]$errTask.Result
             }
         } finally { $proc.Dispose() }
+    }
+
+    # Every process's raw stdout/stderr and exit metadata stay on the operator host.
+    function Save-PrivateProcessEvidence([string]$stage,[object]$result) {
+        if (-not (Test-Path -LiteralPath $privateLogDir -PathType Container)) {
+            throw "PRIVATE_EVIDENCE_DIRECTORY_MISSING"
+        }
+        $base=("{0}-{1}-{2}" -f $stage,
+            (Get-Date).ToString("yyyyMMdd-HHmmssfff"),[guid]::NewGuid().ToString("N"))
+        [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.stdout.txt"),
+            [string]$result.Stdout,[Text.Encoding]::UTF8)
+        [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.stderr.txt"),
+            [string]$result.Stderr,[Text.Encoding]::UTF8)
+        [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.status.txt"),
+            ("exit={0};timeout={1};tree_stopped={2}" -f
+                $result.ExitCode,$result.TimedOut,$result.TreeStopped),[Text.Encoding]::UTF8)
     }
 
     # Derive the entire immutable qualification identity from the generated
@@ -298,7 +319,7 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
     }
 
     try {
-        foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $firmwareRoot,
+        foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $privateLogDir, $firmwareRoot,
                                 (Join-Path $firmwareRoot "CMakeLists.txt"), $defaults)) {
             if (-not (Test-Path -LiteralPath $required)) {
                 $diagnosis = "REQUIRED_PATH_MISSING"
@@ -357,6 +378,7 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
         $buildResult=Invoke-BoundedPython @($idfPy,"-B",$qualifiedBuildDir,
             "-DSDKCONFIG=$qualifiedSdkconfig","-DSDKCONFIG_DEFAULTS=$defaults",
             "-DIDF_TARGET=esp32s3","build") $firmwareRoot $buildDeadlineSeconds
+        Save-PrivateProcessEvidence "build" $buildResult
         $buildExit=$buildResult.ExitCode
         $buildTimedOut=$buildResult.TimedOut
         $buildTreeStopped=$buildResult.TreeStopped
@@ -458,6 +480,7 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
     $idfRoot = "<esp-idf-root>"
     $idfTools = "<idf-tools-root>"
     $python = "<idf-managed-python>"
+    $privateLogDir = "<local-private-evidence-dir>"
     $idfPy = Join-Path $idfRoot "tools\idf.py"
     $serialPort = "<serial-port>"
     $expectedDeviceMac = "<locally-qualified-device-mac>"
@@ -545,9 +568,13 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
                     }
                 } finally { $kill.Dispose() }
                 $rootStopped=$proc.WaitForExit(15000)
+                $partialOut="";$partialErr=""
+                try { if ($outTask.Wait(5000)) { $partialOut=[string]$outTask.Result } } catch {}
+                try { if ($errTask.Wait(5000)) { $partialErr=[string]$errTask.Result } } catch {}
                 return [pscustomobject]@{
                     ExitCode="UNKNOWN";TimedOut=$true
-                    TreeStopped=($treeStopped -and $rootStopped);Stdout="";Stderr=""
+                    TreeStopped=($treeStopped -and $rootStopped)
+                    Stdout=$partialOut;Stderr=$partialErr
                 }
             }
             if (-not $outTask.Wait(10000) -or -not $errTask.Wait(10000)) {
@@ -558,6 +585,22 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
                 Stdout=[string]$outTask.Result;Stderr=[string]$errTask.Result
             }
         } finally { $proc.Dispose() }
+    }
+
+    # Every process's raw stdout/stderr and exit metadata stay on the operator host.
+    function Save-PrivateProcessEvidence([string]$stage,[object]$result) {
+        if (-not (Test-Path -LiteralPath $privateLogDir -PathType Container)) {
+            throw "PRIVATE_EVIDENCE_DIRECTORY_MISSING"
+        }
+        $base=("{0}-{1}-{2}" -f $stage,
+            (Get-Date).ToString("yyyyMMdd-HHmmssfff"),[guid]::NewGuid().ToString("N"))
+        [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.stdout.txt"),
+            [string]$result.Stdout,[Text.Encoding]::UTF8)
+        [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.stderr.txt"),
+            [string]$result.Stderr,[Text.Encoding]::UTF8)
+        [IO.File]::WriteAllText((Join-Path $privateLogDir "$base.status.txt"),
+            ("exit={0};timeout={1};tree_stopped={2}" -f
+                $result.ExitCode,$result.TimedOut,$result.TreeStopped),[Text.Encoding]::UTF8)
     }
 
     # Derive the entire immutable qualification identity from the generated
@@ -660,7 +703,7 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
     }
 
     try {
-        foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $firmwareRoot,
+        foreach ($required in @($repoRoot, $idfRoot, $idfTools, $python, $idfPy, $privateLogDir, $firmwareRoot,
                                 (Join-Path $firmwareRoot "CMakeLists.txt"), $defaults, $qualifiedSdkconfig, $app)) {
             if (-not (Test-Path -LiteralPath $required)) {
                 $diagnosis = "REQUIRED_PATH_MISSING"
@@ -762,6 +805,7 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         $diagnosis="DEVICE_MAC_READ_FAILED"
         $idResult=Invoke-BoundedPython @("-m","esptool","--chip","esp32s3",
             "-p",$serialPort,"--before","no_reset","--after","no_reset","read_mac") $qualifiedBuildDir $identityDeadlineSeconds
+        Save-PrivateProcessEvidence "identity" $idResult
         $identityExit=$idResult.ExitCode
         if ($idResult.TimedOut) { $diagnosis="DEVICE_IDENTITY_TIMEOUT_NO_FLASH";throw $diagnosis }
         if ($identityExit -ne 0) { throw $diagnosis }
@@ -793,6 +837,7 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
             $flashAttempted=$true
             $flashWriteState="WRITE_STATE_UNKNOWN"
             $flashResult=Invoke-BoundedPython (@("-m","esptool") + $flashArgs) $qualifiedBuildDir $flashDeadlineSeconds
+            Save-PrivateProcessEvidence "flash" $flashResult
             $flashExit=$flashResult.ExitCode
             $flashTimedOut=$flashResult.TimedOut
             $flashTreeStopped=$flashResult.TreeStopped
