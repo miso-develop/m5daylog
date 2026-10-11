@@ -70,29 +70,7 @@
         } finally {
             # The bounded read-only ping mock ends on its own. Never blindly
             # kill a PID here: a completed child ID could already be reused.
-            if ($null -ne $mock -and $mock.Started -and [string]$mock.Pid -match '^[0-9]+
-        $diagnosis="HOST_NEGATIVE_FIXTURES_COMPLETE";$disposition="PASS"
-    } catch { $diagnosis="HOST_FIXTURE_FAILED" }
-    finally {
-        foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key,$saved[$key],"Process") }
-        if ($null -ne $temp -and [IO.Directory]::Exists($temp) -and
-            [IO.Path]::GetFileName($temp) -match '^hg-safety-[a-f0-9]{32}$') {
-            try { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop }
-            catch { $diagnosis="HOST_FIXTURE_CLEANUP_FAILED";$disposition="BLOCKED" }
-        }
-        Write-Host ""
-        Write-Host "==== $phase ===="
-        Write-Host ("fixtures_passed={0}" -f $passed)
-        Write-Host ("fixtures_total={0}" -f $total)
-        Write-Host "device_access=False"
-        Write-Host "cycles_counted=0"
-        Write-Host ("diagnosis={0}" -f $diagnosis)
-        Write-Host ("disposition={0}" -f $disposition)
-        Write-Host ("SUMMARY phase={0} diagnosis={1} disposition={2}" -f $phase,$diagnosis,$disposition)
-        Write-Host ""
-    }
-}
-) {
+            if ($null -ne $mock -and $mock.Started -and [string]$mock.Pid -match '^[0-9]+$') {
                 try {
                     $candidate=Get-Process -Id ([int]$mock.Pid) -ErrorAction SilentlyContinue
                     if ($null -ne $candidate -and $candidate.ProcessName -ieq "PING") {
