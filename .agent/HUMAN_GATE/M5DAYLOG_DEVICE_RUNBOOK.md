@@ -378,10 +378,10 @@ For a clean exact-head firmware qualification, use a standalone packet that gene
         $buildResult=Invoke-BoundedPython @($idfPy,"-B",$qualifiedBuildDir,
             "-DSDKCONFIG=$qualifiedSdkconfig","-DSDKCONFIG_DEFAULTS=$defaults",
             "-DIDF_TARGET=esp32s3","build") $firmwareRoot $buildDeadlineSeconds
-        Save-PrivateProcessEvidence "build" $buildResult
         $buildExit=$buildResult.ExitCode
         $buildTimedOut=$buildResult.TimedOut
         $buildTreeStopped=$buildResult.TreeStopped
+        Save-PrivateProcessEvidence "build" $buildResult
         if ($buildTimedOut) { $diagnosis="BUILD_TIMEOUT_NO_AUTOMATIC_RETRY"; throw $diagnosis }
         if ($buildExit -ne 0) {
             $diagnosis = "BUILD_FAILED"
@@ -805,8 +805,8 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
         $diagnosis="DEVICE_MAC_READ_FAILED"
         $idResult=Invoke-BoundedPython @("-m","esptool","--chip","esp32s3",
             "-p",$serialPort,"--before","no_reset","--after","no_reset","read_mac") $qualifiedBuildDir $identityDeadlineSeconds
-        Save-PrivateProcessEvidence "identity" $idResult
         $identityExit=$idResult.ExitCode
+        Save-PrivateProcessEvidence "identity" $idResult
         if ($idResult.TimedOut) { $diagnosis="DEVICE_IDENTITY_TIMEOUT_NO_FLASH";throw $diagnosis }
         if ($identityExit -ne 0) { throw $diagnosis }
         # esptool may print one MAC both during connect and read_mac.
@@ -837,10 +837,10 @@ For normal exact-head flashing, copy **all five** passing HG-BUILD hashes (defau
             $flashAttempted=$true
             $flashWriteState="WRITE_STATE_UNKNOWN"
             $flashResult=Invoke-BoundedPython (@("-m","esptool") + $flashArgs) $qualifiedBuildDir $flashDeadlineSeconds
-            Save-PrivateProcessEvidence "flash" $flashResult
             $flashExit=$flashResult.ExitCode
             $flashTimedOut=$flashResult.TimedOut
             $flashTreeStopped=$flashResult.TreeStopped
+            Save-PrivateProcessEvidence "flash" $flashResult
         } finally { Pop-Location -ErrorAction Stop }
         if ($flashTimedOut) {
             $diagnosis="FLASH_TIMEOUT_WRITE_STATE_UNKNOWN_NO_RETRY";throw $diagnosis
