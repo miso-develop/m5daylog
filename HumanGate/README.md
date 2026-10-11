@@ -34,7 +34,7 @@ No saved script sends SET_TIME, RELEASE_STORAGE, erases flash, writes NVS or cou
 2. Confirm Device mode, exact target and no competing CDC consumer before cdc-readonly.ps1. Do not probe after RELEASE_STORAGE accepted or on an ambiguous session.
 3. For nvs-read.ps1, establish an approved ROM-mode baseline and exact NVS partition layout. After any esptool diagnostic, re-establish runtime baseline before acceptance.
 4. Preserve .local/HumanGate evidence on an error; distinguish harness BLOCKED from product FAIL.
-5. Follow KNOWHOW.md and .agent/HUMAN_GATE/M5DAYLOG_DEVICE_RUNBOOK.md. Public evidence must be sanitized and validated before publication.
+5. Follow KNOWHOW.md, SUCCESS_REGISTRY.md and .agent/HUMAN_GATE/M5DAYLOG_DEVICE_RUNBOOK.md. Public evidence must be sanitized and validated before publication.
 
 ## Traceability
 
