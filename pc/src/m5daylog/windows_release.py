@@ -56,6 +56,7 @@ class DiskInterface:
     disk_number: int
     instance_id: str
     removable_instance_id: str | None
+    physical_usb_instance_id: str | None
 
 
 class Win32DeviceApi(Protocol):
@@ -65,6 +66,7 @@ class Win32DeviceApi(Protocol):
     def filesystem_accessible(self, volume_guid: str) -> bool: ...
     def lock_and_dismount(self, volume_guid: str) -> ContextManager[None]: ...
     def release_cdc(self, port: str, attempt_id: str) -> None: ...
+    def cdc_physical_id(self, port: str) -> str: ...
 
 
 class WindowsHostReleasePort:
@@ -87,14 +89,16 @@ class WindowsHostReleasePort:
         if len(matches) != 1:
             raise UnsupportedTarget("ambiguous disk interface")
         only = matches[0]
-        if not only.instance_id or not only.removable_instance_id:
+        if (not only.instance_id or not only.removable_instance_id
+                or not only.physical_usb_instance_id):
             raise UnsupportedTarget("removable device boundary not proven")
         return EjectTarget(
             expected_device_id, mount_root, guid, disks[0],
             only.instance_id, only.removable_instance_id,
+            only.physical_usb_instance_id,
         )
 
-    def revalidate_target(self, target: EjectTarget) -> None:
+    def revalidate_target(self, target: EjectTarget, cdc_port: str) -> None:
         # Device metadata must still match even when drive-letter reuse occurs.
         try:
             current_id = inspect_device(
@@ -107,6 +111,8 @@ class WindowsHostReleasePort:
         current = self.resolve_target(target.mount_root, target.expected_device_id)
         if current != target:
             raise WrongTarget("frozen target topology changed")
+        if self.api.cdc_physical_id(cdc_port) != target.usb_physical_instance_id:
+            raise WrongTarget("CDC port is not on the frozen USB device")
 
     def volume_available(self, target: EjectTarget) -> bool:
         return self.api.filesystem_accessible(target.volume_guid)
@@ -114,7 +120,10 @@ class WindowsHostReleasePort:
     def quiesce(self, target: EjectTarget) -> ContextManager[None]:
         return self.api.lock_and_dismount(target.volume_guid)
 
-    def release_storage(self, cdc_port: str, attempt_id: str) -> None:
+    def release_storage(self, cdc_port: str, attempt_id: str, target: EjectTarget) -> None:
+        # Repeat the correlation immediately before sending irreversible command.
+        if self.api.cdc_physical_id(cdc_port) != target.usb_physical_instance_id:
+            raise WrongTarget("CDC port changed identity before release")
         self.api.release_cdc(cdc_port, attempt_id)
 
     def volume_disappeared(self, target: EjectTarget) -> bool:
@@ -135,6 +144,11 @@ class GUID(ctypes.Structure):
         ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8),
     ]
 
+
+COMPORT_INTERFACE_GUID = GUID(
+    0x86E0D1E0, 0x8089, 0x11D0,
+    (ctypes.c_ubyte * 8)(0x9C, 0xE4, 0x08, 0x00, 0x3E, 0x30, 0x1F, 0x73),
+)
 
 DISK_INTERFACE_GUID = GUID(
     0x53F56307, 0xB6BF, 0x11D0,
@@ -299,6 +313,22 @@ class NativeWin32DeviceApi:
             raise UnsupportedTarget("device instance id unavailable")
         return buf.value
 
+    def _physical_usb_id(self, devinst: int) -> str | None:
+        # Prefer the nearest USB physical-device node; shared hub ancestors
+        # must not be allowed to correlate different USB devices.
+        for _ in range(32):
+            instance = self._instance_id(devinst)
+            if re.fullmatch(
+                r"USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4}\\[^\\]+",
+                instance, flags=re.IGNORECASE,
+            ):
+                return instance.upper()
+            parent = wintypes.DWORD()
+            if self.cm.CM_Get_Parent(ctypes.byref(parent), devinst, 0) != CR_SUCCESS:
+                break
+            devinst = parent.value
+        return None
+
     def _removable_ancestor(self, devinst: int) -> str | None:
         for _ in range(32):
             caps = wintypes.DWORD()
@@ -359,11 +389,69 @@ class NativeWin32DeviceApi:
                     disk_number,
                     self._instance_id(info.DevInst),
                     self._removable_ancestor(info.DevInst),
+                    self._physical_usb_id(info.DevInst),
                 ))
                 index += 1
         finally:
             self.s.SetupDiDestroyDeviceInfoList(devs)
         return discovered
+
+    def cdc_physical_id(self, port: str) -> str:
+        # The CDC COM port must be a member of the SAME USB physical device
+        # as the validated MSC disk, not just a COM number supplied by the user.
+        import winreg
+
+        if re.fullmatch(r"COM[1-9][0-9]{0,3}", port, re.IGNORECASE) is None:
+            raise WrongTarget("invalid CDC port")
+        devs = self.s.SetupDiGetClassDevsW(
+            ctypes.byref(COMPORT_INTERFACE_GUID), None, None,
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        )
+        if devs is None or devs == INVALID_HANDLE_VALUE:
+            raise WrongTarget("CDC interface enumeration failed")
+        matched: list[str] = []
+        try:
+            index = 0
+            while True:
+                interface = SP_DEVICE_INTERFACE_DATA()
+                interface.cbSize = ctypes.sizeof(interface)
+                if not self.s.SetupDiEnumDeviceInterfaces(
+                    devs, None, ctypes.byref(COMPORT_INTERFACE_GUID),
+                    index, ctypes.byref(interface),
+                ):
+                    if ctypes.get_last_error() == ERROR_NO_MORE_ITEMS:
+                        break
+                    raise WrongTarget("CDC enumeration failed")
+                detail = ctypes.create_string_buffer(4096)
+                struct.pack_into(
+                    "<I", detail, 0, 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6,
+                )
+                required = wintypes.DWORD()
+                info = SP_DEVINFO_DATA()
+                info.cbSize = ctypes.sizeof(info)
+                if not self.s.SetupDiGetDeviceInterfaceDetailW(
+                    devs, ctypes.byref(interface), detail, len(detail),
+                    ctypes.byref(required), ctypes.byref(info),
+                ):
+                    raise WrongTarget("CDC interface details unavailable")
+                try:
+                    path = ("SYSTEM\\CurrentControlSet\\Enum\\"
+                            + self._instance_id(info.DevInst) + "\\Device Parameters")
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+                        assigned, _ = winreg.QueryValueEx(key, "PortName")
+                except (OSError, ValueError):
+                    assigned = None
+                if isinstance(assigned, str) and assigned.upper() == port.upper():
+                    physical = self._physical_usb_id(info.DevInst)
+                    if physical is None:
+                        raise WrongTarget("CDC physical USB identity unavailable")
+                    matched.append(physical)
+                index += 1
+        finally:
+            self.s.SetupDiDestroyDeviceInfoList(devs)
+        if len(matched) != 1:
+            raise WrongTarget("CDC port mapping is missing or ambiguous")
+        return matched[0]
 
     def filesystem_accessible(self, volume_guid: str) -> bool:
         # A failed FS query alone is NOT teardown proof; disk interface
