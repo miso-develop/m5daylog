@@ -29,6 +29,22 @@ class EV018Tests(unittest.TestCase):
         self.assertEqual(x.onset_p95_ms, 23.75)
         self.assertEqual(x.missed_utterances, 0)
 
+    def test_aggregate_onset_gates_use_individual_utterances(self):
+        a = score_fixture("quiet", "quiet", total_samples=10000,
+                          reference=[(0, 1000), (2000, 3000)],
+                          predicted=[(0, 1000), (2400, 3000)])
+        b = score_fixture("noisy", "noise", total_samples=10000,
+                          reference=[(0, 1000)],
+                          predicted=[(800, 1000)])
+        result = aggregate_speech([a, b])
+        self.assertEqual(result["onset_median_ms"], 25.0)
+        self.assertAlmostEqual(result["onset_p95_ms"], 48.75)
+        self.assertTrue(result["onset_pass"])
+        missed = score_fixture("missed", "quiet", total_samples=100,
+                               reference=[(10, 20)], predicted=[])
+        self.assertEqual(aggregate_speech([missed])["missed_utterances"], 1)
+        self.assertFalse(aggregate_speech([missed])["onset_pass"])
+
     def test_silence_excluded_from_recall_and_false_positive_reported(self):
         silence = score_fixture("silence", "digital-silence",
                                 total_samples=16000, reference=[],
