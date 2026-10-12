@@ -200,6 +200,12 @@ def _source(row: sqlite3.Row, root: Path) -> tuple[bytes, int, str, Path]:
             pcm = wav.readframes(total)
             if len(pcm) != total * 2:
                 raise VadError("truncated WAV frames")
+            declared_ms = row["duration_ms"]
+            if declared_ms is not None:
+                if (type(declared_ms) is not int or declared_ms < 0
+                        or abs(declared_ms * SAMPLE_RATE - total * 1000)
+                           > SAMPLE_RATE):
+                    raise VadError("manifest/WAV duration mismatch")
     except (wave.Error, EOFError, OSError):
         raise VadError("unsupported/corrupt WAV format") from None
     return pcm, total, digest, resolved
