@@ -8,6 +8,7 @@ import sys
 
 from . import __version__
 from .db import expected_tables, init_db, list_tables, resolve_db_path
+from .vad import VadError, run_vad
 from .sync import (
     ContractValidationError,
     IntegrityError,
@@ -70,7 +71,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Canonical contracts directory (normally auto-detected).",
     )
+    vad_parser = subparsers.add_parser(
+        "vad", help="Run deterministic Silero VAD on one SYNCED recording."
+    )
+    vad_parser.add_argument("recording_id", help="Recording UUID.")
+    vad_parser.add_argument("--library-root", default=None)
+    vad_parser.add_argument("--db", default=None)
+    vad_parser.add_argument("--data-dir", default=None)
     return parser
+
+
+def cmd_vad(recording_id: str, library_root: str | None,
+            db_arg: str | None, data_dir_arg: str | None) -> int:
+    try:
+        result = run_vad(
+            recording_id,
+            db_path=resolve_db_path(explicit_db=db_arg, data_dir=data_dir_arg),
+            library_root=library_root,
+        )
+    except (VadError, OSError, sqlite3.Error, ImportError) as exc:
+        print(f"error: vad failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    print(f"vad: status={result.status} ranges={result.ranges} sha256={result.sha256}")
+    return 0
 
 
 def cmd_init(db_arg: str | None, data_dir_arg: str | None) -> int:
@@ -142,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_init(args.db, args.data_dir)
     if args.command == "device":
         return cmd_device(args.device_root, args.contracts_dir)
+    if args.command == "vad":
+        return cmd_vad(args.recording_id, args.library_root, args.db, args.data_dir)
     if args.command == "sync":
         return cmd_sync(
             args.device_root,
