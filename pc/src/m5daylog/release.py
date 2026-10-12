@@ -80,6 +80,7 @@ class UsbSessionIoGate:
         self._cv = threading.Condition(threading.RLock())
         self._ordinary = 0
         self._control = False
+        self._drained = False
         self._state = GateState.OPEN
 
     @property
@@ -121,11 +122,13 @@ class UsbSessionIoGate:
                 if remaining <= 0:
                     raise HostQuiesceError("ordinary Device handles did not drain")
                 self._cv.wait(remaining)
+            self._drained = True
 
     @contextmanager
     def release_control(self) -> Iterator[None]:
         with self._cv:
-            if self._state is not GateState.SEALED_FOR_RELEASE or self._control:
+            if (self._state is not GateState.SEALED_FOR_RELEASE
+                    or not self._drained or self._control):
                 raise GateClosed("dedicated release control not available")
             self._control = True
         try:
