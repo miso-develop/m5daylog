@@ -223,6 +223,13 @@ class ReleaseCoordinatorTests(unittest.TestCase):
             with self.assertRaises(HostQuiesceError):
                 gate.seal(timeout_s=0)
         self.assertEqual(gate.state, GateState.SEALED_FOR_RELEASE)
+        # Draining after a failed seal does not retroactively grant a barrier.
+        with self.assertRaises(GateClosed):
+            with gate.release_control():
+                pass
+
+        gate = UsbSessionIoGate()
+        gate.seal(timeout_s=1)
         with gate.release_control():
             with self.assertRaises(GateClosed):
                 with gate.release_control():
