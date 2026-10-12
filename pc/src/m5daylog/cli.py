@@ -81,7 +81,7 @@ def cmd_init(db_arg: str | None, data_dir_arg: str | None) -> int:
     except (OSError, sqlite3.Error) as exc:
         print(f"error: init failed: {type(exc).__name__}", file=sys.stderr)
         return 1
-    print(f"initialized: {db_path}")
+    print("initialized: ok")
     print(f"tables: {','.join(tables)}")
     missing = [name for name in expected_tables() if name not in tables]
     if missing:
