@@ -128,11 +128,12 @@ uv run --frozen python -m unittest discover -s tests -v
 uv run --frozen m5daylog vad <recording-uuid> --library-root "$HOME\Documents\M5Daylog" --db "$env:LOCALAPPDATA\M5Daylog\state\m5daylog.db"
 ```
 
-**Not yet production-ready:** the checked-in `uv.lock` has not yet been
-regenerated from the new Silero dependencies, and the model SHA-256 still
-requires independent measurement and pinning in `vad.py`. Consequently
-`SileroCPU` deliberately fails closed before loading any unverified model.
-Do not claim the live runtime, `uv sync --frozen`, or EV-018 passed yet.
+**Verification status:** `uv.lock` is now resolved for Python 3.11,
+and the expected ONNX SHA-256 has been pinned from the official Silero 6.2.3
+wheel. The runtime checks that hash before loading. The public PC CI checks
+the frozen dependency graph, synthetic tests, and real CPU ONNX silence
+inference. These checks do **not** establish the EV-018 acoustic gates on
+actual M5Daylog recordings, which require separate annotated local fixtures.
 
 The stage checks SYNCED state, canonical local path, source size/hash and PCM
 format; validates/reuses an exact-source, exact-producer artifact without
