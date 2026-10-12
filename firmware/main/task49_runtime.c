@@ -25,6 +25,7 @@ static void recorder_task49_delete(TaskHandle_t task);
 #include "rtc_correction.h"
 #include "recorder_nvs.h"
 #include "task87_wake_recovery.h"
+#include "processed_ack.h"
 #include "usb_cdc_protocol.h"
 #include "usb_msc_ownership.h"
 
@@ -168,11 +169,18 @@ bool recorder_task87_manifest_sync_wav_dir(const char *recordings_dir,
         return ok;
     }
 
-    // main.c calls manifest sync only after Device FAT/VFS is mounted and the
-    // recovery scan has completed. The production seam executes Task #50's
-    // pending RTC flush (when linked) before replacing SHUTDOWN_ARMED with the
-    // durable wake-recovery gate. NORMAL is committed only after a new
-    // recordingId has reached RECORDING.
+    // #52: process only the authoritative ACK file in the already-mounted,
+    // Device-owned manual-WAKE recovery phase. No ACK read/write is possible
+    // in USB_SYNC, RELEASE_QUIESCE or SHUTDOWN_ARMED. Failure to durably apply
+    // a valid ACK prevents a fresh recording and leaves the recovery fail-closed.
+    processed_ack_stats_t ack_stats;
+    if (!processed_ack_apply_manual_wake(device_id, &ack_stats)) {
+        return false;
+    }
+
+    // #87/#50 pending RTC flush and SHUTDOWN_ARMED -> WAKE_RECOVERY_PENDING
+    // transition remain after the #52 ACK/retention evaluation. NORMAL is
+    // committed only after fresh RECORDING begins.
     return task87_wake_recovery_complete_device_recovery(
                &s_wake_recovery, RECORDER_EVENTS_PATH) == ESP_OK;
 }
