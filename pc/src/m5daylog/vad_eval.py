@@ -24,6 +24,7 @@ class FixtureMetrics:
     onset_p95_ms: float | None
     false_positive_samples: int
     false_positive_ratio: float | None
+    onset_late_ms: tuple[float, ...] = ()
 
 
 def _validate_ranges(items: Sequence[tuple[int, int]], total: int) -> None:
@@ -93,6 +94,7 @@ def score_fixture(fixture_id: str, category: str, *, total_samples: int,
         _percentile(late, 0.95) if late else None,
         false_positive,
         false_positive / total_samples if total_samples else None,
+        tuple(late),
     )
 
 
@@ -100,10 +102,16 @@ def aggregate_speech(fixtures: Sequence[FixtureMetrics]) -> dict:
     eligible = [x for x in fixtures if x.reference_samples > 0]
     denominator = sum(x.reference_samples for x in eligible)
     numerator = sum(x.recovered_samples for x in eligible)
+    late = [value for metric in eligible for value in metric.onset_late_ms]
+    median = _percentile(late, 0.5) if late else None
+    p95 = _percentile(late, 0.95) if late else None
     return {
         "reference_samples": denominator,
         "recovered_samples": numerator,
         "speech_recall": numerator / denominator if denominator else None,
         "recall_pass": numerator / denominator >= 0.95 if denominator else False,
         "missed_utterances": sum(x.missed_utterances for x in eligible),
+        "onset_median_ms": median,
+        "onset_p95_ms": p95,
+        "onset_pass": bool(late) and median <= 50 and p95 <= 200,
     }
