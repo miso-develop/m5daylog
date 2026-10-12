@@ -27,9 +27,9 @@ SCHEMA_VERSION = 1
 ALGORITHM_VERSION = 1
 MERGE_VERSION = 1
 SAMPLE_RATE = 16000
-# Must be replaced with independently measured SHA-256 of the model bundled
-# in the locked 6.2.3 wheel before a production VAD attempt is possible.
-EXPECTED_MODEL_SHA256 = None
+# SHA-256 measured from the PyPI silero-vad==6.2.3 wheel in PR #110 CI.
+# Runtime re-hashes the package asset before loading; mismatch fails closed.
+EXPECTED_MODEL_SHA256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
 
 PARAMS = {
     "threshold": 0.5,
