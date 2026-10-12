@@ -47,6 +47,31 @@
 #define ACK_EVENTS_PATH RECORDER_EVENTS_PATH
 #endif
 
+// cJSON's valuestring/key APIs expose NUL-terminated C strings but do not
+// expose the decoded JSON string length. A JSON \\u0000 escape followed by
+// attacker-controlled suffix bytes would otherwise pass strlen/strcmp-based
+// UUID, timestamp, and object-key validation on the truncated prefix.
+// Walk JSON string tokens before parsing; skip escaped backslashes/quotes so
+// a literal "\\\\u0000" does not spuriously count as a decoded NUL.
+// Malformed JSON is still rejected by cJSON after this preflight.
+static bool json_has_decoded_nul(const char *doc, size_t len) {
+    bool in_string = false;
+    size_t i;
+    for (i = 0; i < len; ++i) {
+        if (doc[i] == '"') {
+            in_string = !in_string;
+        } else if (in_string && doc[i] == '\\' && i + 1u < len) {
+            if (doc[i + 1u] == 'u' && i + 5u < len &&
+                doc[i + 2u] == '0' && doc[i + 3u] == '0' &&
+                doc[i + 4u] == '0' && doc[i + 5u] == '0') {
+                return true;
+            }
+            ++i;  // One complete JSON escape, including escaped backslash.
+        }
+    }
+    return false;
+}
+
 // Absence is legitimate; all other read errors fail closed.
 static int read_bounded(const char *path, size_t max_len, char **out,
                         size_t *len) {
@@ -83,7 +108,8 @@ static int read_bounded(const char *path, size_t max_len, char **out,
     }
     // The input is length-delimited JSON; embedded NUL may not truncate
     // validation and hide attacker-controlled trailing bytes.
-    if (memchr(buf, '\0', got) != NULL) {
+    if (memchr(buf, '\0', got) != NULL ||
+        json_has_decoded_nul(buf, got)) {
         free(buf);
         return -1;
     }
