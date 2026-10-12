@@ -137,6 +137,28 @@ jobs:
                 /workspace/firmware/tests/native/usb_cdc_cjson_depth_harness.c \
                 -lm -o /tmp/usb_cdc_cjson_depth_harness
               /tmp/usb_cdc_cjson_depth_harness
+
+              # #52: compile the production ACK ingestion code together with
+              # the actual ESP-IDF cJSON implementation, not the host shim.
+              cc -std=c11 -D_POSIX_C_SOURCE=200809L \
+                -DCJSON_NESTING_LIMIT="$cjson_limit" \
+                -Wall -Wextra -Werror \
+                -I /workspace/firmware/components/recorder/include \
+                -I "$cjson_dir" \
+                -DACK_FILE=\"acks/processed.json\" \
+                -DACK_MARKER_DIR=\"processed-state\" \
+                -DACK_MANIFEST_PATH=\"manifest.json\" \
+                -DACK_EVENTS_PATH=\"events.jsonl\" \
+                /workspace/firmware/components/recorder/processed_ack.c \
+                /workspace/firmware/components/recorder/processed_ack_policy.c \
+                /workspace/firmware/tests/native/processed_ack_native_stubs.c \
+                /workspace/firmware/tests/native/processed_ack_production_cjson_harness.c \
+                "$cjson_dir/cJSON.c" \
+                -Wl,--wrap=fsync -Wl,--wrap=rename \
+                -Wl,--wrap=fopen -Wl,--wrap=fwrite \
+                -Wl,--wrap=fflush -Wl,--wrap=fclose \
+                -lm -o /tmp/processed_ack_production_cjson_harness
+              /tmp/processed_ack_production_cjson_harness
             '
 
       - name: Run ESP-IDF v5.5.5 clean build and CDC stack gate
