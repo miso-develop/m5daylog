@@ -77,8 +77,9 @@ class NonEchoingCliTests(unittest.TestCase):
                     code, stdout, stderr = run_cli("init", "--db", str(candidate))
                 self.assertEqual(code, 1)
                 self.assertTrue(stdout == "", "unexpected CLI stdout")
-                self.assertEqual(
-                    stderr, f"error: init failed: {failure.__name__}\n"
+                self.assertTrue(
+                    stderr == f"error: init failed: {failure.__name__}\n",
+                    "unsafe init failure diagnostic",
                 )
                 self.assert_no_path(stdout, stderr, candidate)
 
@@ -139,9 +140,9 @@ class NonEchoingCliTests(unittest.TestCase):
                             "--db", str(database),
                         )
                     self.assertEqual(code, expected_exit)
-                    self.assertEqual(
-                        stdout,
-                        f"sync: copied=2 reused=1 conflicts={conflicts}\n",
+                    self.assertTrue(
+                        stdout == f"sync: copied=2 reused=1 conflicts={conflicts}\n",
+                        "unsafe sync result",
                     )
                     self.assertTrue(stderr == "", "unexpected CLI stderr")
                     self.assert_no_path(
