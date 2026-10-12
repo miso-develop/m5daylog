@@ -93,12 +93,14 @@ def test_fail_loud_symbols():
 def test_no_scope_creep_into_later_tasks():
     srcs = _sources()
     blob = "\n".join(srcs.values()).lower()
-    # Later retention keywords must not be implemented here
-    # (rotation/finalize #45, recovery/quarantine #46, and
-    # identity/manifest #47 are now in scope; processed-ACK retention
-    # stays out).
+    # #45/#46/#47 implementations must not silently embed later #52
+    # behavior, which now lives in dedicated processed_ack modules.
+    legacy_blob = "\n".join(
+        src for path, src in srcs.items()
+        if not Path(path).name.startswith("processed_ack")
+    ).lower()
     for keyword in ("acks/",):
-        assert keyword not in blob, keyword
+        assert keyword not in legacy_blob, keyword
     # Rotation + recovery + identity/manifest are implemented; later
     # retention stays out.
     assert "quarantine" in blob
