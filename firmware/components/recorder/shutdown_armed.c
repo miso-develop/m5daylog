@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #include "nvs.h"
-#include "nvs_flash.h"
+#include "recorder_nvs.h"
 
 static const char *const k_namespace = "m5daylog";
 static const char *const k_key = "shutdown_armed";
@@ -18,45 +18,29 @@ typedef enum {
     SHUTDOWN_LIFECYCLE_WAKE_RECOVERY_PENDING = 3,
 } shutdown_lifecycle_state_t;
 
-static esp_err_t shutdown_armed_finish_nvs(esp_err_t operation_err) {
-    esp_err_t deinit_err = nvs_flash_deinit();
-    if (operation_err != ESP_OK) {
-        return operation_err;
-    }
-    if (deinit_err == ESP_OK) {
-        return ESP_OK;
-    }
-#ifdef ESP_ERR_NVS_NOT_INITIALIZED
-    // The default NVS partition is already deinitialized, so the desired
-    // cleanup postcondition holds. Do not turn an otherwise valid lifecycle
-    // read/write into a fail-closed boot for this idempotent disposition.
-    if (deinit_err == ESP_ERR_NVS_NOT_INITIALIZED) {
-        return ESP_OK;
-    }
-#endif
-    return deinit_err;
-}
-
 static esp_err_t shutdown_armed_write(uint8_t value) {
-    nvs_handle_t handle;
-    esp_err_t err = nvs_flash_init();
+    nvs_handle_t handle = 0;
+    esp_err_t err = recorder_nvs_lock();
+
     if (err != ESP_OK) {
         return err;
     }
     err = nvs_open(k_namespace, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        return shutdown_armed_finish_nvs(err);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(handle, k_key, value);
     }
-    err = nvs_set_u8(handle, k_key, value);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
-    nvs_close(handle);
-    return shutdown_armed_finish_nvs(err);
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+    recorder_nvs_unlock();
+    return err;
 }
 
 static esp_err_t shutdown_armed_read_state(shutdown_lifecycle_state_t *state) {
-    nvs_handle_t handle;
+    nvs_handle_t handle = 0;
     uint8_t value = SHUTDOWN_LIFECYCLE_NORMAL;
     esp_err_t err;
 
@@ -64,30 +48,39 @@ static esp_err_t shutdown_armed_read_state(shutdown_lifecycle_state_t *state) {
         return ESP_ERR_INVALID_ARG;
     }
     *state = SHUTDOWN_LIFECYCLE_NORMAL;
-    err = nvs_flash_init();
+    err = recorder_nvs_lock();
     if (err != ESP_OK) {
         return err;
     }
+
     err = nvs_open(k_namespace, NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        return shutdown_armed_finish_nvs(ESP_OK);
+        err = ESP_OK;
+        goto done;
     }
     if (err != ESP_OK) {
-        return shutdown_armed_finish_nvs(err);
+        goto done;
     }
     err = nvs_get_u8(handle, k_key, &value);
-    nvs_close(handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        return shutdown_armed_finish_nvs(ESP_OK);
+        err = ESP_OK;
+        goto done;
     }
     if (err != ESP_OK) {
-        return shutdown_armed_finish_nvs(err);
+        goto done;
     }
     if (value > SHUTDOWN_LIFECYCLE_WAKE_RECOVERY_PENDING) {
-        return shutdown_armed_finish_nvs(ESP_FAIL);
+        err = ESP_FAIL;
+        goto done;
     }
     *state = (shutdown_lifecycle_state_t)value;
-    return shutdown_armed_finish_nvs(ESP_OK);
+
+done:
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+    recorder_nvs_unlock();
+    return err;
 }
 
 esp_err_t shutdown_armed_read(bool *armed) {

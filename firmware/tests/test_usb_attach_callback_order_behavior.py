@@ -53,6 +53,9 @@ def _build(tmp_path: Path) -> Path:
             #define USB_BIT_ATTACH (1u << 0)
             #define USB_BIT_HOST_OWNED (1u << 2)
             #define USB_BIT_FAILED (1u << 5)
+            #define USB_BIT_HOST_REATTACHED (1u << 6)
+
+            typedef void (*usb_msc_physical_session_cutoff_fn_t)(void *ctx);
 
             typedef struct event_group {
                 uint32_t bits;
@@ -69,6 +72,10 @@ def _build(tmp_path: Path) -> Path:
             static volatile bool s_provisional_attached = false;
             static volatile bool s_publish_triggered = false;
             static volatile bool s_prepare_disconnected = false;
+            static volatile bool s_host_session_detached = false;
+            static usb_msc_physical_session_cutoff_fn_t
+                s_physical_session_cutoff = NULL;
+            static void *s_physical_session_cutoff_ctx = NULL;
             static bool g_mounted = true;
             static int g_disconnect_calls;
             static bool g_disconnect_result = true;
@@ -123,6 +130,9 @@ def _build(tmp_path: Path) -> Path:
                 s_provisional_attached = false;
                 s_publish_triggered = false;
                 s_prepare_disconnected = false;
+                s_host_session_detached = false;
+                s_physical_session_cutoff = NULL;
+                s_physical_session_cutoff_ctx = NULL;
                 g_mounted = true;
                 g_disconnect_calls = 0;
                 g_disconnect_result = true;

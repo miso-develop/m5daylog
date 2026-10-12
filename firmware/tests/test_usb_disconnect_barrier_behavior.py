@@ -181,6 +181,7 @@ HARNESS = r"""
     #include "freertos/event_groups.h"
     #include "freertos/task.h"
     #include "nvs.h"
+    #include "recorder_nvs.h"
     #include "sd_mount.h"
     #include "shutdown_armed.h"
     #include "tinyusb.h"
@@ -224,6 +225,7 @@ HARNESS = r"""
     static int g_real_read_calls;
     static int g_real_write_calls;
     static int g_sense_calls;
+    static int g_cdc_cutoff_calls;
 
     /* Transactional NVS model: failed commit preserves the last durable value. */
     static bool g_nvs_has_value;
@@ -235,6 +237,9 @@ HARNESS = r"""
 
     esp_err_t nvs_flash_init(void) { return ESP_OK; }
     esp_err_t nvs_flash_deinit(void) { return ESP_OK; }
+    esp_err_t recorder_nvs_init(void) { return ESP_OK; }
+    esp_err_t recorder_nvs_lock(void) { return ESP_OK; }
+    void recorder_nvs_unlock(void) {}
     esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle) {
         CHECK(strcmp(name, "m5daylog") == 0);
         (void)mode;
@@ -295,6 +300,11 @@ HARNESS = r"""
         return result;
     }
     void vTaskDelay(TickType_t ticks) { g_delay_ticks = ticks; }
+
+    static void cdc_physical_session_cutoff(void *ctx) {
+        CHECK(ctx == (void *)0x50);
+        g_cdc_cutoff_calls++;
+    }
 
     bool sd_mount_is_mounted(void) { return g_mounted; }
     esp_err_t sd_mount_transfer_to_usb(void) {
@@ -419,6 +429,8 @@ HARNESS = r"""
         uint8_t test_unit_ready[16] = {0};
 
         CHECK(usb_msc_ownership_init() == ESP_OK);
+        CHECK(usb_msc_ownership_set_physical_session_cutoff(
+                  cdc_physical_session_cutoff, (void *)0x50) == ESP_OK);
         CHECK(usb_msc_ownership_start() == ESP_OK);
         CHECK(g_device_cb != NULL);
         CHECK(g_storage_cb != NULL);
@@ -458,6 +470,7 @@ HARNESS = r"""
         tinyusb_event_t suspended = { .id = TINYUSB_EVENT_SUSPENDED };
         tinyusb_event_t detached = { .id = TINYUSB_EVENT_DETACHED };
         tinyusb_event_t attached = { .id = TINYUSB_EVENT_ATTACHED };
+        uint8_t reconnect_test_unit_ready[16] = {0};
 
         g_device_cb(&suspended, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
@@ -467,6 +480,7 @@ HARNESS = r"""
 
         g_device_cb(&detached, g_device_arg);
         CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(g_cdc_cutoff_calls == 1);
         CHECK(g_disconnect_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         assert_reboot_stays_fail_closed();
@@ -475,7 +489,13 @@ HARNESS = r"""
         CHECK(g_transfer_calls == 1);
         CHECK(g_connect_calls == 1);
         CHECK(g_disconnect_calls == 1);
+        /* ATTACHED itself is too early to reopen CDC: it runs before the
+         * SET_CONFIGURATION status stage. */
         CHECK(next_event() == USB_MSC_EVENT_NONE);
+        tud_msc_scsi_complete_cb(0, reconnect_test_unit_ready);
+        CHECK(next_event() == USB_MSC_EVENT_HOST_REATTACHED);
+        CHECK(next_event() == USB_MSC_EVENT_NONE);
+        CHECK(g_cdc_cutoff_calls == 1);
         CHECK(usb_msc_ownership_is_host_owned());
         CHECK(!g_mounted);
     }

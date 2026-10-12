@@ -22,6 +22,8 @@ static void recorder_task49_delete(TaskHandle_t task);
 #undef app_main
 
 #include "shutdown_armed.h"
+#include "rtc_correction.h"
+#include "recorder_nvs.h"
 #include "task87_wake_recovery.h"
 #include "usb_cdc_protocol.h"
 #include "usb_msc_ownership.h"
@@ -78,6 +80,58 @@ static bool recorder_cdc_release_response_complete(
 static bool recorder_cdc_command_admission_open(void *ctx) {
     (void)ctx;
     return usb_msc_ownership_release_command_admission_open();
+}
+
+static void recorder_cdc_physical_session_cutoff(void *ctx) {
+    (void)ctx;
+    usb_cdc_protocol_close_session();
+}
+
+static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
+    recorder_state_t state;
+    recorder_reason_t reason;
+    int battery_mv;
+    (void)ctx;
+
+    if (out == NULL || s_state_lock == NULL ||
+        xSemaphoreTake(s_state_lock, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    state = s_rec_state.state;
+    reason = s_rec_state.reason;
+    battery_mv = s_last_battery_mv;
+    xSemaphoreGive(s_state_lock);
+
+    out->state = recorder_state_str(state);
+    out->reason = recorder_reason_str(reason);
+    out->battery_mv = battery_mv;
+    out->battery_valid = battery_mv > 0;
+    out->rtc_correction_pending = rtc_correction_is_pending();
+    return out->state != NULL && out->reason != NULL;
+}
+
+static usb_cdc_set_time_result_t recorder_cdc_set_time(
+    const char *requested_time,
+    char *normalized,
+    size_t normalized_size,
+    void *ctx) {
+    rtc_correction_result_t result;
+    (void)ctx;
+
+    result = rtc_correction_apply(requested_time, normalized, normalized_size);
+    switch (result) {
+        case RTC_CORRECTION_OK:
+            return USB_CDC_SET_TIME_OK;
+        case RTC_CORRECTION_INVALID_ARGS:
+            return USB_CDC_SET_TIME_INVALID_ARGS;
+        case RTC_CORRECTION_RANGE_ERROR:
+            return USB_CDC_SET_TIME_RANGE_ERROR;
+        case RTC_CORRECTION_BUSY:
+            return USB_CDC_SET_TIME_BUSY;
+        case RTC_CORRECTION_INTERNAL_ERROR:
+        default:
+            return USB_CDC_SET_TIME_INTERNAL_ERROR;
+    }
 }
 
 static void recorder_task49_delete(TaskHandle_t task) {
@@ -233,6 +287,23 @@ static void recorder_handle_usb_host_owned(void) {
     recorder_flush_usb_scsi_trace();
 }
 
+static void recorder_handle_usb_host_reattached(void) {
+    if (recorder_current_state() != RECORDER_STATE_USB_SYNC ||
+        sd_mount_is_mounted() ||
+        !usb_msc_ownership_is_host_owned() ||
+        !usb_msc_ownership_release_command_admission_open()) {
+        recorder_enter_error(RECORDER_REASON_USB);
+        return;
+    }
+
+    // DETACHED already performed a callback-safe generation cutoff. Complete
+    // the blocking command/TX drain here, outside TinyUSB callback context,
+    // then publish a fresh CDC application session while leaving MSC ownership
+    // unchanged and unresolved on the host side.
+    usb_cdc_protocol_reset_session();
+    usb_cdc_protocol_open_session();
+}
+
 static void recorder_handle_usb_release(void) {
     if (recorder_current_state() != RECORDER_STATE_USB_SYNC ||
         sd_mount_is_mounted() ||
@@ -293,6 +364,9 @@ static void recorder_usb_event_task(void *arg) {
             case USB_MSC_EVENT_HOST_OWNED:
                 recorder_handle_usb_host_owned();
                 break;
+            case USB_MSC_EVENT_HOST_REATTACHED:
+                recorder_handle_usb_host_reattached();
+                break;
             case USB_MSC_EVENT_RELEASE_REQUESTED:
                 recorder_handle_usb_release();
                 break;
@@ -321,6 +395,15 @@ void app_main(void) {
     if (recorder_power_enable_hold() != ESP_OK) {
         return;
     }
+    // Establish the single default-NVS lifetime before any recorder worker
+    // task can run. Recorder-owned NVS users share recorder_nvs' mutex and no
+    // recorder path deinitializes the partition during this process lifetime.
+    if (recorder_nvs_init() != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: nvs, result: init-error, action: fail-closed");
+        recorder_shutdown_armed_now();
+        return;
+    }
     if (recorder_power_manual_wake_asserted(&manual_wake) != ESP_OK ||
         shutdown_armed_boot_action(manual_wake, &action) != ESP_OK) {
         ESP_LOGE(TAG,
@@ -344,6 +427,18 @@ void app_main(void) {
         &s_wake_recovery,
         action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
 
+    // Manual-WAKE recovery needs the durable RTC pending record before
+    // main.c reaches the Device-owned manifest/recovery seam. Normal boot does
+    // not: keep #87's proven recorder startup path free of RTC/I2C bring-up and
+    // initialize the application protocol only after recording is established.
+    if (action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME &&
+        rtc_correction_init() != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: rtc, result: pending-state-init-error, action: manual-wake-fail-closed");
+        recorder_shutdown_armed_now();
+        return;
+    }
+
     if (xTaskCreate(recorder_base_task, "rec_base", 6144, NULL, 2, NULL) !=
         pdPASS) {
         if (task87_wake_recovery_requires_shutdown(&s_wake_recovery)) {
@@ -358,6 +453,17 @@ void app_main(void) {
         return;
     }
 
+    // On a normal boot, load durable pending state only after the recorder has
+    // reached its known-good RECORDING baseline. rtc_correction_init() treats
+    // live RTC transport as best-effort; only an unreadable durable pending
+    // state blocks CDC/MSC publication here. SET_TIME retries RTC hardware
+    // bring-up at mutation time.
+    if (action == SHUTDOWN_ARMED_BOOT_NORMAL &&
+        rtc_correction_init() != ESP_OK) {
+        recorder_enter_error(RECORDER_REASON_INTERNAL);
+        return;
+    }
+
     // Manual-WAKE USB publication is a fresh-session privilege: even if future
     // changes accidentally return from the recording wait early, the ownership
     // stack cannot be rearmed until the production recovery seam says complete.
@@ -368,6 +474,11 @@ void app_main(void) {
     }
 
     memset(&cdc_config, 0, sizeof(cdc_config));
+    cdc_config.device_id = s_device_id;
+    cdc_config.status_provider = recorder_cdc_status;
+    cdc_config.status_ctx = NULL;
+    cdc_config.set_time = recorder_cdc_set_time;
+    cdc_config.set_time_ctx = NULL;
     cdc_config.release_accept = recorder_cdc_release_accept;
     cdc_config.release_response_complete =
         recorder_cdc_release_response_complete;
@@ -375,6 +486,8 @@ void app_main(void) {
         recorder_cdc_command_admission_open;
 
     if (usb_msc_ownership_init() != ESP_OK ||
+        usb_msc_ownership_set_physical_session_cutoff(
+            recorder_cdc_physical_session_cutoff, NULL) != ESP_OK ||
         usb_cdc_protocol_init(&cdc_config) != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_USB);
         return;

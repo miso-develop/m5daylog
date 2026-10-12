@@ -1,27 +1,32 @@
-// D-031 / Task #87: bounded sequential canonical CDC JSON transport.
+// Canonical bounded sequential USB CDC JSON transport.
 //
-// Lifecycle admission is external to TinyUSB callbacks. A valid
-// RELEASE_STORAGE request closes the shared Device/MSC gate from the production
-// dispatcher callback before its success response is written. Only after that
-// response flush completes is RELEASE_REQUESTED signalled to the coordinator.
+// Task #87 lifecycle admission remains authoritative. Task #50 application
+// commands execute inside the same session/command gate. RELEASE_STORAGE closes
+// shared Device/MSC admission before its success response is written.
 
 #include "usb_cdc_protocol.h"
 
 #ifdef ESP_PLATFORM
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 
+#include "device_identity.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tinyusb_cdc_acm.h"
+#include "tusb.h"
+#include "device/usbd_pvt.h"
 #include "usb_cdc_protocol_core.h"
 #include "usb_cdc_session_gate.h"
 #include "usb_cdc_tx.h"
 
 #define CDC_RX_CHUNK_BYTES 256u
-#define CDC_RESPONSE_BYTES 384u
-#define CDC_WORKER_STACK_BYTES 5120u
+#define CDC_RESPONSE_BYTES 768u
+#define CDC_WORKER_STACK_BYTES 6144u
+#define CDC_RELEASE_TX_COMPLETE_TIMEOUT_MS 500u
+#define CDC_RELEASE_HOST_READ_GRACE_MS 150u
 
 static usb_cdc_protocol_config_t s_config;
 static TaskHandle_t s_worker = NULL;
@@ -31,6 +36,24 @@ static volatile bool s_reset_line = false;
 static bool s_initialized = false;
 static bool s_started = false;
 static bool s_open_requested = false;
+static atomic_uint s_cdc_tx_completed = ATOMIC_VAR_INIT(0u);
+
+typedef struct {
+    uint32_t generation;
+    // Snapshot before queueing any bytes: a host-completed last IN transfer
+    // may race the final FIFO flush and precede the wait routine.
+    unsigned tx_completed_before;
+} cdc_tx_context_t;
+
+// TinyUSB calls this after the host USB controller completes a CDC IN
+// transfer. The esp_tinyusb write_flush() success condition checks only the
+// software FIFO, which may be empty while the final IN transfer is in flight.
+void tud_cdc_tx_complete_cb(uint8_t itf) {
+    if (itf == 0u) {
+        (void)atomic_fetch_add_explicit(
+            &s_cdc_tx_completed, 1u, memory_order_release);
+    }
+}
 
 static bool cdc_tx_is_connected(void *ctx) {
     (void)ctx;
@@ -68,10 +91,119 @@ static void cdc_tx_wait(void *ctx) {
     vTaskDelay(1);
 }
 
+// Identify the actual CDC-ACM #0 bulk-IN endpoint from the active USB
+// configuration. Do not guess an endpoint address from an MSC/CDC layout:
+// esp_tinyusb may change endpoint allocation with configuration changes.
+static uint8_t cdc_bulk_in_endpoint(void) {
+    const uint8_t *desc = tud_descriptor_configuration_cb(0u);
+    bool cdc_data_interface = false;
+    unsigned total;
+    unsigned offset;
+
+    if (desc == NULL || desc[0] < 9u ||
+        desc[1] != TUSB_DESC_CONFIGURATION) {
+        return 0u;
+    }
+    total = (unsigned)desc[2] | ((unsigned)desc[3] << 8u);
+    if (total < 9u || total > 1024u) {
+        return 0u;
+    }
+
+    for (offset = 0u; offset < total;) {
+        unsigned size = desc[offset];
+        uint8_t type;
+        if (size < 2u || size > total - offset) {
+            return 0u;
+        }
+        type = desc[offset + 1u];
+        if (type == TUSB_DESC_INTERFACE) {
+            if (size < 9u) {
+                return 0u;
+            }
+            cdc_data_interface =
+                desc[offset + 5u] == TUSB_CLASS_CDC_DATA &&
+                desc[offset + 3u] == 0u;
+        } else if (cdc_data_interface && type == TUSB_DESC_ENDPOINT) {
+            if (size < 7u) {
+                return 0u;
+            }
+            if ((desc[offset + 2u] & 0x80u) != 0u &&
+                (desc[offset + 3u] & 0x03u) == TUSB_XFER_BULK) {
+                return desc[offset + 2u];
+            }
+        }
+        offset += size;
+    }
+    return 0u;
+}
+
+typedef struct {
+    const cdc_tx_context_t *response;
+    uint8_t ep_in;
+} cdc_release_wait_ctx_t;
+
+static bool cdc_release_wait_current(void *ctx) {
+    const cdc_release_wait_ctx_t *wait = ctx;
+    return cdc_tx_session_is_current(
+        &s_session_gate, wait->response->generation);
+}
+
+static bool cdc_release_wait_sample(void *ctx, unsigned *after,
+                                     bool *drained, bool *busy) {
+    const cdc_release_wait_ctx_t *wait = ctx;
+    *after = atomic_load_explicit(&s_cdc_tx_completed, memory_order_acquire);
+    *drained = tud_cdc_n_write_available(TINYUSB_CDC_ACM_0) ==
+               CFG_TUD_CDC_TX_BUFSIZE;
+    *busy = usbd_edpt_busy(0u, wait->ep_in);
+    return true;
+}
+
+static uint32_t cdc_release_now_ticks(void *ctx) {
+    (void)ctx;
+    return (uint32_t)xTaskGetTickCount();
+}
+
+static void cdc_release_delay_ticks(void *ctx, uint32_t ticks) {
+    (void)ctx;
+    vTaskDelay((TickType_t)ticks);
+}
+
+static bool cdc_release_await_endpoint(void *ctx, uint32_t timeout_ms) {
+    const cdc_tx_context_t *response = ctx;
+    const uint8_t ep_in = cdc_bulk_in_endpoint();
+    cdc_release_wait_ctx_t wait_ctx = {
+        .response = response,
+        .ep_in = ep_in,
+    };
+    const usb_cdc_tx_final_wait_ops_t wait_ops = {
+        .ctx = &wait_ctx,
+        .session_current = cdc_release_wait_current,
+        .sample = cdc_release_wait_sample,
+        .now_ticks = cdc_release_now_ticks,
+        .delay_ticks = cdc_release_delay_ticks,
+        .callbacks_before = response->tx_completed_before,
+        .timeout_ticks = pdMS_TO_TICKS(timeout_ms),
+        .host_grace_ticks = pdMS_TO_TICKS(CDC_RELEASE_HOST_READ_GRACE_MS),
+    };
+    if (ep_in == 0u) {
+        return false; // Unknown endpoint: never authorize teardown.
+    }
+    return usb_cdc_tx_wait_final_in(&wait_ops);
+}
+
 static bool cdc_write_response(const char *response, size_t len,
-                               uint32_t response_generation) {
+                               uint32_t response_generation,
+                               bool release_accepted) {
+    cdc_tx_context_t response_ctx = {
+        .generation = response_generation,
+        .tx_completed_before = release_accepted
+                                   ? atomic_load_explicit(
+                                         &s_cdc_tx_completed,
+                                         memory_order_acquire)
+                                   : 0u,
+    };
     usb_cdc_tx_ops_t ops = {
-        .transport_ctx = NULL,
+        .transport_ctx = &response_ctx,
         .session_ctx = &s_session_gate,
         .is_connected = cdc_tx_is_connected,
         .session_is_current = cdc_tx_session_is_current,
@@ -79,6 +211,9 @@ static bool cdc_write_response(const char *response, size_t len,
         .queue_char = cdc_tx_queue_char,
         .flush = cdc_tx_flush,
         .wait = cdc_tx_wait,
+        .await_endpoint = release_accepted
+                              ? cdc_release_await_endpoint : NULL,
+        .endpoint_timeout_ms = CDC_RELEASE_TX_COMPLETE_TIMEOUT_MS,
         .retry_flush_timeout_ms = 20u,
         .final_flush_timeout_ms = 250u,
     };
@@ -207,21 +342,24 @@ static void usb_cdc_worker_task(void *arg) {
                     &s_config, &effect);
                 if (response_len > 0 && s_connected) {
                     response_complete = cdc_write_response(
-                        response, (size_t)response_len, frame_generation);
+                        response, (size_t)response_len, frame_generation,
+                        effect.release_accepted);
                 }
 
                 // End the ordinary command before teardown may be signalled.
                 // The accepted ownership gate remains closed independently.
                 usb_cdc_session_gate_command_end(&s_session_gate);
 
-                if (effect.release_accepted && response_complete &&
-                    s_config.release_response_complete != NULL) {
-                    (void)s_config.release_response_complete(
-                        effect.release_attempt_id, s_config.lifecycle_ctx);
-                }
+                // The production post-command authorization gate is also
+                // executed by the native final-IN/teardown regression.
+                (void)usb_cdc_tx_complete_accepted_release(
+                    effect.release_accepted, response_complete,
+                    effect.release_attempt_id,
+                    s_config.release_response_complete,
+                    s_config.lifecycle_ctx);
 
-                // RELEASE_STORAGE acceptance closes lifecycle admission inside
-                // process_line(), before the success response above is emitted.
+                // Once RELEASE_STORAGE is accepted, no later SET_TIME or other
+                // command can execute in this publication session.
                 if (!cdc_lifecycle_admission_open()) {
                     usb_cdc_protocol_framer_reset(&framer);
                     break;
@@ -229,6 +367,18 @@ static void usb_cdc_worker_task(void *arg) {
             }
         } while (got != 0u);
     }
+}
+
+void usb_cdc_protocol_close_session(void) {
+    // TinyUSB device callbacks must not block or wake the CDC worker into a
+    // transport read while the USB device is detached/reconfiguring. Revoke
+    // transport visibility and invalidate the generation using only local
+    // state/atomics. The recorder coordinator performs the later blocking
+    // reset/drain after MSC proves the fresh host configuration is operational.
+    s_open_requested = false;
+    s_connected = false;
+    s_reset_line = true;
+    usb_cdc_session_gate_close(&s_session_gate);
 }
 
 void usb_cdc_protocol_reset_session(void) {
@@ -258,7 +408,10 @@ void usb_cdc_protocol_open_session(void) {
 }
 
 esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
-    if (config == NULL || config->release_accept == NULL ||
+    if (config == NULL || config->device_id == NULL ||
+        !device_identity_is_valid_uuid(config->device_id) ||
+        config->status_provider == NULL || config->set_time == NULL ||
+        config->release_accept == NULL ||
         config->release_response_complete == NULL ||
         config->command_admission_open == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -304,8 +457,7 @@ esp_err_t usb_cdc_protocol_start(void) {
     }
     s_started = true;
 
-    // HOST_OWNED can race ahead of this late interface start because the
-    // recorder coordinator is intentionally runnable during TinyUSB install.
+    // HOST_OWNED can race ahead of this late interface start.
     open_requested = s_open_requested;
     if (open_requested) {
         usb_cdc_protocol_open_session();
@@ -319,6 +471,7 @@ esp_err_t usb_cdc_protocol_init(const usb_cdc_protocol_config_t *config) {
     (void)config;
     return ESP_ERR_NOT_SUPPORTED;
 }
+void usb_cdc_protocol_close_session(void) {}
 void usb_cdc_protocol_reset_session(void) {}
 void usb_cdc_protocol_open_session(void) {}
 esp_err_t usb_cdc_protocol_start(void) { return ESP_ERR_NOT_SUPPORTED; }

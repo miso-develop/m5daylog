@@ -15,17 +15,21 @@ idf_component_register(
         "i2s_pdm_capture.c"
         "sd_pcm_sink.c"
         "sd_mount.c"
+        "recorder_nvs.c"
         "usb_msc_ownership.c"
         "usb_cdc_protocol_core.c"
         "usb_cdc_session_gate.c"
         "usb_cdc_tx.c"
         "usb_cdc_protocol.c"
+        "rtc_correction_event.c"
+        "rtc_correction.c"
         "shutdown_armed.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
         driver
         esp_adc
+        esp_driver_i2c
         esp_driver_rmt
         esp_timer
         fatfs

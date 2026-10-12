@@ -57,6 +57,7 @@ HARNESS = r"""
     #include <string.h>
 
     #include "nvs.h"
+    #include "recorder_nvs.h"
     #include "shutdown_armed.h"
     #include "task87_wake_recovery.h"
 
@@ -77,6 +78,9 @@ HARNESS = r"""
 
     esp_err_t nvs_flash_init(void) { return ESP_OK; }
     esp_err_t nvs_flash_deinit(void) { return ESP_OK; }
+    esp_err_t recorder_nvs_init(void) { return ESP_OK; }
+    esp_err_t recorder_nvs_lock(void) { return ESP_OK; }
+    void recorder_nvs_unlock(void) {}
     esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle) {
         CHECK(strcmp(name, "m5daylog") == 0);
         (void)mode;

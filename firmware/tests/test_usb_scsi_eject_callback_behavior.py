@@ -2,9 +2,10 @@
 
 Before publication, the first completed MSC TEST UNIT READY is class-binding
 proof and may trigger recorder preparation. After USB ownership is established,
-all SCSI completions, including START STOP UNIT(load_eject=1,start=0), are
-diagnostic-only. D-031 release authority belongs exclusively to canonical CDC
-RELEASE_STORAGE.
+ordinary SCSI completions, including START STOP UNIT(load_eject=1,start=0), do
+not grant storage-release authority. A completed command may only finish the
+CDC fresh-session boundary after a previously observed physical reconnect.
+D-031 release authority belongs exclusively to canonical CDC RELEASE_STORAGE.
 """
 
 from pathlib import Path
@@ -46,6 +47,7 @@ def _build(tmp_path: Path) -> Path:
             #define USB_BIT_ATTACH (1u << 0)
             #define USB_BIT_RELEASE_REQUESTED (1u << 3)
             #define USB_BIT_FAILED (1u << 5)
+            #define USB_BIT_HOST_REATTACHED (1u << 6)
             #define USB_SCSI_CMD_TEST_UNIT_READY 0x00u
             #define USB_SCSI_CMD_START_STOP_UNIT 0x1bu
 
@@ -60,6 +62,7 @@ def _build(tmp_path: Path) -> Path:
             static _Atomic bool s_release_pending = false;
             static volatile bool s_provisional_attached = false;
             static volatile bool s_publish_triggered = true;
+            static volatile bool s_host_session_detached = false;
             static bool g_mounted = false;
             static int g_disconnect_calls;
             static int g_trace_complete_calls;
@@ -119,6 +122,7 @@ def _build(tmp_path: Path) -> Path:
                 s_release_pending = false;
                 s_provisional_attached = false;
                 s_publish_triggered = true;
+                s_host_session_detached = false;
                 g_mounted = false;
                 g_disconnect_calls = 0;
                 g_trace_complete_calls = 0;
