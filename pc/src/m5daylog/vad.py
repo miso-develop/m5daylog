@@ -367,41 +367,68 @@ def _save_success(db: sqlite3.Connection, row: sqlite3.Row, path: Path,
                       last_error=NULL WHERE job_id=?""", (now, "vad:" + row["recording_id"]))
 
 
+
 def run_vad(recording_id: str, *, db_path: str | Path,
             library_root: str | Path | None = None,
             runtime: object | None = None) -> VadResult:
-    """Run one recording. runtime injection is for synthetic deterministic tests."""
+    """Run one recording with OS-held cross-process admission and safe state."""
     if not _UUID.fullmatch(recording_id):
         raise VadError("invalid recording identity")
     root = resolve_library_root(library_root).resolve(strict=True)
     db = sqlite3.connect(str(db_path), timeout=0.1)
     db.row_factory = sqlite3.Row
+    job_id = "vad:" + recording_id
+
+    def fail_safe(exc: Exception) -> None:
+        """Invalidate any previously successful VAD before STT can consume it."""
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            with db:
+                db.execute(
+                    "UPDATE recordings SET vad_status='FAILED' WHERE recording_id=?",
+                    (recording_id,),
+                )
+                db.execute("""INSERT INTO jobs
+                    (job_id,job_type,recording_id,status,attempts,created_at,last_error)
+                    VALUES (?,'VAD',?,'FAILED',0,?,?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                    status='FAILED',last_error=excluded.last_error""",
+                    (job_id, recording_id, now, type(exc).__name__))
+        except sqlite3.Error:
+            pass  # Never cover the original safe failure with logging failure.
+
     try:
         row = db.execute("SELECT * FROM recordings WHERE recording_id=?",
                          (recording_id,)).fetchone()
         if row is None:
             raise VadError("unknown recording")
-        pcm, total, source_sha, resolved = _source(row, root)
         date = _safe_date(row["started_at"])
         out = root.joinpath(*date.split("-"), "vad", recording_id + ".jsonl")
         if not _inside(root, out.parent.resolve(strict=False)):
             raise VadError("VAD output path escapes library")
-        model_runtime = runtime if runtime is not None else SileroCPU()
-        model = metadata(model_runtime)
-        if (model["package_version"] != "6.2.3"
-                or model["runtime_version"] != "1.30.0"
-                or not _SHA.fullmatch(model["model_sha256"])):
-            raise VadError("invalid VAD runtime identity")
-        version = fingerprint(model)
         with _recording_lock(out.with_suffix(".lock")):
+            try:
+                pcm, total, source_sha, resolved = _source(row, root)
+                model_runtime = runtime if runtime is not None else SileroCPU()
+                model = metadata(model_runtime)
+                if (model["package_version"] != "6.2.3"
+                        or model["runtime_version"] != "1.30.0"
+                        or not _SHA.fullmatch(model["model_sha256"])):
+                    raise VadError("invalid VAD runtime identity")
+                version = fingerprint(model)
+            except Exception as exc:
+                fail_safe(exc)
+                raise
+
             existing = db.execute("SELECT * FROM artifacts WHERE artifact_id=?",
-                                  ("vad:" + recording_id,)).fetchone()
+                                  (job_id,)).fetchone()
             valid = None
             if out.is_file() and not out.is_symlink():
                 try:
                     data = out.read_bytes()
-                    valid = (validate_jsonl(data, recording_id, source_sha, version, total),
-                             hashlib.sha256(data).hexdigest())
+                    valid = (validate_jsonl(
+                        data, recording_id, source_sha, version, total),
+                        hashlib.sha256(data).hexdigest())
                 except VadError:
                     valid = None
             if (valid is not None and existing is not None
@@ -412,7 +439,6 @@ def run_vad(recording_id: str, *, db_path: str | Path,
                     and existing["producer_version"] == version):
                 return VadResult("SKIPPED", valid[0], valid[1])
 
-            job_id = "vad:" + recording_id
             started = datetime.now(timezone.utc).isoformat()
             with db:
                 db.execute("""INSERT INTO jobs
@@ -439,14 +465,7 @@ def run_vad(recording_id: str, *, db_path: str | Path,
                 _save_success(db, row, out, digest, version)
                 return VadResult("SUCCEEDED", len(ranges), digest)
             except Exception as exc:
-                try:
-                    with db:
-                        db.execute("UPDATE recordings SET vad_status='FAILED' WHERE recording_id=?",
-                                   (recording_id,))
-                        db.execute("UPDATE jobs SET status='FAILED',last_error=? WHERE job_id=?",
-                                   (type(exc).__name__, job_id))
-                except sqlite3.Error:
-                    pass
+                fail_safe(exc)
                 raise
     finally:
         db.close()
