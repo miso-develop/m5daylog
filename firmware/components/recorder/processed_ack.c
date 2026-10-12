@@ -60,9 +60,13 @@ static int read_bounded(const char *path, size_t max_len, char **out,
         return -1;
     }
     got = fread(buf, 1u, (size_t)st.st_size, fp);
-    if (ferror(fp) || got != (size_t)st.st_size || fclose(fp) != 0) {
-        free(buf);
-        return -1;
+    {
+        bool complete = !ferror(fp) && got == (size_t)st.st_size;
+        int closed = fclose(fp);
+        if (!complete || closed != 0) {
+            free(buf);
+            return -1;
+        }
     }
     buf[got] = '\0';
     *out = buf;
@@ -416,7 +420,7 @@ bool processed_ack_apply_manual_wake(const char *device_id,
         if (out != NULL) *out = stats;
         return true;
     }
-    ack = cJSON_ParseWithLength(ack_doc, ack_len);
+    ack = cJSON_ParseWithLengthOpts(ack_doc, ack_len, NULL, true);
     free(ack_doc);
     ack_doc = NULL;
     if (ack == NULL || !valid_ack(ack, device_id)) {
@@ -431,7 +435,7 @@ bool processed_ack_apply_manual_wake(const char *device_id,
         diagnostic("manifest-read-error", &stats);
         goto done;
     }
-    manifest = cJSON_ParseWithLength(man_doc, man_len);
+    manifest = cJSON_ParseWithLengthOpts(man_doc, man_len, NULL, true);
     free(man_doc);
     man_doc = NULL;
     entries = manifest_recordings(manifest, device_id);
