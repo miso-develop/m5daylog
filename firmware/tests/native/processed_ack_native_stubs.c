@@ -38,6 +38,9 @@ bool ack_test_state_commit(const char *id) {
 }
 void ack_test_fail_state_commit(int v) { s_fail_state_commit = v; }
 
+static unsigned s_usage_percent = 101u;
+unsigned ack_test_usage_percent(void) { return s_usage_percent; }
+void ack_test_set_usage_percent(unsigned v) { s_usage_percent = v; }
 static int s_sd_mounted = 1;
 static int s_fail_fsync = 0;
 static int s_fail_open = 0;
@@ -67,6 +70,7 @@ void ack_test_reset_faults(void) {
     s_sd_mounted = 1;
     s_internal_count = 0u;
     s_fail_state_commit = 0;
+    s_usage_percent = 101u;
 }
 bool sd_mount_is_mounted(void) { return s_sd_mounted != 0; }
 
