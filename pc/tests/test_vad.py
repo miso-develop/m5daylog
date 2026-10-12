@@ -186,6 +186,18 @@ class VadCase(unittest.TestCase):
         with self.assertRaises(VadError):
             self.execute()
 
+    def test_manifest_duration_mismatch_is_rejected(self):
+        self.con.execute("UPDATE recordings SET duration_ms=10000")
+        self.con.commit()
+        with self.assertRaisesRegex(VadError, "duration mismatch"):
+            self.execute()
+        self.assertEqual(self.runtime.calls, 0)
+
+    def test_manifest_duration_one_ms_rounding_is_accepted(self):
+        self.con.execute("UPDATE recordings SET duration_ms=1001")
+        self.con.commit()
+        self.assertEqual(self.execute().status, "SUCCEEDED")
+
     def test_non_synced_rejected(self):
         self.con.execute("UPDATE recordings SET sync_status='CONFLICT'")
         self.con.commit()
