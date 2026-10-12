@@ -73,7 +73,7 @@ sync, then seals ordinary MSC/CDC I/O and invokes the canonical host release:
 
 \`\`\`powershell
 cd pc
-uv run m5daylog sync-release F:\\ --cdc-port COM5
+uv run m5daylog sync-release F:\ --cdc-port COM5
 \`\`\`
 
 **Safety:** This command requests the Device to terminate its USB MSC/CDC
