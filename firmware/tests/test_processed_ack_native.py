@@ -229,7 +229,9 @@ def test_marker_mirror_failure_does_not_block_durable_ack(native_ack, card, fail
     assert ok and stats.applied == 1 and not marker(card).exists()
     if fail in ("fsync", "rename"):
         assert getattr(native_ack, "ack_test_" + fail + "_calls")() >= 1
-    native_ack.ack_test_reset_faults()
+    # Only clear the injected I/O fault: reset_faults() also clears the
+    # synthetic NVS ledger, which would invalidate this reboot/replay test.
+    getattr(native_ack, "ack_test_fail_" + fail)(0)
     ok, stats = invoke(native_ack, card)
     assert ok and stats.applied == 0 and stats.already_applied == 1
     # Replaying ACK never needs the optional mirror to be repaired.
