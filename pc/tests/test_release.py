@@ -276,7 +276,7 @@ class WindowsAdapterTests(unittest.TestCase):
         scenarios = [
             ((8, 9), [DiskInterface(8, "a", "b", TARGET.usb_physical_instance_id)]),
             ((8,), []),
-            ((8,), [DiskInterface(8, "a", "b"), DiskInterface(8, "c", "d", TARGET.usb_physical_instance_id)]),
+            ((8,), [DiskInterface(8, "a", "b", TARGET.usb_physical_instance_id), DiskInterface(8, "c", "d", TARGET.usb_physical_instance_id)]),
             ((8,), [DiskInterface(8, "a", None, TARGET.usb_physical_instance_id)]),
         ]
         for extents, interfaces in scenarios:
