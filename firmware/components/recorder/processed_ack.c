@@ -408,11 +408,6 @@ bool processed_ack_apply_manual_wake(const char *device_id,
         return false;
     }
     ack_read = read_bounded(ACK_FILE, ACK_MAX_BYTES, &ack_doc, &ack_len);
-    if (ack_read == 0) {
-        // Never consume .tmp: only the canonical final is authoritative.
-        diagnostic("absent", &stats);
-        return true;
-    }
     if (ack_read < 0) {
         // Oversize/unreadable files are invalid/untrusted: apply no IDs.
         stats.invalid_payloads = 1;
@@ -420,15 +415,20 @@ bool processed_ack_apply_manual_wake(const char *device_id,
         if (out != NULL) *out = stats;
         return true;
     }
-    ack = cJSON_ParseWithLengthOpts(ack_doc, ack_len, NULL, true);
-    free(ack_doc);
-    ack_doc = NULL;
-    if (ack == NULL || !valid_ack(ack, device_id)) {
-        stats.invalid_payloads = 1;
-        diagnostic("invalid-payload", &stats);
-        ok = true;  // invalid ACK does not prevent new raw recording
-        goto done;
+    if (ack_read > 0) {
+        ack = cJSON_ParseWithLengthOpts(ack_doc, ack_len, NULL, true);
+        free(ack_doc);
+        ack_doc = NULL;
+        if (ack == NULL || !valid_ack(ack, device_id)) {
+            stats.invalid_payloads = 1;
+            diagnostic("invalid-payload", &stats);
+            ok = true;  // invalid ACK does not prevent new raw recording
+            goto done;
+        }
     }
+    // An absent authoritative ACK is normal. Still re-evaluate durable
+    // processed markers during each manual-WAKE recovery, not only on ACK
+    // delivery boots. The non-authoritative .tmp is never read.
     man_read = read_bounded(RECORDER_MANIFEST_PATH,
                             RECORDER_MANIFEST_MAX_BYTES, &man_doc, &man_len);
     if (man_read != 1) {
@@ -443,12 +443,13 @@ bool processed_ack_apply_manual_wake(const char *device_id,
         diagnostic("invalid-manifest", &stats);
         goto done;
     }
-    if (!ensure_marker_dir()) {
+    if (ack != NULL && !ensure_marker_dir()) {
         diagnostic("marker-directory-error", &stats);
         goto done;
     }
-    ids = cJSON_GetObjectItemCaseSensitive(ack, "recordingIds");
-    for (i = 0; i < cJSON_GetArraySize(ids); ++i) {
+    ids = ack != NULL ?
+          cJSON_GetObjectItemCaseSensitive(ack, "recordingIds") : NULL;
+    for (i = 0; ids != NULL && i < cJSON_GetArraySize(ids); ++i) {
         const cJSON *item = cJSON_GetArrayItem(ids, i);
         const char *id = item->valuestring;
         int prior;
@@ -468,7 +469,7 @@ bool processed_ack_apply_manual_wake(const char *device_id,
         stats.applied++;
     }
     report_retention(entries, &stats);
-    diagnostic("ok", &stats);
+    diagnostic(ack_read == 0 ? "absent" : "ok", &stats);
     ok = true;
 done:
     free(man_doc);
