@@ -24,6 +24,8 @@
 #ifdef ESP_PLATFORM
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
+#include "nvs.h"
+#include "recorder_nvs.h"
 #define ACK_LOGW(...) ESP_LOGW("processed_ack", __VA_ARGS__)
 #else
 #define ACK_LOGW(...) ((void)0)
@@ -392,6 +394,92 @@ static bool marker_path(const char *id, const char *suffix,
     return n > 0 && (size_t)n < out_size;
 }
 
+// MSC exports the whole microSD volume to the host. An .applied marker on
+// that volume is therefore NEVER trustworthy as Device-applied evidence.
+// Default NVS (not on MSC) is the authoritative, per-recording apply ledger.
+// A prefix-derived NVS key is merely an index; the stored full UUID must
+// match byte-for-byte. Any prefix collision or malformed value fails closed.
+// NVS capacity exhaustion likewise fails closed, never permits raw deletion.
+static bool processed_state_key(const char *id, char key[16]) {
+    int n;
+    if (!device_identity_is_valid_uuid(id)) return false;
+    n = snprintf(key, 16u, "p%.8s%.4s%.2s", id, id + 9, id + 14);
+    return n == 15;
+}
+
+#ifdef ESP_PLATFORM
+static int processed_state_status_locked(nvs_handle_t handle,
+                                         const char *key, const char *id) {
+    char stored[RECORDER_UUID_STR_LEN] = {0};
+    size_t len = sizeof(stored);
+    esp_err_t err = nvs_get_str(handle, key, stored, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return 0;
+    if (err != ESP_OK || len != sizeof(stored) ||
+        memcmp(stored, id, RECORDER_UUID_STR_LEN - 1u) != 0 ||
+        stored[RECORDER_UUID_STR_LEN - 1u] != '\0') {
+        return -1;
+    }
+    return 1;
+}
+
+static int processed_state_status(const char *id) {
+    char key[16];
+    nvs_handle_t handle = 0;
+    esp_err_t err;
+    int status = -1;
+    if (!processed_state_key(id, key) ||
+        recorder_nvs_lock() != ESP_OK) return -1;
+    err = nvs_open("processed_ack", NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        status = 0;
+    } else if (err == ESP_OK) {
+        status = processed_state_status_locked(handle, key, id);
+        nvs_close(handle);
+    }
+    recorder_nvs_unlock();
+    return status;
+}
+
+static bool processed_state_commit(const char *id) {
+    char key[16];
+    nvs_handle_t handle = 0;
+    esp_err_t err;
+    int status;
+    bool ok = false;
+    if (!processed_state_key(id, key) ||
+        recorder_nvs_lock() != ESP_OK) return false;
+    err = nvs_open("processed_ack", NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        status = processed_state_status_locked(handle, key, id);
+        if (status == 1) {
+            ok = true;
+        } else if (status == 0) {
+            // The irreversible processed transition becomes authoritative
+            // only after the NVS commit succeeds. A crash before commit
+            // leaves the ACK retryable; a crash after commit is idempotent.
+            ok = nvs_set_str(handle, key, id) == ESP_OK &&
+                 nvs_commit(handle) == ESP_OK;
+        }
+        nvs_close(handle);
+    }
+    recorder_nvs_unlock();
+    return ok;
+}
+#else
+// Host-only NVS model lives in the native stub and is intentionally separate
+// from the host-writable fake SD marker directory.
+extern int ack_test_state_status(const char *id);
+extern bool ack_test_state_commit(const char *id);
+static int processed_state_status(const char *id) {
+    char key[16];
+    return processed_state_key(id, key) ? ack_test_state_status(id) : -1;
+}
+static bool processed_state_commit(const char *id) {
+    char key[16];
+    return processed_state_key(id, key) && ack_test_state_commit(id);
+}
+#endif
+
 // 0 absent, 1 valid, -1 corrupt/I/O failure. Corrupt markers are never
 // overwritten or interpreted as processed; the caller fails closed.
 static int marker_status(const char *id) {
@@ -468,7 +556,7 @@ static unsigned device_usage_percent(void) {
 #endif
 }
 
-static void report_retention(const cJSON *entries, processed_ack_stats_t *s) {
+static bool report_retention(const cJSON *entries, processed_ack_stats_t *s) {
     const cJSON *entry;
     const unsigned usage = device_usage_percent();
     const time_t now = time(NULL);
@@ -479,16 +567,20 @@ static void report_retention(const cJSON *entries, processed_ack_stats_t *s) {
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(entry, "recordingId");
         const cJSON *started = cJSON_GetObjectItemCaseSensitive(entry, "startedAt");
         int64_t stamp = -1;
-        if (!cJSON_IsString(id) || marker_status(id->valuestring) != 1 ||
-            !cJSON_IsString(started) ||
+        int applied_state;
+        if (!cJSON_IsString(id) || !cJSON_IsString(started) ||
             !timestamp_epoch(started->valuestring, &stamp)) {
             continue;
         }
+        applied_state = processed_state_status(id->valuestring);
+        if (applied_state < 0) return false;
+        if (applied_state == 0) continue;
         if (processed_ack_retention_eligible(
                 true, stamp, (int64_t)now, usage)) {
             s->retention_candidates++;
         }
     }
+    return true;
 }
 
 bool processed_ack_apply_manual_wake(const char *device_id,
@@ -557,18 +649,22 @@ bool processed_ack_apply_manual_wake(const char *device_id,
             stats.unknown_ids++;
             continue;
         }
-        prior = marker_status(id);
+        prior = processed_state_status(id);
         if (prior == 1) {
             stats.already_applied++;
             continue;
         }
-        if (prior != 0 || !commit_marker(id)) {
+        if (prior != 0 || !commit_marker(id) ||
+            !processed_state_commit(id)) {
             diagnostic("marker-commit-error", &stats);
             goto done;
         }
         stats.applied++;
     }
-    report_retention(entries, &stats);
+    if (!report_retention(entries, &stats)) {
+        diagnostic("processed-state-read-error", &stats);
+        goto done;
+    }
     diagnostic(ack_read == 0 ? "absent" : "ok", &stats);
     ok = true;
 done:
