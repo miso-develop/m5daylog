@@ -399,7 +399,8 @@ static bool marker_path(const char *id, const char *suffix,
 // Default NVS (not on MSC) is the authoritative, per-recording apply ledger.
 // A prefix-derived NVS key is merely an index; the stored full UUID must
 // match byte-for-byte. Any prefix collision or malformed value fails closed.
-// NVS capacity exhaustion likewise fails closed, never permits raw deletion.
+// NVS capacity exhaustion remains a bounded-state issue (Review F4):
+// no processed proof or raw-deletion authority may be fabricated.
 static bool processed_state_key(const char *id, char key[16]) {
     int n;
     if (!device_identity_is_valid_uuid(id)) return false;
@@ -480,8 +481,8 @@ static bool processed_state_commit(const char *id) {
 }
 #endif
 
-// 0 absent, 1 valid, -1 corrupt/I/O failure. Corrupt markers are never
-// overwritten or interpreted as processed; the caller fails closed.
+// 0 absent, 1 valid, -1 corrupt/I/O failure. This host-writable mirror
+// never grants authority, and errors cannot veto a Device-owned NVS commit.
 static int marker_status(const char *id) {
     char path[RECORDER_MAX_PATH_LEN], *doc = NULL;
     size_t len = 0;
@@ -636,10 +637,8 @@ bool processed_ack_apply_manual_wake(const char *device_id,
         diagnostic("invalid-manifest", &stats);
         goto done;
     }
-    if (ack != NULL && !ensure_marker_dir()) {
-        diagnostic("marker-directory-error", &stats);
-        goto done;
-    }
+    // The host-writable SD marker directory is diagnostic only. It must
+    // never gate NVS authority or prevent a fresh recording.
     ids = ack != NULL ?
           cJSON_GetObjectItemCaseSensitive(ack, "recordingIds") : NULL;
     for (i = 0; ids != NULL && i < cJSON_GetArraySize(ids); ++i) {
@@ -655,12 +654,17 @@ bool processed_ack_apply_manual_wake(const char *device_id,
             stats.already_applied++;
             continue;
         }
-        if (prior != 0 || !commit_marker(id) ||
-            !processed_state_commit(id)) {
-            diagnostic("marker-commit-error", &stats);
+        if (prior != 0 || !processed_state_commit(id)) {
+            diagnostic("processed-state-commit-error", &stats);
             goto done;
         }
         stats.applied++;
+        // Publish only after NVS is durable. On a corrupt/unwritable
+        // host-owned diagnostic mirror, preserve the source bytes and
+        // continue recording; this mirror confers no retention authority.
+        if (!ensure_marker_dir() || !commit_marker(id)) {
+            diagnostic("marker-mirror-error", &stats);
+        }
     }
     if (!report_retention(entries, &stats)) {
         diagnostic("processed-state-read-error", &stats);
