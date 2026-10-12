@@ -73,7 +73,7 @@ def native_ack(tmp_path_factory):
     for name in ("ack_test_set_mounted", "ack_test_fail_fsync",
                  "ack_test_fail_rename", "ack_test_fail_open",
                  "ack_test_fail_write", "ack_test_fail_flush",
-                 "ack_test_fail_close"):
+                 "ack_test_fail_close", "ack_test_fail_state_commit"):
         getattr(lib, name).argtypes = [ctypes.c_int]
     lib.ack_test_fsync_calls.restype = ctypes.c_int
     lib.ack_test_rename_calls.restype = ctypes.c_int
@@ -230,6 +230,46 @@ def test_marker_commit_failure_then_retry(native_ack, card, fail):
     native_ack.ack_test_reset_faults()
     ok, stats = invoke(native_ack, card)
     assert ok and stats.applied == 1 and marker(card).exists()
+
+
+
+def test_host_forged_marker_does_not_confer_device_applied_state(native_ack, card):
+    # USB hosts can write this file without delivering a valid ACK.
+    marker(card).write_bytes(ACK_ID.encode() + b"\n")
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.applied == 0 and stats.already_applied == 0
+    assert stats.retention_candidates == 0
+    # A later valid ACK is a new Device transition, not a replay.
+    (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.applied == 1 and stats.already_applied == 0
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.applied == 0 and stats.already_applied == 1
+
+
+def test_nvs_commit_failure_never_authorizes_retention(native_ack, card):
+    (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
+    native_ack.ack_test_fail_state_commit(1)
+    ok, stats = invoke(native_ack, card)
+    assert not ok and stats.applied == 0
+    assert marker(card).exists()  # SD mirror is NOT authoritative
+    native_ack.ack_test_fail_state_commit(0)
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.applied == 1
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.applied == 0 and stats.already_applied == 1
+
+
+def test_nvs_state_survives_lost_sd_marker_and_ack(native_ack, card):
+    (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.applied == 1
+    marker(card).unlink()  # host may erase whole MSC-owned mirror
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.applied == 0 and stats.already_applied == 1
+    (card / "acks/processed.json").unlink()
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.applied == 0 and stats.invalid_payloads == 0
 
 
 def test_corrupt_marker_fails_closed_without_replacement(native_ack, card):
