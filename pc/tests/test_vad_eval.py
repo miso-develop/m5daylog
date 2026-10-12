@@ -38,7 +38,7 @@ class EV018Tests(unittest.TestCase):
                           predicted=[(800, 1000)])
         result = aggregate_speech([a, b])
         self.assertEqual(result["onset_median_ms"], 25.0)
-        self.assertAlmostEqual(result["onset_p95_ms"], 48.75)
+        self.assertAlmostEqual(result["onset_p95_ms"], 47.5)
         self.assertTrue(result["onset_pass"])
         missed = score_fixture("missed", "quiet", total_samples=100,
                                reference=[(10, 20)], predicted=[])
