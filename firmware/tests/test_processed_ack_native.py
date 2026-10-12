@@ -62,7 +62,6 @@ def native_ack(tmp_path_factory):
     else:
         args.append(str(ROOT / "firmware/tests/native/processed_ack_cjson_test_shim.c"))
     args.extend(["-o", str(so)])
-    ]
     subprocess.run(args, check=True, capture_output=True, text=True)
     lib = ctypes.CDLL(str(so))
     lib.processed_ack_apply_manual_wake.argtypes = [
