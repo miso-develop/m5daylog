@@ -72,6 +72,9 @@ def test_ack_preflight_checks_and_safe_unknown_handling():
     source = SRC.read_text(encoding="utf-8")
     assert "valid_ack(ack, device_id)" in source
     assert "manifest_recordings(manifest, device_id)" in source
+    assert "valid_manifest_entry(a)" in source
+    assert "device_manifest_extract_recording_id(" in source
+    assert "device_manifest_is_valid_sha256_hex(" in source
     assert "device_identity_is_valid_uuid(r->valuestring)" in source
     assert "only_unique_keys(ack)" in source
     assert "lookup_record(entries, id) == NULL" in source
