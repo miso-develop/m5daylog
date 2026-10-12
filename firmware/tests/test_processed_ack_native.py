@@ -173,26 +173,17 @@ def test_decoded_unicode_nul_ack_rejects_full_payload(native_ack, card, field):
     """Escaped JSON U+0000 must not hide a bad suffix from cJSON C strings."""
     payload = json.loads(ack_json())
     if field == "recordingId":
-        payload["recordingIds"] = [ACK_ID + "\\u0000not-a-uuid"]
-    elif field == "deviceId":
-        payload["deviceId"] = DEVICE_ID + "\\u0000foreign"
-    else:
-        payload["processedAt"] += "\\u0000garbage"
-    # Turn the literal six-character escape into a decoded NUL, then
-    # serialize it to the actual JSON backslash-u escape sequence.
-    if field == "recordingId":
-        payload["recordingIds"][0] = ACK_ID + chr(0) + "not-a-uuid"
+        payload["recordingIds"] = [ACK_ID + chr(0) + "not-a-uuid"]
     elif field == "deviceId":
         payload["deviceId"] = DEVICE_ID + chr(0) + "foreign"
     else:
         payload["processedAt"] = "2026-10-12T12:00:00Z" + chr(0) + "garbage"
     serialized = json.dumps(payload)
-    assert "\\\\u0000" in serialized
+    assert r"\\u0000" in serialized
     (card / "acks/processed.json").write_text(serialized, encoding="utf-8")
     ok, stats = invoke(native_ack, card)
     assert ok and stats.invalid_payloads == 1 and stats.applied == 0
     assert not marker(card).exists()
-
 
 def test_decoded_unicode_nul_manifest_rejects_before_apply(native_ack, card):
     (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
