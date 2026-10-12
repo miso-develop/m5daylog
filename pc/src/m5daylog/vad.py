@@ -232,13 +232,16 @@ def _artifact_bytes(row: sqlite3.Row, model: dict, version: str,
     return ("\n".join(canonical_json(item) for item in records) + "\n").encode("utf-8")
 
 
-def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str) -> int:
+def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str,
+                  total_samples: int | None = None) -> int:
     try:
         if not data.endswith(b"\n"):
             raise ValueError("missing newline")
         lines = data.decode("utf-8").splitlines()
         records = [json.loads(line) for line in lines]
         head = records[0]
+        if not isinstance(head, dict):
+            raise ValueError("bad metadata")
         if (head.get("type") != "meta" or head.get("schema_version") != 1
                 or head.get("recording_id") != rid
                 or head.get("source_sha256") != source_sha
@@ -248,7 +251,8 @@ def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str) -> int:
                 or type(head.get("total_samples")) is not int):
             raise ValueError("bad meta identity")
         n = head["total_samples"]
-        if n < 0 or any(canonical_json(record) != line for record, line in zip(records, lines)):
+        if ((total_samples is not None and n != total_samples) or n < 0
+                or any(canonical_json(record) != line for record, line in zip(records, lines))):
             raise ValueError("noncanonical JSONL")
         previous_end = -1
         for i, obj in enumerate(records[1:]):
@@ -261,7 +265,7 @@ def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str) -> int:
                 raise ValueError("invalid speech range")
             previous_end = b
         return len(records) - 1
-    except (ValueError, KeyError, TypeError, IndexError, UnicodeError, json.JSONDecodeError):
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError, UnicodeError, json.JSONDecodeError):
         raise VadError("invalid VAD artifact") from None
 
 
@@ -283,7 +287,8 @@ def _recording_lock(path: Path):
         if os.name == "nt":
             import msvcrt
             os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, b"\0")
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
             os.lseek(fd, 0, os.SEEK_SET)
             try:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -386,7 +391,7 @@ def run_vad(recording_id: str, *, db_path: str | Path,
             if out.is_file() and not out.is_symlink():
                 try:
                     data = out.read_bytes()
-                    valid = (validate_jsonl(data, recording_id, source_sha, version),
+                    valid = (validate_jsonl(data, recording_id, source_sha, version, total),
                              hashlib.sha256(data).hexdigest())
                 except VadError:
                     valid = None
