@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
 
 from . import __version__
@@ -74,11 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_init(db_arg: str | None, data_dir_arg: str | None) -> int:
+    # Raw tracebacks can contain host-local paths; diagnostics must not echo them.
     try:
         db_path = resolve_db_path(explicit_db=db_arg, data_dir=data_dir_arg)
         init_db(db_path)
         tables = list_tables(db_path)
-    except (OSError, sqlite3.Error) as exc:
+    except Exception as exc:
         print(f"error: init failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print("initialized: ok")
@@ -93,7 +93,7 @@ def cmd_init(db_arg: str | None, data_dir_arg: str | None) -> int:
 def cmd_device(device_root: str, contracts_dir: str | None) -> int:
     try:
         device = inspect_device(device_root, contracts_dir=contracts_dir)
-    except (ContractValidationError, SyncValidationError, OSError) as exc:
+    except Exception as exc:
         print(f"error: device validation failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(f"device: recognized=1 model={device['model']} device_id={device['deviceId']}")
@@ -116,13 +116,7 @@ def cmd_sync(
             db_path=db_path,
             contracts_dir=contracts_dir,
         )
-    except (
-        ContractValidationError,
-        SyncValidationError,
-        IntegrityError,
-        OSError,
-        sqlite3.Error,
-    ) as exc:
+    except Exception as exc:
         print(f"error: sync failed: {type(exc).__name__}", file=sys.stderr)
         return 1
 
