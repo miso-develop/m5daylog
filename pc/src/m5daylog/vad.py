@@ -154,7 +154,7 @@ def normalize_ranges(raw: list[dict], total_samples: int) -> list[tuple[int, int
 
 def _safe_date(started_at: str) -> str:
     try:
-        parsed = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(started_at[:-1] + "+00:00" if started_at.endswith(("Z", "z")) else started_at)
     except (ValueError, AttributeError):
         raise VadError("invalid started_at") from None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
@@ -220,6 +220,12 @@ def _artifact_bytes(row: sqlite3.Row, model: dict, version: str,
             "speech_pad_ms": PARAMS["speech_pad_ms"],
             "window_size_samples": PARAMS["window_size_samples"],
             "merge_gap_samples": 0,
+            "max_speech_duration_s": "inf",
+            "sampling_rate": SAMPLE_RATE,
+            "return_seconds": False,
+            "min_silence_at_max_speech": PARAMS["min_silence_at_max_speech"],
+            "use_max_poss_sil_at_max_speech": PARAMS["use_max_poss_sil_at_max_speech"],
+            "time_resolution": PARAMS["time_resolution"],
         },
     }
     records = [meta]
@@ -245,6 +251,9 @@ def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str,
         if (head.get("type") != "meta" or head.get("schema_version") != 1
                 or head.get("recording_id") != rid
                 or head.get("source_sha256") != source_sha
+                or not isinstance(head.get("model"), dict)
+                or not isinstance(head.get("params"), dict)
+                or head.get("started_at") is None
                 or head.get("producer") != PRODUCER
                 or head.get("producer_version") != version
                 or head.get("sample_rate") != SAMPLE_RATE
