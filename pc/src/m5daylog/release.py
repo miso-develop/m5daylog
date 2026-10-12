@@ -161,6 +161,7 @@ class EjectTarget:
     disk_number: int
     disk_instance_id: str
     eject_instance_id: str
+    usb_physical_instance_id: str
 
 
 @dataclass(frozen=True)
@@ -189,10 +190,10 @@ class LockedVolume(Protocol):
 
 class HostReleasePort(Protocol):
     def resolve_target(self, mount_root: str, expected_device_id: str) -> EjectTarget: ...
-    def revalidate_target(self, target: EjectTarget) -> None: ...
+    def revalidate_target(self, target: EjectTarget, cdc_port: str) -> None: ...
     def volume_available(self, target: EjectTarget) -> bool: ...
     def quiesce(self, target: EjectTarget) -> LockedVolume: ...
-    def release_storage(self, cdc_port: str, attempt_id: str) -> None: ...
+    def release_storage(self, cdc_port: str, attempt_id: str, target: EjectTarget) -> None: ...
     def volume_disappeared(self, target: EjectTarget) -> bool: ...
 
 
@@ -251,7 +252,7 @@ class SyncReleaseCoordinator:
                     cdc_mutations()
 
             target = self.port.resolve_target(mount_root, expected_id)
-            self.port.revalidate_target(target)
+            self.port.revalidate_target(target, cdc_port)
             if not self.port.volume_available(target):
                 raise AlreadyRemoved("exact volume absent before release")
 
@@ -261,7 +262,7 @@ class SyncReleaseCoordinator:
                 # Lock stays held until response and disappearance observation.
                 with self.port.quiesce(target):
                     gate.host_quiesced()
-                    self.port.release_storage(cdc_port, attempt_id)
+                    self.port.release_storage(cdc_port, attempt_id, target)
                     gate.accepted()
                     deadline = self.clock() + self.timeout_s
                     while True:
