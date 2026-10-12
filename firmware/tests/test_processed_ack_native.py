@@ -167,6 +167,44 @@ def test_invalid_payload_applies_no_id(native_ack, card, payload):
     assert not marker(card).exists()
 
 
+
+@pytest.mark.parametrize("field", ["recordingId", "deviceId", "processedAt"])
+def test_decoded_unicode_nul_ack_rejects_full_payload(native_ack, card, field):
+    """Escaped JSON U+0000 must not hide a bad suffix from cJSON C strings."""
+    payload = json.loads(ack_json())
+    if field == "recordingId":
+        payload["recordingIds"] = [ACK_ID + "\\u0000not-a-uuid"]
+    elif field == "deviceId":
+        payload["deviceId"] = DEVICE_ID + "\\u0000foreign"
+    else:
+        payload["processedAt"] += "\\u0000garbage"
+    # Turn the literal six-character escape into a decoded NUL, then
+    # serialize it to the actual JSON backslash-u escape sequence.
+    if field == "recordingId":
+        payload["recordingIds"][0] = ACK_ID + chr(0) + "not-a-uuid"
+    elif field == "deviceId":
+        payload["deviceId"] = DEVICE_ID + chr(0) + "foreign"
+    else:
+        payload["processedAt"] = "2026-10-12T12:00:00Z" + chr(0) + "garbage"
+    serialized = json.dumps(payload)
+    assert "\\\\u0000" in serialized
+    (card / "acks/processed.json").write_text(serialized, encoding="utf-8")
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.invalid_payloads == 1 and stats.applied == 0
+    assert not marker(card).exists()
+
+
+def test_decoded_unicode_nul_manifest_rejects_before_apply(native_ack, card):
+    (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
+    path = card / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["recordings"][0]["recordingId"] = ACK_ID + chr(0) + "foreign"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    ok, stats = invoke(native_ack, card)
+    assert not ok and stats.applied == 0
+    assert not marker(card).exists()
+
+
 def test_embedded_nul_and_nonfinal_tmp_are_ignored(native_ack, card):
     (card / "acks/processed.json.tmp").write_text(ack_json(), encoding="utf-8")
     ok, stats = invoke(native_ack, card)
