@@ -32,8 +32,20 @@
 #define ACK_MAX_BYTES (128u * 1024u)
 #define ACK_MAX_IDS 1024u
 #define ACK_MARKER_BYTES (RECORDER_UUID_STR_LEN)
+// Test overrides affect only a host-compiled sandbox. Production builds
+// always use the canonical recorder paths from recorder_config.h.
+#ifndef ACK_FILE
 #define ACK_FILE RECORDER_M5DAYLOG_DIR "/acks/processed.json"
+#endif
+#ifndef ACK_MARKER_DIR
 #define ACK_MARKER_DIR RECORDER_M5DAYLOG_DIR "/processed-state"
+#endif
+#ifndef ACK_MANIFEST_PATH
+#define ACK_MANIFEST_PATH RECORDER_MANIFEST_PATH
+#endif
+#ifndef ACK_EVENTS_PATH
+#define ACK_EVENTS_PATH RECORDER_EVENTS_PATH
+#endif
 
 // Absence is legitimate; all other read errors fail closed.
 static int read_bounded(const char *path, size_t max_len, char **out,
@@ -85,7 +97,7 @@ static void diagnostic(const char *result, const processed_ack_stats_t *s) {
     FILE *fp;
     // Fixed internal diagnostic result identifiers only; neither untrusted
     // JSON nor any raw recording/audio content is ever copied into events.
-    fp = fopen(RECORDER_EVENTS_PATH, "ab");
+    fp = fopen(ACK_EVENTS_PATH, "ab");
     if (fp != NULL) {
         (void)fprintf(fp,
                       "{\"type\":\"processed_ack\",\"result\":\"%s\","
@@ -491,7 +503,7 @@ bool processed_ack_apply_manual_wake(const char *device_id,
     // An absent authoritative ACK is normal. Still re-evaluate durable
     // processed markers during each manual-WAKE recovery, not only on ACK
     // delivery boots. The non-authoritative .tmp is never read.
-    man_read = read_bounded(RECORDER_MANIFEST_PATH,
+    man_read = read_bounded(ACK_MANIFEST_PATH,
                             RECORDER_MANIFEST_MAX_BYTES, &man_doc, &man_len);
     if (man_read != 1) {
         diagnostic("manifest-read-error", &stats);
