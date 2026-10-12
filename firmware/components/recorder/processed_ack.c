@@ -552,7 +552,8 @@ static unsigned device_usage_percent(void) {
     }
     return (unsigned)((total - free_bytes) * 100u / total);
 #else
-    return 101u;
+    extern unsigned ack_test_usage_percent(void);
+    return ack_test_usage_percent();
 #endif
 }
 
