@@ -18,6 +18,7 @@ from m5daylog.windows_release import DiskInterface, WindowsHostReleasePort
 TARGET = EjectTarget(
     "test-device", "E:\\", "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\",
     8, "USBSTOR\\DISK&VEN_TEST", "USB\\VID_TEST",
+    "USB\\VID_303A&PID_4001\\TEST",
 )
 
 
@@ -46,7 +47,7 @@ class FakePort:
             raise WrongTarget("target changed")
         return TARGET
 
-    def revalidate_target(self, target):
+    def revalidate_target(self, target, cdc_port):
         self.steps.append("revalidate")
         if self.failure == "revalidate":
             raise WrongTarget("device changed")
@@ -70,7 +71,7 @@ class FakePort:
         finally:
             self.steps.append("unlock")
 
-    def release_storage(self, cdc_port, attempt_id):
+    def release_storage(self, cdc_port, attempt_id, target):
         self.steps.append("release")
         if self.failure == "reject":
             raise ReleaseRejected("rejected")
@@ -235,7 +236,7 @@ class FakeWindowsApi:
     def __init__(self):
         self.guid = TARGET.volume_guid
         self.disks = (8,)
-        self.interfaces = [DiskInterface(8, TARGET.disk_instance_id, TARGET.eject_instance_id)]
+        self.interfaces = [DiskInterface(8, TARGET.disk_instance_id, TARGET.eject_instance_id, TARGET.usb_physical_instance_id)]
         self.accessible = True
         self.calls = []
 
@@ -259,6 +260,9 @@ class FakeWindowsApi:
     def release_cdc(self, port, attempt):
         self.calls.append("cdc-release")
 
+    def cdc_physical_id(self, port):
+        return getattr(self, "cdc_usb_id", TARGET.usb_physical_instance_id)
+
 
 class WindowsAdapterTests(unittest.TestCase):
     def setUp(self):
@@ -270,10 +274,10 @@ class WindowsAdapterTests(unittest.TestCase):
 
     def test_reject_ambiguous_or_unsupported_topology(self):
         scenarios = [
-            ((8, 9), [DiskInterface(8, "a", "b")]),
+            ((8, 9), [DiskInterface(8, "a", "b", TARGET.usb_physical_instance_id)]),
             ((8,), []),
-            ((8,), [DiskInterface(8, "a", "b"), DiskInterface(8, "c", "d")]),
-            ((8,), [DiskInterface(8, "a", None)]),
+            ((8,), [DiskInterface(8, "a", "b"), DiskInterface(8, "c", "d", TARGET.usb_physical_instance_id)]),
+            ((8,), [DiskInterface(8, "a", None, TARGET.usb_physical_instance_id)]),
         ]
         for extents, interfaces in scenarios:
             with self.subTest(extents=extents, interfaces=interfaces):
@@ -287,16 +291,26 @@ class WindowsAdapterTests(unittest.TestCase):
             for mutate in (
                 lambda: setattr(self.api, "guid", "different"),
                 lambda: setattr(self.api, "disks", (7,)),
-                lambda: setattr(self.api, "interfaces", [DiskInterface(8, "changed", "usb")]),
+                lambda: setattr(self.api, "interfaces", [DiskInterface(8, "changed", "usb", TARGET.usb_physical_instance_id)]),
             ):
                 self.setUp()
                 mutate()
                 with self.assertRaises(Exception):
-                    self.adapter.revalidate_target(TARGET)
+                    self.adapter.revalidate_target(TARGET, "COM5")
         self.setUp()
         with patch("m5daylog.windows_release.inspect_device", return_value={"deviceId": "swapped"}):
             with self.assertRaises(WrongTarget):
-                self.adapter.revalidate_target(TARGET)
+                self.adapter.revalidate_target(TARGET, "COM5")
+
+    def test_cdc_from_another_usb_device_cannot_release_target(self):
+        self.api.cdc_usb_id = "USB\\\\VID_303A&PID_4001\\\\OTHER"
+        with patch("m5daylog.windows_release.inspect_device",
+                   return_value={"deviceId": "test-device"}):
+            with self.assertRaises(WrongTarget):
+                self.adapter.revalidate_target(TARGET, "COM5")
+        with self.assertRaises(WrongTarget):
+            self.adapter.release_storage("COM5", "attempt", TARGET)
+        self.assertEqual(self.api.calls, [])
 
     def test_dismount_is_not_accepted_as_release_disappearance(self):
         self.assertFalse(self.adapter.volume_disappeared(TARGET))
