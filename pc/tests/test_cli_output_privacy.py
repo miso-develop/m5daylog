@@ -31,9 +31,9 @@ def run_cli(*args: str) -> tuple[int, str, str]:
 class NonEchoingCliTests(unittest.TestCase):
     def assert_no_path(self, stdout: str, stderr: str, *paths: Path | str) -> None:
         for stream in (stdout, stderr):
-            self.assertNotIn(MARKER, stream)
+            self.assertFalse(MARKER in stream, "CLI echoed a synthetic sensitive marker")
             for path in paths:
-                self.assertNotIn(str(path), stream)
+                self.assertFalse(str(path) in stream, "CLI echoed a configured path")
 
     def test_init_explicit_db_success_preserves_schema_and_does_not_echo_path(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -47,11 +47,11 @@ class NonEchoingCliTests(unittest.TestCase):
             self.assertTrue(target.is_file())
             self.assertFalse(unused_data_dir.exists())
             self.assertEqual(db.list_tables(target), sorted(db.expected_tables()))
-            self.assertIn("initialized: ok", stdout)
-            self.assertIn("tables:", stdout)
+            self.assertTrue("initialized: ok" in stdout, "safe init status missing")
+            self.assertTrue("tables:" in stdout, "safe table status missing")
             for table in db.expected_tables():
-                self.assertIn(table, stdout)
-            self.assertEqual(stderr, "")
+                self.assertTrue(table in stdout, "expected table missing")
+            self.assertTrue(stderr == "", "unexpected CLI stderr")
             self.assert_no_path(stdout, stderr, target, unused_data_dir)
 
     def test_init_data_dir_success_does_not_echo_resolved_database(self) -> None:
@@ -61,9 +61,9 @@ class NonEchoingCliTests(unittest.TestCase):
             code, stdout, stderr = run_cli("init", "--data-dir", str(data_dir))
             self.assertEqual(code, 0)
             self.assertTrue(target.is_file())
-            self.assertIn("initialized: ok", stdout)
-            self.assertIn("tables:", stdout)
-            self.assertEqual(stderr, "")
+            self.assertTrue("initialized: ok" in stdout, "safe init status missing")
+            self.assertTrue("tables:" in stdout, "safe table status missing")
+            self.assertTrue(stderr == "", "unexpected CLI stderr")
             self.assert_no_path(stdout, stderr, target, data_dir)
 
     def test_init_failure_does_not_echo_candidate_or_exception_text(self) -> None:
@@ -76,7 +76,7 @@ class NonEchoingCliTests(unittest.TestCase):
                 ):
                     code, stdout, stderr = run_cli("init", "--db", str(candidate))
                 self.assertEqual(code, 1)
-                self.assertEqual(stdout, "")
+                self.assertTrue(stdout == "", "unexpected CLI stdout")
                 self.assertEqual(
                     stderr, f"error: init failed: {failure.__name__}\n"
                 )
@@ -88,9 +88,9 @@ class NonEchoingCliTests(unittest.TestCase):
             with patch.object(cli, "list_tables", return_value=[]):
                 code, stdout, stderr = run_cli("init", "--db", str(target))
             self.assertEqual(code, 1)
-            self.assertIn("initialized: ok", stdout)
-            self.assertIn("tables:", stdout)
-            self.assertIn("error: missing tables:", stderr)
+            self.assertTrue("initialized: ok" in stdout, "safe init status missing")
+            self.assertTrue("tables:" in stdout, "safe table status missing")
+            self.assertTrue("error: missing tables:" in stderr, "missing-table diagnostic absent")
             self.assert_no_path(stdout, stderr, target)
 
     def test_device_success_and_failure_do_not_echo_source_paths(self) -> None:
@@ -105,8 +105,8 @@ class NonEchoingCliTests(unittest.TestCase):
                 "device", str(source), "--contracts-dir", str(contracts)
             )
         self.assertEqual(code, 0)
-        self.assertIn("device: recognized=1", stdout)
-        self.assertEqual(stderr, "")
+        self.assertTrue("device: recognized=1" in stdout, "device result absent")
+        self.assertTrue(stderr == "", "unexpected CLI stderr")
         self.assert_no_path(stdout, stderr, source, contracts)
 
         with patch.object(
@@ -115,8 +115,8 @@ class NonEchoingCliTests(unittest.TestCase):
         ):
             code, stdout, stderr = run_cli("device", str(source))
         self.assertEqual(code, 1)
-        self.assertEqual(stdout, "")
-        self.assertEqual(stderr, "error: device validation failed: OSError\n")
+        self.assertTrue(stdout == "", "unexpected CLI stdout")
+        self.assertTrue(stderr == "error: device validation failed: OSError\n", "unsafe device diagnostic")
         self.assert_no_path(stdout, stderr, source)
 
     def test_sync_counts_and_conflict_exit_do_not_echo_resolved_paths(self) -> None:
@@ -143,7 +143,7 @@ class NonEchoingCliTests(unittest.TestCase):
                         stdout,
                         f"sync: copied=2 reused=1 conflicts={conflicts}\n",
                     )
-                    self.assertEqual(stderr, "")
+                    self.assertTrue(stderr == "", "unexpected CLI stderr")
                     self.assert_no_path(
                         stdout, stderr, source, library, database
                     )
@@ -165,8 +165,8 @@ class NonEchoingCliTests(unittest.TestCase):
                     "--data-dir", str(data_dir),
                 )
             self.assertEqual(code, 1)
-            self.assertEqual(stdout, "")
-            self.assertEqual(stderr, "error: sync failed: OSError\n")
+            self.assertTrue(stdout == "", "unexpected CLI stdout")
+            self.assertTrue(stderr == "error: sync failed: OSError\n", "unsafe sync diagnostic")
             self.assert_no_path(
                 stdout, stderr, source, library, data_dir, database
             )
