@@ -154,7 +154,8 @@ static cJSON *number(parser_t *s) {
 static cJSON *value(parser_t *s) {
     cJSON *out = NULL;
     ws(s);
-    if (s->p == s->end || ++s->depth > 8u) {
+    if (s->p == s->end) return NULL;
+    if (++s->depth > 8u) {
         --s->depth;
         return NULL;
     }
