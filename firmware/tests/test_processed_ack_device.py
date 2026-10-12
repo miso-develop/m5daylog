@@ -82,3 +82,19 @@ def test_ack_preflight_checks_and_safe_unknown_handling():
     assert "marker_status(id) == 1" in source
     assert "if (!sd_mount_is_mounted()" in source
     assert "ok = true;  // invalid ACK does not prevent new raw recording" in source
+
+
+def test_length_delimited_json_cannot_hide_trailing_bytes():
+    """Regression: strict cJSON parser must receive the appended NUL byte.
+
+    cJSON_ParseWithLengthOpts(..., require_null_terminated=true) requires a
+    buffer_length including the trailing terminator. The firmware reads raw
+    bytes and allocates exactly one additional sentinel byte.
+    """
+    source = SRC.read_text(encoding="utf-8")
+    assert "memchr(buf, '\\0', got) != NULL" in source
+    assert "buf[got] = '\\0';" in source
+    assert "cJSON_ParseWithLengthOpts(ack_doc, ack_len + 1u, NULL, true)" in source
+    assert "cJSON_ParseWithLengthOpts(man_doc, man_len + 1u, NULL, true)" in source
+    assert "cJSON_ParseWithLengthOpts(ack_doc, ack_len, NULL, true)" not in source
+    assert "cJSON_ParseWithLengthOpts(man_doc, man_len, NULL, true)" not in source
