@@ -389,7 +389,7 @@ class NativeWin32DeviceApi:
             "id": request_id, "cmd": "RELEASE_STORAGE",
             "args": {"releaseAttemptId": attempt_id},
         }, separators=(",", ":")) + "\n").encode("ascii")
-        handle = self._open(r"\\.\\" + port.upper(), GENERIC_READ | GENERIC_WRITE, 0)
+        handle = self._open("\\\\.\\" + port.upper(), GENERIC_READ | GENERIC_WRITE, 0)
         try:
             timeouts = COMMTIMEOUTS(0xFFFFFFFF, 0, 250, 0, 1000)
             if not self.k.SetCommTimeouts(handle, ctypes.byref(timeouts)):
