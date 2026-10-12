@@ -15,17 +15,29 @@
 
 static int s_sd_mounted = 1;
 static int s_fail_fsync = 0;
+static int s_fail_open = 0;
+static int s_fail_write = 0;
+static int s_fail_flush = 0;
+static int s_fail_close = 0;
+static FILE *s_marker_fp = NULL;
 static int s_fail_rename = 0;
 static int s_fsync_calls = 0;
 static int s_rename_calls = 0;
 
 void ack_test_set_mounted(int v) { s_sd_mounted = v; }
 void ack_test_fail_fsync(int v) { s_fail_fsync = v; }
+void ack_test_fail_open(int v) { s_fail_open = v; }
+void ack_test_fail_write(int v) { s_fail_write = v; }
+void ack_test_fail_flush(int v) { s_fail_flush = v; }
+void ack_test_fail_close(int v) { s_fail_close = v; }
 void ack_test_fail_rename(int v) { s_fail_rename = v; }
 int ack_test_fsync_calls(void) { return s_fsync_calls; }
 int ack_test_rename_calls(void) { return s_rename_calls; }
 void ack_test_reset_faults(void) {
     s_fail_fsync = 0; s_fail_rename = 0;
+    s_fail_open = 0; s_fail_write = 0;
+    s_fail_flush = 0; s_fail_close = 0;
+    s_marker_fp = NULL;
     s_fsync_calls = 0; s_rename_calls = 0;
     s_sd_mounted = 1;
 }
@@ -87,4 +99,53 @@ int __wrap_rename(const char *from, const char *to) {
         return -1;
     }
     return __real_rename(from, to);
+}
+
+
+// Interpose only the temporary marker file. The production read path and
+// events diagnostics remain normal. A failed temporary write/flush/close
+// must never promote a partial applied marker.
+FILE *__real_fopen(const char *, const char *);
+FILE *__wrap_fopen(const char *path, const char *mode) {
+    bool marker_write = path != NULL && mode != NULL &&
+                        strstr(path, "processed-state/") != NULL &&
+                        strchr(mode, 'w') != NULL;
+    FILE *fp;
+    if (marker_write && s_fail_open) {
+        errno = EIO;
+        return NULL;
+    }
+    fp = __real_fopen(path, mode);
+    if (marker_write) s_marker_fp = fp;
+    return fp;
+}
+
+size_t __real_fwrite(const void *, size_t, size_t, FILE *);
+size_t __wrap_fwrite(const void *ptr, size_t sz, size_t n, FILE *fp) {
+    if (s_fail_write && fp == s_marker_fp) {
+        errno = EIO;
+        return 0u;
+    }
+    return __real_fwrite(ptr, sz, n, fp);
+}
+int __real_fflush(FILE *);
+int __wrap_fflush(FILE *fp) {
+    if (s_fail_flush && fp == s_marker_fp) {
+        errno = EIO;
+        return EOF;
+    }
+    return __real_fflush(fp);
+}
+int __real_fclose(FILE *);
+int __wrap_fclose(FILE *fp) {
+    bool marker = fp != NULL && fp == s_marker_fp;
+    int rc = __real_fclose(fp);
+    if (marker) {
+        s_marker_fp = NULL;
+        if (s_fail_close) {
+            errno = EIO;
+            return EOF;
+        }
+    }
+    return rc;
 }
