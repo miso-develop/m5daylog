@@ -582,8 +582,14 @@ def test_no_audio_deletion_and_no_scope_creep():
                 p.name
     man = (COMP / "device_manifest.c").read_text(encoding="utf-8")
     assert ".wav" in man  # suffix guards present
-    # Task #47 is now in scope; processed-ACK retention stays out.
-    lowered = blob.lower()
+    # The legacy #47 implementations must not silently embed #52 logic.
+    # #52 is now an explicit module; preserve global no-audio-deletion tests.
+    legacy_blob = "\n".join(
+        p.read_text(encoding="utf-8") for p in COMP.rglob("*")
+        if p.is_file() and p.suffix in (".c", ".h")
+        and not p.name.startswith("processed_ack")
+    )
+    lowered = legacy_blob.lower()
     assert "manifest" in lowered
     assert "device.json" in lowered or "device_json" in lowered
     assert "sha256" in lowered
