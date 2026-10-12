@@ -78,4 +78,4 @@ def test_ack_preflight_checks_and_safe_unknown_handling():
     assert "stats.unknown_ids++" in source
     assert "marker_status(id) == 1" in source
     assert "if (!sd_mount_is_mounted()" in source
-    assert "return true;  // invalid ACK does not prevent new raw recording" in source
+    assert "ok = true;  // invalid ACK does not prevent new raw recording" in source
