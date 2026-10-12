@@ -270,7 +270,7 @@ class NativeWin32DeviceApi:
             raise WrongTarget("mount path is not the volume root")
         if not self.k.GetVolumeNameForVolumeMountPointW(path.value, guid, len(guid)):
             raise WrongTarget("volume GUID resolution failed")
-        if re.fullmatch(r"\\\\\\?\\Volume\\{[0-9a-fA-F-]{36}\\}\\", guid.value) is None:
+        if re.fullmatch(r"\\\\\?\\Volume\{[0-9a-fA-F-]{36}\}\\", guid.value) is None:
             raise WrongTarget("invalid Volume GUID")
         return guid.value
 
@@ -390,7 +390,6 @@ class NativeWin32DeviceApi:
             "args": {"releaseAttemptId": attempt_id},
         }, separators=(",", ":")) + "\n").encode("ascii")
         handle = self._open(r"\\.\\" + port.upper(), GENERIC_READ | GENERIC_WRITE, 0)
-        sent = False
         try:
             timeouts = COMMTIMEOUTS(0xFFFFFFFF, 0, 250, 0, 1000)
             if not self.k.SetCommTimeouts(handle, ctypes.byref(timeouts)):
@@ -401,7 +400,6 @@ class NativeWin32DeviceApi:
                 raise ReleaseIndeterminate("CDC write failed")
             if written.value != len(request):
                 raise ReleaseIndeterminate("CDC short write")
-            sent = True
             deadline = time.monotonic() + 5.0
             reply = bytearray()
             while time.monotonic() < deadline and len(reply) < MAX_CDC_REPLY:
