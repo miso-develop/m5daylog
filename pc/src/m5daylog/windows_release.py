@@ -25,6 +25,9 @@ from .release import (
     ReleaseIndeterminate,
     ReleaseRejected,
     UnsupportedTarget,
+    VolumeBusy,
+    VolumeDismountError,
+    VolumeLockError,
     WrongTarget,
 )
 from .sync import inspect_device
@@ -93,9 +96,12 @@ class WindowsHostReleasePort:
 
     def revalidate_target(self, target: EjectTarget) -> None:
         # Device metadata must still match even when drive-letter reuse occurs.
-        current_id = inspect_device(
-            target.mount_root, contracts_dir=self.contracts_dir
-        )["deviceId"]
+        try:
+            current_id = inspect_device(
+                target.mount_root, contracts_dir=self.contracts_dir
+            )["deviceId"]
+        except (OSError, ValueError, KeyError):
+            raise WrongTarget("target Device metadata no longer validated") from None
         if current_id != target.expected_device_id:
             raise WrongTarget("device identity changed")
         current = self.resolve_target(target.mount_root, target.expected_device_id)
@@ -370,13 +376,26 @@ class NativeWin32DeviceApi:
 
     @contextmanager
     def lock_and_dismount(self, volume_guid: str):
-        handle = self._open(
-            volume_guid.rstrip("\\"),
-            GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        )
         try:
-            self._ioctl(handle, FSCTL_LOCK_VOLUME)
-            self._ioctl(handle, FSCTL_DISMOUNT_VOLUME)
+            handle = self._open(
+                volume_guid.rstrip("\\"),
+                GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            )
+        except HostQuiesceError:
+            if ctypes.get_last_error() in (32, 33):
+                raise VolumeBusy("volume has outstanding host access") from None
+            raise VolumeLockError("exact volume could not be opened") from None
+        try:
+            try:
+                self._ioctl(handle, FSCTL_LOCK_VOLUME)
+            except HostQuiesceError:
+                if ctypes.get_last_error() in (32, 33):
+                    raise VolumeBusy("volume lock vetoed by active I/O") from None
+                raise VolumeLockError("exact volume lock failed") from None
+            try:
+                self._ioctl(handle, FSCTL_DISMOUNT_VOLUME)
+            except HostQuiesceError:
+                raise VolumeDismountError("exact volume dismount failed") from None
             yield
         finally:
             self.k.CloseHandle(handle)
@@ -415,6 +434,8 @@ class NativeWin32DeviceApi:
                 raise ReleaseIndeterminate("CDC response deadline or length exceeded")
             try:
                 obj = json.loads(reply.decode("utf-8"))
+                if obj.get("id") == request_id and obj.get("ok") is False:
+                    raise ReleaseRejected("CDC release rejected")
                 result = obj["result"]
                 valid = (obj.get("id") == request_id and obj.get("ok") is True
                          and isinstance(result, dict)
@@ -425,8 +446,6 @@ class NativeWin32DeviceApi:
             if not valid:
                 # A negative response can be distinguished, but an invalid/mismatched
                 # response cannot prove that the Device did not accept the command.
-                if (obj.get("id") == request_id and obj.get("ok") is False):
-                    raise ReleaseRejected("CDC release rejected")
                 raise ReleaseIndeterminate("CDC release acceptance unproven")
         finally:
             self.k.CloseHandle(handle)
