@@ -1,4 +1,4 @@
-name: PC VAD candidate verification
+name: PC VAD verification
 
 on:
   pull_request:
@@ -11,9 +11,9 @@ permissions:
 
 jobs:
   pc-vad:
-    name: pc:vad-synthetic
+    name: pc:vad-synthetic-locked-smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -25,39 +25,29 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Check Python 3.11 and run dependency-free synthetic VAD suite
-        run: |
-          python3.11 --version
-          PYTHONPATH=pc/src python3.11 -m unittest discover -s pc/tests -p 'test_vad*.py' -v
+      - name: Run synthetic regression suite without installing the AI model
+        run: PYTHONPATH=pc/src python3.11 -m unittest discover -s pc/tests -v
 
-      - name: Resolve candidate locked environment
-        if: always()
+      - name: Verify frozen dependency graph
         run: |
           python3.11 -m venv /tmp/pc-uv
           /tmp/pc-uv/bin/pip install --disable-pip-version-check uv
           cd pc
-          /tmp/pc-uv/bin/uv lock --python 3.11
+          /tmp/pc-uv/bin/uv lock --check --python 3.11
+          /tmp/pc-uv/bin/uv sync --frozen
 
-      - name: Emit candidate lock and model digest for explicitly verified pinning
-        if: always()
+      - name: Real Silero CPU ONNX model and silence smoke
+        working-directory: pc
         run: |
-          python3.11 -m venv /tmp/pc-model
-          /tmp/pc-model/bin/pip download --disable-pip-version-check --no-deps -d /tmp/pc-wheels silero-vad==6.2.3
-          python3.11 - <<'PY'
-          import base64
+          /tmp/pc-uv/bin/uv run --frozen python - <<'PY'
           import hashlib
-          import zipfile
-          from pathlib import Path
-          wheel = next(Path('/tmp/pc-wheels').glob('silero_vad-6.2.3-*.whl'))
-          with zipfile.ZipFile(wheel) as archive:
-              model_name = next(name for name in archive.namelist() if name.endswith('/silero_vad.onnx'))
-              data = archive.read(model_name)
-          print('CANDIDATE_SILERO_6_2_3_MODEL_SHA256=' + hashlib.sha256(data).hexdigest())
-          blob = Path('pc/uv.lock').read_bytes()
-          print('CANDIDATE_UV_LOCK_SHA256=' + hashlib.sha256(blob).hexdigest())
-          print('CANDIDATE_UV_LOCK_BASE64_BEGIN')
-          encoded = base64.b64encode(blob).decode('ascii')
-          for i in range(0, len(encoded), 120):
-              print(encoded[i:i+120])
-          print('CANDIDATE_UV_LOCK_BASE64_END')
+          from importlib import resources
+          from m5daylog.vad import EXPECTED_MODEL_SHA256, SileroCPU
+          model = resources.files('silero_vad.data').joinpath('silero_vad.onnx')
+          checksum = hashlib.sha256(model.read_bytes()).hexdigest()
+          assert checksum == EXPECTED_MODEL_SHA256
+          runtime = SileroCPU()
+          assert runtime.model_sha256 == EXPECTED_MODEL_SHA256
+          assert runtime.detect(b'\x00\x00' * 16000) == []
+          print('LIVE_SILERO_CPU_SMOKE_PASS model_sha256=' + checksum)
           PY
