@@ -56,6 +56,8 @@ def native_ack(tmp_path_factory):
         str(COMP / "processed_ack_policy.c"),
         str(STUBS),
         "-Wl,--wrap=fsync", "-Wl,--wrap=rename",
+        "-Wl,--wrap=fopen", "-Wl,--wrap=fwrite",
+        "-Wl,--wrap=fflush", "-Wl,--wrap=fclose",
     ]
     if libcjson:
         args.append(f"-l:{libcjson}")
@@ -69,7 +71,9 @@ def native_ack(tmp_path_factory):
     ]
     lib.processed_ack_apply_manual_wake.restype = ctypes.c_bool
     for name in ("ack_test_set_mounted", "ack_test_fail_fsync",
-                 "ack_test_fail_rename"):
+                 "ack_test_fail_rename", "ack_test_fail_open",
+                 "ack_test_fail_write", "ack_test_fail_flush",
+                 "ack_test_fail_close"):
         getattr(lib, name).argtypes = [ctypes.c_int]
     lib.ack_test_fsync_calls.restype = ctypes.c_int
     lib.ack_test_rename_calls.restype = ctypes.c_int
@@ -186,13 +190,14 @@ def test_unknown_id_and_empty_ack_never_create_marker(native_ack, card):
     assert ok and stats.unknown_ids == 0 and stats.applied == 0
 
 
-@pytest.mark.parametrize("fail", ["fsync", "rename"])
+@pytest.mark.parametrize("fail", ["open", "write", "flush", "close", "fsync", "rename"])
 def test_marker_commit_failure_then_retry(native_ack, card, fail):
     (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
     getattr(native_ack, "ack_test_fail_" + fail)(1)
     ok, stats = invoke(native_ack, card)
     assert not ok and stats.applied == 0 and not marker(card).exists()
-    assert getattr(native_ack, "ack_test_" + fail + "_calls")() >= 1
+    if fail in ("fsync", "rename"):
+        assert getattr(native_ack, "ack_test_" + fail + "_calls")() >= 1
     native_ack.ack_test_reset_faults()
     ok, stats = invoke(native_ack, card)
     assert ok and stats.applied == 1 and marker(card).exists()
