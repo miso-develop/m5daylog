@@ -221,16 +221,19 @@ def test_unknown_id_and_empty_ack_never_create_marker(native_ack, card):
 
 
 @pytest.mark.parametrize("fail", ["open", "write", "flush", "close", "fsync", "rename"])
-def test_marker_commit_failure_then_retry(native_ack, card, fail):
+def test_marker_mirror_failure_does_not_block_durable_ack(native_ack, card, fail):
     (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
     getattr(native_ack, "ack_test_fail_" + fail)(1)
     ok, stats = invoke(native_ack, card)
-    assert not ok and stats.applied == 0 and not marker(card).exists()
+    # The NVS-backed proof commits independently of the untrusted SD mirror.
+    assert ok and stats.applied == 1 and not marker(card).exists()
     if fail in ("fsync", "rename"):
         assert getattr(native_ack, "ack_test_" + fail + "_calls")() >= 1
     native_ack.ack_test_reset_faults()
     ok, stats = invoke(native_ack, card)
-    assert ok and stats.applied == 1 and marker(card).exists()
+    assert ok and stats.applied == 0 and stats.already_applied == 1
+    # Replaying ACK never needs the optional mirror to be repaired.
+    assert not marker(card).exists()
 
 
 
@@ -255,10 +258,10 @@ def test_nvs_commit_failure_never_authorizes_retention(native_ack, card):
     native_ack.ack_test_fail_state_commit(1)
     ok, stats = invoke(native_ack, card)
     assert not ok and stats.applied == 0
-    assert marker(card).exists()  # SD mirror is NOT authoritative
+    assert not marker(card).exists()  # No mirror may precede the NVS commit.
     native_ack.ack_test_fail_state_commit(0)
     ok, stats = invoke(native_ack, card)
-    assert ok and stats.applied == 1
+    assert ok and stats.applied == 1 and marker(card).exists()
     ok, stats = invoke(native_ack, card)
     assert ok and stats.applied == 0 and stats.already_applied == 1
 
@@ -275,12 +278,27 @@ def test_nvs_state_survives_lost_sd_marker_and_ack(native_ack, card):
     assert ok and stats.applied == 0 and stats.invalid_payloads == 0
 
 
-def test_corrupt_marker_fails_closed_without_replacement(native_ack, card):
+def test_host_corrupt_marker_cannot_veto_valid_ack(native_ack, card):
     (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
     marker(card).write_bytes(b"corrupt")
+    native_ack.ack_test_set_usage_percent(80)
     ok, stats = invoke(native_ack, card)
-    assert not ok and stats.applied == 0
+    assert ok and stats.applied == 1 and stats.retention_candidates == 1
     assert marker(card).read_bytes() == b"corrupt"
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.already_applied == 1 and stats.applied == 0
+    assert marker(card).read_bytes() == b"corrupt"
+
+
+def test_host_unusable_marker_namespace_cannot_veto_valid_ack(native_ack, card):
+    (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
+    (card / "processed-state").rmdir()
+    (card / "processed-state").write_bytes(b"untrusted-file-instead-of-directory")
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.applied == 1
+    assert (card / "processed-state").read_bytes() == b"untrusted-file-instead-of-directory"
+    ok, stats = invoke(native_ack, card)
+    assert ok and stats.already_applied == 1
 
 
 def test_unmounted_device_refuses_access(native_ack, card):
