@@ -179,7 +179,7 @@ def test_decoded_unicode_nul_ack_rejects_full_payload(native_ack, card, field):
     else:
         payload["processedAt"] = "2026-10-12T12:00:00Z" + chr(0) + "garbage"
     serialized = json.dumps(payload)
-    assert r"\\u0000" in serialized
+    assert r"\u0000" in serialized
     (card / "acks/processed.json").write_text(serialized, encoding="utf-8")
     ok, stats = invoke(native_ack, card)
     assert ok and stats.invalid_payloads == 1 and stats.applied == 0
