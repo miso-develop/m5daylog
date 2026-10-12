@@ -68,7 +68,7 @@ class NonEchoingCliTests(unittest.TestCase):
 
     def test_init_failure_does_not_echo_candidate_or_exception_text(self) -> None:
         candidate = Path("synthetic-root") / MARKER / "m5daylog.db"
-        for failure in (OSError, sqlite3.OperationalError):
+        for failure in (OSError, sqlite3.OperationalError, RuntimeError):
             with self.subTest(failure=failure.__name__):
                 with patch.object(
                     cli, "init_db",
@@ -110,15 +110,20 @@ class NonEchoingCliTests(unittest.TestCase):
         self.assertTrue(stderr == "", "unexpected CLI stderr")
         self.assert_no_path(stdout, stderr, source, contracts)
 
-        with patch.object(
-            cli, "inspect_device",
-            side_effect=OSError(f"invalid source {source}: {MARKER}"),
-        ):
-            code, stdout, stderr = run_cli("device", str(source))
-        self.assertEqual(code, 1)
-        self.assertTrue(stdout == "", "unexpected CLI stdout")
-        self.assertTrue(stderr == "error: device validation failed: OSError\n", "unsafe device diagnostic")
-        self.assert_no_path(stdout, stderr, source)
+        for failure in (OSError, RuntimeError):
+            with self.subTest(failure=failure.__name__):
+                with patch.object(
+                    cli, "inspect_device",
+                    side_effect=failure(f"invalid source {source}: {MARKER}"),
+                ):
+                    code, stdout, stderr = run_cli("device", str(source))
+                self.assertEqual(code, 1)
+                self.assertTrue(stdout == "", "unexpected CLI stdout")
+                self.assertTrue(
+                    stderr == f"error: device validation failed: {failure.__name__}\n",
+                    "unsafe device diagnostic",
+                )
+                self.assert_no_path(stdout, stderr, source)
 
     def test_sync_counts_and_conflict_exit_do_not_echo_resolved_paths(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -156,21 +161,26 @@ class NonEchoingCliTests(unittest.TestCase):
             library = root / "library"
             data_dir = root / "data"
             database = data_dir / "state" / "m5daylog.db"
-            with patch.object(
-                cli, "sync_device",
-                side_effect=OSError(f"failed on {database}: {MARKER}"),
-            ):
-                code, stdout, stderr = run_cli(
-                    "sync", str(source),
-                    "--library-root", str(library),
-                    "--data-dir", str(data_dir),
-                )
-            self.assertEqual(code, 1)
-            self.assertTrue(stdout == "", "unexpected CLI stdout")
-            self.assertTrue(stderr == "error: sync failed: OSError\n", "unsafe sync diagnostic")
-            self.assert_no_path(
-                stdout, stderr, source, library, data_dir, database
-            )
+            for failure in (OSError, RuntimeError):
+                with self.subTest(failure=failure.__name__):
+                    with patch.object(
+                        cli, "sync_device",
+                        side_effect=failure(f"failed on {database}: {MARKER}"),
+                    ):
+                        code, stdout, stderr = run_cli(
+                            "sync", str(source),
+                            "--library-root", str(library),
+                            "--data-dir", str(data_dir),
+                        )
+                    self.assertEqual(code, 1)
+                    self.assertTrue(stdout == "", "unexpected CLI stdout")
+                    self.assertTrue(
+                        stderr == f"error: sync failed: {failure.__name__}\n",
+                        "unsafe sync diagnostic",
+                    )
+                    self.assert_no_path(
+                        stdout, stderr, source, library, data_dir, database
+                    )
 
 
 if __name__ == "__main__":
