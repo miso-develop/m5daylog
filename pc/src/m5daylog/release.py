@@ -12,7 +12,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Iterator, Protocol, TypeVar
+from typing import Callable, Iterator, Protocol
 
 from .sync import SyncSummary
 
@@ -34,6 +34,18 @@ class AlreadyRemoved(ReleaseError):
 
 
 class HostQuiesceError(ReleaseError):
+    pass
+
+
+class VolumeBusy(HostQuiesceError):
+    pass
+
+
+class VolumeLockError(HostQuiesceError):
+    pass
+
+
+class VolumeDismountError(HostQuiesceError):
     pass
 
 
@@ -268,6 +280,9 @@ class SyncReleaseCoordinator:
                 AlreadyRemoved: "ALREADY_REMOVED_UNPROVEN",
                 ReleaseRejected: "RELEASE_REJECTED",
                 ReleaseIndeterminate: "INDETERMINATE",
+                VolumeBusy: "BUSY",
+                VolumeLockError: "LOCK_FAILED",
+                VolumeDismountError: "DISMOUNT_FAILED",
                 GateClosed: "GATE_CLOSED",
             }
             reason = next((code for typ, code in known.items() if isinstance(exc, typ)), None)
