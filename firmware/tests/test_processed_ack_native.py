@@ -75,6 +75,7 @@ def native_ack(tmp_path_factory):
                  "ack_test_fail_write", "ack_test_fail_flush",
                  "ack_test_fail_close", "ack_test_fail_state_commit"):
         getattr(lib, name).argtypes = [ctypes.c_int]
+    lib.ack_test_set_usage_percent.argtypes = [ctypes.c_uint]
     lib.ack_test_fsync_calls.restype = ctypes.c_int
     lib.ack_test_rename_calls.restype = ctypes.c_int
     return lib
@@ -235,6 +236,7 @@ def test_marker_commit_failure_then_retry(native_ack, card, fail):
 
 def test_host_forged_marker_does_not_confer_device_applied_state(native_ack, card):
     # USB hosts can write this file without delivering a valid ACK.
+    native_ack.ack_test_set_usage_percent(80)
     marker(card).write_bytes(ACK_ID.encode() + b"\n")
     ok, stats = invoke(native_ack, card)
     assert ok and stats.applied == 0 and stats.already_applied == 0
@@ -243,6 +245,7 @@ def test_host_forged_marker_does_not_confer_device_applied_state(native_ack, car
     (card / "acks/processed.json").write_text(ack_json(), encoding="utf-8")
     ok, stats = invoke(native_ack, card)
     assert ok and stats.applied == 1 and stats.already_applied == 0
+    assert stats.retention_candidates == 1  # only NVS-committed ID counts
     ok, stats = invoke(native_ack, card)
     assert ok and stats.applied == 0 and stats.already_applied == 1
 
