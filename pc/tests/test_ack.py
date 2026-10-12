@@ -107,6 +107,24 @@ class AckTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_fsync_failure_keeps_old_final_and_outbox_pending(self):
+        final = self.ackdir / "processed.json"
+        final.write_bytes(b"previous-authoritative")
+        before = final.read_bytes()
+        with patch.object(ack.os, "fsync", side_effect=OSError("synthetic fsync")):
+            result = self.flush()
+        self.assertEqual(result.status, "DEFERRED")
+        self.assertEqual(final.read_bytes(), before)
+        self.assertEqual(self.pending_state(), [(RID, None)])
+
+    def test_payload_failure_deferred_without_leasing_device(self):
+        lease = Lease()
+        with patch.object(ack, "validate_contract_document", side_effect=ValueError("synthetic schema")):
+            result = self.flush(lease=lease)
+        self.assertEqual(result.status, "DEFERRED")
+        self.assertFalse(lease.opened)
+        self.assertEqual(self.pending_state(), [(RID, None)])
+
     def test_no_op_before_all_four_stages_durable(self):
         conn = sqlite3.connect(self.db)
         conn.execute("UPDATE recordings SET day_status='FAILED'")
