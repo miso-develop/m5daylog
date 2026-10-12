@@ -16,6 +16,7 @@
 
 #include "cJSON.h"
 #include "device_identity.h"
+#include "device_manifest.h"
 #include "processed_ack_policy.h"
 #include "recorder_config.h"
 #include "sd_mount.h"
@@ -235,30 +236,85 @@ static bool valid_ack(const cJSON *ack, const char *device_id) {
     return true;
 }
 
+static bool json_uint(const cJSON *value, uint32_t minimum) {
+    double n;
+    if (!cJSON_IsNumber(value)) {
+        return false;
+    }
+    n = value->valuedouble;
+    // Reject fraction/negative/overflow/NaN before any integer conversion.
+    return n >= (double)minimum && n <= (double)UINT32_MAX &&
+           n == (double)(uint32_t)n;
+}
+
+static bool valid_manifest_entry(const cJSON *entry) {
+    const cJSON *rid = cJSON_GetObjectItemCaseSensitive(entry, "recordingId");
+    const cJSON *filename = cJSON_GetObjectItemCaseSensitive(entry, "filename");
+    const cJSON *started = cJSON_GetObjectItemCaseSensitive(entry, "startedAt");
+    const cJSON *duration = cJSON_GetObjectItemCaseSensitive(entry, "durationMs");
+    const cJSON *size = cJSON_GetObjectItemCaseSensitive(entry, "sizeBytes");
+    const cJSON *sha = cJSON_GetObjectItemCaseSensitive(entry, "sha256");
+    const cJSON *sample_rate = cJSON_GetObjectItemCaseSensitive(entry, "sampleRate");
+    const cJSON *bit_depth = cJSON_GetObjectItemCaseSensitive(entry, "bitDepth");
+    const cJSON *channels = cJSON_GetObjectItemCaseSensitive(entry, "channels");
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(entry, "state");
+    const cJSON *fw = cJSON_GetObjectItemCaseSensitive(entry, "firmwareVersion");
+    char extracted_id[65];
+    int64_t started_epoch;
+    if (!only_unique_keys(entry) ||
+        !cJSON_IsString(rid) ||
+        !device_identity_is_valid_uuid(rid->valuestring) ||
+        !cJSON_IsString(filename) || filename->valuestring == NULL ||
+        strncmp(filename->valuestring, "recordings/", 11u) != 0 ||
+        strstr(filename->valuestring, "..") != NULL ||
+        strchr(filename->valuestring, '\\') != NULL ||
+        !device_manifest_extract_recording_id(filename->valuestring,
+                                               extracted_id, sizeof(extracted_id)) ||
+        strcmp(extracted_id, rid->valuestring) != 0 ||
+        !cJSON_IsString(started) ||
+        !timestamp_epoch(started->valuestring, &started_epoch) ||
+        !json_uint(duration, 0u) || !json_uint(size, RECORDER_WAV_HEADER_SIZE) ||
+        !cJSON_IsString(sha) ||
+        !device_manifest_is_valid_sha256_hex(sha->valuestring) ||
+        !json_uint(sample_rate, RECORDER_SAMPLE_RATE_HZ) ||
+        sample_rate->valuedouble != RECORDER_SAMPLE_RATE_HZ ||
+        !json_uint(bit_depth, RECORDER_BITS_PER_SAMPLE) ||
+        bit_depth->valuedouble != RECORDER_BITS_PER_SAMPLE ||
+        !json_uint(channels, RECORDER_CHANNELS) ||
+        channels->valuedouble != RECORDER_CHANNELS ||
+        !cJSON_IsString(state) ||
+        (strcmp(state->valuestring, "finalized") != 0 &&
+         strcmp(state->valuestring, "recovered") != 0) ||
+        !cJSON_IsString(fw) || fw->valuestring[0] == '\0') {
+        return false;
+    }
+    return true;
+}
+
 static const cJSON *manifest_recordings(const cJSON *manifest,
                                          const char *device_id) {
-    const cJSON *id, *entries;
+    const cJSON *id, *entries, *updated;
     const cJSON *a;
+    int64_t updated_epoch;
     if (!only_unique_keys(manifest) || !json_version_one(manifest)) {
         return NULL;
     }
     id = cJSON_GetObjectItemCaseSensitive(manifest, "deviceId");
     entries = cJSON_GetObjectItemCaseSensitive(manifest, "recordings");
+    updated = cJSON_GetObjectItemCaseSensitive(manifest, "updatedAt");
     if (!cJSON_IsString(id) || strcmp(id->valuestring, device_id) != 0 ||
+        !cJSON_IsString(updated) ||
+        !timestamp_epoch(updated->valuestring, &updated_epoch) ||
         !cJSON_IsArray(entries)) {
         return NULL;
     }
     for (a = entries->child; a != NULL; a = a->next) {
         const cJSON *rid;
         const cJSON *b;
-        if (!only_unique_keys(a)) {
+        if (!valid_manifest_entry(a)) {
             return NULL;
         }
         rid = cJSON_GetObjectItemCaseSensitive(a, "recordingId");
-        if (!cJSON_IsString(rid) ||
-            !device_identity_is_valid_uuid(rid->valuestring)) {
-            return NULL;
-        }
         for (b = a->next; b != NULL; b = b->next) {
             const cJSON *other = cJSON_GetObjectItemCaseSensitive(b, "recordingId");
             if (!cJSON_IsString(other) ||
