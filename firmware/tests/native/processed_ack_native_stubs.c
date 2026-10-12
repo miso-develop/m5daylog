@@ -13,6 +13,31 @@
 #include "device_manifest.h"
 #include "sd_mount.h"
 
+// This is a separate host-only model of internal NVS, NOT a file on MSC.
+// Tests may forge SD markers without acquiring this ledger's authority.
+#define ACK_TEST_MAX_STATES 128u
+static char s_internal_applied[ACK_TEST_MAX_STATES][37];
+static size_t s_internal_count = 0u;
+static int s_fail_state_commit = 0;
+
+int ack_test_state_status(const char *id) {
+    size_t i;
+    for (i = 0u; i < s_internal_count; ++i) {
+        if (strcmp(s_internal_applied[i], id) == 0) return 1;
+    }
+    return 0;
+}
+bool ack_test_state_commit(const char *id) {
+    if (s_fail_state_commit) return false;
+    if (ack_test_state_status(id) == 1) return true;
+    if (s_internal_count == ACK_TEST_MAX_STATES || strlen(id) != 36u) {
+        return false;
+    }
+    memcpy(s_internal_applied[s_internal_count++], id, 37u);
+    return true;
+}
+void ack_test_fail_state_commit(int v) { s_fail_state_commit = v; }
+
 static int s_sd_mounted = 1;
 static int s_fail_fsync = 0;
 static int s_fail_open = 0;
@@ -40,6 +65,8 @@ void ack_test_reset_faults(void) {
     s_marker_fp = NULL;
     s_fsync_calls = 0; s_rename_calls = 0;
     s_sd_mounted = 1;
+    s_internal_count = 0u;
+    s_fail_state_commit = 0;
 }
 bool sd_mount_is_mounted(void) { return s_sd_mounted != 0; }
 
