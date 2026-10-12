@@ -1,0 +1,56 @@
+name: PC VAD candidate verification
+
+on:
+  pull_request:
+    paths:
+      - 'pc/**'
+      - '.github/workflows/pc-vad.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  pc-vad:
+    name: pc:vad-synthetic
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check Python 3.11 and run dependency-free synthetic VAD suite
+        run: |
+          python3.11 --version
+          PYTHONPATH=pc/src python3.11 -m unittest discover -s pc/tests -p 'test_vad*.py' -v
+
+      - name: Resolve candidate locked environment
+        run: |
+          python3.11 -m venv /tmp/pc-uv
+          /tmp/pc-uv/bin/pip install --disable-pip-version-check uv
+          cd pc
+          /tmp/pc-uv/bin/uv lock --python 3.11
+
+      - name: Emit candidate lock and model digest for explicitly verified pinning
+        run: |
+          python3.11 -m venv /tmp/pc-model
+          /tmp/pc-model/bin/pip install --disable-pip-version-check --no-deps silero-vad==6.2.3
+          /tmp/pc-model/bin/python - <<'PY'
+          import base64
+          import hashlib
+          import sys
+          from importlib import resources
+          from pathlib import Path
+          sys.path.insert(0, '/tmp/pc-model/lib/python3.11/site-packages')
+          model = resources.files('silero_vad.data').joinpath('silero_vad.onnx')
+          data = model.read_bytes()
+          print('CANDIDATE_SILERO_6_2_3_MODEL_SHA256=' + hashlib.sha256(data).hexdigest())
+          blob = Path('pc/uv.lock').read_bytes()
+          print('CANDIDATE_UV_LOCK_SHA256=' + hashlib.sha256(blob).hexdigest())
+          print('CANDIDATE_UV_LOCK_BASE64_BEGIN')
+          encoded = base64.b64encode(blob).decode('ascii')
+          for i in range(0, len(encoded), 120):
+              print(encoded[i:i+120])
+          print('CANDIDATE_UV_LOCK_BASE64_END')
+          PY
