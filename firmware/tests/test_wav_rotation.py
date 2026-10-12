@@ -316,12 +316,17 @@ def test_no_deletion_or_scope_creep():
                 p.name != "device_manifest.c":
             assert not _has_c_call(
                 p.read_text(encoding="utf-8"), "remove"), p.name
-    # Task #46 recovery/quarantine and Task #47 identity/manifest are now
-    # in scope (own modules + wiring); processed-ACK retention stays out.
+    # Existing rotation/recovery/manifest sources must not absorb the
+    # separately owned #52 ACK implementation.
     assert "manifest" in blob.lower()
     assert "device.json" in blob.lower() or "device_json" in blob.lower()
+    legacy_blob = "\n".join(
+        p.read_text(encoding="utf-8") for p in COMP.rglob("*")
+        if p.is_file() and p.suffix in (".c", ".h")
+        and not p.name.startswith("processed_ack")
+    ).lower()
     for keyword in ("acks/",):
-        assert keyword not in blob.lower(), keyword
+        assert keyword not in legacy_blob, keyword
 
 
 def _writer_fn():
