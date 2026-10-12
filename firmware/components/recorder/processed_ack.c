@@ -69,6 +69,12 @@ static int read_bounded(const char *path, size_t max_len, char **out,
             return -1;
         }
     }
+    // The input is length-delimited JSON; embedded NUL may not truncate
+    // validation and hide attacker-controlled trailing bytes.
+    if (memchr(buf, '\0', got) != NULL) {
+        free(buf);
+        return -1;
+    }
     buf[got] = '\0';
     *out = buf;
     *len = got;
@@ -472,7 +478,7 @@ bool processed_ack_apply_manual_wake(const char *device_id,
         return true;
     }
     if (ack_read > 0) {
-        ack = cJSON_ParseWithLengthOpts(ack_doc, ack_len, NULL, true);
+        ack = cJSON_ParseWithLengthOpts(ack_doc, ack_len + 1u, NULL, true);
         free(ack_doc);
         ack_doc = NULL;
         if (ack == NULL || !valid_ack(ack, device_id)) {
@@ -491,7 +497,7 @@ bool processed_ack_apply_manual_wake(const char *device_id,
         diagnostic("manifest-read-error", &stats);
         goto done;
     }
-    manifest = cJSON_ParseWithLengthOpts(man_doc, man_len, NULL, true);
+    manifest = cJSON_ParseWithLengthOpts(man_doc, man_len + 1u, NULL, true);
     free(man_doc);
     man_doc = NULL;
     entries = manifest_recordings(manifest, device_id);
