@@ -152,6 +152,19 @@ class VadCase(unittest.TestCase):
         self.assertEqual(self.runtime.calls, 0)
         self.assertFalse(self.outfile().exists())
 
+    def test_changed_raw_invalidates_prior_success_before_stt(self):
+        self.execute()
+        self.raw.write_bytes(self.original + b"modified")
+        with self.assertRaisesRegex(VadError, "integrity"):
+            self.execute()
+        self.assertEqual(
+            self.con.execute("SELECT vad_status FROM recordings").fetchone()[0],
+            "FAILED")
+        self.assertEqual(
+            self.con.execute("SELECT status FROM jobs").fetchone()[0],
+            "FAILED")
+        self.assertEqual(self.runtime.calls, 1)
+
     def test_invalid_wav_formats(self):
         for payload in (wav_bytes(channels=2), wav_bytes(rate=8000),
                         wav_bytes(width=1), b"not a WAV"):
