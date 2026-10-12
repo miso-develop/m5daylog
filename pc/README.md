@@ -112,3 +112,31 @@ pc/
 - Sync never uploads protected content; no analytics, telemetry, or remote error reporting is introduced.
 - Device metadata and manifest content are not dumped on errors.
 - Tests use synthetic IDs, metadata, paths, and byte payloads only.
+
+## Recording-scoped VAD (Task #54; implementation in progress)
+
+VAD reads a single previously synced 16-kHz mono signed-PCM WAV. It never
+modifies that WAV. It produces the deterministic UTF-8 artifact
+`YYYY/MM/DD/vad/<recording_id>.jsonl`. The initial meta line is present even
+when no speech is found; subsequent lines use the original WAV sample timeline.
+
+```powershell
+cd pc
+uv lock --python 3.11
+uv sync --frozen
+uv run --frozen python -m unittest discover -s tests -v
+uv run --frozen m5daylog vad <recording-uuid> --library-root "$HOME\Documents\M5Daylog" --db "$env:LOCALAPPDATA\M5Daylog\state\m5daylog.db"
+```
+
+**Not yet production-ready:** the checked-in `uv.lock` has not yet been
+regenerated from the new Silero dependencies, and the model SHA-256 still
+requires independent measurement and pinning in `vad.py`. Consequently
+`SileroCPU` deliberately fails closed before loading any unverified model.
+Do not claim the live runtime, `uv sync --frozen`, or EV-018 passed yet.
+
+The stage checks SYNCED state, canonical local path, source size/hash and PCM
+format; validates/reuses an exact-source, exact-producer artifact without
+inference; and atomically publishes fresh JSONL via fsynced temporary file.
+A final artifact published before an interrupted SQLite commit can be
+validated and adopted on retry. Source audio and transcripts are never logged.
+STT (#55) must consume only a successful, current schema-v1 VAD artifact.
