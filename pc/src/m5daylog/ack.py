@@ -173,7 +173,11 @@ def _commit_file(final: Path, data: bytes, port: AtomicAckPort) -> None:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(temporary, flags, 0o600)
-    stream = os.fdopen(descriptor, "wb")
+    try:
+        stream = os.fdopen(descriptor, "wb")
+    except Exception:
+        os.close(descriptor)
+        raise
     write_error = None
     try:
         stream.write(data)
@@ -224,8 +228,11 @@ def flush_pre_release_acks(
         "processedAt": _timestamp(),
         "recordingIds": list(ids),
     }
-    validate_contract_document(payload, contracts / "processed-ack.schema.json")
-    data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    try:
+        validate_contract_document(payload, contracts / "processed-ack.schema.json")
+        data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    except (OSError, ValueError, TypeError):
+        return AckFlushResult("DEFERRED", len(ids), "payload-validation-failed")
 
     # Admission/teardown are separate from payload errors. A sealed gate
     # rejects without acquiring any Device handle; failed lease teardown
