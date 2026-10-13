@@ -17,7 +17,7 @@ from .vad import (
     SAMPLE_RATE, SileroCPU, VadError, _SHA, _UUID, _source,
     canonical_json, fingerprint, metadata, normalize_ranges,
 )
-from .vad_eval import FixtureMetrics, score_fixture
+from .vad_eval import FixtureMetrics, aggregate_speech, score_fixture
 
 RAW = "RAW_v1"
 DC = "dc_global_mean_v1"
@@ -340,3 +340,39 @@ def run_diagnostic(recording_id: str, *, db_path: str | Path,
             lock_sha256=_lock_sha256(), code_revision=code_revision,
             annotation_sha256=annotation_sha256, raw=raw_variant, dc=dc_variant,
         )
+
+
+def aggregate_annotated(results: Sequence[DiagnosticResult]) -> dict:
+    """Pooled variant metrics from independently annotated local recordings.
+
+    Numerical threshold flags from vad_eval are NOT Human Gate acceptance.
+    Neither a longer detection duration nor a threshold alone proves the
+    absence of systematic missed utterances or excessive false positives.
+    """
+    if not results or any(r.annotation_sha256 is None
+                          or r.raw.metrics is None or r.dc.metrics is None
+                          for r in results):
+        raise VadError("pooled diagnostic requires fully annotated results")
+    keys = [(r.source_sha256, r.total_samples) for r in results]
+    if len(keys) != len(set(keys)):
+        raise VadError("duplicate diagnostic source in pool")
+    variants = {}
+    for name in (RAW, DC):
+        metrics = [r.raw.metrics if name == RAW else r.dc.metrics for r in results]
+        pooled = aggregate_speech(metrics)
+        false_pos = sum(m.false_positive_samples for m in metrics)
+        nonspeech = sum(r.total_samples - m.reference_samples
+                        for r, m in zip(results, metrics))
+        variants[name] = {
+            **pooled,
+            "false_positive_samples": false_pos,
+            "false_positive_seconds": false_pos / SAMPLE_RATE,
+            "false_positive_ratio_over_nonspeech": (
+                false_pos / nonspeech if nonspeech else None
+            ),
+            "fixtures": len(metrics),
+        }
+    return {
+        "status": "MEASUREMENTS_ONLY_MANUAL_EV018_REVIEW_REQUIRED",
+        "variants": variants,
+    }
