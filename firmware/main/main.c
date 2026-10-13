@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -435,26 +437,29 @@ static bool recorder_ensure_manifest_exists(void) {
         ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest time");
         return false;
     }
-    probe = fopen(RECORDER_MANIFEST_PATH, "rb");
-    if (probe != NULL) {
-        fclose(probe);
+    // Always validate/reconcile the full M0/M1 transaction, even when
+    // manifest.json exists: a staged .bak may be the only proven M0.
+    if (device_manifest_recover_tmp(RECORDER_MANIFEST_PATH,
+                                    RECORDER_MANIFEST_TMP_PATH,
+                                    s_device_id)) {
         return true;
     }
-    if (!device_manifest_recover_tmp(RECORDER_MANIFEST_PATH,
-                                     RECORDER_MANIFEST_TMP_PATH,
-                                     s_device_id)) {
-        FILE *tmp_probe = fopen(RECORDER_MANIFEST_TMP_PATH, "rb");
-        if (tmp_probe != NULL) {
-            fclose(tmp_probe);
-            ESP_LOGE(TAG,
-                     "stage: manifest, result: error, reason: manifest tmp");
-            return false;
-        }
-    } else {
-        probe = fopen(RECORDER_MANIFEST_PATH, "rb");
-        if (probe != NULL) {
-            fclose(probe);
-            return true;
+    {
+        struct stat st;
+        // A failed recovery with *any* surviving artifact is never a
+        // blank first boot. Never replace uncertain metadata with [].
+        const char *artifacts[] = {
+            RECORDER_MANIFEST_PATH,
+            RECORDER_MANIFEST_TMP_PATH,
+            RECORDER_MANIFEST_PATH ".bak"
+        };
+        size_t i;
+        for (i = 0; i < sizeof(artifacts) / sizeof(artifacts[0]); ++i) {
+            if (stat(artifacts[i], &st) == 0 || errno != ENOENT) {
+                ESP_LOGE(TAG,
+                         "stage: manifest, result: error, reason: MANIFEST_RECOVERY_REQUIRED");
+                return false;
+            }
         }
     }
     {
@@ -483,8 +488,11 @@ static bool recorder_ensure_manifest_exists(void) {
         }
         {
             int fd = fileno(out);
-            if (fd >= 0) {
-                (void)fsync(fd);
+            if (fd < 0 || fsync(fd) != 0) {
+                (void)fclose(out);
+                ESP_LOGE(TAG,
+                         "stage: manifest, result: error, reason: manifest fsync");
+                return false;
             }
         }
         if (fclose(out) != 0) {
