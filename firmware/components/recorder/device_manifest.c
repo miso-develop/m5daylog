@@ -598,6 +598,18 @@ static bool manifest_uint32(const char **cursor, const char *end,
     return true;
 }
 
+static bool manifest_entry_size(const char *doc, size_t len,
+                                uint32_t *value) {
+    const char *key = memfind(doc, len, "\"sizeBytes\":");
+    const char *p, *end = doc + len;
+    if (key == NULL || value == NULL) {
+        return false;
+    }
+    p = key + strlen("\"sizeBytes\":");
+    return manifest_uint32(&p, end, value) && p < end &&
+           (*p == ',' || *p == '}');
+}
+
 static bool manifest_string_equals(const char *value, size_t length,
                                    const char *expected) {
     return length == strlen(expected) &&
@@ -864,6 +876,7 @@ device_manifest_result_t device_manifest_upsert_file(
     char entry_id[65];
     char entry_sha[65];
     char entry_fn[192];
+    uint32_t entry_size = 0;
     unsigned version = 0;
     char stored_id[RECORDER_UUID_STR_LEN];
     device_manifest_result_t ret = DEVICE_MANIFEST_ERROR;
@@ -910,7 +923,8 @@ device_manifest_result_t device_manifest_upsert_file(
     entry_fn[fn_len] = '\0';
     if (!device_identity_is_valid_uuid(entry_id) ||
         !device_manifest_is_valid_sha256_hex(entry_sha) ||
-        !valid_filename(entry_fn)) {
+        !valid_filename(entry_fn) ||
+        !manifest_entry_size(entry_json, strlen(entry_json), &entry_size)) {
         return DEVICE_MANIFEST_ERROR;
     }
 
@@ -1005,6 +1019,7 @@ device_manifest_result_t device_manifest_upsert_file(
             const char *f_at;
             char old_sha[65];
             char old_fn[192];
+            uint32_t old_size = 0;
             size_t scope_len;
             next_id = memfind(hit + 1, (size_t)((doc + doc_len) - (hit + 1)),
                               "\"recordingId\"");
@@ -1032,7 +1047,8 @@ device_manifest_result_t device_manifest_upsert_file(
                 (void)s_at;
                 (void)f_at;
                 if (!ok_s || sl != 64u || !ok_f || fl == 0u ||
-                    fl >= sizeof(old_fn)) {
+                    fl >= sizeof(old_fn) ||
+                    !manifest_entry_size(scope, scope_len, &old_size)) {
                     free(scope);
                     free(doc);
                     return DEVICE_MANIFEST_ERROR;
@@ -1044,7 +1060,8 @@ device_manifest_result_t device_manifest_upsert_file(
             }
             free(scope);
             if (strcmp(old_sha, entry_sha) == 0 &&
-                strcmp(old_fn, entry_fn) == 0) {
+                strcmp(old_fn, entry_fn) == 0 &&
+                old_size == entry_size) {
                 // Exact duplicate (retry / duplicate sync): idempotent OK
                 // with the file untouched.
                 free(doc);
