@@ -525,8 +525,7 @@ static bool read_file_bounded(const char *path, char **out_buf, size_t *out_len,
         return false;
     }
     got = fread(buf, 1, (size_t)st.st_size, fp);
-    fclose(fp);
-    if (got != (size_t)st.st_size) {
+    if (fclose(fp) != 0 || got != (size_t)st.st_size) {
         free(buf);
         return false;
     }
@@ -545,6 +544,8 @@ static bool manifest_snapshot_valid(const char *doc, size_t len,
     char stored[RECORDER_UUID_STR_LEN];
     const char *arr;
     const char *open;
+    const char *updated = NULL;
+    size_t updated_len = 0;
     const char *end = doc + len;
     const char *p;
     if (doc == NULL || len < 2u || device_id == NULL ||
@@ -552,8 +553,19 @@ static bool manifest_snapshot_valid(const char *doc, size_t len,
         !device_identity_parse_schema_version(doc, len, &ver) ||
         ver != RECORDER_METADATA_SCHEMA_VERSION ||
         !device_identity_parse_device_id(doc, len, stored) ||
-        strcmp(stored, device_id) != 0) {
+        strcmp(stored, device_id) != 0 ||
+        !json_string_field(doc, len, "\"updatedAt\"", NULL,
+                           &updated, &updated_len) ||
+        updated_len != 25u) {
         return false;
+    }
+    {
+        char stamp[RECORDER_ISO8601_STR_LEN];
+        memcpy(stamp, updated, updated_len);
+        stamp[updated_len] = '\0';
+        if (!device_manifest_is_valid_iso8601_offset(stamp)) {
+            return false;
+        }
     }
     arr = memfind(doc, len, "\"recordings\":[");
     if (arr == NULL) {
@@ -571,9 +583,12 @@ static bool manifest_snapshot_valid(const char *doc, size_t len,
         const char *sha;
         const char *name;
         const char *state;
+        const char *started;
         size_t rid_len = 0, sha_len = 0, name_len = 0, state_len = 0;
+        size_t started_len = 0;
         char uuid[RECORDER_UUID_STR_LEN], hash[RECORDER_SHA256_HEX_LEN];
         char filename[192], needle[64];
+        char started_at[RECORDER_ISO8601_STR_LEN];
         int n;
         if (*p != '{') {
             return false;
@@ -592,6 +607,10 @@ static bool manifest_snapshot_valid(const char *doc, size_t len,
                                "\"filename\"", NULL, &name, &name_len) ||
             !json_string_field(p, (size_t)(close + 1 - p),
                                "\"state\"", NULL, &state, &state_len) ||
+            !json_string_field(p, (size_t)(close + 1 - p),
+                               "\"startedAt\"", NULL,
+                               &started, &started_len) ||
+            started_len != 25u ||
             rid_len != 36u || sha_len != 64u ||
             name_len == 0u || name_len >= sizeof(filename) ||
             state_len == 0u || state_len > 9u) {
@@ -603,7 +622,10 @@ static bool manifest_snapshot_valid(const char *doc, size_t len,
         hash[sha_len] = '\0';
         memcpy(filename, name, name_len);
         filename[name_len] = '\0';
-        if (!device_identity_is_valid_uuid(uuid) ||
+        memcpy(started_at, started, started_len);
+        started_at[started_len] = '\0';
+        if (!device_manifest_is_valid_iso8601_offset(started_at) ||
+            !device_identity_is_valid_uuid(uuid) ||
             !device_manifest_is_valid_sha256_hex(hash) ||
             !valid_filename(filename) ||
             !((state_len == 9u &&
@@ -707,8 +729,13 @@ static bool write_tmp_and_rename(const char *tmp_path,
     FILE *fp;
     size_t wrote;
     char backup[RECORDER_MAX_PATH_LEN];
+    char doc_device_id[RECORDER_UUID_STR_LEN];
     struct stat st;
     bool had_final;
+    if (!device_identity_parse_device_id(doc, doc_len, doc_device_id) ||
+        !manifest_snapshot_valid(doc, doc_len, doc_device_id)) {
+        return false;
+    }
     if (!manifest_backup_path(manifest_path, backup) ||
         stat(backup, &st) == 0 || errno != ENOENT) {
         // An unresolved prior transaction cannot be overwritten.
@@ -740,7 +767,7 @@ static bool write_tmp_and_rename(const char *tmp_path,
         return false;
     }
     if (rename(tmp_path, manifest_path) == 0) {
-        return true;  // no prior final, or POSIX atomic replacement
+        return manifest_file_valid(manifest_path, doc_device_id);
     }
     // FAT cannot rename over an existing destination. Only a known
     // target-exists error may enter the two-snapshot recovery protocol.
@@ -760,11 +787,9 @@ static bool write_tmp_and_rename(const char *tmp_path,
     }
     // Do not retire the backup unless the new published manifest is
     // readable, structurally valid, and still contains all M0 entries.
-    // During this powered session the writer supplied the validated M1;
-    // the startup recovery enforces the same M0/M1 relationship.
-    // Backup cleanup is deferred to boot/recovery to keep an independent
-    // rollback candidate across this critical crash boundary.
-    return true;
+    // Validate again against M0 before reporting success. The backup is
+    // intentionally left for a later recovery checkpoint.
+    return manifest_file_extends(manifest_path, backup, doc_device_id);
 }
 
 device_manifest_result_t device_manifest_upsert_file(
