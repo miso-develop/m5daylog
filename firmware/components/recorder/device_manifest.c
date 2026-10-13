@@ -1516,8 +1516,16 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
         needed = snprintf(child, sizeof(child), "%s/%s", recordings_dir,
                           ent->d_name);
         if (needed < 0 || (size_t)needed >= sizeof(child)) {
-            skipped++;
-            continue;
+            // Unknown directory content cannot be classified as excluded;
+            // there may be a canonical UUID WAV hidden by path truncation.
+            (void)closedir(dir);
+            return false;
+        }
+        if (valid_date_dir(ent->d_name) && !path_is_dir_local(child)) {
+            // A canonical date subtree must be enumerable. A stat failure,
+            // reparse error or unexpected file type forbids healthy sync.
+            (void)closedir(dir);
+            return false;
         }
         if (path_is_dir_local(child)) {
             DIR *sub = NULL;
