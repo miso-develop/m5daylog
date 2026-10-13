@@ -11,7 +11,10 @@ import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 from m5daylog.db import init_db
 from m5daylog.vad import VadError
@@ -57,6 +60,7 @@ class StubRuntime:
         return [{"start": 0, "end": 4}] if len(audio) >= 4 else []
 
 
+@unittest.skipIf(np is None, "numpy not installed in the dependency-free smoke phase")
 class DiagnosticsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
