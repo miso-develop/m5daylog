@@ -109,6 +109,34 @@ def cmd_vad(recording_id: str, library_root: str | None,
     return 0
 
 
+def cmd_vad_diagnose(recording_id: str, library_root: str | None,
+                     db_arg: str | None, data_dir_arg: str | None,
+                     annotation_arg: str | None, code_revision: str | None) -> int:
+    if code_revision is not None and (len(code_revision) != 40 or
+            any(ch not in "0123456789abcdefABCDEF" for ch in code_revision)):
+        print("error: diagnostic invalid code revision", file=sys.stderr)
+        return 1
+    try:
+        annotation, digest = read_annotation(annotation_arg) if annotation_arg else (None, None)
+        result = run_diagnostic(
+            recording_id,
+            db_path=resolve_db_path(explicit_db=db_arg, data_dir=data_dir_arg),
+            library_root=library_root,
+            annotation=annotation,
+            annotation_sha256=digest,
+            code_revision=code_revision,
+        )
+    except DiagnosticResourceBlocked:
+        print("vad-diagnose: status=DIAGNOSTIC_RESOURCE_BLOCKED", file=sys.stderr)
+        return 2
+    except (VadError, OSError, sqlite3.Error, ImportError, ValueError):
+        print("error: vad-diagnose failed (safe diagnostic)", file=sys.stderr)
+        return 1
+    print(json.dumps(result.summary(), ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"), allow_nan=False))
+    return 0
+
+
 def cmd_init(db_arg: str | None, data_dir_arg: str | None) -> int:
     try:
         db_path = resolve_db_path(explicit_db=db_arg, data_dir=data_dir_arg)
