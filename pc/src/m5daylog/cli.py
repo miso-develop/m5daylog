@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 
 from . import __version__
 from .db import expected_tables, init_db, list_tables, resolve_db_path
 from .vad import VadError, run_vad
+from .vad_diagnostic import DiagnosticResourceBlocked, read_annotation, run_diagnostic
 from .sync import (
     ContractValidationError,
     IntegrityError,
