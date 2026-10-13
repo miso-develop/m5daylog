@@ -1290,17 +1290,14 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
             return true;
         }
     }
-    if (!device_manifest_hash_wav_file(wav_path, sha, &size_bytes)) {
+    if (!device_manifest_hash_wav_file(wav_path, sha, &size_bytes) ||
+        size_bytes < RECORDER_WAV_HEADER_SIZE) {
+        // A canonical UUID WAV that could not be hashed/parsed cannot be
+        // ignored as "legacy": the PC would otherwise sync a partial tree.
         if (skipped != NULL) {
             (*skipped)++;
         }
-        return true;
-    }
-    if (size_bytes < RECORDER_WAV_HEADER_SIZE) {
-        if (skipped != NULL) {
-            (*skipped)++;
-        }
-        return true;
+        return false;
     }
     pcm_bytes = size_bytes - RECORDER_WAV_HEADER_SIZE;
     pcm_bytes -= (pcm_bytes % RECORDER_BYTES_PER_SAMPLE);
@@ -1310,7 +1307,7 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
         if (skipped != NULL) {
             (*skipped)++;
         }
-        return true;
+        return false;
     }
     if (!device_manifest_build_entry(rec_id, rel_filename, started, duration,
                                      size_bytes, sha, RECORDER_SAMPLE_RATE_HZ,
@@ -1321,7 +1318,7 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
         if (skipped != NULL) {
             (*skipped)++;
         }
-        return true;
+        return false;
     }
     r = device_manifest_upsert_file(manifest_path, tmp_path, device_id,
                                     updated_at, entry);
@@ -1335,9 +1332,10 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
     if (skipped != NULL) {
         (*skipped)++;
     }
-    // CONFLICT and ERROR both preserve the manifest; a conflicting or
-    // unreadable file never fails the whole boot sync.
-    return true;
+    // CONFLICT/ERROR means a valid finalized/recovered WAV is not
+    // provably indexed. Preserve source RAW, but stop recording and
+    // prohibit a healthy USB publication until repaired.
+    return false;
 }
 
 bool device_manifest_sync_wav_dir(const char *recordings_dir,
@@ -1419,9 +1417,20 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
                     skipped++;
                     continue;
                 }
-                ensure_one_wav(wav, rel, ent->d_name, subent->d_name,
-                               manifest_path, tmp_path, device_id, updated_at,
-                               state, &added, &skipped);
+                if (!ensure_one_wav(wav, rel, ent->d_name, subent->d_name,
+                                    manifest_path, tmp_path, device_id,
+                                    updated_at, state, &added, &skipped)) {
+                    // Existing RAW and manifest stay on SD for recovery.
+                    closedir(sub);
+                    closedir(dir);
+                    if (out_added != NULL) {
+                        *out_added = added;
+                    }
+                    if (out_skipped != NULL) {
+                        *out_skipped = skipped;
+                    }
+                    return false;
+                }
             }
             closedir(sub);
         } else {
