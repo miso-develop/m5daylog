@@ -1160,6 +1160,29 @@ bool device_manifest_recover_tmp(const char *manifest_path,
            manifest_file_valid(manifest_path, device_id);
 }
 
+
+bool device_manifest_has_append_room(const char *manifest_path,
+                                     const char *device_id) {
+    char *doc = NULL;
+    size_t len = 0;
+    bool ok = false;
+    // Two worst-case entries plus fixed-format delimiters are reserved:
+    // the segment being admitted and one recovery/rotation margin.
+    // This is metadata admission only; physical free clusters and the
+    // full replacement temp are independently checked before recording.
+    const size_t reserve = 2u * RECORDER_MANIFEST_ENTRY_MAX + 64u;
+    if (manifest_path == NULL || device_id == NULL ||
+        !read_file_bounded(manifest_path, &doc, &len,
+                           RECORDER_MANIFEST_MAX_BYTES)) {
+        return false;
+    }
+    ok = manifest_snapshot_valid(doc, len, device_id) &&
+         len <= RECORDER_MANIFEST_MAX_BYTES &&
+         reserve <= RECORDER_MANIFEST_MAX_BYTES - len;
+    free(doc);
+    return ok;
+}
+
 // --- Boot sync of finalized WAVs ------------------------------------------
 
 static bool path_is_dir_local(const char *path) {
