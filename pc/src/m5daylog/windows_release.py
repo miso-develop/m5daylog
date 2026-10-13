@@ -76,8 +76,8 @@ class Win32DeviceApi(Protocol):
     def disk_instance_present(self, instance_id: str) -> bool: ...
     def mount_point_present(self, mount_root: str) -> bool: ...
     def lock_and_dismount(self, volume_guid: str) -> ContextManager[None]: ...
-    def release_cdc(self, port: str, attempt_id: str, expected_physical_id: str) -> None: ...
-    def cdc_physical_id(self, port: str) -> str: ...
+    def release_cdc(self, port: str, attempt_id: str, binding: CdcInterface) -> None: ...
+    def cdc_interface(self, port: str) -> CdcInterface: ...
 
 
 class WindowsHostReleasePort:
@@ -86,6 +86,9 @@ class WindowsHostReleasePort:
     def __init__(self, api: Win32DeviceApi, *, contracts_dir: str | None = None):
         self.api = api
         self.contracts_dir = contracts_dir
+        # Freeze once for this port/session; a later re-enumeration may never
+        # silently replace the CDC endpoint selected before the I/O cutoff.
+        self._cdc_binding: tuple[str, str, CdcInterface] | None = None
 
     def resolve_target(self, mount_root: str, expected_device_id: str) -> EjectTarget:
         # Fail closed on non-root paths; no drive label / first removable heuristic.
@@ -122,8 +125,13 @@ class WindowsHostReleasePort:
         current = self.resolve_target(target.mount_root, target.expected_device_id)
         if current != target:
             raise WrongTarget("frozen target topology changed")
-        if self.api.cdc_physical_id(cdc_port) != target.usb_physical_instance_id:
+        endpoint = self.api.cdc_interface(cdc_port)
+        if endpoint.physical_usb_instance_id != target.usb_physical_instance_id:
             raise WrongTarget("CDC port is not on the frozen USB device")
+        binding = (target.usb_physical_instance_id, cdc_port.upper(), endpoint)
+        if self._cdc_binding is not None and self._cdc_binding != binding:
+            raise WrongTarget("CDC endpoint changed within the release session")
+        self._cdc_binding = binding
 
     def volume_available(self, target: EjectTarget) -> bool:
         return self.api.filesystem_accessible(target.volume_guid)
@@ -132,10 +140,14 @@ class WindowsHostReleasePort:
         return self.api.lock_and_dismount(target.volume_guid)
 
     def release_storage(self, cdc_port: str, attempt_id: str, target: EjectTarget) -> None:
-        # Repeat the correlation immediately before sending irreversible command.
-        if self.api.cdc_physical_id(cdc_port) != target.usb_physical_instance_id:
-            raise WrongTarget("CDC port changed identity before release")
-        self.api.release_cdc(cdc_port, attempt_id, target.usb_physical_instance_id)
+        # Do not acquire a new binding after seal; this must be the exact
+        # endpoint frozen while the ordinary MSC lease was still open.
+        binding = self._cdc_binding
+        if (binding is None or binding[0] != target.usb_physical_instance_id
+                or binding[1] != cdc_port.upper()
+                or self.api.cdc_interface(cdc_port) != binding[2]):
+            raise WrongTarget("CDC endpoint changed identity before release")
+        self.api.release_cdc(cdc_port, attempt_id, binding[2])
 
     def volume_disappeared(self, target: EjectTarget) -> bool:
         # No post-acceptance CreateFile, storage IOCTL, or filesystem query.
@@ -532,8 +544,8 @@ class NativeWin32DeviceApi:
             raise WrongTarget("CDC port mapping is missing or ambiguous")
         return matched[0]
 
-    def cdc_physical_id(self, port: str) -> str:
-        return self._cdc_interface(port).physical_usb_instance_id
+    def cdc_interface(self, port: str) -> CdcInterface:
+        return self._cdc_interface(port)
 
     def filesystem_accessible(self, volume_guid: str) -> bool:
         # A failed FS query alone is NOT teardown proof; disk interface
@@ -570,13 +582,13 @@ class NativeWin32DeviceApi:
         finally:
             self.k.CloseHandle(handle)
 
-    def release_cdc(self, port: str, attempt_id: str, expected_physical_id: str) -> None:
+    def release_cdc(self, port: str, attempt_id: str, binding: CdcInterface) -> None:
         # A PnP interface path identifies the endpoint independently of COMx.
         # A COM alias may be reassigned between the adapter's last check and
         # CreateFileW; it must never select the endpoint receiving the command.
         endpoint = self._cdc_interface(port)
-        if endpoint.physical_usb_instance_id != expected_physical_id:
-            raise WrongTarget("CDC release endpoint is not the frozen USB device")
+        if endpoint != binding:
+            raise WrongTarget("CDC release endpoint no longer matches frozen binding")
         request_id = str(uuid.uuid4())
         request = (json.dumps({
             "id": request_id, "cmd": "RELEASE_STORAGE",
@@ -586,7 +598,7 @@ class NativeWin32DeviceApi:
         try:
             # If the port disappeared or was re-enumerated between resolution
             # and handle opening, abort before any CDC protocol bytes are sent.
-            if self._cdc_interface(port) != endpoint:
+            if self._cdc_interface(port) != binding:
                 raise WrongTarget("CDC endpoint changed during handle acquisition")
             timeouts = COMMTIMEOUTS(0xFFFFFFFF, 0, 250, 0, 1000)
             if not self.k.SetCommTimeouts(handle, ctypes.byref(timeouts)):
