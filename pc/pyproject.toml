@@ -5,7 +5,10 @@ description = "M5Daylog PoC Python CLI (local-first audio lifelog scaffold)"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 license = { text = "MIT" }
-dependencies = []
+dependencies = [
+    "silero-vad[onnx-cpu]==6.2.3",
+    "onnxruntime==1.30.0",
+]
 
 [project.scripts]
 m5daylog = "m5daylog.cli:main"
