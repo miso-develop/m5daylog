@@ -33,8 +33,12 @@ RENAME_EMULATOR = r"""
 #include <unistd.h>
 
 static int calls = 0;
-
-void manifest_test_reset(void) { calls = 0; }
+static int flush_calls = 0, close_calls = 0, sync_calls = 0;
+static int remove_calls = 0, write_calls = 0;
+void manifest_test_reset(void) {
+    calls = 0;
+    flush_calls = close_calls = sync_calls = remove_calls = write_calls = 0;
+}
 int manifest_test_calls(void) { return calls; }
 
 static int fault_at(int call) {
@@ -72,39 +76,34 @@ static int io_call(const char *name, int *counter) {
 }
 
 int manifest_test_fflush(FILE *fp) {
-    static int n = 0;
-    if (io_call("M5_TEST_FAIL_FFLUSH", &n)) {
+    if (io_call("M5_TEST_FAIL_FFLUSH", &flush_calls)) {
         errno = EIO;
         return EOF;
     }
     return fflush(fp);
 }
 int manifest_test_fclose(FILE *fp) {
-    static int n = 0;
     int ret = fclose(fp);
-    if (io_call("M5_TEST_FAIL_FCLOSE", &n)) {
+    if (io_call("M5_TEST_FAIL_FCLOSE", &close_calls)) {
         errno = EIO;
         return EOF;
     }
     return ret;
 }
 int manifest_test_fsync(int fd) {
-    static int n = 0;
-    if (io_call("M5_TEST_FAIL_FSYNC", &n)) {
+    if (io_call("M5_TEST_FAIL_FSYNC", &sync_calls)) {
         errno = EIO;
         return -1;
     }
     return fsync(fd);
 }
 int manifest_test_remove(const char *path) {
-    static int n = 0;
-    if (io_call("M5_TEST_FAIL_REMOVE", &n)) {
+    if (io_call("M5_TEST_FAIL_REMOVE", &remove_calls)) {
         errno = EIO;
         return -1;
     }
     return remove(path);
 }
-static int write_calls = 0;
 size_t manifest_test_fwrite(const void *ptr, size_t size, size_t nmemb,
                             FILE *fp) {
     ++write_calls;
