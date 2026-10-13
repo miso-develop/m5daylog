@@ -417,6 +417,49 @@ class WindowsAdapterTests(unittest.TestCase):
              "pnp-presence", "dos-namespace"],
         )
 
+    def test_native_pnp_observer_never_opens_disk_or_sends_ioctl(self):
+        # Exercise the actual NativeWin32DeviceApi observer against Win32 spies,
+        # without requiring a real Windows host or removable device.
+        import ctypes
+        from types import SimpleNamespace
+        from m5daylog.windows_release import NativeWin32DeviceApi, SP_DEVINFO_DATA
+
+        present = {"value": True}
+
+        def prohibited_device_io(*_args):
+            raise AssertionError("target-directed Win32 disk I/O after acceptance")
+
+        def enum_interfaces(_devs, _data, _guid, index, _out):
+            return present["value"] and index == 0
+
+        def details(_devs, _interface, _buffer, _length, _needed, info):
+            ctypes.cast(
+                info, ctypes.POINTER(SP_DEVINFO_DATA)
+            ).contents.DevInst = 7
+            return True
+
+        api = NativeWin32DeviceApi.__new__(NativeWin32DeviceApi)
+        api.k = SimpleNamespace(
+            CreateFileW=prohibited_device_io,
+            DeviceIoControl=prohibited_device_io,
+            QueryDosDeviceW=lambda *_args: 0,
+        )
+        api.s = SimpleNamespace(
+            SetupDiGetClassDevsW=lambda *_args: 4,
+            SetupDiEnumDeviceInterfaces=enum_interfaces,
+            SetupDiGetDeviceInterfaceDetailW=details,
+            SetupDiDestroyDeviceInfoList=lambda *_args: True,
+        )
+        api._instance_id = lambda _devinst: TARGET.disk_instance_id
+        observer = WindowsHostReleasePort(api)
+
+        self.assertFalse(observer.volume_disappeared(TARGET))
+        present["value"] = False
+        # 259: end of PnP enumeration; 2: DOS-drive link no longer found.
+        with patch("m5daylog.windows_release.ctypes.get_last_error",
+                   create=True, side_effect=[259, 2]):
+            self.assertTrue(observer.volume_disappeared(TARGET))
+
     def test_no_other_volume_is_chosen_on_bad_mount(self):
         for root in ("F:\\M5DAYLOG", ".", "E:", "\\\\server\\share"):
             with self.subTest(root=root), self.assertRaises(Exception):
