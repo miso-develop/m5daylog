@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
@@ -40,6 +42,7 @@ class FakePort:
         self.present = True
         self.disappeared = True
         self.on_quiesce = None
+        self.on_revalidate = None
 
     def resolve_target(self, root, expected):
         self.steps.append("resolve")
@@ -49,6 +52,8 @@ class FakePort:
 
     def revalidate_target(self, target, cdc_port):
         self.steps.append("revalidate")
+        if self.on_revalidate is not None:
+            self.on_revalidate()
         if self.failure == "revalidate":
             raise WrongTarget("device changed")
 
@@ -217,6 +222,58 @@ class ReleaseCoordinatorTests(unittest.TestCase):
             with self.gate.ordinary("cdc"):
                 pass
 
+    def test_concurrent_revalidation_is_leased_until_drain(self):
+        """No host release can pass seal while another run reads device.json."""
+        entered = threading.Event()
+        resume = threading.Event()
+        errors = []
+        results = {}
+
+        def on_revalidate():
+            if threading.current_thread().name == "slow-revalidation":
+                entered.set()
+                if not resume.wait(3):
+                    raise AssertionError("test revalidation release timed out")
+
+        self.port.on_revalidate = on_revalidate
+
+        def work(label):
+            try:
+                results[label] = self.coordinator.run(
+                    mount_root="E:\\", cdc_port="COM5",
+                    device_id=lambda: "test-device",
+                    sync=lambda: SyncSummary(copied=1, conflicts=0),
+                    gate=self.gate,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=work, args=("first",), name="slow-revalidation")
+        second = threading.Thread(target=work, args=("second",), name="sealing-run")
+        first.start()
+        try:
+            self.assertTrue(entered.wait(2), "first run never reached target validation")
+            self.assertEqual(self.gate.outstanding_ordinary, 1)
+            second.start()
+            deadline = time.monotonic() + 2
+            while self.gate.state is GateState.OPEN and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertEqual(self.gate.state, GateState.SEALED_FOR_RELEASE)
+            # The second run is blocked by the first run's tracked MSC lease.
+            self.assertEqual(self.gate.outstanding_ordinary, 1)
+            self.assertNotIn("lock", self.port.steps)
+        finally:
+            resume.set()
+            first.join(4)
+            if second.ident is not None:
+                second.join(4)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertFalse(errors, errors)
+        self.assertEqual(results["first"].reason, "GATE_CLOSED")
+        self.assertTrue(results["second"].success)
+        self.assertEqual(self.port.steps.count("lock"), 1)
+
     def test_seal_draining_and_control_exclusivity(self):
         gate = UsbSessionIoGate()
         with gate.ordinary("msc"):
@@ -245,6 +302,7 @@ class FakeWindowsApi:
         self.disks = (8,)
         self.interfaces = [DiskInterface(8, TARGET.disk_instance_id, TARGET.eject_instance_id, TARGET.usb_physical_instance_id)]
         self.accessible = True
+        self.mount_point_active = True
         self.calls = []
 
     def volume_guid(self, mount_root):
@@ -258,6 +316,17 @@ class FakeWindowsApi:
 
     def filesystem_accessible(self, guid):
         return self.accessible
+
+    def disk_instance_present(self, instance_id):
+        self.calls.append("pnp-presence")
+        return any(
+            iface.instance_id.casefold() == instance_id.casefold()
+            for iface in self.interfaces
+        )
+
+    def mount_point_present(self, mount_root):
+        self.calls.append("dos-namespace")
+        return self.mount_point_active
 
     @contextmanager
     def lock_and_dismount(self, guid):
@@ -325,7 +394,28 @@ class WindowsAdapterTests(unittest.TestCase):
         # Locked/dismounted volume is unreadable but the disk still exists.
         self.assertFalse(self.adapter.volume_disappeared(TARGET))
         self.api.interfaces = []
+        # Disappearance requires BOTH passive proofs, not only one.
+        self.assertFalse(self.adapter.volume_disappeared(TARGET))
+        self.api.mount_point_active = False
         self.assertTrue(self.adapter.volume_disappeared(TARGET))
+
+    def test_post_acceptance_observation_never_uses_disk_or_filesystem_io(self):
+        # Detect the prior disk_interfaces() CreateFile/IOCTL and
+        # GetVolumeInformationW filesystem paths after acceptance.
+        with (patch.object(self.api, "disk_interfaces",
+                           side_effect=AssertionError("disk I/O after acceptance")),
+              patch.object(self.api, "filesystem_accessible",
+                           side_effect=AssertionError("filesystem I/O after acceptance"))):
+            self.assertFalse(self.adapter.volume_disappeared(TARGET))
+            self.api.interfaces = []
+            self.assertFalse(self.adapter.volume_disappeared(TARGET))
+            self.api.mount_point_active = False
+            self.assertTrue(self.adapter.volume_disappeared(TARGET))
+        self.assertEqual(
+            self.api.calls,
+            ["pnp-presence", "pnp-presence", "dos-namespace",
+             "pnp-presence", "dos-namespace"],
+        )
 
     def test_no_other_volume_is_chosen_on_bad_mount(self):
         for root in ("F:\\M5DAYLOG", ".", "E:", "\\\\server\\share"):
