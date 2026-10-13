@@ -31,13 +31,15 @@ RENAME_EMULATOR = r"""
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <dirent.h>
 
 static int calls = 0;
 static int flush_calls = 0, close_calls = 0, sync_calls = 0;
-static int remove_calls = 0, write_calls = 0;
+static int remove_calls = 0, write_calls = 0, readdir_calls = 0;
 void manifest_test_reset(void) {
     calls = 0;
     flush_calls = close_calls = sync_calls = remove_calls = write_calls = 0;
+    readdir_calls = 0;
 }
 int manifest_test_calls(void) { return calls; }
 
@@ -113,6 +115,15 @@ size_t manifest_test_fwrite(const void *ptr, size_t size, size_t nmemb,
     }
     return fwrite(ptr, size, nmemb, fp);
 }
+struct dirent *manifest_test_readdir(DIR *dir) {
+    ++readdir_calls;
+    if (getenv("M5_TEST_FAIL_READDIR") &&
+        atoi(getenv("M5_TEST_FAIL_READDIR")) == readdir_calls) {
+        errno = EIO;
+        return NULL;
+    }
+    return readdir(dir);
+}
 """
 
 
@@ -136,6 +147,7 @@ def native_manifest(tmp_path_factory):
              "-Dfsync=manifest_test_fsync",
              "-Dremove=manifest_test_remove",
              "-Dfwrite=manifest_test_fwrite",
+             "-Dreaddir=manifest_test_readdir",
              "-c", str(COMP / source),
              "-o", str(obj)],
             check=True, capture_output=True, text=True,
@@ -457,3 +469,26 @@ def test_close_error_does_not_retire_m0(
     assert _upsert(native_manifest, final, temp, _entry(2)) == 2
     assert final.read_bytes() == m0
     monkeypatch.delenv("M5_TEST_FAIL_FCLOSE")
+
+
+def test_readdir_eio_cannot_produce_healthy_index_scan(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    final, temp = _create(tmp_path, [])
+    directory = tmp_path / "recordings" / "2026-10-13"
+    directory.mkdir(parents=True)
+    rec = _entry(1)
+    wav = directory / Path(rec["filename"]).name
+    wav.write_bytes(b"x" * 44)
+    before = final.read_bytes()
+    added, skipped = ctypes.c_uint32(), ctypes.c_uint32()
+    native_manifest.manifest_test_reset()
+    monkeypatch.setenv("M5_TEST_FAIL_READDIR", "2")
+    assert not native_manifest.device_manifest_sync_wav_dir(
+        _b(directory.parent), _b(final), _b(temp), _b(DEVICE_ID), _b(NOW),
+        _b("recovered"), ctypes.byref(added), ctypes.byref(skipped),
+    )
+    monkeypatch.delenv("M5_TEST_FAIL_READDIR")
+    assert final.read_bytes() == before
+    assert wav.read_bytes() == b"x" * 44
