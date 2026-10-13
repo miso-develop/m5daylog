@@ -80,6 +80,17 @@ def build_parser() -> argparse.ArgumentParser:
     vad_parser.add_argument("--library-root", default=None)
     vad_parser.add_argument("--db", default=None)
     vad_parser.add_argument("--data-dir", default=None)
+    diag_parser = subparsers.add_parser(
+        "vad-diagnose", help="Offline RAW/DC comparison only; no artifact or DB writes."
+    )
+    diag_parser.add_argument("recording_id", help="SYNCED recording UUID.")
+    diag_parser.add_argument("--library-root", default=None)
+    diag_parser.add_argument("--db", default=None)
+    diag_parser.add_argument("--data-dir", default=None)
+    diag_parser.add_argument("--annotation", default=None,
+                             help="Local sample-index annotation JSON.")
+    diag_parser.add_argument("--code-revision", default=None,
+                             help="Operator-verified 40-hex Git HEAD for evidence.")
     return parser
 
 
