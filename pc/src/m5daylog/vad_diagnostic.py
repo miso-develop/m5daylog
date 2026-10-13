@@ -114,17 +114,6 @@ class DiagnosticResult:
         }
 
 
-def _blocks(pcm: bytes, *, block_samples: int = BLOCK_SAMPLES):
-    """Bound integer accumulation to blocks; never int16-accumulate a file."""
-    if block_samples <= 0 or len(pcm) % 2:
-        raise VadError("invalid diagnostic PCM")
-    import numpy as np
-
-    view = memoryview(pcm)
-    for begin in range(0, len(view), block_samples * 2):
-        yield np.frombuffer(view[begin:begin + block_samples * 2], dtype="<i2")
-
-
 def _stat(pcm: bytes) -> tuple[int, int, float | None, tuple[float, ...]]:
     """Exact int64 block sums and fixed 60-second drift windows."""
     import numpy as np
