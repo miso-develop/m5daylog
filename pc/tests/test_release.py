@@ -185,6 +185,27 @@ class ReleaseCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.port.steps.count("release"), 1)
         self.assertGreaterEqual(self.clock.now, 1.0)
 
+    def test_lease_drain_deadline_is_timeout_without_release(self):
+        # Model a separately admitted MSC lease with a deterministic clock.
+        # The second clock reading reaches the deadline with the lease active.
+        self.coordinator.clock = iter((0.0, 1.0)).__next__
+        with self.gate.ordinary("msc"):
+            outcome = self.run_release()
+            self.assertEqual(self.gate.outstanding_ordinary, 1)
+            self.assertEqual(self.gate.state, GateState.SEALED_FOR_RELEASE)
+
+        self.assertEqual(outcome.status, "SYNC_COMPLETE_RELEASE_FAILED")
+        self.assertEqual(outcome.reason, "TIMEOUT")
+        self.assertEqual(self.port.steps, [
+            "resolve", "revalidate", "available",
+        ])
+        self.assertEqual(self.gate.state, GateState.SEALED_FOR_RELEASE)
+        for transport in ("msc", "cdc"):
+            with self.subTest(transport=transport):
+                with self.assertRaises(GateClosed):
+                    with self.gate.ordinary(transport):
+                        pass
+
     def test_post_seal_msc_and_cdc_both_denied(self):
         denied = []
         def attempt_late_io():
