@@ -343,14 +343,11 @@ esp_err_t device_identity_ensure_device_id(char out[RECORDER_UUID_STR_LEN]) {
         return ESP_ERR_INVALID_ARG;
     }
     memset(out, 0, RECORDER_UUID_STR_LEN);
+    // PoC-C never erases default NVS as an error-recovery shortcut.
+    // A full/unknown-version NVS may contain the only durable deviceId,
+    // RTC correction and shutdown-armed history. Fail closed instead of
+    // silently losing identity or making retained recordings unverifiable.
     err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        if (nvs_flash_erase() != ESP_OK) {
-            return ESP_FAIL;
-        }
-        err = nvs_flash_init();
-    }
     if (err != ESP_OK) {
         return err;
     }
