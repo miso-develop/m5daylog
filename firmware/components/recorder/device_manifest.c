@@ -1288,6 +1288,24 @@ bool device_manifest_has_append_room(const char *manifest_path,
     return ok;
 }
 
+static device_manifest_scan_error_t s_scan_error = DEVICE_MANIFEST_SCAN_OK;
+
+device_manifest_scan_error_t device_manifest_last_scan_error(void) {
+    return s_scan_error;
+}
+
+const char *device_manifest_scan_error_name(device_manifest_scan_error_t e) {
+    switch (e) {
+        case DEVICE_MANIFEST_SCAN_OK: return "OK";
+        case DEVICE_MANIFEST_SCAN_INVALID_INPUT: return "INVALID_INPUT";
+        case DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR: return "DIRECTORY_ERROR";
+        case DEVICE_MANIFEST_SCAN_WAV_UNREADABLE: return "WAV_UNREADABLE";
+        case DEVICE_MANIFEST_SCAN_INDEX_CONFLICT: return "INDEX_CONFLICT";
+        case DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR: return "INDEX_WRITE_ERROR";
+        default: return "UNKNOWN";
+    }
+}
+
 // --- Boot sync of finalized WAVs ------------------------------------------
 
 static bool path_is_dir_local(const char *path) {
@@ -1422,6 +1440,7 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
         size_bytes < RECORDER_WAV_HEADER_SIZE) {
         // A canonical UUID WAV that could not be hashed/parsed cannot be
         // ignored as "legacy": the PC would otherwise sync a partial tree.
+        s_scan_error = DEVICE_MANIFEST_SCAN_WAV_UNREADABLE;
         if (skipped != NULL) {
             (*skipped)++;
         }
@@ -1432,6 +1451,7 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
     duration = device_manifest_duration_ms(pcm_bytes);
     entry = (char *)malloc(RECORDER_MANIFEST_ENTRY_MAX);
     if (entry == NULL) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
         if (skipped != NULL) {
             (*skipped)++;
         }
@@ -1443,6 +1463,7 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
                                      RECORDER_CHANNELS, state, NULL, entry,
                                      RECORDER_MANIFEST_ENTRY_MAX)) {
         free(entry);
+        s_scan_error = DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
         if (skipped != NULL) {
             (*skipped)++;
         }
@@ -1451,6 +1472,11 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
     r = device_manifest_upsert_file(manifest_path, tmp_path, device_id,
                                     updated_at, entry);
     free(entry);
+    if (r != DEVICE_MANIFEST_OK) {
+        s_scan_error = (r == DEVICE_MANIFEST_CONFLICT)
+            ? DEVICE_MANIFEST_SCAN_INDEX_CONFLICT
+            : DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
+    }
     if (r == DEVICE_MANIFEST_OK) {
         if (added != NULL) {
             (*added)++;
@@ -1475,6 +1501,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
     struct dirent *ent = NULL;
     uint32_t added = 0;
     uint32_t skipped = 0;
+    s_scan_error = DEVICE_MANIFEST_SCAN_INVALID_INPUT;
     if (out_added != NULL) {
         *out_added = 0;
     }
@@ -1496,8 +1523,10 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
     }
     dir = opendir(recordings_dir);
     if (dir == NULL) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
         return false;
     }
+    s_scan_error = DEVICE_MANIFEST_SCAN_OK;
     for (;;) {
         char child[RECORDER_MAX_PATH_LEN];
         int needed;
@@ -1602,6 +1631,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
         }
     }
     if (closedir(dir) != 0) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
         return false;
     }
     if (out_added != NULL) {
