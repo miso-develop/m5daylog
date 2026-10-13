@@ -536,3 +536,16 @@ def test_scan_failure_classification_survives_for_operator_diagnostics(
         _b("recovered"), ctypes.byref(added), ctypes.byref(skipped),
     )
     assert native_manifest.device_manifest_last_scan_error() == 0
+
+
+def test_missing_manifest_cannot_reset_nonempty_recording_history():
+    # Source integration check for the ESP-only recorder startup path.
+    # FAT32 behavior and injected power loss remain a separate physical gate.
+    main = (ROOT / "firmware/main/main.c").read_text(encoding="utf-8")
+    ensure = main.split("static bool recorder_ensure_manifest_exists(void)", 1)[1]
+    ensure = ensure.split("static void recorder_battery_task", 1)[0]
+    assert "recorder_recordings_tree_pristine()" in ensure
+    assert ensure.index("recorder_recordings_tree_pristine()") < ensure.index(
+        "device_manifest_build_empty("
+    )
+    assert "MANIFEST_RECOVERY_REQUIRED" in ensure
