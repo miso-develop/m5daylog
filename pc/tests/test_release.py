@@ -354,7 +354,11 @@ class FakeWindowsApi:
         self.calls.append("lock-dismount")
         yield
 
-    def release_cdc(self, port, attempt):
+    def release_cdc(self, port, attempt, expected_physical_id):
+        # The native API must check the endpoint it will actually open, not
+        # just the earlier adapter-level COM-name correlation.
+        if self.cdc_physical_id(port) != expected_physical_id:
+            raise WrongTarget("CDC identity changed before handle open")
         self.calls.append("cdc-release")
 
     def cdc_physical_id(self, port):
@@ -408,6 +412,123 @@ class WindowsAdapterTests(unittest.TestCase):
         with self.assertRaises(WrongTarget):
             self.adapter.release_storage("COM5", "attempt", TARGET)
         self.assertEqual(self.api.calls, [])
+
+    def test_release_binds_to_frozen_usb_even_if_com_alias_reassigned(self):
+        self.api.cdc_usb_id = TARGET.usb_physical_instance_id
+        # The adapter's initial check observes A, but the actual release
+        # method's endpoint resolution sees reassigned device B.
+        first = self.api.cdc_physical_id
+        calls = 0
+
+        def rebind_after_initial_check(port):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                self.api.cdc_usb_id = "USB\\VID_303A&PID_4001\\OTHER"
+            return first(port)
+
+        with patch.object(self.api, "cdc_physical_id",
+                          side_effect=rebind_after_initial_check):
+            with self.assertRaises(WrongTarget):
+                self.adapter.release_storage("COM5", "attempt", TARGET)
+        self.assertEqual(self.api.calls, [])
+
+    def test_native_cdc_rebind_after_open_cannot_write_release(self):
+        # The checked PnP path is opened directly. If enumeration changes
+        # while the handle opens, the second check aborts before WriteFile.
+        from types import SimpleNamespace
+        from m5daylog.windows_release import CdcInterface, NativeWin32DeviceApi
+
+        good = CdcInterface(
+            r"\\?\usb#vid_303a&pid_4001#port_A",
+            r"USB\VID_303A&PID_4001\INTERFACE_A",
+            TARGET.usb_physical_instance_id,
+        )
+        rebound = CdcInterface(
+            r"\\?\usb#vid_303a&pid_4001#port_B",
+            r"USB\VID_303A&PID_4001\INTERFACE_B",
+            "USB\\VID_303A&PID_4001\\OTHER",
+        )
+        api = NativeWin32DeviceApi.__new__(NativeWin32DeviceApi)
+        endpoints = iter((good, rebound))
+        api._cdc_interface = lambda _port: next(endpoints)
+        opened = []
+        closed = []
+        written = []
+        api._open = lambda path, _access, _sharing: opened.append(path) or 7
+        api.k = SimpleNamespace(
+            SetCommTimeouts=lambda *_args: True,
+            WriteFile=lambda *_args: written.append(True) or True,
+            CloseHandle=lambda h: closed.append(h),
+        )
+        with self.assertRaises(WrongTarget):
+            api.release_cdc("COM5", "attempt", TARGET.usb_physical_instance_id)
+        self.assertEqual(opened, [good.device_path])
+        self.assertEqual(closed, [7])
+        self.assertEqual(written, [])
+
+    def test_native_cdc_wrong_physical_id_never_opens_endpoint(self):
+        from m5daylog.windows_release import CdcInterface, NativeWin32DeviceApi
+
+        api = NativeWin32DeviceApi.__new__(NativeWin32DeviceApi)
+        api._cdc_interface = lambda _port: CdcInterface(
+            r"\\?\usb#other", "USB\\OTHER", "USB\\VID_OTHER&PID_0001\\OTHER"
+        )
+        api._open = lambda *_args: self.fail("wrong-target handle was opened")
+        with self.assertRaises(WrongTarget):
+            api.release_cdc("COM5", "attempt", TARGET.usb_physical_instance_id)
+
+    def test_native_cdc_release_uses_pnp_path_and_correlated_reply(self):
+        import ctypes
+        import json
+        from ctypes import wintypes
+        from types import SimpleNamespace
+        from m5daylog.windows_release import CdcInterface, NativeWin32DeviceApi
+
+        endpoint = CdcInterface(
+            r"\\?\usb#vid_303a&pid_4001#port_A",
+            r"USB\VID_303A&PID_4001\INTERFACE_A",
+            TARGET.usb_physical_instance_id,
+        )
+        api = NativeWin32DeviceApi.__new__(NativeWin32DeviceApi)
+        api._cdc_interface = lambda _port: endpoint
+        opened, written, closed = [], [], []
+        incoming = bytearray()
+        api._open = lambda path, _access, _sharing: opened.append(path) or 11
+
+        def write(_h, data, count, count_written, _overlap):
+            request = json.loads(ctypes.string_at(data, count))
+            self.assertEqual(request["cmd"], "RELEASE_STORAGE")
+            self.assertEqual(request["args"]["releaseAttemptId"], "attempt")
+            written.append(request)
+            incoming.extend((json.dumps({
+                "id": request["id"], "ok": True,
+                "result": {"releaseAttemptId": "attempt", "accepted": True},
+            }) + "\n").encode("utf-8"))
+            ctypes.cast(count_written, ctypes.POINTER(wintypes.DWORD)).contents.value = count
+            return True
+
+        def read(_h, output, _count, count_read, _overlap):
+            if incoming:
+                ctypes.memmove(output, bytes(incoming[:1]), 1)
+                del incoming[:1]
+                got = 1
+            else:
+                got = 0
+            ctypes.cast(count_read, ctypes.POINTER(wintypes.DWORD)).contents.value = got
+            return True
+
+        api.k = SimpleNamespace(
+            SetCommTimeouts=lambda *_args: True,
+            WriteFile=write,
+            ReadFile=read,
+            CloseHandle=lambda h: closed.append(h),
+        )
+        api.release_cdc("COM5", "attempt", TARGET.usb_physical_instance_id)
+        self.assertEqual(opened, [endpoint.device_path])
+        self.assertNotEqual(opened[0], r"\\.\COM5")
+        self.assertEqual(len(written), 1)
+        self.assertEqual(closed, [11])
 
     def test_dismount_is_not_accepted_as_release_disappearance(self):
         self.assertFalse(self.adapter.volume_disappeared(TARGET))
