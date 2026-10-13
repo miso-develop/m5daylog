@@ -36,6 +36,10 @@ jobs:
           /tmp/pc-uv/bin/uv lock --check --python 3.11
           /tmp/pc-uv/bin/uv sync --frozen
 
+      - name: Run complete synthetic suite with frozen NumPy/Silero dependencies
+        working-directory: pc
+        run: /tmp/pc-uv/bin/uv run --frozen python -m unittest discover -s tests -v
+
       - name: Real Silero CPU ONNX model and silence smoke
         working-directory: pc
         run: |
