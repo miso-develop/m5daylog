@@ -211,6 +211,8 @@ def read_annotation(path: str | Path) -> tuple[dict, str]:
                 or not isinstance(obj.get("category"), str)
                 or len(obj["fixture_id"]) > 128 or len(obj["category"]) > 128
                 or type(obj.get("total_samples")) is not int
+                or not isinstance(obj.get("source_sha256"), str)
+                or not _SHA.fullmatch(obj["source_sha256"])
                 or not isinstance(obj.get("reference"), list)):
             raise ValueError("invalid fields")
         reference = obj["reference"]
@@ -224,6 +226,7 @@ def read_annotation(path: str | Path) -> tuple[dict, str]:
             "fixture_id": obj["fixture_id"],
             "category": obj["category"],
             "total_samples": obj["total_samples"],
+            "source_sha256": obj["source_sha256"],
             "reference": tuple(tuple(x) for x in reference),
         }, hashlib.sha256(raw).hexdigest())
     except (ValueError, TypeError, UnicodeDecodeError, OSError, json.JSONDecodeError):
@@ -293,12 +296,18 @@ def run_diagnostic(recording_id: str, *, db_path: str | Path,
         if (type(row["size_bytes"]) is not int or row["size_bytes"] < 0 or
                 row["size_bytes"] > 2 * max_samples + MAX_WAV_HEADER_BYTES):
             raise DiagnosticResourceBlocked("DIAGNOSTIC_RESOURCE_BLOCKED")
+        # Check physical file size before _source's all-at-once read.
+        candidate = Path(row["local_path"] or "")
+        if candidate.stat().st_size > 2 * max_samples + MAX_WAV_HEADER_BYTES:
+            raise DiagnosticResourceBlocked("DIAGNOSTIC_RESOURCE_BLOCKED")
         pcm, total, source_sha, resolved = _source(row, root)
         if total > max_samples:
             raise DiagnosticResourceBlocked("DIAGNOSTIC_RESOURCE_BLOCKED")
         if annotation is not None:
-            if type(annotation.get("total_samples")) is not int or annotation["total_samples"] != total:
-                raise VadError("diagnostic annotation source length mismatch")
+            if (type(annotation.get("total_samples")) is not int or
+                    annotation["total_samples"] != total or
+                    annotation.get("source_sha256") != source_sha):
+                raise VadError("diagnostic annotation source identity mismatch")
         n, sample_sum, mu, drift = _stat(pcm)
         if n != total:
             raise VadError("diagnostic sample count mismatch")
