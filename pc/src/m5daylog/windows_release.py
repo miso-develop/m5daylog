@@ -59,6 +59,15 @@ class DiskInterface:
     physical_usb_instance_id: str | None
 
 
+@dataclass(frozen=True)
+class CdcInterface:
+    """A present COM interface's exact PnP path, not a mutable COM-name alias."""
+
+    device_path: str
+    instance_id: str
+    physical_usb_instance_id: str
+
+
 class Win32DeviceApi(Protocol):
     def volume_guid(self, mount_root: str) -> str: ...
     def volume_disk_numbers(self, volume_guid: str) -> tuple[int, ...]: ...
@@ -67,7 +76,7 @@ class Win32DeviceApi(Protocol):
     def disk_instance_present(self, instance_id: str) -> bool: ...
     def mount_point_present(self, mount_root: str) -> bool: ...
     def lock_and_dismount(self, volume_guid: str) -> ContextManager[None]: ...
-    def release_cdc(self, port: str, attempt_id: str) -> None: ...
+    def release_cdc(self, port: str, attempt_id: str, expected_physical_id: str) -> None: ...
     def cdc_physical_id(self, port: str) -> str: ...
 
 
@@ -126,7 +135,7 @@ class WindowsHostReleasePort:
         # Repeat the correlation immediately before sending irreversible command.
         if self.api.cdc_physical_id(cdc_port) != target.usb_physical_instance_id:
             raise WrongTarget("CDC port changed identity before release")
-        self.api.release_cdc(cdc_port, attempt_id)
+        self.api.release_cdc(cdc_port, attempt_id, target.usb_physical_instance_id)
 
     def volume_disappeared(self, target: EjectTarget) -> bool:
         # No post-acceptance CreateFile, storage IOCTL, or filesystem query.
@@ -459,7 +468,7 @@ class NativeWin32DeviceApi:
             return False
         raise HostQuiesceError("host mount namespace query failed")
 
-    def cdc_physical_id(self, port: str) -> str:
+    def _cdc_interface(self, port: str) -> CdcInterface:
         # The CDC COM port must be a member of the SAME USB physical device
         # as the validated MSC disk, not just a COM number supplied by the user.
         import winreg
@@ -472,7 +481,7 @@ class NativeWin32DeviceApi:
         )
         if devs is None or devs == INVALID_HANDLE_VALUE:
             raise WrongTarget("CDC interface enumeration failed")
-        matched: list[str] = []
+        matched: list[CdcInterface] = []
         try:
             index = 0
             while True:
@@ -508,13 +517,23 @@ class NativeWin32DeviceApi:
                     physical = self._physical_usb_id(info.DevInst)
                     if physical is None:
                         raise WrongTarget("CDC physical USB identity unavailable")
-                    matched.append(physical)
+                    # Keep the OS-published PnP interface path for the actual
+                    # CreateFileW call. Never reopen the reusable COMx alias.
+                    device_path = ctypes.wstring_at(ctypes.addressof(detail) + 4)
+                    if not device_path.startswith("\\\\?\\"):
+                        raise WrongTarget("CDC device interface path invalid")
+                    matched.append(CdcInterface(
+                        device_path, self._instance_id(info.DevInst), physical,
+                    ))
                 index += 1
         finally:
             self.s.SetupDiDestroyDeviceInfoList(devs)
         if len(matched) != 1:
             raise WrongTarget("CDC port mapping is missing or ambiguous")
         return matched[0]
+
+    def cdc_physical_id(self, port: str) -> str:
+        return self._cdc_interface(port).physical_usb_instance_id
 
     def filesystem_accessible(self, volume_guid: str) -> bool:
         # A failed FS query alone is NOT teardown proof; disk interface
@@ -551,16 +570,24 @@ class NativeWin32DeviceApi:
         finally:
             self.k.CloseHandle(handle)
 
-    def release_cdc(self, port: str, attempt_id: str) -> None:
-        if re.fullmatch(r"COM[1-9][0-9]{0,3}", port, flags=re.IGNORECASE) is None:
-            raise ReleaseRejected("invalid CDC port")
+    def release_cdc(self, port: str, attempt_id: str, expected_physical_id: str) -> None:
+        # A PnP interface path identifies the endpoint independently of COMx.
+        # A COM alias may be reassigned between the adapter's last check and
+        # CreateFileW; it must never select the endpoint receiving the command.
+        endpoint = self._cdc_interface(port)
+        if endpoint.physical_usb_instance_id != expected_physical_id:
+            raise WrongTarget("CDC release endpoint is not the frozen USB device")
         request_id = str(uuid.uuid4())
         request = (json.dumps({
             "id": request_id, "cmd": "RELEASE_STORAGE",
             "args": {"releaseAttemptId": attempt_id},
         }, separators=(",", ":")) + "\n").encode("ascii")
-        handle = self._open("\\\\.\\" + port.upper(), GENERIC_READ | GENERIC_WRITE, 0)
+        handle = self._open(endpoint.device_path, GENERIC_READ | GENERIC_WRITE, 0)
         try:
+            # If the port disappeared or was re-enumerated between resolution
+            # and handle opening, abort before any CDC protocol bytes are sent.
+            if self._cdc_interface(port) != endpoint:
+                raise WrongTarget("CDC endpoint changed during handle acquisition")
             timeouts = COMMTIMEOUTS(0xFFFFFFFF, 0, 250, 0, 1000)
             if not self.k.SetCommTimeouts(handle, ctypes.byref(timeouts)):
                 raise ReleaseRejected("CDC timeout configuration failed")
