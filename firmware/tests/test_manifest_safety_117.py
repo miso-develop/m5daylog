@@ -177,6 +177,8 @@ def native_manifest(tmp_path_factory):
     lib.device_manifest_sync_wav_dir.restype = ctypes.c_bool
     lib.device_manifest_has_append_room.argtypes = [ctypes.c_char_p] * 2
     lib.device_manifest_has_append_room.restype = ctypes.c_bool
+    lib.device_manifest_last_scan_error.argtypes = []
+    lib.device_manifest_last_scan_error.restype = ctypes.c_int
     return lib
 
 
@@ -304,6 +306,7 @@ def test_unindexed_canonical_wav_conflict_fails_boot_scan(
         _b(directory.parent), _b(final), _b(temp), _b(DEVICE_ID), _b(NOW),
         _b("recovered"), ctypes.byref(n_added), ctypes.byref(n_skipped),
     )
+    assert native_manifest.device_manifest_last_scan_error() == 4
     assert final.read_bytes() == _manifest([rec])
     assert wav.read_bytes() == b"x" * 44
 
@@ -506,3 +509,30 @@ def test_poc_c_default_nvs_and_ack_negatives_are_not_enabled():
     assert "nvs_flash_erase(" not in nvs
     assert "processed_ack.h" not in runtime
     assert "processed_ack_apply(" not in runtime
+
+
+def test_scan_failure_classification_survives_for_operator_diagnostics(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    final, temp = _create(tmp_path, [])
+    directory = tmp_path / "recordings" / "2026-10-13"
+    directory.mkdir(parents=True)
+    wav = directory / Path(_entry(1)["filename"]).name
+    wav.write_bytes(b"x" * 44)
+    added, skipped = ctypes.c_uint32(), ctypes.c_uint32()
+    native_manifest.manifest_test_reset()
+    monkeypatch.setenv("M5_TEST_FAIL_READDIR", "2")
+    assert not native_manifest.device_manifest_sync_wav_dir(
+        _b(directory.parent), _b(final), _b(temp), _b(DEVICE_ID), _b(NOW),
+        _b("recovered"), ctypes.byref(added), ctypes.byref(skipped),
+    )
+    assert native_manifest.device_manifest_last_scan_error() == 2  # DIRECTORY_ERROR
+    monkeypatch.delenv("M5_TEST_FAIL_READDIR")
+    native_manifest.manifest_test_reset()
+    # Clean retry converges and clears the previous failure status.
+    assert native_manifest.device_manifest_sync_wav_dir(
+        _b(directory.parent), _b(final), _b(temp), _b(DEVICE_ID), _b(NOW),
+        _b("recovered"), ctypes.byref(added), ctypes.byref(skipped),
+    )
+    assert native_manifest.device_manifest_last_scan_error() == 0
