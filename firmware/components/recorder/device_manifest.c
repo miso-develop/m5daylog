@@ -27,7 +27,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) || defined(DEVICE_MANIFEST_NATIVE_SYNC_TEST)
 #include <unistd.h>
 #endif
 
@@ -802,7 +802,7 @@ static bool write_tmp_and_rename(const char *tmp_path,
         (void)remove(tmp_path);
         return false;
     }
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) || defined(DEVICE_MANIFEST_NATIVE_SYNC_TEST)
     if (fileno(fp) < 0 || fsync(fileno(fp)) != 0) {
         (void)fclose(fp);
         (void)remove(tmp_path);
