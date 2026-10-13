@@ -783,9 +783,19 @@ static bool write_tmp_and_rename(const char *tmp_path,
         !manifest_snapshot_valid(doc, doc_len, doc_device_id)) {
         return false;
     }
-    if (!manifest_backup_path(manifest_path, backup) ||
-        stat(backup, &st) == 0 || errno != ENOENT) {
-        // An unresolved prior transaction cannot be overwritten.
+    if (!manifest_backup_path(manifest_path, backup)) {
+        return false;
+    }
+    if (stat(backup, &st) == 0) {
+        // The preceding successful append may have kept its independent
+        // M0 fallback. Qualify M1 as a complete superset before retiring
+        // that backup and starting the next append. An unresolved pair is
+        // never overwritten or mistaken for free space.
+        if (!manifest_file_extends(manifest_path, backup, doc_device_id) ||
+            remove(backup) != 0) {
+            return false;
+        }
+    } else if (errno != ENOENT) {
         return false;
     }
     had_final = stat(manifest_path, &st) == 0;
