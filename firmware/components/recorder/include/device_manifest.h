@@ -137,6 +137,23 @@ bool device_manifest_recover_tmp(const char *manifest_path,
 bool device_manifest_has_append_room(const char *manifest_path,
                                      const char *device_id);
 
+// Scan diagnostics are metadata-only; the first unresolved failure
+// is retained for boot ERROR reporting. These codes never authorize
+// recording/USB publication when the scan returned false.
+typedef enum {
+    DEVICE_MANIFEST_SCAN_OK = 0,
+    DEVICE_MANIFEST_SCAN_INVALID_INPUT,
+    DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR,
+    DEVICE_MANIFEST_SCAN_WAV_UNREADABLE,
+    DEVICE_MANIFEST_SCAN_INDEX_CONFLICT,
+    DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR
+} device_manifest_scan_error_t;
+
+// Caller must inspect only after device_manifest_sync_wav_dir returns.
+// The recorder writer is the sole owner of this boot-time scan state.
+device_manifest_scan_error_t device_manifest_last_scan_error(void);
+const char *device_manifest_scan_error_name(device_manifest_scan_error_t error);
+
 // Scan `recordings_dir` (top level plus one-level `YYYY-MM-DD/`
 // subdirectories, mirroring the recovery scan) for finalized `.wav`
 // files missing from the manifest and append them with `state`
