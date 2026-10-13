@@ -278,7 +278,7 @@ def test_manifest_limit_refuses_extra_uuid_without_losing_m0(
     # Produce a complete canonical M0 just below the compiled 131072B
     # ceiling; another entry would exceed it. No padding or invalid JSON.
     entries = []
-    while len(_manifest(entries + [_entry(len(entries) + 1)])) < 130900:
+    while len(_manifest(entries + [_entry(len(entries) + 1)])) < 131072:
         entries.append(_entry(len(entries) + 1))
     final, temp = _create(tmp_path, entries)
     before = final.read_bytes()
