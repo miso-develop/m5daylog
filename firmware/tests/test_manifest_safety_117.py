@@ -163,6 +163,8 @@ def native_manifest(tmp_path_factory):
         [ctypes.POINTER(ctypes.c_uint32)] * 2
     )
     lib.device_manifest_sync_wav_dir.restype = ctypes.c_bool
+    lib.device_manifest_has_append_room.argtypes = [ctypes.c_char_p] * 2
+    lib.device_manifest_has_append_room.restype = ctypes.c_bool
     return lib
 
 
@@ -385,3 +387,73 @@ def test_failed_backup_cleanup_preserves_both_snapshots(
     monkeypatch.delenv("M5_TEST_FAIL_REMOVE")
     assert _recover(native_manifest, final, temp)
     assert not bak.exists()
+
+
+def test_multiple_fat_appends_preserve_every_uuid(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    final, temp = _create(tmp_path, [_entry(1)])
+    native_manifest.manifest_test_reset()
+    assert _upsert(native_manifest, final, temp, _entry(2)) == 0
+    assert (tmp_path / "manifest.json.bak").exists()
+    assert _upsert(native_manifest, final, temp, _entry(3)) == 0
+    assert [x["recordingId"] for x in json.loads(final.read_bytes())["recordings"]] == [
+        _entry(1)["recordingId"], _entry(2)["recordingId"],
+        _entry(3)["recordingId"],
+    ]
+    assert _recover(native_manifest, final, temp)
+
+
+def test_wrong_size_same_uuid_same_hash_fails_closed(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    final, temp = _create(tmp_path, [])
+    directory = tmp_path / "recordings" / "2026-10-13"
+    directory.mkdir(parents=True)
+    rec = _entry(1, hashlib.sha256(b"x" * 44).hexdigest())
+    wav = directory / Path(rec["filename"]).name
+    wav.write_bytes(b"x" * 44)
+    stale = dict(rec, sizeBytes=46)
+    final.write_bytes(_manifest([stale]))
+    before = final.read_bytes()
+    added, skipped = ctypes.c_uint32(), ctypes.c_uint32()
+    native_manifest.manifest_test_reset()
+    assert not native_manifest.device_manifest_sync_wav_dir(
+        _b(directory.parent), _b(final), _b(temp), _b(DEVICE_ID), _b(NOW),
+        _b("recovered"), ctypes.byref(added), ctypes.byref(skipped),
+    )
+    assert final.read_bytes() == before
+    assert wav.read_bytes() == b"x" * 44
+
+
+def test_metadata_admission_guard_covers_queued_rotation(
+    native_manifest, tmp_path
+):
+    final, temp = _create(tmp_path, [])
+    assert native_manifest.device_manifest_has_append_room(
+        _b(final), _b(DEVICE_ID)
+    )
+    rows = []
+    while len(_manifest(rows + [_entry(len(rows) + 1)])) < 130000:
+        rows.append(_entry(len(rows) + 1))
+    final.write_bytes(_manifest(rows))
+    assert not native_manifest.device_manifest_has_append_room(
+        _b(final), _b(DEVICE_ID)
+    )
+    assert all(r["recordingId"] for r in rows)
+
+
+def test_close_error_does_not_retire_m0(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    final, temp = _create(tmp_path, [_entry(1)])
+    m0 = final.read_bytes()
+    native_manifest.manifest_test_reset()
+    # Read/close existing M0 is call 1; temp close is call 2.
+    monkeypatch.setenv("M5_TEST_FAIL_FCLOSE", "2")
+    assert _upsert(native_manifest, final, temp, _entry(2)) == 2
+    assert final.read_bytes() == m0
+    monkeypatch.delenv("M5_TEST_FAIL_FCLOSE")
