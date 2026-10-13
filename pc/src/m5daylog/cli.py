@@ -129,7 +129,9 @@ def cmd_vad_diagnose(recording_id: str, library_root: str | None,
     except DiagnosticResourceBlocked:
         print("vad-diagnose: status=DIAGNOSTIC_RESOURCE_BLOCKED", file=sys.stderr)
         return 2
-    except (VadError, OSError, sqlite3.Error, ImportError, ValueError):
+    except Exception:
+        # Third-party ONNX/Torch errors may embed protected local paths.
+        # Do not print exception messages or native tracebacks from diagnostics.
         print("error: vad-diagnose failed (safe diagnostic)", file=sys.stderr)
         return 1
     print(json.dumps(result.summary(), ensure_ascii=False, sort_keys=True,
