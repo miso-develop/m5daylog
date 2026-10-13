@@ -1,0 +1,90 @@
+name: S0 Offline Partition Geometry
+
+on:
+  pull_request:
+    paths:
+      - "firmware/tests/tools/s0_partition_geometry.py"
+      - ".github/workflows/s0-offline-geometry.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s0-static:
+    name: device:S0-offline-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout S0 evidence tooling at exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Checkout pinned existing Device PR #109 as OLD baseline (not installed target)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: f69ec03603f657af9c5dc8eca7ae8f95e42d66fb
+          path: baseline
+          persist-credentials: false
+      - name: Verify both exact source revisions
+        env:
+          EXPECTED_S0_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_S0_HEAD"
+          test "$(git -C baseline rev-parse HEAD)" = "f69ec03603f657af9c5dc8eca7ae8f95e42d66fb"
+          echo "S0 evidence HEAD: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pinned old source HEAD: f69ec03603f657af9c5dc8eca7ae8f95e42d66fb" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build OLD app/table in immutable ESP-IDF v5.5.5 and evaluate candidate offline
+        env:
+          IDF_IMAGE: espressif/idf@sha256:6e2800a69f1c6521a5651da524f811e237d13e34cad369687916d0ad0bc4ef89
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace/baseline/firmware \
+            "$IDF_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              version="$(idf.py --version)"
+              echo "$version"
+              case "$version" in *"v5.5.5"*) ;; *) echo "wrong ESP-IDF version" >&2; exit 1 ;; esac
+              idf.py fullclean
+              idf.py set-target esp32s3
+              idf.py build
+              python3 /workspace/firmware/tests/tools/s0_partition_geometry.py \
+                --baseline-root /workspace/baseline \
+                --idf-path "$IDF_PATH" \
+                --output /workspace/s0-offline-result
+            '
+      - name: Summarize static-only result and report digest
+        if: always()
+        run: |
+          set -euo pipefail
+          if test -f s0-offline-result/s0-report.json; then
+            python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          path = Path("s0-offline-result/s0-report.json")
+          data = json.loads(path.read_text())
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as s:
+              s.write("\n### S0 offline results (NOT a hardware/flash authorization)\n\n")
+              for key in ("geometry_static_result", "full_s0_admission_result", "physical_human_gate_s5"):
+                  s.write(f"- {key}: {data.get(key, 'NO_GO')}\n")
+              s.write(f"- report SHA-256: {hashlib.sha256(path.read_bytes()).hexdigest()}\n")
+              if "baseline" in data:
+                  s.write(f"- generated OLD table SHA-256: {data['baseline']['old_partition_binary_sha256']}\n")
+                  s.write(f"- generated candidate table SHA-256: {data['candidate']['partition_binary_sha256']}\n")
+          PY
+          else
+            echo "No S0 report: build or environment failed closed (not a geometry PASS)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Publish synthetic/compiled non-device evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: s0-offline-partition-evidence
+          path: s0-offline-result/
+          if-no-files-found: warn
+          retention-days: 14
