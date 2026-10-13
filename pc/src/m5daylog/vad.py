@@ -129,6 +129,21 @@ class SileroCPU:
         args.pop("merge_gap_samples")
         return self._infer(audio, self.model, **args)
 
+    def detect_float32(self, audio_float32) -> list[dict]:
+        """Diagnostic-only: apply the exact pinned Silero call to supplied float32."""
+        import numpy as np
+        if (not isinstance(audio_float32, np.ndarray)
+                or audio_float32.ndim != 1
+                or audio_float32.dtype != np.float32
+                or not audio_float32.flags.c_contiguous
+                or not np.isfinite(audio_float32).all()):
+            raise VadError("invalid diagnostic inference samples")
+        audio = self._torch.from_numpy(audio_float32)
+        args = dict(PARAMS)
+        args["max_speech_duration_s"] = float("inf")
+        args.pop("merge_gap_samples")
+        return self._infer(audio, self.model, **args)
+
 
 def normalize_ranges(raw: list[dict], total_samples: int) -> list[tuple[int, int]]:
     ranges = []
