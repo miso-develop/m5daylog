@@ -208,6 +208,11 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_device(args.device_root, args.contracts_dir)
     if args.command == "vad":
         return cmd_vad(args.recording_id, args.library_root, args.db, args.data_dir)
+    if args.command == "vad-diagnose":
+        return cmd_vad_diagnose(
+            args.recording_id, args.library_root, args.db, args.data_dir,
+            args.annotation, args.code_revision,
+        )
     if args.command == "sync":
         return cmd_sync(
             args.device_root,
