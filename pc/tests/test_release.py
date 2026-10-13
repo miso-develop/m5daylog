@@ -14,7 +14,7 @@ from m5daylog.release import (
     SyncReleaseCoordinator, UsbSessionIoGate, WrongTarget,
 )
 from m5daylog.sync import SyncSummary
-from m5daylog.windows_release import DiskInterface, WindowsHostReleasePort
+from m5daylog.windows_release import CdcInterface, DiskInterface, WindowsHostReleasePort
 
 
 TARGET = EjectTarget(
@@ -354,15 +354,19 @@ class FakeWindowsApi:
         self.calls.append("lock-dismount")
         yield
 
-    def release_cdc(self, port, attempt, expected_physical_id):
-        # The native API must check the endpoint it will actually open, not
-        # just the earlier adapter-level COM-name correlation.
-        if self.cdc_physical_id(port) != expected_physical_id:
-            raise WrongTarget("CDC identity changed before handle open")
+    def release_cdc(self, port, attempt, binding):
+        # The native API must check the actual endpoint against the original
+        # binding, including interface path and instance, not just its USB parent.
+        if self.cdc_interface(port) != binding:
+            raise WrongTarget("CDC binding changed before handle open")
         self.calls.append("cdc-release")
 
-    def cdc_physical_id(self, port):
-        return getattr(self, "cdc_usb_id", TARGET.usb_physical_instance_id)
+    def cdc_interface(self, port):
+        return CdcInterface(
+            getattr(self, "cdc_path", r"\\?\usb#vid_303a&pid_4001#port_A"),
+            getattr(self, "cdc_instance", r"USB\VID_303A&PID_4001\INTERFACE_A"),
+            getattr(self, "cdc_usb_id", TARGET.usb_physical_instance_id),
+        )
 
 
 class WindowsAdapterTests(unittest.TestCase):
@@ -414,23 +418,24 @@ class WindowsAdapterTests(unittest.TestCase):
         self.assertEqual(self.api.calls, [])
 
     def test_release_binds_to_frozen_usb_even_if_com_alias_reassigned(self):
-        self.api.cdc_usb_id = TARGET.usb_physical_instance_id
-        # The adapter's initial check observes A, but the actual release
-        # method's endpoint resolution sees reassigned device B.
-        first = self.api.cdc_physical_id
-        calls = 0
+        # Freeze A in the ordinary pre-seal stage, then remap the name to B.
+        with patch("m5daylog.windows_release.inspect_device",
+                   return_value={"deviceId": "test-device"}):
+            self.adapter.revalidate_target(TARGET, "COM5")
+        self.api.cdc_usb_id = "USB\\VID_303A&PID_4001\\OTHER"
+        with self.assertRaises(WrongTarget):
+            self.adapter.release_storage("COM5", "attempt", TARGET)
+        self.assertEqual(self.api.calls, [])
 
-        def rebind_after_initial_check(port):
-            nonlocal calls
-            calls += 1
-            if calls > 1:
-                self.api.cdc_usb_id = "USB\\VID_303A&PID_4001\\OTHER"
-            return first(port)
-
-        with patch.object(self.api, "cdc_physical_id",
-                          side_effect=rebind_after_initial_check):
-            with self.assertRaises(WrongTarget):
-                self.adapter.release_storage("COM5", "attempt", TARGET)
+    def test_reenumerated_cdc_on_same_physical_usb_is_also_rejected(self):
+        with patch("m5daylog.windows_release.inspect_device",
+                   return_value={"deviceId": "test-device"}):
+            self.adapter.revalidate_target(TARGET, "COM5")
+        # Same USB parent but new CDC interface instance: must not silently
+        # replace the endpoint frozen before seal.
+        self.api.cdc_instance = r"USB\VID_303A&PID_4001\INTERFACE_B"
+        with self.assertRaises(WrongTarget):
+            self.adapter.release_storage("COM5", "attempt", TARGET)
         self.assertEqual(self.api.calls, [])
 
     def test_native_cdc_rebind_after_open_cannot_write_release(self):
@@ -462,7 +467,7 @@ class WindowsAdapterTests(unittest.TestCase):
             CloseHandle=lambda h: closed.append(h),
         )
         with self.assertRaises(WrongTarget):
-            api.release_cdc("COM5", "attempt", TARGET.usb_physical_instance_id)
+            api.release_cdc("COM5", "attempt", good)
         self.assertEqual(opened, [good.device_path])
         self.assertEqual(closed, [7])
         self.assertEqual(written, [])
@@ -519,7 +524,11 @@ class WindowsAdapterTests(unittest.TestCase):
         )
         api._open = lambda *_args: self.fail("wrong-target handle was opened")
         with self.assertRaises(WrongTarget):
-            api.release_cdc("COM5", "attempt", TARGET.usb_physical_instance_id)
+            api.release_cdc("COM5", "attempt", CdcInterface(
+                r"\\?\usb#vid_303a&pid_4001#port_A",
+                r"USB\VID_303A&PID_4001\INTERFACE_A",
+                TARGET.usb_physical_instance_id,
+            ))
 
     def test_native_cdc_release_uses_pnp_path_and_correlated_reply(self):
         import ctypes
@@ -567,7 +576,7 @@ class WindowsAdapterTests(unittest.TestCase):
             ReadFile=read,
             CloseHandle=lambda h: closed.append(h),
         )
-        api.release_cdc("COM5", "attempt", TARGET.usb_physical_instance_id)
+        api.release_cdc("COM5", "attempt", endpoint)
         self.assertEqual(opened, [endpoint.device_path])
         self.assertNotEqual(opened[0], r"\\.\COM5")
         self.assertEqual(len(written), 1)
