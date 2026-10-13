@@ -64,6 +64,8 @@ class Win32DeviceApi(Protocol):
     def volume_disk_numbers(self, volume_guid: str) -> tuple[int, ...]: ...
     def disk_interfaces(self) -> list[DiskInterface]: ...
     def filesystem_accessible(self, volume_guid: str) -> bool: ...
+    def disk_instance_present(self, instance_id: str) -> bool: ...
+    def mount_point_present(self, mount_root: str) -> bool: ...
     def lock_and_dismount(self, volume_guid: str) -> ContextManager[None]: ...
     def release_cdc(self, port: str, attempt_id: str) -> None: ...
     def cdc_physical_id(self, port: str) -> str: ...
@@ -127,15 +129,12 @@ class WindowsHostReleasePort:
         self.api.release_cdc(cdc_port, attempt_id)
 
     def volume_disappeared(self, target: EjectTarget) -> bool:
-        # Dismount alone blocks normal filesystem opens; it is NOT release proof.
-        # The exact disk interface must also disappear from the live interface set.
-        matching = [
-            iface for iface in self.api.disk_interfaces()
-            if iface.instance_id == target.disk_instance_id
-        ]
-        if matching:
+        # No post-acceptance CreateFile, storage IOCTL, or filesystem query.
+        # Observe only host PnP and DOS namespace state. Dismount alone keeps
+        # the disk interface present and is NOT sufficient release proof.
+        if self.api.disk_instance_present(target.disk_instance_id):
             return False
-        return not self.api.filesystem_accessible(target.volume_guid)
+        return not self.api.mount_point_present(target.mount_root)
 
 
 class GUID(ctypes.Structure):
@@ -217,6 +216,10 @@ class NativeWin32DeviceApi:
             ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD,
         ]
         self.k.GetVolumeInformationW.restype = wintypes.BOOL
+        self.k.QueryDosDeviceW.argtypes = [
+            wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
+        ]
+        self.k.QueryDosDeviceW.restype = wintypes.DWORD
 
         self.s.SetupDiGetClassDevsW.argtypes = [
             ctypes.POINTER(GUID), wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD,
@@ -395,6 +398,66 @@ class NativeWin32DeviceApi:
         finally:
             self.s.SetupDiDestroyDeviceInfoList(devs)
         return discovered
+
+    def disk_instance_present(self, instance_id: str) -> bool:
+        """Poll read-only PnP metadata for the frozen disk instance.
+
+        This MUST NOT open a disk handle or issue a storage DeviceIoControl
+        after RELEASE_ACCEPTED.
+        """
+        if not instance_id:
+            raise HostQuiesceError("missing frozen disk identity")
+        devs = self.s.SetupDiGetClassDevsW(
+            ctypes.byref(DISK_INTERFACE_GUID), None, None,
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        )
+        if devs is None or devs == INVALID_HANDLE_VALUE:
+            raise HostQuiesceError("PnP presence query failed")
+        try:
+            index = 0
+            while True:
+                interface = SP_DEVICE_INTERFACE_DATA()
+                interface.cbSize = ctypes.sizeof(interface)
+                if not self.s.SetupDiEnumDeviceInterfaces(
+                    devs, None, ctypes.byref(DISK_INTERFACE_GUID), index,
+                    ctypes.byref(interface),
+                ):
+                    if ctypes.get_last_error() == ERROR_NO_MORE_ITEMS:
+                        return False
+                    raise HostQuiesceError("PnP presence iteration failed")
+                detail = ctypes.create_string_buffer(4096)
+                struct.pack_into(
+                    "<I", detail, 0,
+                    8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6,
+                )
+                needed = wintypes.DWORD()
+                info = SP_DEVINFO_DATA()
+                info.cbSize = ctypes.sizeof(info)
+                if not self.s.SetupDiGetDeviceInterfaceDetailW(
+                    devs, ctypes.byref(interface), detail, len(detail),
+                    ctypes.byref(needed), ctypes.byref(info),
+                ):
+                    raise HostQuiesceError("PnP presence identity unavailable")
+                if self._instance_id(info.DevInst).casefold() == instance_id.casefold():
+                    return True
+                index += 1
+        finally:
+            self.s.SetupDiDestroyDeviceInfoList(devs)
+
+    def mount_point_present(self, mount_root: str) -> bool:
+        """Query only the host DOS-device symbolic-link namespace.
+
+        QueryDosDeviceW does not open a volume or inspect its filesystem.
+        Unknown errors fail closed rather than proving disappearance.
+        """
+        if re.fullmatch(r"[A-Za-z]:\\", mount_root) is None:
+            raise HostQuiesceError("frozen mount root invalid")
+        buffer = ctypes.create_unicode_buffer(32768)
+        if self.k.QueryDosDeviceW(mount_root[:2], buffer, len(buffer)):
+            return True
+        if ctypes.get_last_error() in (2, 3):  # not found / path not found
+            return False
+        raise HostQuiesceError("host mount namespace query failed")
 
     def cdc_physical_id(self, port: str) -> str:
         # The CDC COM port must be a member of the SAME USB physical device
