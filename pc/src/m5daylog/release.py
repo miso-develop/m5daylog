@@ -37,6 +37,10 @@ class HostQuiesceError(ReleaseError):
     pass
 
 
+class ReleaseTimeout(HostQuiesceError):
+    """A bounded release barrier or disappearance deadline expired."""
+
+
 class VolumeBusy(HostQuiesceError):
     pass
 
@@ -120,7 +124,7 @@ class UsbSessionIoGate:
             while self._ordinary:
                 remaining = deadline - clock()
                 if remaining <= 0:
-                    raise HostQuiesceError("ordinary Device handles did not drain")
+                    raise ReleaseTimeout("ordinary Device handles did not drain")
                 self._cv.wait(remaining)
             self._drained = True
 
@@ -279,7 +283,7 @@ class SyncReleaseCoordinator:
                                 "SYNC_COMPLETE_RELEASED", "RELEASED", attempt_id, target
                             )
                         if self.clock() >= deadline:
-                            raise HostQuiesceError("volume removal deadline exceeded")
+                            raise ReleaseTimeout("volume removal deadline exceeded")
                         self.sleep(min(self.poll_interval_s, max(0, deadline - self.clock())))
         except Exception as exc:
             known = {
@@ -291,10 +295,11 @@ class SyncReleaseCoordinator:
                 VolumeBusy: "BUSY",
                 VolumeLockError: "LOCK_FAILED",
                 VolumeDismountError: "DISMOUNT_FAILED",
+                ReleaseTimeout: "TIMEOUT",
                 GateClosed: "GATE_CLOSED",
             }
-            reason = next((code for typ, code in known.items() if isinstance(exc, typ)), None)
-            if reason is None:
-                reason = ("TIMEOUT" if isinstance(exc, HostQuiesceError)
-                          and "deadline" in str(exc) else "RELEASE_ERROR")
+            reason = next(
+                (code for typ, code in known.items() if isinstance(exc, typ)),
+                "RELEASE_ERROR",
+            )
             return ReleaseOutcome("SYNC_COMPLETE_RELEASE_FAILED", reason, attempt_id, target)
