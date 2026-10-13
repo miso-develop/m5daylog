@@ -1,22 +1,23 @@
 // Device manifest / integrity — Task #47 (IM-010). Stdio + dirent +
 // sys/stat only; no ESP-IDF dependency.
 //
-// Durability model (power-loss safe):
-// - Updates never truncate `manifest.json` in place. The full new
-//   document goes to `manifest.tmp` (fwrite + fflush + fsync on ESP-IDF,
-//   fclose-checked) and only then is renamed over the destination.
-//   A crash during the tmp write leaves the old manifest untouched.
-// - On POSIX the rename overwrites atomically. On ESP-IDF FATFS a rename
-//   over an existing name fails with EEXIST, so the module retries once
-//   as remove(dest) + rename(tmp, dest): the complete new document is
-//   already durable in tmp at that point, and a crash inside that window
-//   is recovered at boot by promoting a valid tmp when the destination is
-//   missing. `remove()` appears ONLY for this tmp/destination replace
-//   (plus best-effort stale-tmp cleanup) — audio files (`.wav`,
-//   `.wav.part`) are never removed, unlinked, or overwritten in place:
-//   entry collisions report CONFLICT and preserve the on-card manifest.
-// - Unknown `schemaVersion` majors and `deviceId` mismatches fail closed
-//   without writing, preserving the existing manifest.
+// Manifest durability protocol (logical crash-recovery candidate; physical
+// FAT32/power-interruption qualification is a separate acceptance gate):
+// - M1 is fully written to manifest.tmp, flushed, fsynced on the ESP
+//   target, closed and reread/validated before success is reported.
+// - A FAT target-exists rename failure preserves M0 under manifest.json.bak
+//   before renaming the complete M1 into place. A first rename EIO or any
+//   unqualified error never authorizes deletion of the previous final.
+// - Recovery with both M1 and M0 validates their complete canonical shapes
+//   and requires M1 to contain the exact M0 recording entry prefix. When M1
+//   has not published, M0 is restored from backup. Ambiguous states stay
+//   available as artifacts and cause a fail-closed boot, never an empty
+//   manifest reset.
+// - A previous validated M0 fallback must be retired before the next
+//   append, with M1 proven to extend it. Only manifest artifacts (.tmp,
+//   .bak) are removed by this module; no WAV file is ever deleted.
+// - No algorithm can reconstruct physically destroyed FAT sectors. Exact
+//   ESP-IDF v5.5.5 + FAT fault/power-cycle tests remain required.
 
 #include "device_manifest.h"
 
