@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -432,6 +433,38 @@ static bool recorder_manifest_record_wav(const char *wav_path,
     }
 }
 
+// A blank manifest may be created only for a genuinely fresh recordings
+// tree. If all manifest artifacts vanished yet a dated recording directory
+// remains, prior M0 cannot be reconstructed byte-for-byte from WAV headers.
+// Do not silently certify a synthesized empty manifest as healthy history.
+static bool recorder_recordings_tree_pristine(void) {
+    DIR *dir = opendir(RECORDER_RECORDINGS_DIR);
+    struct dirent *entry;
+    bool pristine = true;
+    if (dir == NULL) {
+        return false;
+    }
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL) {
+            if (errno != 0) {
+                pristine = false;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            pristine = false;
+            break;
+        }
+    }
+    if (closedir(dir) != 0) {
+        pristine = false;
+    }
+    return pristine;
+}
+
 static bool recorder_ensure_manifest_exists(void) {
     FILE *probe = NULL;
     if (!recorder_current_iso8601(s_manifest_now)) {
@@ -462,6 +495,11 @@ static bool recorder_ensure_manifest_exists(void) {
                 return false;
             }
         }
+    }
+    if (!recorder_recordings_tree_pristine()) {
+        ESP_LOGE(TAG,
+                 "stage: manifest, result: error, reason: MANIFEST_RECOVERY_REQUIRED");
+        return false;
     }
     {
         char empty[256];
