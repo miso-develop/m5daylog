@@ -254,10 +254,14 @@ class SyncReleaseCoordinator:
                 with gate.ordinary("cdc"):
                     cdc_mutations()
 
-            target = self.port.resolve_target(mount_root, expected_id)
-            self.port.revalidate_target(target, cdc_port)
-            if not self.port.volume_available(target):
-                raise AlreadyRemoved("exact volume absent before release")
+            # Device metadata, volume extent discovery, and filesystem checks
+            # are ordinary MSC I/O. Keep every such operation inside a lease;
+            # seal() then rejects new admission and drains existing leases.
+            with gate.ordinary("msc"):
+                target = self.port.resolve_target(mount_root, expected_id)
+                self.port.revalidate_target(target, cdc_port)
+                if not self.port.volume_available(target):
+                    raise AlreadyRemoved("exact volume absent before release")
 
             gate.seal(timeout_s=self.timeout_s, clock=self.clock)
             attempt_id = str(uuid.uuid4())
