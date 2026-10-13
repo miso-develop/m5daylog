@@ -536,69 +536,235 @@ static bool read_file_bounded(const char *path, char **out_buf, size_t *out_len,
     return true;
 }
 
+// Check the complete writer-generated canonical document, not merely a
+// matching deviceId. Device-owned manifests have a fixed field order and
+// non-escaped strings. Unknown layouts fail closed pending explicit migration.
+static bool manifest_snapshot_valid(const char *doc, size_t len,
+                                    const char *device_id) {
+    unsigned ver = 0;
+    char stored[RECORDER_UUID_STR_LEN];
+    const char *arr;
+    const char *open;
+    const char *end = doc + len;
+    const char *p;
+    if (doc == NULL || len < 2u || device_id == NULL ||
+        memchr(doc, '\0', len) != NULL ||
+        !device_identity_parse_schema_version(doc, len, &ver) ||
+        ver != RECORDER_METADATA_SCHEMA_VERSION ||
+        !device_identity_parse_device_id(doc, len, stored) ||
+        strcmp(stored, device_id) != 0) {
+        return false;
+    }
+    arr = memfind(doc, len, "\"recordings\":[");
+    if (arr == NULL) {
+        return false;
+    }
+    open = strchr(arr, '[');
+    if (open == NULL || end - doc < 2 || end[-2] != ']' ||
+        end[-1] != '}' || open >= end - 2) {
+        return false;
+    }
+    p = open + 1;
+    while (p < end - 2) {
+        const char *close;
+        const char *rid;
+        const char *sha;
+        const char *name;
+        const char *state;
+        size_t rid_len = 0, sha_len = 0, name_len = 0, state_len = 0;
+        char uuid[RECORDER_UUID_STR_LEN], hash[RECORDER_SHA256_HEX_LEN];
+        char filename[192], needle[64];
+        int n;
+        if (*p != '{') {
+            return false;
+        }
+        close = memchr(p, '}', (size_t)((end - 2) - p));
+        if (close == NULL) {
+            return false;
+        }
+        // Scope each lookup to exactly one entry. No nested objects/arrays
+        // or escaped JSON are emitted by the canonical Device writer.
+        if (!json_string_field(p, (size_t)(close + 1 - p),
+                               "\"recordingId\"", NULL, &rid, &rid_len) ||
+            !json_string_field(p, (size_t)(close + 1 - p),
+                               "\"sha256\"", NULL, &sha, &sha_len) ||
+            !json_string_field(p, (size_t)(close + 1 - p),
+                               "\"filename\"", NULL, &name, &name_len) ||
+            !json_string_field(p, (size_t)(close + 1 - p),
+                               "\"state\"", NULL, &state, &state_len) ||
+            rid_len != 36u || sha_len != 64u ||
+            name_len == 0u || name_len >= sizeof(filename) ||
+            state_len == 0u || state_len > 9u) {
+            return false;
+        }
+        memcpy(uuid, rid, rid_len);
+        uuid[rid_len] = '\0';
+        memcpy(hash, sha, sha_len);
+        hash[sha_len] = '\0';
+        memcpy(filename, name, name_len);
+        filename[name_len] = '\0';
+        if (!device_identity_is_valid_uuid(uuid) ||
+            !device_manifest_is_valid_sha256_hex(hash) ||
+            !valid_filename(filename) ||
+            !((state_len == 9u &&
+               memcmp(state, "finalized", 9u) == 0) ||
+              (state_len == 9u &&
+               memcmp(state, "recovered", 9u) == 0)) ||
+            memfind(p, (size_t)(close - p), "\"startedAt\":") == NULL ||
+            memfind(p, (size_t)(close - p), "\"durationMs\":") == NULL ||
+            memfind(p, (size_t)(close - p), "\"sizeBytes\":") == NULL ||
+            memfind(p, (size_t)(close - p), "\"sampleRate\":") == NULL ||
+            memfind(p, (size_t)(close - p), "\"bitDepth\":") == NULL ||
+            memfind(p, (size_t)(close - p), "\"channels\":") == NULL ||
+            memfind(p, (size_t)(close - p), "\"firmwareVersion\":") == NULL) {
+            return false;
+        }
+        n = snprintf(needle, sizeof(needle), "\"recordingId\":\"%s\"", uuid);
+        if (n < 0 || (size_t)n >= sizeof(needle) ||
+            memfind(close + 1, (size_t)((end - 2) - (close + 1)),
+                    needle) != NULL) {
+            // A repeated UUID is never a valid committed manifest.
+            return false;
+        }
+        p = close + 1;
+        if (p == end - 2) {
+            break;
+        }
+        if (*p != ',') {
+            return false;
+        }
+        p++;
+    }
+    return p == end - 2;
+}
+
+static bool manifest_file_valid(const char *path, const char *device_id) {
+    char *buf = NULL;
+    size_t len = 0;
+    bool ok;
+    if (!read_file_bounded(path, &buf, &len,
+                           RECORDER_MANIFEST_MAX_BYTES)) {
+        return false;
+    }
+    ok = manifest_snapshot_valid(buf, len, device_id);
+    free(buf);
+    return ok;
+}
+
+// A new published snapshot may only extend the previous byte-exact entry
+// prefix. No independently committed UUID, hash or metadata can disappear.
+static bool manifest_file_extends(const char *candidate_path,
+                                  const char *old_path,
+                                  const char *device_id) {
+    char *new_doc = NULL;
+    char *old_doc = NULL;
+    size_t new_len = 0, old_len = 0;
+    const char *a, *b, *a_end, *b_end;
+    bool ok = false;
+    if (!read_file_bounded(candidate_path, &new_doc, &new_len,
+                           RECORDER_MANIFEST_MAX_BYTES) ||
+        !read_file_bounded(old_path, &old_doc, &old_len,
+                           RECORDER_MANIFEST_MAX_BYTES)) {
+        goto done;
+    }
+    if (!manifest_snapshot_valid(new_doc, new_len, device_id) ||
+        !manifest_snapshot_valid(old_doc, old_len, device_id)) {
+        goto done;
+    }
+    a = memfind(old_doc, old_len, "\"recordings\":[");
+    b = memfind(new_doc, new_len, "\"recordings\":[");
+    if (a == NULL || b == NULL) {
+        goto done;
+    }
+    a = strchr(a, '[') + 1;
+    b = strchr(b, '[') + 1;
+    a_end = old_doc + old_len - 2;
+    b_end = new_doc + new_len - 2;
+    ok = a_end >= a && b_end >= b &&
+         (size_t)(b_end - b) >= (size_t)(a_end - a) &&
+         memcmp(a, b, (size_t)(a_end - a)) == 0 &&
+         (a_end == a || b + (a_end - a) == b_end ||
+          b[a_end - a] == ',');
+done:
+    free(new_doc);
+    free(old_doc);
+    return ok;
+}
+
+static bool manifest_backup_path(const char *manifest_path,
+                                 char out[RECORDER_MAX_PATH_LEN]) {
+    int n;
+    if (manifest_path == NULL || out == NULL) {
+        return false;
+    }
+    n = snprintf(out, RECORDER_MAX_PATH_LEN, "%s.bak", manifest_path);
+    return n > 0 && (size_t)n < RECORDER_MAX_PATH_LEN;
+}
+
 static bool write_tmp_and_rename(const char *tmp_path,
                                  const char *manifest_path, const char *doc,
                                  size_t doc_len) {
-    FILE *fp = NULL;
+    FILE *fp;
     size_t wrote;
+    char backup[RECORDER_MAX_PATH_LEN];
+    struct stat st;
+    bool had_final;
+    if (!manifest_backup_path(manifest_path, backup) ||
+        stat(backup, &st) == 0 || errno != ENOENT) {
+        // An unresolved prior transaction cannot be overwritten.
+        return false;
+    }
+    had_final = stat(manifest_path, &st) == 0;
+    if (!had_final && errno != ENOENT) {
+        return false;
+    }
     fp = fopen(tmp_path, "wb");
     if (fp == NULL) {
         return false;
     }
     wrote = fwrite(doc, 1, doc_len, fp);
-    if (wrote != doc_len) {
-        fclose(fp);
-        remove(tmp_path);
-        return false;
-    }
-    if (fflush(fp) != 0) {
-        fclose(fp);
-        remove(tmp_path);
+    if (wrote != doc_len || fflush(fp) != 0) {
+        (void)fclose(fp);
+        (void)remove(tmp_path);
         return false;
     }
 #ifdef ESP_PLATFORM
-    {
-        int fd = fileno(fp);
-        if (fd >= 0) {
-            (void)fsync(fd);
-        } else {
-            fclose(fp);
-            remove(tmp_path);
-            return false;
-        }
+    if (fileno(fp) < 0 || fsync(fileno(fp)) != 0) {
+        (void)fclose(fp);
+        (void)remove(tmp_path);
+        return false;
     }
-#else
-    // Host builds: fflush durability is sufficient for contract tests;
-    // fsync is an ESP-IDF media concern (see wav_part.c).
-    (void)0;
 #endif
     if (fclose(fp) != 0) {
-        remove(tmp_path);
+        (void)remove(tmp_path);
         return false;
     }
-    // Atomic publish: POSIX rename overwrites atomically. ESP-IDF FATFS
-    // rename fails when the destination exists, so retry once as
-    // remove+rename with the complete tmp already durable (a crash inside
-    // that window is recovered at boot by promoting a valid tmp when the
-    // destination is missing).
     if (rename(tmp_path, manifest_path) == 0) {
-        return true;
+        return true;  // no prior final, or POSIX atomic replacement
     }
-#ifdef ESP_PLATFORM
-    (void)remove(manifest_path);
-    if (rename(tmp_path, manifest_path) == 0) {
-        return true;
+    // FAT cannot rename over an existing destination. Only a known
+    // target-exists error may enter the two-snapshot recovery protocol.
+    if (!had_final || errno != EEXIST) {
+        return false;  // preserve M0 and complete tmp for diagnosis
     }
-#else
-    if (errno == EEXIST) {
-        (void)remove(manifest_path);
-        if (rename(tmp_path, manifest_path) == 0) {
-            return true;
+    if (rename(manifest_path, backup) != 0) {
+        return false;  // original M0 remains authoritative
+    }
+    if (rename(tmp_path, manifest_path) != 0) {
+        // Power loss here leaves M0 at .bak; the boot gate restores it.
+        // Preserve .bak and tmp even if the best-effort rollback fails.
+        if (stat(manifest_path, &st) != 0 && errno == ENOENT) {
+            (void)rename(backup, manifest_path);
         }
+        return false;
     }
-#endif
-    remove(tmp_path);
-    return false;
+    // Do not retire the backup unless the new published manifest is
+    // readable, structurally valid, and still contains all M0 entries.
+    // During this powered session the writer supplied the validated M1;
+    // the startup recovery enforces the same M0/M1 relationship.
+    // Backup cleanup is deferred to boot/recovery to keep an independent
+    // rollback candidate across this critical crash boundary.
+    return true;
 }
 
 device_manifest_result_t device_manifest_upsert_file(
@@ -713,6 +879,13 @@ device_manifest_result_t device_manifest_upsert_file(
             free(fresh);
             return ok ? DEVICE_MANIFEST_OK : DEVICE_MANIFEST_ERROR;
         }
+    }
+
+    // A previously published file must be a complete canonical snapshot.
+    // An arbitrary substring-match is insufficient before appending M1.
+    if (!manifest_snapshot_valid(doc, doc_len, device_id)) {
+        free(doc);
+        return DEVICE_MANIFEST_ERROR;
     }
 
     // Present: validate identity + major before touching anything.
@@ -939,55 +1112,52 @@ device_manifest_result_t device_manifest_upsert_file(
 
 bool device_manifest_recover_tmp(const char *manifest_path,
                                  const char *tmp_path, const char *device_id) {
-    struct stat st_dest;
-    struct stat st_tmp;
-    bool dest_exists;
-    bool tmp_exists;
-    char *tmp_doc = NULL;
-    size_t tmp_len = 0;
-    unsigned version = 0;
-    char stored[RECORDER_UUID_STR_LEN];
-    if (manifest_path == NULL || tmp_path == NULL || device_id == NULL) {
+    char backup[RECORDER_MAX_PATH_LEN];
+    struct stat st;
+    bool final_exists, tmp_exists, backup_exists;
+    if (manifest_path == NULL || tmp_path == NULL ||
+        !device_identity_is_valid_uuid(device_id) ||
+        !manifest_backup_path(manifest_path, backup)) {
         return false;
     }
-    if (!device_identity_is_valid_uuid(device_id)) {
-        return false;
+    final_exists = stat(manifest_path, &st) == 0;
+    tmp_exists = stat(tmp_path, &st) == 0;
+    backup_exists = stat(backup, &st) == 0;
+
+    if (backup_exists) {
+        if (!manifest_file_valid(backup, device_id)) {
+            return false;  // preserve evidence; no inferred healthy boot
+        }
+        if (!final_exists) {
+            // Transaction interrupted after M0 moved to backup.
+            if (rename(backup, manifest_path) != 0) {
+                return false;
+            }
+            final_exists = true;
+        } else if (!manifest_file_extends(manifest_path, backup, device_id)) {
+            return false;  // torn M1, missing M0 entry or identity fork
+        } else if (remove(backup) != 0) {
+            return false;
+        }
     }
-    dest_exists = (stat(manifest_path, &st_dest) == 0);
-    tmp_exists = (stat(tmp_path, &st_tmp) == 0);
-    if (dest_exists) {
-        // Destination healthy: drop any stale tmp from an interrupted
-        // update (its content, if newer, is re-derivable via the next
-        // idempotent upsert).
-        if (tmp_exists) {
-            (void)remove(tmp_path);
+    if (final_exists) {
+        if (!manifest_file_valid(manifest_path, device_id)) {
+            return false;
+        }
+        // A complete old/final M0 is authoritative; a temp from an
+        // interrupted pre-publish attempt must not displace it.
+        if (tmp_exists && remove(tmp_path) != 0) {
+            return false;
         }
         return true;
     }
-    if (!tmp_exists) {
+    if (!tmp_exists || !manifest_file_valid(tmp_path, device_id)) {
         return false;
     }
-    if (!read_file_bounded(tmp_path, &tmp_doc, &tmp_len,
-                            RECORDER_MANIFEST_MAX_BYTES)) {
-        return false;
-    }
-    if (!device_identity_parse_schema_version(tmp_doc, tmp_len, &version) ||
-        version != RECORDER_METADATA_SCHEMA_VERSION) {
-        free(tmp_doc);
-        return false;
-    }
-    memset(stored, 0, sizeof(stored));
-    if (!device_identity_parse_device_id(tmp_doc, tmp_len, stored) ||
-        strcmp(stored, device_id) != 0) {
-        free(tmp_doc);
-        return false;
-    }
-    if (memfind(tmp_doc, tmp_len, "\"recordings\"") == NULL) {
-        free(tmp_doc);
-        return false;
-    }
-    free(tmp_doc);
-    return rename(tmp_path, manifest_path) == 0;
+    // No M0 was present (first creation). Only a complete canonical tmp
+    // may be promoted. A partial or mismatched tmp is left untouched.
+    return rename(tmp_path, manifest_path) == 0 &&
+           manifest_file_valid(manifest_path, device_id);
 }
 
 // --- Boot sync of finalized WAVs ------------------------------------------
