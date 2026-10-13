@@ -1492,9 +1492,18 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
     if (dir == NULL) {
         return false;
     }
-    while ((ent = readdir(dir)) != NULL) {
+    for (;;) {
         char child[RECORDER_MAX_PATH_LEN];
         int needed;
+        errno = 0;
+        ent = readdir(dir);
+        if (ent == NULL) {
+            if (errno != 0) {
+                (void)closedir(dir);
+                return false;  // FAT enumeration/I/O fault
+            }
+            break;
+        }
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
             continue;
         }
@@ -1512,11 +1521,21 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
             }
             sub = opendir(child);
             if (sub == NULL) {
-                skipped++;
-                continue;
+                (void)closedir(dir);
+                return false;  // eligible date subtree inaccessible
             }
-            while ((subent = readdir(sub)) != NULL) {
+            for (;;) {
                 char wav[RECORDER_MAX_PATH_LEN];
+                errno = 0;
+                subent = readdir(sub);
+                if (subent == NULL) {
+                    if (errno != 0) {
+                        (void)closedir(sub);
+                        (void)closedir(dir);
+                        return false;
+                    }
+                    break;
+                }
                 char rel[192];
                 int n2;
                 int nr;
@@ -1530,14 +1549,16 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
                 n2 = snprintf(wav, sizeof(wav), "%s/%s", child,
                               subent->d_name);
                 if (n2 < 0 || (size_t)n2 >= sizeof(wav)) {
-                    skipped++;
-                    continue;
+                    (void)closedir(sub);
+                    (void)closedir(dir);
+                    return false;
                 }
                 nr = snprintf(rel, sizeof(rel), "recordings/%s/%s",
                               ent->d_name, subent->d_name);
                 if (nr < 0 || (size_t)nr >= sizeof(rel)) {
-                    skipped++;
-                    continue;
+                    (void)closedir(sub);
+                    (void)closedir(dir);
+                    return false;
                 }
                 if (!ensure_one_wav(wav, rel, ent->d_name, subent->d_name,
                                     manifest_path, tmp_path, device_id,
@@ -1554,7 +1575,10 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
                     return false;
                 }
             }
-            closedir(sub);
+            if (closedir(sub) != 0) {
+                (void)closedir(dir);
+                return false;
+            }
         } else {
             // Top-level `.wav` without a date directory: skipped (no
             // trustworthy startedAt source; never fabricate timestamps).
@@ -1563,7 +1587,9 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
             }
         }
     }
-    closedir(dir);
+    if (closedir(dir) != 0) {
+        return false;
+    }
     if (out_added != NULL) {
         *out_added = added;
     }
