@@ -1,6 +1,7 @@
 // Device manifest / integrity — Task #47 (IM-010). Stdio + dirent +
 // sys/stat only; no ESP-IDF dependency.
 //
+// Manifest updates never truncate a committed manifest.json in place.
 // Manifest durability protocol (logical crash-recovery candidate; physical
 // FAT32/power-interruption qualification is a separate acceptance gate):
 // - M1 is fully written to manifest.tmp, flushed, fsynced on the ESP
@@ -629,12 +630,16 @@ static bool manifest_iso8601(const char *value, size_t length) {
 
 static bool manifest_snapshot_valid(const char *doc, size_t len,
                                     const char *device_id) {
-    const char *p = doc, *end = doc + len;
+    const char *p, *end;
     const char *v;
     size_t n;
     uint32_t ver, num;
-    if (doc == NULL || device_id == NULL || len == 0u ||
-        memchr(doc, '\0', len) != NULL ||
+    if (doc == NULL || device_id == NULL || len == 0u) {
+        return false;
+    }
+    p = doc;
+    end = doc + len;
+    if (memchr(doc, '\0', len) != NULL ||
         !manifest_expect(&p, end, "{\"schemaVersion\":") ||
         !manifest_uint32(&p, end, &ver) ||
         ver != RECORDER_METADATA_SCHEMA_VERSION ||
