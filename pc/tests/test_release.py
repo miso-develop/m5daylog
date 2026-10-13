@@ -467,6 +467,49 @@ class WindowsAdapterTests(unittest.TestCase):
         self.assertEqual(closed, [7])
         self.assertEqual(written, [])
 
+    def test_native_cdc_enumeration_returns_validated_pnp_path(self):
+        # Exercise the production SetupAPI extraction path with no host I/O.
+        import ctypes
+        import sys
+        from contextlib import nullcontext
+        from ctypes import wintypes
+        from types import SimpleNamespace
+        from m5daylog.windows_release import (
+            CdcInterface, NativeWin32DeviceApi, SP_DEVINFO_DATA,
+        )
+
+        path = r"\\?\usb#vid_303a&pid_4001#port_A"
+        wide = ctypes.create_unicode_buffer(path)
+        api = NativeWin32DeviceApi.__new__(NativeWin32DeviceApi)
+        api._instance_id = lambda _devinst: r"USB\VID_303A&PID_4001\INTERFACE_A"
+        api._physical_usb_id = lambda _devinst: TARGET.usb_physical_instance_id
+
+        def detail(_devs, _interface, buffer, buffer_len, _needed, info):
+            self.assertGreaterEqual(buffer_len, 4 + ctypes.sizeof(wide))
+            ctypes.memmove(ctypes.addressof(buffer) + 4, wide, ctypes.sizeof(wide))
+            ctypes.cast(info, ctypes.POINTER(SP_DEVINFO_DATA)).contents.DevInst = 42
+            return True
+
+        api.s = SimpleNamespace(
+            SetupDiGetClassDevsW=lambda *_args: 5,
+            SetupDiEnumDeviceInterfaces=lambda *_args: _args[3] == 0,
+            SetupDiGetDeviceInterfaceDetailW=detail,
+            SetupDiDestroyDeviceInfoList=lambda *_args: True,
+        )
+        fake_winreg = SimpleNamespace(
+            HKEY_LOCAL_MACHINE=1,
+            OpenKey=lambda *_args: nullcontext(),
+            QueryValueEx=lambda *_args: ("COM5", 1),
+        )
+        with (patch.dict(sys.modules, {"winreg": fake_winreg}),
+              patch("m5daylog.windows_release.ctypes.get_last_error",
+                    create=True, return_value=259)):
+            result = api._cdc_interface("COM5")
+        self.assertEqual(result, CdcInterface(
+            path, r"USB\VID_303A&PID_4001\INTERFACE_A",
+            TARGET.usb_physical_instance_id,
+        ))
+
     def test_native_cdc_wrong_physical_id_never_opens_endpoint(self):
         from m5daylog.windows_release import CdcInterface, NativeWin32DeviceApi
 
