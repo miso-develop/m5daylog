@@ -492,3 +492,17 @@ def test_readdir_eio_cannot_produce_healthy_index_scan(
     monkeypatch.delenv("M5_TEST_FAIL_READDIR")
     assert final.read_bytes() == before
     assert wav.read_bytes() == b"x" * 44
+
+
+def test_poc_c_default_nvs_and_ack_negatives_are_not_enabled():
+    identity = (COMP / "device_identity.c").read_text(encoding="utf-8")
+    nvs = (COMP / "recorder_nvs.c").read_text(encoding="utf-8")
+    runtime = (ROOT / "firmware/main/task49_runtime.c").read_text(
+        encoding="utf-8"
+    )
+    # This is a source-level regression. It is not a runtime or physical
+    # no-mutation certificate, which remains a separate release gate.
+    assert "nvs_flash_erase(" not in identity
+    assert "nvs_flash_erase(" not in nvs
+    assert "processed_ack.h" not in runtime
+    assert "processed_ack_apply(" not in runtime
