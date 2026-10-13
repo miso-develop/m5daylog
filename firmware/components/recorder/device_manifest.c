@@ -538,126 +538,173 @@ static bool read_file_bounded(const char *path, char **out_buf, size_t *out_len,
 // Check the complete writer-generated canonical document, not merely a
 // matching deviceId. Device-owned manifests have a fixed field order and
 // non-escaped strings. Unknown layouts fail closed pending explicit migration.
+// Parse the *writer-emitted canonical v1 wire format* completely, with
+// bounded decimal numbers and no escaped/control strings. Rejecting an
+// alternative JSON encoding is intentional: any migration requires a
+// separately accepted contract; a torn snapshot must never look healthy.
+static bool manifest_expect(const char **cursor, const char *end,
+                            const char *literal) {
+    size_t n = strlen(literal);
+    if (*cursor > end || (size_t)(end - *cursor) < n ||
+        memcmp(*cursor, literal, n) != 0) {
+        return false;
+    }
+    *cursor += n;
+    return true;
+}
+
+static bool manifest_string(const char **cursor, const char *end,
+                            const char **value, size_t *length) {
+    const char *p = *cursor, *start;
+    if (p >= end || *p != '"') {
+        return false;
+    }
+    start = ++p;
+    while (p < end && *p != '"') {
+        if (*p == '\\' || (unsigned char)*p < 0x20u) {
+            return false;
+        }
+        ++p;
+    }
+    if (p == end) {
+        return false;
+    }
+    *value = start;
+    *length = (size_t)(p - start);
+    *cursor = p + 1;
+    return true;
+}
+
+static bool manifest_uint32(const char **cursor, const char *end,
+                            uint32_t *value) {
+    const char *p = *cursor;
+    uint32_t result = 0;
+    if (p == end || !is_digit(*p)) {
+        return false;
+    }
+    if (*p == '0' && p + 1 < end && is_digit(p[1])) {
+        return false;
+    }
+    while (p < end && is_digit(*p)) {
+        unsigned digit = (unsigned)(*p - '0');
+        if (result > (UINT32_MAX - digit) / 10u) {
+            return false;
+        }
+        result = result * 10u + digit;
+        ++p;
+    }
+    *value = result;
+    *cursor = p;
+    return true;
+}
+
+static bool manifest_string_equals(const char *value, size_t length,
+                                   const char *expected) {
+    return length == strlen(expected) &&
+           memcmp(value, expected, length) == 0;
+}
+
+static bool manifest_iso8601(const char *value, size_t length) {
+    char stamp[RECORDER_ISO8601_STR_LEN];
+    if (length != 25u) {
+        return false;
+    }
+    memcpy(stamp, value, length);
+    stamp[length] = '\0';
+    return device_manifest_is_valid_iso8601_offset(stamp);
+}
+
 static bool manifest_snapshot_valid(const char *doc, size_t len,
                                     const char *device_id) {
-    unsigned ver = 0;
-    char stored[RECORDER_UUID_STR_LEN];
-    const char *arr;
-    const char *open;
-    const char *updated = NULL;
-    size_t updated_len = 0;
-    const char *end = doc + len;
-    const char *p;
-    if (doc == NULL || len < 2u || device_id == NULL ||
+    const char *p = doc, *end = doc + len;
+    const char *v;
+    size_t n;
+    uint32_t ver, num;
+    if (doc == NULL || device_id == NULL || len == 0u ||
         memchr(doc, '\0', len) != NULL ||
-        !device_identity_parse_schema_version(doc, len, &ver) ||
+        !manifest_expect(&p, end, "{\"schemaVersion\":") ||
+        !manifest_uint32(&p, end, &ver) ||
         ver != RECORDER_METADATA_SCHEMA_VERSION ||
-        !device_identity_parse_device_id(doc, len, stored) ||
-        strcmp(stored, device_id) != 0 ||
-        !json_string_field(doc, len, "\"updatedAt\"", NULL,
-                           &updated, &updated_len) ||
-        updated_len != 25u) {
+        !manifest_expect(&p, end, ",\"deviceId\":") ||
+        !manifest_string(&p, end, &v, &n) ||
+        !manifest_string_equals(v, n, device_id) ||
+        !manifest_expect(&p, end, ",\"updatedAt\":") ||
+        !manifest_string(&p, end, &v, &n) ||
+        !manifest_iso8601(v, n) ||
+        !manifest_expect(&p, end, ",\"recordings\":[")) {
         return false;
     }
-    {
-        char stamp[RECORDER_ISO8601_STR_LEN];
-        memcpy(stamp, updated, updated_len);
-        stamp[updated_len] = '\0';
-        if (!device_manifest_is_valid_iso8601_offset(stamp)) {
-            return false;
-        }
-    }
-    arr = memfind(doc, len, "\"recordings\":[");
-    if (arr == NULL) {
-        return false;
-    }
-    open = strchr(arr, '[');
-    if (open == NULL || end - doc < 2 || end[-2] != ']' ||
-        end[-1] != '}' || open >= end - 2) {
-        return false;
-    }
-    p = open + 1;
-    while (p < end - 2) {
-        const char *close;
-        const char *rid;
-        const char *sha;
-        const char *name;
-        const char *state;
-        const char *started;
-        size_t rid_len = 0, sha_len = 0, name_len = 0, state_len = 0;
-        size_t started_len = 0;
-        char uuid[RECORDER_UUID_STR_LEN], hash[RECORDER_SHA256_HEX_LEN];
-        char filename[192], needle[64];
-        char started_at[RECORDER_ISO8601_STR_LEN];
-        int n;
-        if (*p != '{') {
-            return false;
-        }
-        close = memchr(p, '}', (size_t)((end - 2) - p));
-        if (close == NULL) {
-            return false;
-        }
-        // Scope each lookup to exactly one entry. No nested objects/arrays
-        // or escaped JSON are emitted by the canonical Device writer.
-        if (!json_string_field(p, (size_t)(close + 1 - p),
-                               "\"recordingId\"", NULL, &rid, &rid_len) ||
-            !json_string_field(p, (size_t)(close + 1 - p),
-                               "\"sha256\"", NULL, &sha, &sha_len) ||
-            !json_string_field(p, (size_t)(close + 1 - p),
-                               "\"filename\"", NULL, &name, &name_len) ||
-            !json_string_field(p, (size_t)(close + 1 - p),
-                               "\"state\"", NULL, &state, &state_len) ||
-            !json_string_field(p, (size_t)(close + 1 - p),
-                               "\"startedAt\"", NULL,
-                               &started, &started_len) ||
-            started_len != 25u ||
-            rid_len != 36u || sha_len != 64u ||
+    while (p < end && *p != ']') {
+        const char *id, *name, *sha, *state, *fw;
+        size_t id_len, name_len, sha_len, state_len, fw_len;
+        char uuid[RECORDER_UUID_STR_LEN];
+        char filename[192];
+        char hash[RECORDER_SHA256_HEX_LEN];
+        char duplicate_needle[64];
+        int printed;
+        if (!manifest_expect(&p, end, "{\"recordingId\":") ||
+            !manifest_string(&p, end, &id, &id_len) ||
+            id_len != 36u ||
+            !manifest_expect(&p, end, ",\"filename\":") ||
+            !manifest_string(&p, end, &name, &name_len) ||
             name_len == 0u || name_len >= sizeof(filename) ||
-            state_len == 0u || state_len > 9u) {
+            !manifest_expect(&p, end, ",\"startedAt\":") ||
+            !manifest_string(&p, end, &v, &n) ||
+            !manifest_iso8601(v, n) ||
+            !manifest_expect(&p, end, ",\"durationMs\":") ||
+            !manifest_uint32(&p, end, &num) ||
+            !manifest_expect(&p, end, ",\"sizeBytes\":") ||
+            !manifest_uint32(&p, end, &num) ||
+            num < RECORDER_WAV_HEADER_SIZE ||
+            !manifest_expect(&p, end, ",\"sha256\":") ||
+            !manifest_string(&p, end, &sha, &sha_len) ||
+            sha_len != 64u ||
+            !manifest_expect(&p, end, ",\"sampleRate\":") ||
+            !manifest_uint32(&p, end, &num) ||
+            num != RECORDER_SAMPLE_RATE_HZ ||
+            !manifest_expect(&p, end, ",\"bitDepth\":") ||
+            !manifest_uint32(&p, end, &num) ||
+            num != RECORDER_BITS_PER_SAMPLE ||
+            !manifest_expect(&p, end, ",\"channels\":") ||
+            !manifest_uint32(&p, end, &num) ||
+            num != RECORDER_CHANNELS ||
+            !manifest_expect(&p, end, ",\"state\":") ||
+            !manifest_string(&p, end, &state, &state_len) ||
+            !((manifest_string_equals(state, state_len, "finalized")) ||
+              (manifest_string_equals(state, state_len, "recovered"))) ||
+            !manifest_expect(&p, end, ",\"firmwareVersion\":") ||
+            !manifest_string(&p, end, &fw, &fw_len) ||
+            fw_len == 0u || fw_len > 32u ||
+            !manifest_expect(&p, end, "}")) {
             return false;
         }
-        memcpy(uuid, rid, rid_len);
-        uuid[rid_len] = '\0';
-        memcpy(hash, sha, sha_len);
-        hash[sha_len] = '\0';
+        memcpy(uuid, id, id_len);
+        uuid[id_len] = '\0';
         memcpy(filename, name, name_len);
         filename[name_len] = '\0';
-        memcpy(started_at, started, started_len);
-        started_at[started_len] = '\0';
-        if (!device_manifest_is_valid_iso8601_offset(started_at) ||
-            !device_identity_is_valid_uuid(uuid) ||
-            !device_manifest_is_valid_sha256_hex(hash) ||
+        memcpy(hash, sha, sha_len);
+        hash[sha_len] = '\0';
+        if (!device_identity_is_valid_uuid(uuid) ||
             !valid_filename(filename) ||
-            !((state_len == 9u &&
-               memcmp(state, "finalized", 9u) == 0) ||
-              (state_len == 9u &&
-               memcmp(state, "recovered", 9u) == 0)) ||
-            memfind(p, (size_t)(close - p), "\"startedAt\":") == NULL ||
-            memfind(p, (size_t)(close - p), "\"durationMs\":") == NULL ||
-            memfind(p, (size_t)(close - p), "\"sizeBytes\":") == NULL ||
-            memfind(p, (size_t)(close - p), "\"sampleRate\":") == NULL ||
-            memfind(p, (size_t)(close - p), "\"bitDepth\":") == NULL ||
-            memfind(p, (size_t)(close - p), "\"channels\":") == NULL ||
-            memfind(p, (size_t)(close - p), "\"firmwareVersion\":") == NULL) {
+            !device_manifest_is_valid_sha256_hex(hash)) {
             return false;
         }
-        n = snprintf(needle, sizeof(needle), "\"recordingId\":\"%s\"", uuid);
-        if (n < 0 || (size_t)n >= sizeof(needle) ||
-            memfind(close + 1, (size_t)((end - 2) - (close + 1)),
-                    needle) != NULL) {
-            // A repeated UUID is never a valid committed manifest.
+        printed = snprintf(duplicate_needle, sizeof(duplicate_needle),
+                           "\"recordingId\":\"%s\"", uuid);
+        if (printed < 0 || (size_t)printed >= sizeof(duplicate_needle) ||
+            memfind(p, (size_t)(end - p), duplicate_needle) != NULL) {
             return false;
         }
-        p = close + 1;
-        if (p == end - 2) {
-            break;
-        }
-        if (*p != ',') {
+        if (p < end && *p == ',') {
+            ++p;
+            if (p == end || *p != '{') {
+                return false;
+            }
+        } else if (p < end && *p != ']') {
             return false;
         }
-        p++;
     }
-    return p == end - 2;
+    return manifest_expect(&p, end, "]}") && p == end;
 }
 
 static bool manifest_file_valid(const char *path, const char *device_id) {
