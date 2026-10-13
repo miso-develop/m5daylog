@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -285,7 +286,7 @@ def run_diagnostic(recording_id: str, *, db_path: str | Path,
         raise VadError("invalid diagnostic resource limit")
     root = resolve_library_root(library_root).resolve(strict=True)
     uri = Path(db_path).resolve(strict=True).as_uri() + "?mode=ro"
-    with sqlite3.connect(uri, uri=True, timeout=0.1) as db:
+    with closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as db:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA query_only=ON")
         row = db.execute("SELECT * FROM recordings WHERE recording_id=?",
