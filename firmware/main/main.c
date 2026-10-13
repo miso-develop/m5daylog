@@ -13,6 +13,7 @@
 #include "esp_flash.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -510,6 +511,34 @@ static bool recorder_ensure_manifest_exists(void) {
     }
 }
 
+// Reserve enough physical space for the entire next 30-minute PCM WAV,
+// a full 128KiB temp manifest rewrite, and one additional rotation/error
+// margin. FAT free bytes are observed, not locked; any later exhaustion
+// still fails loud via the existing sink/finalize error path.
+static bool recorder_can_admit_segment(void) {
+    uint64_t total_bytes = 0;
+    uint64_t free_bytes = 0;
+    const uint64_t min_free =
+        (uint64_t)RECORDER_ROTATION_PAYLOAD_BYTES +
+        (uint64_t)RECORDER_WAV_HEADER_SIZE +
+        3u * (uint64_t)RECORDER_MANIFEST_MAX_BYTES +
+        (uint64_t)RECORDER_BUFFER_BYTES;
+    if (!device_manifest_has_append_room(RECORDER_MANIFEST_PATH,
+                                         s_device_id)) {
+        ESP_LOGE(TAG,
+                 "stage: manifest, result: error, reason: METADATA_FULL");
+        return false;
+    }
+    if (esp_vfs_fat_info(RECORDER_SD_MOUNT_POINT, &total_bytes,
+                         &free_bytes) != ESP_OK ||
+        total_bytes == 0u || free_bytes < min_free) {
+        ESP_LOGE(TAG,
+                 "stage: record, result: error, reason: STORAGE_FULL");
+        return false;
+    }
+    return true;
+}
+
 static void recorder_battery_task(void *arg) {
     EventBits_t bits;
     uint32_t low_samples = 0;
@@ -927,6 +956,14 @@ static void recorder_writer_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
+    if (!recorder_can_admit_segment()) {
+        recorder_enter_error(RECORDER_REASON_MANIFEST);
+        recorder_set_events_ready(false);
+        sd_mount_unmount();
+        recorder_log_writer_stack_hw("capacity admission");
+        vTaskDelete(NULL);
+        return;
+    }
     if (!sd_pcm_sink_open(&s_sink, s_seg_part)) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: part open");
         recorder_enter_error(RECORDER_REASON_SD_WRITE);
@@ -1070,6 +1107,11 @@ static void recorder_writer_task(void *arg) {
                     ESP_LOGE(TAG,
                              "stage: rotate, result: error, reason: mkdir date");
                     recorder_enter_error(RECORDER_REASON_SD_WRITE);
+                    running = false;
+                    break;
+                }
+                if (!recorder_can_admit_segment()) {
+                    recorder_enter_error(RECORDER_REASON_MANIFEST);
                     running = false;
                     break;
                 }
