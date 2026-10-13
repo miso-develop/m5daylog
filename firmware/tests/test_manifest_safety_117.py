@@ -30,6 +30,7 @@ RENAME_EMULATOR = r"""
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static int calls = 0;
 
@@ -62,6 +63,57 @@ int manifest_test_rename(const char *from, const char *to) {
     }
     return rename(from, to);
 }
+
+static int io_call(const char *name, int *counter) {
+    const char *p = getenv(name);
+    *counter += 1;
+    if (!p) return 0;
+    return atoi(p) == *counter;
+}
+
+int manifest_test_fflush(FILE *fp) {
+    static int n = 0;
+    if (io_call("M5_TEST_FAIL_FFLUSH", &n)) {
+        errno = EIO;
+        return EOF;
+    }
+    return fflush(fp);
+}
+int manifest_test_fclose(FILE *fp) {
+    static int n = 0;
+    int ret = fclose(fp);
+    if (io_call("M5_TEST_FAIL_FCLOSE", &n)) {
+        errno = EIO;
+        return EOF;
+    }
+    return ret;
+}
+int manifest_test_fsync(int fd) {
+    static int n = 0;
+    if (io_call("M5_TEST_FAIL_FSYNC", &n)) {
+        errno = EIO;
+        return -1;
+    }
+    return fsync(fd);
+}
+int manifest_test_remove(const char *path) {
+    static int n = 0;
+    if (io_call("M5_TEST_FAIL_REMOVE", &n)) {
+        errno = EIO;
+        return -1;
+    }
+    return remove(path);
+}
+static int write_calls = 0;
+size_t manifest_test_fwrite(const void *ptr, size_t size, size_t nmemb,
+                            FILE *fp) {
+    ++write_calls;
+    if (getenv("M5_TEST_FAIL_FWRITE") &&
+        atoi(getenv("M5_TEST_FAIL_FWRITE")) == write_calls && nmemb > 0) {
+        return fwrite(ptr, size, nmemb - 1u, fp);
+    }
+    return fwrite(ptr, size, nmemb, fp);
+}
 """
 
 
@@ -78,7 +130,14 @@ def native_manifest(tmp_path_factory):
         obj = work / (source + ".o")
         subprocess.run(
             [cc, "-std=c11", "-fPIC", "-O0", "-I", str(INCLUDE),
-             "-Drename=manifest_test_rename", "-c", str(COMP / source),
+             "-DDEVICE_MANIFEST_NATIVE_SYNC_TEST",
+             "-Drename=manifest_test_rename",
+             "-Dfflush=manifest_test_fflush",
+             "-Dfclose=manifest_test_fclose",
+             "-Dfsync=manifest_test_fsync",
+             "-Dremove=manifest_test_remove",
+             "-Dfwrite=manifest_test_fwrite",
+             "-c", str(COMP / source),
              "-o", str(obj)],
             check=True, capture_output=True, text=True,
         )
@@ -287,3 +346,43 @@ def test_manifest_limit_refuses_extra_uuid_without_losing_m0(
     native_manifest.manifest_test_reset()
     assert _upsert(native_manifest, final, temp, _entry(999)) == 2
     assert final.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "fault,call",
+    [
+        ("M5_TEST_FAIL_FWRITE", "1"),
+        ("M5_TEST_FAIL_FFLUSH", "1"),
+        ("M5_TEST_FAIL_FSYNC", "1"),
+    ],
+)
+def test_failed_temp_write_flush_or_fsync_never_retires_m0(
+    native_manifest, tmp_path, monkeypatch, fault, call
+):
+    old = _entry(1)
+    final, temp = _create(tmp_path, [old])
+    m0 = final.read_bytes()
+    monkeypatch.setenv(fault, call)
+    native_manifest.manifest_test_reset()
+    assert _upsert(native_manifest, final, temp, _entry(2)) == 2
+    assert final.read_bytes() == m0
+    monkeypatch.delenv(fault)
+
+
+def test_failed_backup_cleanup_preserves_both_snapshots(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    old = _entry(1)
+    final, temp = _create(tmp_path, [old])
+    native_manifest.manifest_test_reset()
+    assert _upsert(native_manifest, final, temp, _entry(2)) == 0
+    bak = tmp_path / "manifest.json.bak"
+    assert bak.exists()
+    monkeypatch.setenv("M5_TEST_FAIL_REMOVE", "1")
+    assert not _recover(native_manifest, final, temp)
+    assert bak.exists()
+    assert len(json.loads(final.read_bytes())["recordings"]) == 2
+    monkeypatch.delenv("M5_TEST_FAIL_REMOVE")
+    assert _recover(native_manifest, final, temp)
+    assert not bak.exists()
