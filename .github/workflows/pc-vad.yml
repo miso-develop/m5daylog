@@ -53,6 +53,8 @@ jobs:
           runtime = SileroCPU()
           assert runtime.model_sha256 == EXPECTED_MODEL_SHA256
           assert runtime.detect(b'\x00\x00' * 16000) == []
+          import numpy as np
+          assert runtime.detect_float32(np.zeros(16000, dtype=np.float32)) == []
           print('LIVE_SILERO_CPU_SMOKE_PASS model_sha256=' + checksum)
           PY
 
@@ -85,4 +87,4 @@ jobs:
       - name: Windows CPU ONNX silent input smoke
         working-directory: pc
         run: |
-          uv run --frozen python -c "from m5daylog.vad import SileroCPU; model = SileroCPU(); assert model.detect(bytes(32000)) == []; print('WINDOWS_SILERO_CPU_SMOKE_PASS')"
+          uv run --frozen python -c "import numpy as np; from m5daylog.vad import SileroCPU; model = SileroCPU(); assert model.detect(bytes(32000)) == []; assert model.detect_float32(np.zeros(16000, dtype=np.float32)) == []; print('WINDOWS_SILERO_CPU_SMOKE_PASS')"
