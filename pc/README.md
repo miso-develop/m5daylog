@@ -141,3 +141,56 @@ inference; and atomically publishes fresh JSONL via fsynced temporary file.
 A final artifact published before an interrupted SQLite commit can be
 validated and adopted on retry. Source audio and transcripts are never logged.
 STT (#55) must consume only a successful, current schema-v1 VAD artifact.
+
+
+## Offline RAW/DC diagnostic comparator (Issue #54, section 16)
+
+The production `m5daylog vad` command remains **RAW v1**: its original
+fingerprint, JSONL schema, SQLite state and STT input contract are unchanged.
+The explicit `vad-diagnose` command compares raw PCM to whole-recording
+DC-mean-subtracted PCM using the identical pinned Silero parameters.
+It is **analysis-only**: no canonical artifact or database writes, no
+raw WAV edits, no off-host transfers, and no STT consumption.
+
+Local PowerShell (from pc/, with frozen Python 3.11 dependencies):
+
+```powershell
+uv run --frozen m5daylog vad-diagnose <recording-uuid> --db <local-db> --library-root <local-library> --code-revision <verified-40-hex-HEAD>
+```
+
+Optional local annotation for measured recall and false positives:
+
+```json
+{
+  "fixture_id": "local-fixture",
+  "category": "quiet",
+  "source_sha256": "<full WAV SHA-256>",
+  "total_samples": 16000,
+  "reference": [[100, 2800], [6500, 11000]]
+}
+```
+
+Pass `--annotation <local-reference.json>`; the sample count and WAV hash
+must match. Keep recordings, annotations and personal observations local.
+The code-revision option is an operator-supplied exact revision **label**,
+not proof that installed code matches the revision. Evidence identifies
+RAW_v1 and dc_global_mean_v1, SHA-256, sample count, signed sum, mean PCM
+LSB, temporary clipping, 60s drift-window means, model/lock/version
+fingerprints and range digests. The CLI does not emit speech boundaries,
+raw samples, transcripts, or filesystem paths; nevertheless review any
+evidence before public publication.
+
+Transform order: all signed PCM16 values are summed exactly in bounded
+blocks; their whole-recording mean is subtracted in float64, divided by
+32768, clipped to [-1,1], then cast to float32 for inference. No gain,
+resample, inserted samples, trim, or per-window mean reset. Both ranges
+refer to the **original** WAV sample timeline. Single WAV inputs longer
+than 31 minutes receive DIAGNOSTIC_RESOURCE_BLOCKED (exit 2), not a
+product VAD failure; other invalid inputs fail closed (exit 1).
+
+EV-018 remains **NOT_RUN** until qualified annotated silence, device-noise,
+quiet, 1m, and noisy real-audio fixtures are evaluated with independent
+acoustic evidence for both variants. Increased detected duration alone is
+not acceptance. Production DC compensation would require a further
+Specification approval, algorithm bump and independent Review/Security/
+Human Gate. Draft PR #110 is not authorized to merge.
