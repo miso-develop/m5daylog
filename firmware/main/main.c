@@ -896,7 +896,9 @@ static void recorder_writer_task(void *arg) {
                     RECORDER_MANIFEST_TMP_PATH, s_device_id, s_manifest_now,
                     DEVICE_MANIFEST_STATE_RECOVERED, &added, &skipped)) {
                 ESP_LOGE(TAG,
-                         "stage: manifest, result: error, reason: manifest sync");
+                         "stage: manifest, result: error, reason: %s",
+                         device_manifest_scan_error_name(
+                             device_manifest_last_scan_error()));
                 recorder_enter_error(RECORDER_REASON_MANIFEST);
                 recorder_set_events_ready(false);
                 sd_mount_unmount();
