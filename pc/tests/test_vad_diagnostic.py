@@ -20,7 +20,7 @@ from m5daylog.db import init_db
 from m5daylog.vad import VadError
 from m5daylog.vad_diagnostic import (
     BLOCK_SAMPLES, DC, RAW, DRIFT_WINDOW_SAMPLES,
-    DiagnosticResourceBlocked, _dc_samples, _stat, read_annotation,
+    DiagnosticResourceBlocked, _dc_samples, _stat, aggregate_annotated, read_annotation,
     run_diagnostic,
 )
 
@@ -220,6 +220,23 @@ class DiagnosticsTests(unittest.TestCase):
         ref_file.write_text(json.dumps(annotation), encoding="utf-8")
         with self.assertRaisesRegex(VadError, "identity"):
             self.run_diag(annotation=read_annotation(ref_file)[0])
+
+    def test_pooled_pair_rejects_unannotated_and_duplicate_sources(self):
+        with self.assertRaises(VadError):
+            aggregate_annotated([self.run_diag()])
+        annotation = {
+            "fixture_id": "synthetic", "category": "quiet",
+            "source_sha256": hashlib.sha256(self.raw_path.read_bytes()).hexdigest(),
+            "total_samples": 5, "reference": ((0, 4),),
+        }
+        result = self.run_diag(annotation=annotation, annotation_sha256="f" * 64)
+        pooled = aggregate_annotated([result])
+        self.assertAlmostEqual(pooled["variants"][RAW]["speech_recall"], 0.75)
+        self.assertAlmostEqual(pooled["variants"][DC]["speech_recall"], 1.0)
+        self.assertEqual(pooled["status"],
+                         "MEASUREMENTS_ONLY_MANUAL_EV018_REVIEW_REQUIRED")
+        with self.assertRaisesRegex(VadError, "duplicate"):
+            aggregate_annotated([result, result])
 
     def test_annotation_rejects_bad_reference_structure(self):
         file = Path(self.tmp.name) / "reference.json"
