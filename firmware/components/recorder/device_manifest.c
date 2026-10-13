@@ -1535,6 +1535,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
         if (ent == NULL) {
             if (errno != 0) {
                 (void)closedir(dir);
+                s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
                 return false;  // FAT enumeration/I/O fault
             }
             break;
@@ -1548,12 +1549,14 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
             // Unknown directory content cannot be classified as excluded;
             // there may be a canonical UUID WAV hidden by path truncation.
             (void)closedir(dir);
+            s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
             return false;
         }
         if (valid_date_dir(ent->d_name) && !path_is_dir_local(child)) {
             // A canonical date subtree must be enumerable. A stat failure,
             // reparse error or unexpected file type forbids healthy sync.
             (void)closedir(dir);
+            s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
             return false;
         }
         if (path_is_dir_local(child)) {
@@ -1565,6 +1568,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
             sub = opendir(child);
             if (sub == NULL) {
                 (void)closedir(dir);
+                s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
                 return false;  // eligible date subtree inaccessible
             }
             for (;;) {
@@ -1575,6 +1579,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
                     if (errno != 0) {
                         (void)closedir(sub);
                         (void)closedir(dir);
+                        s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
                         return false;
                     }
                     break;
@@ -1594,6 +1599,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
                 if (n2 < 0 || (size_t)n2 >= sizeof(wav)) {
                     (void)closedir(sub);
                     (void)closedir(dir);
+                    s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
                     return false;
                 }
                 nr = snprintf(rel, sizeof(rel), "recordings/%s/%s",
@@ -1601,6 +1607,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
                 if (nr < 0 || (size_t)nr >= sizeof(rel)) {
                     (void)closedir(sub);
                     (void)closedir(dir);
+                    s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
                     return false;
                 }
                 if (!ensure_one_wav(wav, rel, ent->d_name, subent->d_name,
@@ -1620,6 +1627,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
             }
             if (closedir(sub) != 0) {
                 (void)closedir(dir);
+                s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
                 return false;
             }
         } else {
