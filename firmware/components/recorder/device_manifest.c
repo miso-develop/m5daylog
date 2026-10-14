@@ -1242,7 +1242,7 @@ device_manifest_result_t device_manifest_upsert_file(
                 return DEVICE_MANIFEST_ERROR;
             }
             if (doc_len - old_ts_len + new_ts_len + extra >
-                RECORDER_MANIFEST_MAX_BYTES) {
+                DEVICE_MANIFEST_ADMISSION_CEILING_BYTES) {
                 free(doc);
                 return DEVICE_MANIFEST_ERROR;
             }
@@ -1279,13 +1279,17 @@ device_manifest_result_t device_manifest_upsert_file(
             free(doc);
             return DEVICE_MANIFEST_ERROR;
         }
+        // Candidate M1 already has an independent copy of every M0 entry.
+        // The transaction re-reads M0 from storage. Drop the now-unused
+        // in-memory M0 before write/readback so at most three full-sized
+        // manifest buffers coexist, rather than four.
+        free(doc);
+        doc = NULL;
         if (!write_tmp_and_rename(tmp_path, manifest_path, fresh, fresh_len)) {
             free(fresh);
-            free(doc);
             return DEVICE_MANIFEST_ERROR;
         }
         free(fresh);
-        free(doc);
         return DEVICE_MANIFEST_OK;
     }
 }
@@ -1357,8 +1361,8 @@ bool device_manifest_has_append_room(const char *manifest_path,
         return false;
     }
     ok = manifest_snapshot_valid(doc, len, device_id) &&
-         len <= RECORDER_MANIFEST_MAX_BYTES &&
-         reserve <= RECORDER_MANIFEST_MAX_BYTES - len;
+         len <= DEVICE_MANIFEST_ADMISSION_CEILING_BYTES &&
+         reserve <= DEVICE_MANIFEST_ADMISSION_CEILING_BYTES - len;
     free(doc);
     return ok;
 }
