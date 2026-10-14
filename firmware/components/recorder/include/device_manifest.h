@@ -83,8 +83,9 @@ bool device_manifest_build_empty(const char *device_id, const char *updated_at,
 // Hash the WAV file bytes entire incrementally (4KB reads) into
 // lowercase hex (`out_hex` needs RECORDER_SHA256_HEX_LEN bytes) and
 // report the total file size in `out_size_bytes` (may be NULL).
-// Returns false on NULL input, missing/unreadable file, read error, or
-// invalid (non-`.wav`) suffix. The file content is never logged.
+// Returns false on NULL input, missing/unreadable file, read error,
+// invalid RIFF/WAVE/PCM format, truncated/odd payload, inconsistent
+// declared lengths, or invalid (non-`.wav`) suffix. The file content is never logged.
 bool device_manifest_hash_wav_file(const char *wav_path,
                                    char out_hex[RECORDER_SHA256_HEX_LEN],
                                    uint32_t *out_size_bytes);
@@ -146,12 +147,16 @@ typedef enum {
     DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR,
     DEVICE_MANIFEST_SCAN_WAV_UNREADABLE,
     DEVICE_MANIFEST_SCAN_INDEX_CONFLICT,
-    DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR
+    DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR,
+    DEVICE_MANIFEST_SCAN_MISSING_WAV
 } device_manifest_scan_error_t;
 
 // Caller must inspect only after device_manifest_sync_wav_dir returns.
 // The recorder writer is the sole owner of this boot-time scan state.
 device_manifest_scan_error_t device_manifest_last_scan_error(void);
+// Number of canonical WAVs validated and matched to entries on last
+// successful scan; already-indexed = indexed - out_added.
+uint32_t device_manifest_last_scan_indexed(void);
 const char *device_manifest_scan_error_name(device_manifest_scan_error_t error);
 
 // Scan `recordings_dir` (top level plus one-level `YYYY-MM-DD/`
@@ -164,7 +169,12 @@ const char *device_manifest_scan_error_name(device_manifest_scan_error_t error);
 // hash fails are excluded only when the name cannot identify a canonical
 // UUID WAV. A canonical UUID WAV whose hash/index upsert fails returns
 // false (INDEX_INCOMPLETE); it is never silently skipped as healthy.
-// `out_added`/`out_skipped` may be NULL. No WAV is deleted.
+// Scan must also validate the reverse direction: every durable manifest
+// entry must correspond to one validated canonical WAV; MISSING_WAV
+// forbids healthy recording/USB publication. out_added is actual new
+// inserts, out_skipped is excluded names, and the successful indexed
+// count includes already-indexed files. Either pointer may be NULL.
+// No WAV is deleted.
 bool device_manifest_sync_wav_dir(const char *recordings_dir,
                                   const char *manifest_path,
                                   const char *tmp_path, const char *device_id,
