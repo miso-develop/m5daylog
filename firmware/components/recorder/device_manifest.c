@@ -326,6 +326,46 @@ bool device_manifest_build_empty(const char *device_id, const char *updated_at,
     return true;
 }
 
+static uint16_t wav_u16(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t wav_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Reject invalid/truncated finalized audio before advertising it as RAW.
+static bool finalized_wav_valid(const char *path, uint32_t total) {
+    uint8_t header[RECORDER_WAV_HEADER_SIZE];
+    FILE *fp;
+    bool ok;
+    if (total < RECORDER_WAV_HEADER_SIZE ||
+        (total - RECORDER_WAV_HEADER_SIZE) % RECORDER_BLOCK_ALIGN != 0u) {
+        return false;
+    }
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return false;
+    }
+    ok = fread(header, 1, sizeof(header), fp) == sizeof(header);
+    if (fclose(fp) != 0) {
+        return false;
+    }
+    return ok && memcmp(header, "RIFF", 4) == 0 &&
+           wav_u32(header + 4) == total - 8u &&
+           memcmp(header + 8, "WAVEfmt ", 8) == 0 &&
+           wav_u32(header + 16) == 16u &&
+           wav_u16(header + 20) == 1u &&
+           wav_u16(header + 22) == RECORDER_CHANNELS &&
+           wav_u32(header + 24) == RECORDER_SAMPLE_RATE_HZ &&
+           wav_u32(header + 28) == RECORDER_BYTE_RATE &&
+           wav_u16(header + 32) == RECORDER_BLOCK_ALIGN &&
+           wav_u16(header + 34) == RECORDER_BITS_PER_SAMPLE &&
+           memcmp(header + 36, "data", 4) == 0 &&
+           wav_u32(header + 40) == total - RECORDER_WAV_HEADER_SIZE;
+}
+
 bool device_manifest_hash_wav_file(const char *wav_path,
                                    char out_hex[RECORDER_SHA256_HEX_LEN],
                                    uint32_t *out_size_bytes) {
@@ -350,11 +390,21 @@ bool device_manifest_hash_wav_file(const char *wav_path,
         // entered into the manifest.
         return false;
     }
-    if (stat(wav_path, &st) != 0 || st.st_size < 0) {
+    if (stat(wav_path, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size < RECORDER_WAV_HEADER_SIZE ||
+        (uint64_t)st.st_size > UINT32_MAX ||
+        !finalized_wav_valid(wav_path, (uint32_t)st.st_size)) {
         return false;
     }
     if (!sha256_file_hex(wav_path, out_hex)) {
         return false;
+    }
+    {
+        struct stat after;
+        if (stat(wav_path, &after) != 0 || after.st_size != st.st_size) {
+            out_hex[0] = '\0';
+            return false;
+        }
     }
     if (out_size_bytes != NULL) {
         *out_size_bytes = (uint32_t)st.st_size;
@@ -612,6 +662,18 @@ static bool manifest_entry_size(const char *doc, size_t len,
            (*p == ',' || *p == '}');
 }
 
+static bool manifest_entry_duration(const char *doc, size_t len,
+                                    uint32_t *value) {
+    const char *key = memfind(doc, len, "\"durationMs\":");
+    const char *p, *end = doc + len;
+    if (key == NULL || value == NULL) {
+        return false;
+    }
+    p = key + strlen("\"durationMs\":");
+    return manifest_uint32(&p, end, value) && p < end &&
+           (*p == ',' || *p == '}');
+}
+
 static bool manifest_string_equals(const char *value, size_t length,
                                    const char *expected) {
     return length == strlen(expected) &&
@@ -659,6 +721,7 @@ static bool manifest_snapshot_valid(const char *doc, size_t len,
         char filename[192];
         char hash[RECORDER_SHA256_HEX_LEN];
         char duplicate_needle[64];
+        uint32_t stored_duration = 0, stored_size = 0;
         int printed;
         if (!manifest_expect(&p, end, "{\"recordingId\":") ||
             !manifest_string(&p, end, &id, &id_len) ||
@@ -670,10 +733,13 @@ static bool manifest_snapshot_valid(const char *doc, size_t len,
             !manifest_string(&p, end, &v, &n) ||
             !manifest_iso8601(v, n) ||
             !manifest_expect(&p, end, ",\"durationMs\":") ||
-            !manifest_uint32(&p, end, &num) ||
+            !manifest_uint32(&p, end, &stored_duration) ||
             !manifest_expect(&p, end, ",\"sizeBytes\":") ||
-            !manifest_uint32(&p, end, &num) ||
-            num < RECORDER_WAV_HEADER_SIZE ||
+            !manifest_uint32(&p, end, &stored_size) ||
+            stored_size < RECORDER_WAV_HEADER_SIZE ||
+            (stored_size - RECORDER_WAV_HEADER_SIZE) % RECORDER_BLOCK_ALIGN != 0u ||
+            stored_duration != device_manifest_duration_ms(
+                stored_size - RECORDER_WAV_HEADER_SIZE) ||
             !manifest_expect(&p, end, ",\"sha256\":") ||
             !manifest_string(&p, end, &sha, &sha_len) ||
             sha_len != 64u ||
@@ -883,6 +949,7 @@ device_manifest_result_t device_manifest_upsert_file(
     char entry_sha[65];
     char entry_fn[192];
     uint32_t entry_size = 0;
+    uint32_t entry_duration = 0;
     unsigned version = 0;
     char stored_id[RECORDER_UUID_STR_LEN];
     device_manifest_result_t ret = DEVICE_MANIFEST_ERROR;
@@ -930,7 +997,12 @@ device_manifest_result_t device_manifest_upsert_file(
     if (!device_identity_is_valid_uuid(entry_id) ||
         !device_manifest_is_valid_sha256_hex(entry_sha) ||
         !valid_filename(entry_fn) ||
-        !manifest_entry_size(entry_json, strlen(entry_json), &entry_size)) {
+        !manifest_entry_size(entry_json, strlen(entry_json), &entry_size) ||
+        !manifest_entry_duration(entry_json, strlen(entry_json), &entry_duration) ||
+        entry_size < RECORDER_WAV_HEADER_SIZE ||
+        (entry_size - RECORDER_WAV_HEADER_SIZE) % RECORDER_BLOCK_ALIGN != 0u ||
+        entry_duration != device_manifest_duration_ms(
+            entry_size - RECORDER_WAV_HEADER_SIZE)) {
         return DEVICE_MANIFEST_ERROR;
     }
 
@@ -1026,6 +1098,7 @@ device_manifest_result_t device_manifest_upsert_file(
             char old_sha[65];
             char old_fn[192];
             uint32_t old_size = 0;
+            uint32_t old_duration = 0;
             size_t scope_len;
             next_id = memfind(hit + 1, (size_t)((doc + doc_len) - (hit + 1)),
                               "\"recordingId\"");
@@ -1054,7 +1127,8 @@ device_manifest_result_t device_manifest_upsert_file(
                 (void)f_at;
                 if (!ok_s || sl != 64u || !ok_f || fl == 0u ||
                     fl >= sizeof(old_fn) ||
-                    !manifest_entry_size(scope, scope_len, &old_size)) {
+                    !manifest_entry_size(scope, scope_len, &old_size) ||
+                    !manifest_entry_duration(scope, scope_len, &old_duration)) {
                     free(scope);
                     free(doc);
                     return DEVICE_MANIFEST_ERROR;
@@ -1067,7 +1141,8 @@ device_manifest_result_t device_manifest_upsert_file(
             free(scope);
             if (strcmp(old_sha, entry_sha) == 0 &&
                 strcmp(old_fn, entry_fn) == 0 &&
-                old_size == entry_size) {
+                old_size == entry_size &&
+                old_duration == entry_duration) {
                 // Exact duplicate (retry / duplicate sync): idempotent OK
                 // with the file untouched.
                 free(doc);
@@ -1289,6 +1364,9 @@ bool device_manifest_has_append_room(const char *manifest_path,
 }
 
 static device_manifest_scan_error_t s_scan_error = DEVICE_MANIFEST_SCAN_OK;
+static uint32_t s_scan_indexed = 0;
+
+uint32_t device_manifest_last_scan_indexed(void) { return s_scan_indexed; }
 
 device_manifest_scan_error_t device_manifest_last_scan_error(void) {
     return s_scan_error;
@@ -1302,11 +1380,42 @@ const char *device_manifest_scan_error_name(device_manifest_scan_error_t e) {
         case DEVICE_MANIFEST_SCAN_WAV_UNREADABLE: return "WAV_UNREADABLE";
         case DEVICE_MANIFEST_SCAN_INDEX_CONFLICT: return "INDEX_CONFLICT";
         case DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR: return "INDEX_WRITE_ERROR";
+        case DEVICE_MANIFEST_SCAN_MISSING_WAV: return "MISSING_WAV";
         default: return "UNKNOWN";
     }
 }
 
 // --- Boot sync of finalized WAVs ------------------------------------------
+
+// A successful disk-to-manifest scan must also prove the converse:
+// every committed entry has been visited as one valid canonical WAV.
+static bool manifest_recording_count(const char *path, const char *device_id,
+                                     uint32_t *out_count) {
+    char *doc = NULL;
+    size_t len = 0, offset = 0;
+    uint32_t count = 0;
+    bool ok = false;
+    if (out_count == NULL ||
+        !read_file_bounded(path, &doc, &len, RECORDER_MANIFEST_MAX_BYTES)) {
+        return false;
+    }
+    if (!manifest_snapshot_valid(doc, len, device_id)) {
+        goto done;
+    }
+    while (offset < len) {
+        const char *p = memfind(doc + offset, len - offset, "\"recordingId\":");
+        if (p == NULL) {
+            break;
+        }
+        count++;
+        offset = (size_t)(p - doc) + strlen("\"recordingId\":");
+    }
+    *out_count = count;
+    ok = true;
+done:
+    free(doc);
+    return ok;
+}
 
 static bool path_is_dir_local(const char *path) {
     struct stat st;
@@ -1375,7 +1484,7 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
                            const char *date_dir_or_null, const char *base,
                            const char *manifest_path, const char *tmp_path,
                            const char *device_id, const char *updated_at,
-                           const char *state, uint32_t *added,
+                           const char *state, uint32_t *indexed,
                            uint32_t *skipped) {
     char rec_id[65];
     char sha[RECORDER_SHA256_HEX_LEN];
@@ -1478,8 +1587,8 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
             : DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
     }
     if (r == DEVICE_MANIFEST_OK) {
-        if (added != NULL) {
-            (*added)++;
+        if (indexed != NULL) {
+            (*indexed)++;
         }
         return true;
     }
@@ -1500,8 +1609,11 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
     DIR *dir = NULL;
     struct dirent *ent = NULL;
     uint32_t added = 0;
+    uint32_t indexed = 0;
+    uint32_t before_count = 0, after_count = 0;
     uint32_t skipped = 0;
     s_scan_error = DEVICE_MANIFEST_SCAN_INVALID_INPUT;
+    s_scan_indexed = 0;
     if (out_added != NULL) {
         *out_added = 0;
     }
@@ -1519,6 +1631,10 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
     }
     if (state == NULL || (strcmp(state, DEVICE_MANIFEST_STATE_FINALIZED) != 0 &&
                           strcmp(state, DEVICE_MANIFEST_STATE_RECOVERED) != 0)) {
+        return false;
+    }
+    if (!manifest_recording_count(manifest_path, device_id, &before_count)) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
         return false;
     }
     dir = opendir(recordings_dir);
@@ -1612,7 +1728,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
                 }
                 if (!ensure_one_wav(wav, rel, ent->d_name, subent->d_name,
                                     manifest_path, tmp_path, device_id,
-                                    updated_at, state, &added, &skipped)) {
+                                    updated_at, state, &indexed, &skipped)) {
                     // Existing RAW and manifest stay on SD for recovery.
                     closedir(sub);
                     closedir(dir);
@@ -1642,6 +1758,21 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
         s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
         return false;
     }
+    if (!manifest_recording_count(manifest_path, device_id, &after_count)) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
+        return false;
+    }
+    if (after_count != indexed || after_count < before_count) {
+        // Missing indexed RAW, an unscanned entry, or a noncanonical
+        // historical entry: never advertise a complete sync inventory.
+        s_scan_error = DEVICE_MANIFEST_SCAN_MISSING_WAV;
+        if (out_skipped != NULL) {
+            *out_skipped = skipped;
+        }
+        return false;
+    }
+    added = after_count - before_count;
+    s_scan_indexed = indexed;
     if (out_added != NULL) {
         *out_added = added;
     }
