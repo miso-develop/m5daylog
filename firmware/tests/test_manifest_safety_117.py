@@ -42,6 +42,36 @@ RENAME_EMULATOR = r"""
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <stddef.h>
+#include <stdint.h>
+
+// Instrument allocations issued by the compiled production-C path.
+typedef union { max_align_t align; size_t bytes; } manifest_alloc_hdr;
+static size_t mem_live = 0, mem_peak = 0, mem_limit = SIZE_MAX;
+void manifest_test_memory_limit(size_t limit) {
+    mem_limit = limit;
+    mem_peak = mem_live;
+}
+size_t manifest_test_memory_peak(void) { return mem_peak; }
+size_t manifest_test_memory_live(void) { return mem_live; }
+void *manifest_test_malloc(size_t count) {
+    manifest_alloc_hdr *h;
+    if (count > mem_limit - mem_live ||
+        count > SIZE_MAX - sizeof(*h)) return NULL;
+    h = (manifest_alloc_hdr *)malloc(sizeof(*h) + count);
+    if (!h) return NULL;
+    h->bytes = count;
+    mem_live += count;
+    if (mem_live > mem_peak) mem_peak = mem_live;
+    return h + 1;
+}
+void manifest_test_free(void *ptr) {
+    manifest_alloc_hdr *h;
+    if (!ptr) return;
+    h = (manifest_alloc_hdr *)ptr - 1;
+    mem_live -= h->bytes;
+    free(h);
+}
 
 static int calls = 0;
 static int flush_calls = 0, close_calls = 0, sync_calls = 0;
@@ -158,6 +188,8 @@ def native_manifest(tmp_path_factory):
              "-Dremove=manifest_test_remove",
              "-Dfwrite=manifest_test_fwrite",
              "-Dreaddir=manifest_test_readdir",
+             "-Dmalloc=manifest_test_malloc",
+             "-Dfree=manifest_test_free",
              "-c", str(COMP / source),
              "-o", str(obj)],
             check=True, capture_output=True, text=True,
@@ -176,6 +208,9 @@ def native_manifest(tmp_path_factory):
     lib = ctypes.CDLL(str(dll))
     lib.manifest_test_reset.argtypes = []
     lib.manifest_test_calls.restype = ctypes.c_int
+    lib.manifest_test_memory_limit.argtypes = [ctypes.c_size_t]
+    lib.manifest_test_memory_peak.restype = ctypes.c_size_t
+    lib.manifest_test_memory_live.restype = ctypes.c_size_t
     lib.device_manifest_upsert_file.argtypes = [ctypes.c_char_p] * 5
     lib.device_manifest_upsert_file.restype = ctypes.c_int
     lib.device_manifest_recover_tmp.argtypes = [ctypes.c_char_p] * 3
