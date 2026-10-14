@@ -721,3 +721,132 @@ def test_committed_duration_disagreement_stays_fail_closed_on_replay(
         assert native_manifest.device_manifest_last_scan_error() == 5  # INDEX_WRITE_ERROR
         assert final.read_bytes() == before
         assert wav.read_bytes() == raw
+
+
+def test_large_accepted_transaction_bounded_heap_restart(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    rows = []
+    while len(_manifest(rows + [_entry(len(rows) + 1)])) < 29500:
+        rows.append(_entry(len(rows) + 1))
+    final, temp = _create(tmp_path, rows)
+    assert native_manifest.device_manifest_has_append_room(
+        _b(final), _b(DEVICE_ID)
+    )
+    before = final.read_bytes()
+    incoming = _entry(len(rows) + 1)
+    native_manifest.manifest_test_reset()
+    # The old four-snapshot algorithm exceeds this budget; at most three
+    # live snapshots are needed by the modified production C.
+    native_manifest.manifest_test_memory_limit(112 * 1024)
+    try:
+        assert _upsert(native_manifest, final, temp, incoming) == 0
+        peak = native_manifest.manifest_test_memory_peak()
+        assert peak <= 112 * 1024
+        assert native_manifest.manifest_test_memory_live() == 0
+        assert _recover(native_manifest, final, temp)
+        assert json.loads(final.read_bytes())["recordings"] == rows + [incoming]
+        assert len(final.read_bytes()) > len(before)
+        assert native_manifest.manifest_test_memory_live() == 0
+    finally:
+        native_manifest.manifest_test_memory_limit(2**63 - 1)
+
+
+def test_low_memory_append_fail_closed_preserves_m0(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    rows = []
+    while len(_manifest(rows + [_entry(len(rows) + 1)])) < 29500:
+        rows.append(_entry(len(rows) + 1))
+    final, temp = _create(tmp_path, rows)
+    before = final.read_bytes()
+    native_manifest.manifest_test_reset()
+    native_manifest.manifest_test_memory_limit(50 * 1024)
+    try:
+        assert _upsert(native_manifest, final, temp, _entry(len(rows) + 1)) == 2
+        assert final.read_bytes() == before
+        assert native_manifest.manifest_test_memory_live() == 0
+    finally:
+        native_manifest.manifest_test_memory_limit(2**63 - 1)
+    native_manifest.manifest_test_reset()
+    assert _recover(native_manifest, final, temp)
+    assert final.read_bytes() == before
+
+
+@pytest.mark.parametrize("started_at", [
+    "2026-10-13T18:00:00+00:00",
+    "2026-10-13T12:00:03+00:00",
+    "2026-10-13T12:00:00+01:00",
+])
+def test_replay_timestamp_conflict_repeat_restart_and_recover(
+    native_manifest, tmp_path, monkeypatch, started_at
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2026-10-13"
+    date_dir.mkdir(parents=True)
+    data = _wav(b"\0" * 64)
+    entry = _entry(1, hashlib.sha256(data).hexdigest())
+    entry.update(startedAt=started_at, sizeBytes=len(data), durationMs=2)
+    final, temp = _create(tmp_path, [entry])
+    wav = date_dir / Path(entry["filename"]).name
+    wav.write_bytes(data)
+    original = final.read_bytes()
+    for _ in range(2):
+        native_manifest.manifest_test_reset()
+        assert _scan(native_manifest, recordings, final, temp)[0] is False
+        assert native_manifest.device_manifest_last_scan_error() == 4
+        assert final.read_bytes() == original and wav.read_bytes() == data
+    entry["startedAt"] = NOW
+    final.write_bytes(_manifest([entry]))
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp) == (True, 0, 0)
+
+
+@pytest.mark.parametrize("started_at", [
+    "2026-10-13T11:59:58+00:00",
+    "2026-10-13T13:00:00+01:00",
+    "2026-10-13T12:00:02+00:00",
+])
+def test_replay_permits_bounded_clock_skew(
+    native_manifest, tmp_path, monkeypatch, started_at
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2026-10-13"
+    date_dir.mkdir(parents=True)
+    data = _wav(b"\0" * 64)
+    entry = _entry(1, hashlib.sha256(data).hexdigest())
+    entry.update(startedAt=started_at, sizeBytes=len(data), durationMs=2)
+    final, temp = _create(tmp_path, [entry])
+    (date_dir / Path(entry["filename"]).name).write_bytes(data)
+    before = final.read_bytes()
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp) == (True, 0, 0)
+    assert final.read_bytes() == before
+
+
+def test_replay_midnight_second_boundary(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2026-10-14"
+    date_dir.mkdir(parents=True)
+    data = _wav(b"\0" * 64)
+    entry = _entry(1, hashlib.sha256(data).hexdigest())
+    entry.update(
+        filename=entry["filename"].replace(
+            "2026-10-13/120000_", "2026-10-14/000000_"
+        ),
+        startedAt="2026-10-13T23:59:59+00:00",
+        sizeBytes=len(data), durationMs=2,
+    )
+    final, temp = _create(tmp_path, [entry])
+    (date_dir / Path(entry["filename"]).name).write_bytes(data)
+    before = final.read_bytes()
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp) == (True, 0, 0)
+    assert final.read_bytes() == before
