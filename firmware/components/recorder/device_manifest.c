@@ -40,6 +40,26 @@ static bool is_digit(char c) {
     return c >= '0' && c <= '9';
 }
 
+// Common proleptic-Gregorian calendar check for manifest timestamps,
+// recovered WAV directories, and replay UTC normalization. A malformed
+// date must never be committed as healthy on the first scan only to
+// become a duplicate-ID conflict on a later scan.
+static bool valid_calendar_date(unsigned year, unsigned month, unsigned day) {
+    static const unsigned days_in_month[12] = {
+        31u, 28u, 31u, 30u, 31u, 30u, 31u, 31u, 30u, 31u, 30u, 31u
+    };
+    unsigned last;
+    if (year == 0u || month < 1u || month > 12u || day < 1u) {
+        return false;
+    }
+    last = days_in_month[month - 1u];
+    if (month == 2u && year % 4u == 0u &&
+        (year % 100u != 0u || year % 400u == 0u)) {
+        ++last;
+    }
+    return day <= last;
+}
+
 // --- Validation ----------------------------------------------------------
 
 bool device_manifest_is_valid_sha256_hex(const char *s) {
@@ -49,6 +69,7 @@ bool device_manifest_is_valid_sha256_hex(const char *s) {
 bool device_manifest_is_valid_iso8601_offset(const char *s) {
     // `YYYY-MM-DDTHH:MM:SS+HH:MM` (25 chars).
     unsigned i;
+    int year;
     int mon;
     int day;
     int hour;
@@ -72,6 +93,8 @@ bool device_manifest_is_valid_iso8601_offset(const char *s) {
             return false;
         }
     }
+    year = (s[0] - '0') * 1000 + (s[1] - '0') * 100 +
+           (s[2] - '0') * 10 + (s[3] - '0');
     mon = (s[5] - '0') * 10 + (s[6] - '0');
     day = (s[8] - '0') * 10 + (s[9] - '0');
     hour = (s[11] - '0') * 10 + (s[12] - '0');
@@ -79,13 +102,15 @@ bool device_manifest_is_valid_iso8601_offset(const char *s) {
     sec = (s[17] - '0') * 10 + (s[18] - '0');
     oh = (s[20] - '0') * 10 + (s[21] - '0');
     om = (s[23] - '0') * 10 + (s[24] - '0');
-    if (mon < 1 || mon > 12 || day < 1 || day > 31) {
+    if (!valid_calendar_date((unsigned)year, (unsigned)mon,
+                             (unsigned)day)) {
         return false;
     }
     if (hour > 23 || min > 59 || sec > 60) {
         return false;
     }
-    if (oh > 14 || om > 59) {
+    // ISO-8601 permits at most 14:00, not a fictitious +14:01.
+    if (oh > 14 || om > 59 || (oh == 14 && om != 0)) {
         return false;
     }
     return true;
@@ -104,8 +129,9 @@ bool device_manifest_format_iso8601_utc(int year, int mon, int mday, int hour,
         return false;
     }
     memset(out, 0, RECORDER_ISO8601_STR_LEN);
-    if (year < 1970 || year > 2100 || mon < 1 || mon > 12 || mday < 1 ||
-        mday > 31 || hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 ||
+    if (year < 1970 || year > 2100 ||
+        !valid_calendar_date((unsigned)year, (unsigned)mon, (unsigned)mday) ||
+        hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 ||
         sec > 60) {
         return false;
     }
@@ -684,10 +710,8 @@ static bool manifest_string_equals(const char *value, size_t length,
 // time for the filename and startedAt. Allow two seconds of read skew,
 // including midnight, without accepting material chronology corruption.
 static bool manifest_utc_seconds(const char *s, int64_t *out) {
-    static const unsigned month_days[12] =
-        {31u,28u,31u,30u,31u,30u,31u,31u,30u,31u,30u,31u};
     int y, m, d, hh, mm, ss, oh, om, ya, era;
-    unsigned yoe, doy, doe, md;
+    unsigned yoe, doy, doe;
     int64_t days;
     if (out == NULL || !device_manifest_is_valid_iso8601_offset(s)) {
         return false;
@@ -700,9 +724,8 @@ static bool manifest_utc_seconds(const char *s, int64_t *out) {
     ss=(s[17]-'0')*10+(s[18]-'0');
     oh=(s[20]-'0')*10+(s[21]-'0');
     om=(s[23]-'0')*10+(s[24]-'0');
-    md=month_days[m-1];
-    if (m==2 && y%4==0 && (y%100!=0 || y%400==0)) md++;
-    if (d<1 || (unsigned)d>md || (oh==14 && om!=0)) return false;
+    if (!valid_calendar_date((unsigned)y, (unsigned)m, (unsigned)d) ||
+        (oh == 14 && om != 0)) return false;
     ya=y-(m<=2);
     era=ya>=0 ? ya/400 : (ya-399)/400;
     yoe=(unsigned)(ya-era*400);
@@ -1539,23 +1562,34 @@ static bool split_wav_name(const char *base, char time6[7]) {
     return true;
 }
 
-static bool valid_date_dir(const char *name) {
+static bool date_dir_has_shape(const char *name) {
     unsigned i;
-    if (name == NULL || strlen(name) != 10u) {
-        return false;
-    }
-    if (name[4] != '-' || name[7] != '-') {
+    if (name == NULL || strlen(name) != 10u ||
+        name[4] != '-' || name[7] != '-') {
         return false;
     }
     for (i = 0; i < 10u; ++i) {
-        if (i == 4u || i == 7u) {
-            continue;
-        }
-        if (name[i] < '0' || name[i] > '9') {
+        if (i != 4u && i != 7u && !is_digit(name[i])) {
             return false;
         }
     }
     return true;
+}
+
+static bool valid_date_dir(const char *name) {
+    unsigned year, mon, day;
+    if (!date_dir_has_shape(name)) {
+        return false;
+    }
+    year = (unsigned)(name[0] - '0') * 1000u +
+           (unsigned)(name[1] - '0') * 100u +
+           (unsigned)(name[2] - '0') * 10u +
+           (unsigned)(name[3] - '0');
+    mon = (unsigned)(name[5] - '0') * 10u +
+          (unsigned)(name[6] - '0');
+    day = (unsigned)(name[8] - '0') * 10u +
+          (unsigned)(name[9] - '0');
+    return valid_calendar_date(year, mon, day);
 }
 
 // Ensure one `.wav` has a manifest entry. Missing entries are appended;
@@ -1753,8 +1787,11 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
         // Exactly one checked stat for this child: a transient EIO is
         // never equivalent to a legacy/non-directory exclusion.
         if (stat(child, &child_st) != 0 ||
-            (valid_date_dir(ent->d_name) &&
-             !S_ISDIR(child_st.st_mode))) {
+            // A YYYY-MM-DD-shaped but impossible calendar directory
+            // is uncertain RAW history, not an ignorable legacy folder.
+            (date_dir_has_shape(ent->d_name) &&
+             (!valid_date_dir(ent->d_name) ||
+              !S_ISDIR(child_st.st_mode)))) {
             (void)closedir(dir);
             s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
             return false;
