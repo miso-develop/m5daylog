@@ -927,7 +927,7 @@ def test_backup_stat_eio_cannot_hide_m0_regression(
 ):
     # M0 proves that A+B were committed. A separately valid but regressed
     # final A cannot supersede it even if the backup lookup hits EIO.
-    wav_data = _wav(b"\\0" * 64)
+    wav_data = _wav(b"\0" * 64)
     wav_hash = hashlib.sha256(wav_data).hexdigest()
     rows = [_entry(i, wav_hash) for i in (1, 2)]
     for row in rows:
@@ -973,7 +973,7 @@ def test_date_subtree_stat_eio_vetoes_index_scan_on_replay(
     recordings = tmp_path / "recordings"
     date_dir = recordings / "2026-10-13"
     date_dir.mkdir(parents=True)
-    wav_data = _wav(b"\\0" * 64)
+    wav_data = _wav(b"\0" * 64)
     wav_path = date_dir / Path(_entry(1)["filename"]).name
     wav_path.write_bytes(wav_data)
     native_manifest.manifest_test_reset()
