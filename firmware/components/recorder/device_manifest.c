@@ -680,6 +680,48 @@ static bool manifest_string_equals(const char *value, size_t length,
            memcmp(value, expected, length) == 0;
 }
 
+// Offset-aware replay comparison: the writer separately reads wall-clock
+// time for the filename and startedAt. Allow two seconds of read skew,
+// including midnight, without accepting material chronology corruption.
+static bool manifest_utc_seconds(const char *s, int64_t *out) {
+    static const unsigned month_days[12] =
+        {31u,28u,31u,30u,31u,30u,31u,31u,30u,31u,30u,31u};
+    int y, m, d, hh, mm, ss, oh, om, ya, era;
+    unsigned yoe, doy, doe, md;
+    int64_t days;
+    if (out == NULL || !device_manifest_is_valid_iso8601_offset(s)) {
+        return false;
+    }
+    y=(s[0]-'0')*1000+(s[1]-'0')*100+(s[2]-'0')*10+(s[3]-'0');
+    m=(s[5]-'0')*10+(s[6]-'0');
+    d=(s[8]-'0')*10+(s[9]-'0');
+    hh=(s[11]-'0')*10+(s[12]-'0');
+    mm=(s[14]-'0')*10+(s[15]-'0');
+    ss=(s[17]-'0')*10+(s[18]-'0');
+    oh=(s[20]-'0')*10+(s[21]-'0');
+    om=(s[23]-'0')*10+(s[24]-'0');
+    md=month_days[m-1];
+    if (m==2 && y%4==0 && (y%100!=0 || y%400==0)) md++;
+    if (d<1 || (unsigned)d>md || (oh==14 && om!=0)) return false;
+    ya=y-(m<=2);
+    era=ya>=0 ? ya/400 : (ya-399)/400;
+    yoe=(unsigned)(ya-era*400);
+    doy=(153u*(unsigned)(m+(m>2 ? -3 : 9))+2u)/5u+(unsigned)d-1u;
+    doe=yoe*365u+yoe/4u-yoe/100u+doy;
+    days=(int64_t)era*146097+(int64_t)doe-719468;
+    *out=days*86400+hh*3600+mm*60+ss+
+         (s[19]=='+' ? -1 : 1)*(oh*3600+om*60);
+    return true;
+}
+static bool manifest_start_times_compatible(const char *committed,
+                                             const char *observed) {
+    int64_t old_time, new_time, diff;
+    if (!manifest_utc_seconds(committed, &old_time) ||
+        !manifest_utc_seconds(observed, &new_time)) return false;
+    diff=old_time-new_time;
+    return diff>=-2 && diff<=2;
+}
+
 static bool manifest_iso8601(const char *value, size_t length) {
     char stamp[RECORDER_ISO8601_STR_LEN];
     if (length != 25u) {
@@ -948,6 +990,7 @@ device_manifest_result_t device_manifest_upsert_file(
     char entry_id[65];
     char entry_sha[65];
     char entry_fn[192];
+    char entry_started[RECORDER_ISO8601_STR_LEN];
     uint32_t entry_size = 0;
     uint32_t entry_duration = 0;
     unsigned version = 0;
@@ -994,8 +1037,18 @@ device_manifest_result_t device_manifest_upsert_file(
     entry_sha[sha_len] = '\0';
     memcpy(entry_fn, fn_begin, fn_len);
     entry_fn[fn_len] = '\0';
+    {
+        const char *tb = NULL;
+        size_t tl = 0;
+        if (!json_string_field(entry_json, strlen(entry_json),
+                               "\"startedAt\"", NULL, &tb, &tl) ||
+            tl != 25u) return DEVICE_MANIFEST_ERROR;
+        memcpy(entry_started, tb, tl);
+        entry_started[tl] = '\0';
+    }
     if (!device_identity_is_valid_uuid(entry_id) ||
         !device_manifest_is_valid_sha256_hex(entry_sha) ||
+        !device_manifest_is_valid_iso8601_offset(entry_started) ||
         !valid_filename(entry_fn) ||
         !manifest_entry_size(entry_json, strlen(entry_json), &entry_size) ||
         !manifest_entry_duration(entry_json, strlen(entry_json), &entry_duration) ||
@@ -1097,6 +1150,7 @@ device_manifest_result_t device_manifest_upsert_file(
             const char *f_at;
             char old_sha[65];
             char old_fn[192];
+            char old_started[RECORDER_ISO8601_STR_LEN];
             uint32_t old_size = 0;
             uint32_t old_duration = 0;
             size_t scope_len;
@@ -1119,14 +1173,18 @@ device_manifest_result_t device_manifest_upsert_file(
                 size_t sl = 0;
                 const char *fb = NULL;
                 size_t fl = 0;
+                const char *tb = NULL;
+                size_t tl = 0;
                 bool ok_s = json_string_field(scope, scope_len, "\"sha256\"",
                                               NULL, &sb, &sl);
                 bool ok_f = json_string_field(scope, scope_len,
                                               "\"filename\"", NULL, &fb, &fl);
+                bool ok_t = json_string_field(scope, scope_len,
+                                              "\"startedAt\"", NULL, &tb, &tl);
                 (void)s_at;
                 (void)f_at;
                 if (!ok_s || sl != 64u || !ok_f || fl == 0u ||
-                    fl >= sizeof(old_fn) ||
+                    fl >= sizeof(old_fn) || !ok_t || tl != 25u ||
                     !manifest_entry_size(scope, scope_len, &old_size) ||
                     !manifest_entry_duration(scope, scope_len, &old_duration)) {
                     free(scope);
@@ -1137,12 +1195,15 @@ device_manifest_result_t device_manifest_upsert_file(
                 old_sha[sl] = '\0';
                 memcpy(old_fn, fb, fl);
                 old_fn[fl] = '\0';
+                memcpy(old_started, tb, tl);
+                old_started[tl] = '\0';
             }
             free(scope);
             if (strcmp(old_sha, entry_sha) == 0 &&
                 strcmp(old_fn, entry_fn) == 0 &&
                 old_size == entry_size &&
-                old_duration == entry_duration) {
+                old_duration == entry_duration &&
+                manifest_start_times_compatible(old_started, entry_started)) {
                 // Exact duplicate (retry / duplicate sync): idempotent OK
                 // with the file untouched.
                 free(doc);
