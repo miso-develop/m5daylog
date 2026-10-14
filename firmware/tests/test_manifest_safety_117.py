@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 
 import pytest
@@ -21,6 +22,15 @@ COMP = ROOT / "firmware/components/recorder"
 INCLUDE = COMP / "include"
 DEVICE_ID = "123e4567-e89b-42d3-a456-426614174000"
 NOW = "2026-10-13T12:00:00+00:00"
+
+
+def _wav(pcm=b""):
+    assert len(pcm) % 2 == 0
+    return (
+        b"RIFF" + struct.pack("<I", len(pcm) + 36) +
+        b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16) +
+        b"data" + struct.pack("<I", len(pcm)) + pcm
+    )
 
 # Hook only the manifest update's rename calls. Normal host rename can
 # overwrite a destination; FAT cannot. This deterministic adapter fails
@@ -297,7 +307,7 @@ def test_unindexed_canonical_wav_conflict_fails_boot_scan(
     directory.mkdir(parents=True)
     rec = _entry(1)
     wav = directory / Path(rec["filename"]).name
-    wav.write_bytes(b"x" * 44)
+    wav.write_bytes(_wav())
     # Identical ID but an old committed different hash: no RAW overwrite.
     final.write_bytes(_manifest([rec]))
     n_added, n_skipped = ctypes.c_uint32(), ctypes.c_uint32()
@@ -308,7 +318,7 @@ def test_unindexed_canonical_wav_conflict_fails_boot_scan(
     )
     assert native_manifest.device_manifest_last_scan_error() == 4
     assert final.read_bytes() == _manifest([rec])
-    assert wav.read_bytes() == b"x" * 44
+    assert wav.read_bytes() == _wav()
 
 
 def test_unreadable_canonical_wav_is_not_skipped_as_healthy(
@@ -427,9 +437,9 @@ def test_wrong_size_same_uuid_same_hash_fails_closed(
     final, temp = _create(tmp_path, [])
     directory = tmp_path / "recordings" / "2026-10-13"
     directory.mkdir(parents=True)
-    rec = _entry(1, hashlib.sha256(b"x" * 44).hexdigest())
+    rec = _entry(1, hashlib.sha256(_wav()).hexdigest())
     wav = directory / Path(rec["filename"]).name
-    wav.write_bytes(b"x" * 44)
+    wav.write_bytes(_wav())
     stale = dict(rec, sizeBytes=46)
     final.write_bytes(_manifest([stale]))
     before = final.read_bytes()
@@ -440,7 +450,7 @@ def test_wrong_size_same_uuid_same_hash_fails_closed(
         _b("recovered"), ctypes.byref(added), ctypes.byref(skipped),
     )
     assert final.read_bytes() == before
-    assert wav.read_bytes() == b"x" * 44
+    assert wav.read_bytes() == _wav()
 
 
 def test_metadata_admission_guard_covers_queued_rotation(
@@ -483,7 +493,7 @@ def test_readdir_eio_cannot_produce_healthy_index_scan(
     directory.mkdir(parents=True)
     rec = _entry(1)
     wav = directory / Path(rec["filename"]).name
-    wav.write_bytes(b"x" * 44)
+    wav.write_bytes(_wav())
     before = final.read_bytes()
     added, skipped = ctypes.c_uint32(), ctypes.c_uint32()
     native_manifest.manifest_test_reset()
@@ -494,7 +504,7 @@ def test_readdir_eio_cannot_produce_healthy_index_scan(
     )
     monkeypatch.delenv("M5_TEST_FAIL_READDIR")
     assert final.read_bytes() == before
-    assert wav.read_bytes() == b"x" * 44
+    assert wav.read_bytes() == _wav()
 
 
 def test_poc_c_default_nvs_and_ack_negatives_are_not_enabled():
@@ -519,7 +529,7 @@ def test_scan_failure_classification_survives_for_operator_diagnostics(
     directory = tmp_path / "recordings" / "2026-10-13"
     directory.mkdir(parents=True)
     wav = directory / Path(_entry(1)["filename"]).name
-    wav.write_bytes(b"x" * 44)
+    wav.write_bytes(_wav())
     added, skipped = ctypes.c_uint32(), ctypes.c_uint32()
     native_manifest.manifest_test_reset()
     monkeypatch.setenv("M5_TEST_FAIL_READDIR", "2")
@@ -549,3 +559,130 @@ def test_missing_manifest_cannot_reset_nonempty_recording_history():
         "device_manifest_build_empty("
     )
     assert "MANIFEST_RECOVERY_REQUIRED" in ensure
+
+
+def _scan(native_manifest, directory, final, temp):
+    added, excluded = ctypes.c_uint32(), ctypes.c_uint32()
+    ok = native_manifest.device_manifest_sync_wav_dir(
+        _b(directory), _b(final), _b(temp), _b(DEVICE_ID), _b(NOW),
+        _b("recovered"), ctypes.byref(added), ctypes.byref(excluded),
+    )
+    return ok, added.value, excluded.value
+
+
+def test_reverse_completeness_missing_committed_wav_fails_and_recovers(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    contents = _wav(b"\0" * 64)
+    rows = [_entry(n, hashlib.sha256(contents).hexdigest()) for n in (1, 2)]
+    for row in rows:
+        row["sizeBytes"] = len(contents)
+        row["durationMs"] = 2
+    final, temp = _create(tmp_path, rows)
+    before = final.read_bytes()
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2026-10-13"
+    date_dir.mkdir(parents=True)
+    (date_dir / Path(rows[0]["filename"]).name).write_bytes(contents)
+
+    for _ in range(2):  # restart/replay must never produce healthy inventory
+        native_manifest.manifest_test_reset()
+        ok, added, _ = _scan(native_manifest, recordings, final, temp)
+        assert not ok
+        assert added == 0
+        assert native_manifest.device_manifest_last_scan_error() == 6  # MISSING_WAV
+        assert final.read_bytes() == before
+        assert len(list(date_dir.glob("*.wav"))) == 1
+
+    (date_dir / Path(rows[1]["filename"]).name).write_bytes(contents)
+    native_manifest.manifest_test_reset()
+    ok, added, excluded = _scan(native_manifest, recordings, final, temp)
+    assert ok and added == 0 and excluded == 0
+    assert native_manifest.device_manifest_last_scan_indexed() == 2
+    assert final.read_bytes() == before
+
+
+@pytest.mark.parametrize("damage", [
+    "not_riff", "declared_riff_size", "declared_data_size", "format", "truncated",
+    "unaligned",
+])
+def test_corrupt_finalized_wav_is_never_indexed(
+    native_manifest, tmp_path, monkeypatch, damage
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    final, temp = _create(tmp_path, [])
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2026-10-13"
+    date_dir.mkdir(parents=True)
+    wav = date_dir / Path(_entry(1)["filename"]).name
+    raw = bytearray(_wav(b"\0" * 64))
+    if damage == "not_riff":
+        raw[:4] = b"JUNK"
+    elif damage == "declared_riff_size":
+        raw[4:8] = struct.pack("<I", len(raw) - 6)
+    elif damage == "declared_data_size":
+        raw[40:44] = struct.pack("<I", 66)
+    elif damage == "format":
+        raw[20:22] = struct.pack("<H", 3)
+    elif damage == "truncated":
+        del raw[-2:]
+    else:
+        raw.append(0)
+    wav.write_bytes(raw)
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp)[0] is False
+    assert native_manifest.device_manifest_last_scan_error() == 3  # WAV_UNREADABLE
+    assert json.loads(final.read_bytes())["recordings"] == []
+    assert wav.read_bytes() == raw
+
+
+def test_valid_finalized_wav_new_index_and_noop_replay_counts(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    final, temp = _create(tmp_path, [])
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2026-10-13"
+    date_dir.mkdir(parents=True)
+    raw = _wav(b"\0" * 32000)
+    wav = date_dir / Path(_entry(1)["filename"]).name
+    wav.write_bytes(raw)
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp) == (True, 1, 0)
+    assert native_manifest.device_manifest_last_scan_indexed() == 1
+    first = json.loads(final.read_bytes())["recordings"]
+    assert len(first) == 1
+    assert first[0]["sizeBytes"] == len(raw)
+    assert first[0]["durationMs"] == 1000
+    assert first[0]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert _recover(native_manifest, final, temp)
+    snapshot = final.read_bytes()
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp) == (True, 0, 0)
+    assert native_manifest.device_manifest_last_scan_indexed() == 1
+    assert final.read_bytes() == snapshot
+
+
+def test_committed_duration_disagreement_stays_fail_closed_on_replay(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    raw = _wav(b"\0" * 32000)
+    old = _entry(1, hashlib.sha256(raw).hexdigest())
+    old["sizeBytes"] = len(raw)
+    old["durationMs"] = 1800000  # corrupt pre-existing duration; never rewrite M0
+    final, temp = _create(tmp_path, [old])
+    before = final.read_bytes()
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2026-10-13"
+    date_dir.mkdir(parents=True)
+    wav = date_dir / Path(old["filename"]).name
+    wav.write_bytes(raw)
+    for _ in range(2):
+        native_manifest.manifest_test_reset()
+        ok, _, _ = _scan(native_manifest, recordings, final, temp)
+        assert not ok
+        assert native_manifest.device_manifest_last_scan_error() == 5  # INDEX_WRITE_ERROR
+        assert final.read_bytes() == before
+        assert wav.read_bytes() == raw
