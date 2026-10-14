@@ -850,3 +850,21 @@ def test_replay_midnight_second_boundary(
     native_manifest.manifest_test_reset()
     assert _scan(native_manifest, recordings, final, temp) == (True, 0, 0)
     assert final.read_bytes() == before
+
+
+def test_device_admission_checks_internal_heap_and_same_clock_snapshot():
+    # Source integration for ESP-only recorder control flow. Native-C tests
+    # exercise the transaction; target RAM watermark measurement remains HG.
+    main = (ROOT / "firmware/main/main.c").read_text(encoding="utf-8")
+    admission = main.split("static bool recorder_can_admit_segment(void)", 1)[1]
+    admission = admission.split("static void recorder_battery_task", 1)[0]
+    assert "heap_caps_get_free_size(MALLOC_CAP_8BIT)" in admission
+    assert "heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)" in admission
+    assert "DEVICE_MANIFEST_HEAP_ADMISSION_BYTES" in admission
+    assert "METADATA_HEAP" in admission
+    assert "recorder_iso8601_from_parts(seg_date, cur_time," in main
+    rotation = main.split("if (reason == WAV_ROTATE_TIME_30MIN ||", 1)[1]
+    assert rotation.index("recorder_manifest_record_wav(") < rotation.index(
+        "recorder_current_date_time(now_date, now_time);"
+    )
+    assert "recorder_iso8601_from_parts(now_date, now_time," in rotation
