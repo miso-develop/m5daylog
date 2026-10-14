@@ -377,9 +377,14 @@ def test_c_recovery_never_deletes():
                 p.name != "device_manifest.c":
             assert not _has_c_call(
                 p.read_text(encoding="utf-8"), "remove"), p.name
-    # Recovery/quarantine and Task #47 identity/manifest are now in
-    # scope; processed-ACK retention stays out.
-    lowered = blob.lower()
+    # Recovery/#47 sources still cannot embed ACK/retention. Dedicated
+    # #52 processed_ack modules are explicitly excluded from this scope check.
+    legacy_blob = "\n".join(
+        p.read_text(encoding="utf-8") for p in COMP.rglob("*")
+        if p.is_file() and p.suffix in (".c", ".h")
+        and not p.name.startswith("processed_ack")
+    )
+    lowered = legacy_blob.lower()
     assert "quarantine" in lowered
     assert "wav_recovery" in lowered or "wav_recovery" in lowered
     assert "manifest" in lowered
