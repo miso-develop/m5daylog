@@ -1,22 +1,24 @@
 // Device manifest / integrity — Task #47 (IM-010). Stdio + dirent +
 // sys/stat only; no ESP-IDF dependency.
 //
-// Durability model (power-loss safe):
-// - Updates never truncate `manifest.json` in place. The full new
-//   document goes to `manifest.tmp` (fwrite + fflush + fsync on ESP-IDF,
-//   fclose-checked) and only then is renamed over the destination.
-//   A crash during the tmp write leaves the old manifest untouched.
-// - On POSIX the rename overwrites atomically. On ESP-IDF FATFS a rename
-//   over an existing name fails with EEXIST, so the module retries once
-//   as remove(dest) + rename(tmp, dest): the complete new document is
-//   already durable in tmp at that point, and a crash inside that window
-//   is recovered at boot by promoting a valid tmp when the destination is
-//   missing. `remove()` appears ONLY for this tmp/destination replace
-//   (plus best-effort stale-tmp cleanup) — audio files (`.wav`,
-//   `.wav.part`) are never removed, unlinked, or overwritten in place:
-//   entry collisions report CONFLICT and preserve the on-card manifest.
-// - Unknown `schemaVersion` majors and `deviceId` mismatches fail closed
-//   without writing, preserving the existing manifest.
+// Manifest updates never truncate a committed manifest.json in place.
+// Manifest durability protocol (logical crash-recovery candidate; physical
+// FAT32/power-interruption qualification is a separate acceptance gate):
+// - M1 is fully written to manifest.tmp, flushed, fsynced on the ESP
+//   target, closed and reread/validated before success is reported.
+// - A FAT target-exists rename failure preserves M0 under manifest.json.bak
+//   before renaming the complete M1 into place. A first rename EIO or any
+//   unqualified error never authorizes deletion of the previous final.
+// - Recovery with both M1 and M0 validates their complete canonical shapes
+//   and requires M1 to contain the exact M0 recording entry prefix. When M1
+//   has not published, M0 is restored from backup. Ambiguous states stay
+//   available as artifacts and cause a fail-closed boot, never an empty
+//   manifest reset.
+// - A previous validated M0 fallback must be retired before the next
+//   append, with M1 proven to extend it. Only manifest artifacts (.tmp,
+//   .bak) are removed by this module; no WAV file is ever deleted.
+// - No algorithm can reconstruct physically destroyed FAT sectors. Exact
+//   ESP-IDF v5.5.5 + FAT fault/power-cycle tests remain required.
 
 #include "device_manifest.h"
 
@@ -27,7 +29,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#ifdef ESP_PLATFORM
+#if defined(ESP_PLATFORM) || defined(DEVICE_MANIFEST_NATIVE_SYNC_TEST)
 #include <unistd.h>
 #endif
 
@@ -36,6 +38,26 @@
 
 static bool is_digit(char c) {
     return c >= '0' && c <= '9';
+}
+
+// Common proleptic-Gregorian calendar check for manifest timestamps,
+// recovered WAV directories, and replay UTC normalization. A malformed
+// date must never be committed as healthy on the first scan only to
+// become a duplicate-ID conflict on a later scan.
+static bool valid_calendar_date(unsigned year, unsigned month, unsigned day) {
+    static const unsigned days_in_month[12] = {
+        31u, 28u, 31u, 30u, 31u, 30u, 31u, 31u, 30u, 31u, 30u, 31u
+    };
+    unsigned last;
+    if (year == 0u || month < 1u || month > 12u || day < 1u) {
+        return false;
+    }
+    last = days_in_month[month - 1u];
+    if (month == 2u && year % 4u == 0u &&
+        (year % 100u != 0u || year % 400u == 0u)) {
+        ++last;
+    }
+    return day <= last;
 }
 
 // --- Validation ----------------------------------------------------------
@@ -47,6 +69,7 @@ bool device_manifest_is_valid_sha256_hex(const char *s) {
 bool device_manifest_is_valid_iso8601_offset(const char *s) {
     // `YYYY-MM-DDTHH:MM:SS+HH:MM` (25 chars).
     unsigned i;
+    int year;
     int mon;
     int day;
     int hour;
@@ -70,6 +93,8 @@ bool device_manifest_is_valid_iso8601_offset(const char *s) {
             return false;
         }
     }
+    year = (s[0] - '0') * 1000 + (s[1] - '0') * 100 +
+           (s[2] - '0') * 10 + (s[3] - '0');
     mon = (s[5] - '0') * 10 + (s[6] - '0');
     day = (s[8] - '0') * 10 + (s[9] - '0');
     hour = (s[11] - '0') * 10 + (s[12] - '0');
@@ -77,13 +102,15 @@ bool device_manifest_is_valid_iso8601_offset(const char *s) {
     sec = (s[17] - '0') * 10 + (s[18] - '0');
     oh = (s[20] - '0') * 10 + (s[21] - '0');
     om = (s[23] - '0') * 10 + (s[24] - '0');
-    if (mon < 1 || mon > 12 || day < 1 || day > 31) {
+    if (!valid_calendar_date((unsigned)year, (unsigned)mon,
+                             (unsigned)day)) {
         return false;
     }
     if (hour > 23 || min > 59 || sec > 60) {
         return false;
     }
-    if (oh > 14 || om > 59) {
+    // ISO-8601 permits at most 14:00, not a fictitious +14:01.
+    if (oh > 14 || om > 59 || (oh == 14 && om != 0)) {
         return false;
     }
     return true;
@@ -102,8 +129,9 @@ bool device_manifest_format_iso8601_utc(int year, int mon, int mday, int hour,
         return false;
     }
     memset(out, 0, RECORDER_ISO8601_STR_LEN);
-    if (year < 1970 || year > 2100 || mon < 1 || mon > 12 || mday < 1 ||
-        mday > 31 || hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 ||
+    if (year < 1970 || year > 2100 ||
+        !valid_calendar_date((unsigned)year, (unsigned)mon, (unsigned)mday) ||
+        hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 ||
         sec > 60) {
         return false;
     }
@@ -324,6 +352,46 @@ bool device_manifest_build_empty(const char *device_id, const char *updated_at,
     return true;
 }
 
+static uint16_t wav_u16(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t wav_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Reject invalid/truncated finalized audio before advertising it as RAW.
+static bool finalized_wav_valid(const char *path, uint32_t total) {
+    uint8_t header[RECORDER_WAV_HEADER_SIZE];
+    FILE *fp;
+    bool ok;
+    if (total < RECORDER_WAV_HEADER_SIZE ||
+        (total - RECORDER_WAV_HEADER_SIZE) % RECORDER_BLOCK_ALIGN != 0u) {
+        return false;
+    }
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return false;
+    }
+    ok = fread(header, 1, sizeof(header), fp) == sizeof(header);
+    if (fclose(fp) != 0) {
+        return false;
+    }
+    return ok && memcmp(header, "RIFF", 4) == 0 &&
+           wav_u32(header + 4) == total - 8u &&
+           memcmp(header + 8, "WAVEfmt ", 8) == 0 &&
+           wav_u32(header + 16) == 16u &&
+           wav_u16(header + 20) == 1u &&
+           wav_u16(header + 22) == RECORDER_CHANNELS &&
+           wav_u32(header + 24) == RECORDER_SAMPLE_RATE_HZ &&
+           wav_u32(header + 28) == RECORDER_BYTE_RATE &&
+           wav_u16(header + 32) == RECORDER_BLOCK_ALIGN &&
+           wav_u16(header + 34) == RECORDER_BITS_PER_SAMPLE &&
+           memcmp(header + 36, "data", 4) == 0 &&
+           wav_u32(header + 40) == total - RECORDER_WAV_HEADER_SIZE;
+}
+
 bool device_manifest_hash_wav_file(const char *wav_path,
                                    char out_hex[RECORDER_SHA256_HEX_LEN],
                                    uint32_t *out_size_bytes) {
@@ -348,11 +416,21 @@ bool device_manifest_hash_wav_file(const char *wav_path,
         // entered into the manifest.
         return false;
     }
-    if (stat(wav_path, &st) != 0 || st.st_size < 0) {
+    if (stat(wav_path, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size < RECORDER_WAV_HEADER_SIZE ||
+        (uint64_t)st.st_size > UINT32_MAX ||
+        !finalized_wav_valid(wav_path, (uint32_t)st.st_size)) {
         return false;
     }
     if (!sha256_file_hex(wav_path, out_hex)) {
         return false;
+    }
+    {
+        struct stat after;
+        if (stat(wav_path, &after) != 0 || after.st_size != st.st_size) {
+            out_hex[0] = '\0';
+            return false;
+        }
     }
     if (out_size_bytes != NULL) {
         *out_size_bytes = (uint32_t)st.st_size;
@@ -525,8 +603,7 @@ static bool read_file_bounded(const char *path, char **out_buf, size_t *out_len,
         return false;
     }
     got = fread(buf, 1, (size_t)st.st_size, fp);
-    fclose(fp);
-    if (got != (size_t)st.st_size) {
+    if (fclose(fp) != 0 || got != (size_t)st.st_size) {
         free(buf);
         return false;
     }
@@ -536,69 +613,389 @@ static bool read_file_bounded(const char *path, char **out_buf, size_t *out_len,
     return true;
 }
 
+// Check the complete writer-generated canonical document, not merely a
+// matching deviceId. Device-owned manifests have a fixed field order and
+// non-escaped strings. Unknown layouts fail closed pending explicit migration.
+// Parse the *writer-emitted canonical v1 wire format* completely, with
+// bounded decimal numbers and no escaped/control strings. Rejecting an
+// alternative JSON encoding is intentional: any migration requires a
+// separately accepted contract; a torn snapshot must never look healthy.
+static bool manifest_expect(const char **cursor, const char *end,
+                            const char *literal) {
+    size_t n = strlen(literal);
+    if (*cursor > end || (size_t)(end - *cursor) < n ||
+        memcmp(*cursor, literal, n) != 0) {
+        return false;
+    }
+    *cursor += n;
+    return true;
+}
+
+static bool manifest_string(const char **cursor, const char *end,
+                            const char **value, size_t *length) {
+    const char *p = *cursor, *start;
+    if (p >= end || *p != '"') {
+        return false;
+    }
+    start = ++p;
+    while (p < end && *p != '"') {
+        if (*p == '\\' || (unsigned char)*p < 0x20u) {
+            return false;
+        }
+        ++p;
+    }
+    if (p == end) {
+        return false;
+    }
+    *value = start;
+    *length = (size_t)(p - start);
+    *cursor = p + 1;
+    return true;
+}
+
+static bool manifest_uint32(const char **cursor, const char *end,
+                            uint32_t *value) {
+    const char *p = *cursor;
+    uint32_t result = 0;
+    if (p == end || !is_digit(*p)) {
+        return false;
+    }
+    if (*p == '0' && p + 1 < end && is_digit(p[1])) {
+        return false;
+    }
+    while (p < end && is_digit(*p)) {
+        unsigned digit = (unsigned)(*p - '0');
+        if (result > (UINT32_MAX - digit) / 10u) {
+            return false;
+        }
+        result = result * 10u + digit;
+        ++p;
+    }
+    *value = result;
+    *cursor = p;
+    return true;
+}
+
+static bool manifest_entry_size(const char *doc, size_t len,
+                                uint32_t *value) {
+    const char *key = memfind(doc, len, "\"sizeBytes\":");
+    const char *p, *end = doc + len;
+    if (key == NULL || value == NULL) {
+        return false;
+    }
+    p = key + strlen("\"sizeBytes\":");
+    return manifest_uint32(&p, end, value) && p < end &&
+           (*p == ',' || *p == '}');
+}
+
+static bool manifest_entry_duration(const char *doc, size_t len,
+                                    uint32_t *value) {
+    const char *key = memfind(doc, len, "\"durationMs\":");
+    const char *p, *end = doc + len;
+    if (key == NULL || value == NULL) {
+        return false;
+    }
+    p = key + strlen("\"durationMs\":");
+    return manifest_uint32(&p, end, value) && p < end &&
+           (*p == ',' || *p == '}');
+}
+
+static bool manifest_string_equals(const char *value, size_t length,
+                                   const char *expected) {
+    return length == strlen(expected) &&
+           memcmp(value, expected, length) == 0;
+}
+
+// Offset-aware replay comparison: the writer separately reads wall-clock
+// time for the filename and startedAt. Allow two seconds of read skew,
+// including midnight, without accepting material chronology corruption.
+static bool manifest_utc_seconds(const char *s, int64_t *out) {
+    int y, m, d, hh, mm, ss, oh, om, ya, era;
+    unsigned yoe, doy, doe;
+    int64_t days;
+    if (out == NULL || !device_manifest_is_valid_iso8601_offset(s)) {
+        return false;
+    }
+    y=(s[0]-'0')*1000+(s[1]-'0')*100+(s[2]-'0')*10+(s[3]-'0');
+    m=(s[5]-'0')*10+(s[6]-'0');
+    d=(s[8]-'0')*10+(s[9]-'0');
+    hh=(s[11]-'0')*10+(s[12]-'0');
+    mm=(s[14]-'0')*10+(s[15]-'0');
+    ss=(s[17]-'0')*10+(s[18]-'0');
+    oh=(s[20]-'0')*10+(s[21]-'0');
+    om=(s[23]-'0')*10+(s[24]-'0');
+    if (!valid_calendar_date((unsigned)y, (unsigned)m, (unsigned)d) ||
+        (oh == 14 && om != 0)) return false;
+    ya=y-(m<=2);
+    era=ya>=0 ? ya/400 : (ya-399)/400;
+    yoe=(unsigned)(ya-era*400);
+    doy=(153u*(unsigned)(m+(m>2 ? -3 : 9))+2u)/5u+(unsigned)d-1u;
+    doe=yoe*365u+yoe/4u-yoe/100u+doy;
+    days=(int64_t)era*146097+(int64_t)doe-719468;
+    *out=days*86400+hh*3600+mm*60+ss+
+         (s[19]=='+' ? -1 : 1)*(oh*3600+om*60);
+    return true;
+}
+static bool manifest_start_times_compatible(const char *committed,
+                                             const char *observed) {
+    int64_t old_time, new_time, diff;
+    if (!manifest_utc_seconds(committed, &old_time) ||
+        !manifest_utc_seconds(observed, &new_time)) return false;
+    diff=old_time-new_time;
+    return diff>=-2 && diff<=2;
+}
+
+static bool manifest_iso8601(const char *value, size_t length) {
+    char stamp[RECORDER_ISO8601_STR_LEN];
+    if (length != 25u) {
+        return false;
+    }
+    memcpy(stamp, value, length);
+    stamp[length] = '\0';
+    return device_manifest_is_valid_iso8601_offset(stamp);
+}
+
+static bool manifest_snapshot_valid(const char *doc, size_t len,
+                                    const char *device_id) {
+    const char *p, *end;
+    const char *v;
+    size_t n;
+    uint32_t ver, num;
+    if (doc == NULL || device_id == NULL || len == 0u) {
+        return false;
+    }
+    p = doc;
+    end = doc + len;
+    if (memchr(doc, '\0', len) != NULL ||
+        !manifest_expect(&p, end, "{\"schemaVersion\":") ||
+        !manifest_uint32(&p, end, &ver) ||
+        ver != RECORDER_METADATA_SCHEMA_VERSION ||
+        !manifest_expect(&p, end, ",\"deviceId\":") ||
+        !manifest_string(&p, end, &v, &n) ||
+        !manifest_string_equals(v, n, device_id) ||
+        !manifest_expect(&p, end, ",\"updatedAt\":") ||
+        !manifest_string(&p, end, &v, &n) ||
+        !manifest_iso8601(v, n) ||
+        !manifest_expect(&p, end, ",\"recordings\":[")) {
+        return false;
+    }
+    while (p < end && *p != ']') {
+        const char *id, *name, *sha, *state, *fw;
+        size_t id_len, name_len, sha_len, state_len, fw_len;
+        char uuid[RECORDER_UUID_STR_LEN];
+        char filename[192];
+        char hash[RECORDER_SHA256_HEX_LEN];
+        char duplicate_needle[64];
+        uint32_t stored_duration = 0, stored_size = 0;
+        int printed;
+        if (!manifest_expect(&p, end, "{\"recordingId\":") ||
+            !manifest_string(&p, end, &id, &id_len) ||
+            id_len != 36u ||
+            !manifest_expect(&p, end, ",\"filename\":") ||
+            !manifest_string(&p, end, &name, &name_len) ||
+            name_len == 0u || name_len >= sizeof(filename) ||
+            !manifest_expect(&p, end, ",\"startedAt\":") ||
+            !manifest_string(&p, end, &v, &n) ||
+            !manifest_iso8601(v, n) ||
+            !manifest_expect(&p, end, ",\"durationMs\":") ||
+            !manifest_uint32(&p, end, &stored_duration) ||
+            !manifest_expect(&p, end, ",\"sizeBytes\":") ||
+            !manifest_uint32(&p, end, &stored_size) ||
+            stored_size < RECORDER_WAV_HEADER_SIZE ||
+            (stored_size - RECORDER_WAV_HEADER_SIZE) % RECORDER_BLOCK_ALIGN != 0u ||
+            stored_duration != device_manifest_duration_ms(
+                stored_size - RECORDER_WAV_HEADER_SIZE) ||
+            !manifest_expect(&p, end, ",\"sha256\":") ||
+            !manifest_string(&p, end, &sha, &sha_len) ||
+            sha_len != 64u ||
+            !manifest_expect(&p, end, ",\"sampleRate\":") ||
+            !manifest_uint32(&p, end, &num) ||
+            num != RECORDER_SAMPLE_RATE_HZ ||
+            !manifest_expect(&p, end, ",\"bitDepth\":") ||
+            !manifest_uint32(&p, end, &num) ||
+            num != RECORDER_BITS_PER_SAMPLE ||
+            !manifest_expect(&p, end, ",\"channels\":") ||
+            !manifest_uint32(&p, end, &num) ||
+            num != RECORDER_CHANNELS ||
+            !manifest_expect(&p, end, ",\"state\":") ||
+            !manifest_string(&p, end, &state, &state_len) ||
+            !((manifest_string_equals(state, state_len, "finalized")) ||
+              (manifest_string_equals(state, state_len, "recovered"))) ||
+            !manifest_expect(&p, end, ",\"firmwareVersion\":") ||
+            !manifest_string(&p, end, &fw, &fw_len) ||
+            fw_len == 0u || fw_len > 32u ||
+            !manifest_expect(&p, end, "}")) {
+            return false;
+        }
+        memcpy(uuid, id, id_len);
+        uuid[id_len] = '\0';
+        memcpy(filename, name, name_len);
+        filename[name_len] = '\0';
+        memcpy(hash, sha, sha_len);
+        hash[sha_len] = '\0';
+        if (!device_identity_is_valid_uuid(uuid) ||
+            !valid_filename(filename) ||
+            !device_manifest_is_valid_sha256_hex(hash)) {
+            return false;
+        }
+        printed = snprintf(duplicate_needle, sizeof(duplicate_needle),
+                           "\"recordingId\":\"%s\"", uuid);
+        if (printed < 0 || (size_t)printed >= sizeof(duplicate_needle) ||
+            memfind(p, (size_t)(end - p), duplicate_needle) != NULL) {
+            return false;
+        }
+        if (p < end && *p == ',') {
+            ++p;
+            if (p == end || *p != '{') {
+                return false;
+            }
+        } else if (p < end && *p != ']') {
+            return false;
+        }
+    }
+    return manifest_expect(&p, end, "]}") && p == end;
+}
+
+static bool manifest_file_valid(const char *path, const char *device_id) {
+    char *buf = NULL;
+    size_t len = 0;
+    bool ok;
+    if (!read_file_bounded(path, &buf, &len,
+                           RECORDER_MANIFEST_MAX_BYTES)) {
+        return false;
+    }
+    ok = manifest_snapshot_valid(buf, len, device_id);
+    free(buf);
+    return ok;
+}
+
+// A new published snapshot may only extend the previous byte-exact entry
+// prefix. No independently committed UUID, hash or metadata can disappear.
+static bool manifest_file_extends(const char *candidate_path,
+                                  const char *old_path,
+                                  const char *device_id) {
+    char *new_doc = NULL;
+    char *old_doc = NULL;
+    size_t new_len = 0, old_len = 0;
+    const char *a, *b, *a_end, *b_end;
+    bool ok = false;
+    if (!read_file_bounded(candidate_path, &new_doc, &new_len,
+                           RECORDER_MANIFEST_MAX_BYTES) ||
+        !read_file_bounded(old_path, &old_doc, &old_len,
+                           RECORDER_MANIFEST_MAX_BYTES)) {
+        goto done;
+    }
+    if (!manifest_snapshot_valid(new_doc, new_len, device_id) ||
+        !manifest_snapshot_valid(old_doc, old_len, device_id)) {
+        goto done;
+    }
+    a = memfind(old_doc, old_len, "\"recordings\":[");
+    b = memfind(new_doc, new_len, "\"recordings\":[");
+    if (a == NULL || b == NULL) {
+        goto done;
+    }
+    a = strchr(a, '[') + 1;
+    b = strchr(b, '[') + 1;
+    a_end = old_doc + old_len - 2;
+    b_end = new_doc + new_len - 2;
+    ok = a_end >= a && b_end >= b &&
+         (size_t)(b_end - b) >= (size_t)(a_end - a) &&
+         memcmp(a, b, (size_t)(a_end - a)) == 0 &&
+         (a_end == a || b + (a_end - a) == b_end ||
+          b[a_end - a] == ',');
+done:
+    free(new_doc);
+    free(old_doc);
+    return ok;
+}
+
+static bool manifest_backup_path(const char *manifest_path,
+                                 char out[RECORDER_MAX_PATH_LEN]) {
+    int n;
+    if (manifest_path == NULL || out == NULL) {
+        return false;
+    }
+    n = snprintf(out, RECORDER_MAX_PATH_LEN, "%s.bak", manifest_path);
+    return n > 0 && (size_t)n < RECORDER_MAX_PATH_LEN;
+}
+
 static bool write_tmp_and_rename(const char *tmp_path,
                                  const char *manifest_path, const char *doc,
                                  size_t doc_len) {
-    FILE *fp = NULL;
+    FILE *fp;
     size_t wrote;
+    char backup[RECORDER_MAX_PATH_LEN];
+    char doc_device_id[RECORDER_UUID_STR_LEN];
+    struct stat st;
+    bool had_final;
+    if (!device_identity_parse_device_id(doc, doc_len, doc_device_id) ||
+        !manifest_snapshot_valid(doc, doc_len, doc_device_id)) {
+        return false;
+    }
+    if (!manifest_backup_path(manifest_path, backup)) {
+        return false;
+    }
+    if (stat(backup, &st) == 0) {
+        // The preceding successful append may have kept its independent
+        // M0 fallback. Qualify M1 as a complete superset before retiring
+        // that backup and starting the next append. An unresolved pair is
+        // never overwritten or mistaken for free space.
+        if (!manifest_file_extends(manifest_path, backup, doc_device_id) ||
+            remove(backup) != 0) {
+            return false;
+        }
+    } else if (errno != ENOENT) {
+        return false;
+    }
+    had_final = stat(manifest_path, &st) == 0;
+    if (!had_final && errno != ENOENT) {
+        return false;
+    }
     fp = fopen(tmp_path, "wb");
     if (fp == NULL) {
         return false;
     }
     wrote = fwrite(doc, 1, doc_len, fp);
-    if (wrote != doc_len) {
-        fclose(fp);
-        remove(tmp_path);
+    if (wrote != doc_len || fflush(fp) != 0) {
+        (void)fclose(fp);
+        (void)remove(tmp_path);
         return false;
     }
-    if (fflush(fp) != 0) {
-        fclose(fp);
-        remove(tmp_path);
+#if defined(ESP_PLATFORM) || defined(DEVICE_MANIFEST_NATIVE_SYNC_TEST)
+    if (fileno(fp) < 0 || fsync(fileno(fp)) != 0) {
+        (void)fclose(fp);
+        (void)remove(tmp_path);
         return false;
     }
-#ifdef ESP_PLATFORM
-    {
-        int fd = fileno(fp);
-        if (fd >= 0) {
-            (void)fsync(fd);
-        } else {
-            fclose(fp);
-            remove(tmp_path);
-            return false;
-        }
-    }
-#else
-    // Host builds: fflush durability is sufficient for contract tests;
-    // fsync is an ESP-IDF media concern (see wav_part.c).
-    (void)0;
 #endif
     if (fclose(fp) != 0) {
-        remove(tmp_path);
+        (void)remove(tmp_path);
         return false;
     }
-    // Atomic publish: POSIX rename overwrites atomically. ESP-IDF FATFS
-    // rename fails when the destination exists, so retry once as
-    // remove+rename with the complete tmp already durable (a crash inside
-    // that window is recovered at boot by promoting a valid tmp when the
-    // destination is missing).
     if (rename(tmp_path, manifest_path) == 0) {
-        return true;
+        return manifest_file_valid(manifest_path, doc_device_id);
     }
-#ifdef ESP_PLATFORM
-    (void)remove(manifest_path);
-    if (rename(tmp_path, manifest_path) == 0) {
-        return true;
+    // FAT cannot rename over an existing destination. Only a known
+    // target-exists error may enter the two-snapshot recovery protocol.
+    if (!had_final || errno != EEXIST) {
+        return false;  // preserve M0 and complete tmp for diagnosis
     }
-#else
-    if (errno == EEXIST) {
-        (void)remove(manifest_path);
-        if (rename(tmp_path, manifest_path) == 0) {
-            return true;
+    if (rename(manifest_path, backup) != 0) {
+        return false;  // original M0 remains authoritative
+    }
+    if (rename(tmp_path, manifest_path) != 0) {
+        // Power loss here leaves M0 at .bak; the boot gate restores it.
+        // Preserve .bak and tmp even if the best-effort rollback fails.
+        if (stat(manifest_path, &st) != 0 && errno == ENOENT) {
+            (void)rename(backup, manifest_path);
         }
+        return false;
     }
-#endif
-    remove(tmp_path);
-    return false;
+    // Do not retire the backup unless the new published manifest is
+    // readable, structurally valid, and still contains all M0 entries.
+    // Validate again against M0 before reporting success. The backup is
+    // intentionally left for a later recovery checkpoint.
+    return manifest_file_extends(manifest_path, backup, doc_device_id);
 }
 
 device_manifest_result_t device_manifest_upsert_file(
@@ -616,6 +1013,9 @@ device_manifest_result_t device_manifest_upsert_file(
     char entry_id[65];
     char entry_sha[65];
     char entry_fn[192];
+    char entry_started[RECORDER_ISO8601_STR_LEN];
+    uint32_t entry_size = 0;
+    uint32_t entry_duration = 0;
     unsigned version = 0;
     char stored_id[RECORDER_UUID_STR_LEN];
     device_manifest_result_t ret = DEVICE_MANIFEST_ERROR;
@@ -660,9 +1060,25 @@ device_manifest_result_t device_manifest_upsert_file(
     entry_sha[sha_len] = '\0';
     memcpy(entry_fn, fn_begin, fn_len);
     entry_fn[fn_len] = '\0';
+    {
+        const char *tb = NULL;
+        size_t tl = 0;
+        if (!json_string_field(entry_json, strlen(entry_json),
+                               "\"startedAt\"", NULL, &tb, &tl) ||
+            tl != 25u) return DEVICE_MANIFEST_ERROR;
+        memcpy(entry_started, tb, tl);
+        entry_started[tl] = '\0';
+    }
     if (!device_identity_is_valid_uuid(entry_id) ||
         !device_manifest_is_valid_sha256_hex(entry_sha) ||
-        !valid_filename(entry_fn)) {
+        !device_manifest_is_valid_iso8601_offset(entry_started) ||
+        !valid_filename(entry_fn) ||
+        !manifest_entry_size(entry_json, strlen(entry_json), &entry_size) ||
+        !manifest_entry_duration(entry_json, strlen(entry_json), &entry_duration) ||
+        entry_size < RECORDER_WAV_HEADER_SIZE ||
+        (entry_size - RECORDER_WAV_HEADER_SIZE) % RECORDER_BLOCK_ALIGN != 0u ||
+        entry_duration != device_manifest_duration_ms(
+            entry_size - RECORDER_WAV_HEADER_SIZE)) {
         return DEVICE_MANIFEST_ERROR;
     }
 
@@ -715,6 +1131,13 @@ device_manifest_result_t device_manifest_upsert_file(
         }
     }
 
+    // A previously published file must be a complete canonical snapshot.
+    // An arbitrary substring-match is insufficient before appending M1.
+    if (!manifest_snapshot_valid(doc, doc_len, device_id)) {
+        free(doc);
+        return DEVICE_MANIFEST_ERROR;
+    }
+
     // Present: validate identity + major before touching anything.
     if (!device_identity_parse_schema_version(doc, doc_len, &version) ||
         version != RECORDER_METADATA_SCHEMA_VERSION) {
@@ -750,6 +1173,9 @@ device_manifest_result_t device_manifest_upsert_file(
             const char *f_at;
             char old_sha[65];
             char old_fn[192];
+            char old_started[RECORDER_ISO8601_STR_LEN];
+            uint32_t old_size = 0;
+            uint32_t old_duration = 0;
             size_t scope_len;
             next_id = memfind(hit + 1, (size_t)((doc + doc_len) - (hit + 1)),
                               "\"recordingId\"");
@@ -770,14 +1196,20 @@ device_manifest_result_t device_manifest_upsert_file(
                 size_t sl = 0;
                 const char *fb = NULL;
                 size_t fl = 0;
+                const char *tb = NULL;
+                size_t tl = 0;
                 bool ok_s = json_string_field(scope, scope_len, "\"sha256\"",
                                               NULL, &sb, &sl);
                 bool ok_f = json_string_field(scope, scope_len,
                                               "\"filename\"", NULL, &fb, &fl);
+                bool ok_t = json_string_field(scope, scope_len,
+                                              "\"startedAt\"", NULL, &tb, &tl);
                 (void)s_at;
                 (void)f_at;
                 if (!ok_s || sl != 64u || !ok_f || fl == 0u ||
-                    fl >= sizeof(old_fn)) {
+                    fl >= sizeof(old_fn) || !ok_t || tl != 25u ||
+                    !manifest_entry_size(scope, scope_len, &old_size) ||
+                    !manifest_entry_duration(scope, scope_len, &old_duration)) {
                     free(scope);
                     free(doc);
                     return DEVICE_MANIFEST_ERROR;
@@ -786,10 +1218,15 @@ device_manifest_result_t device_manifest_upsert_file(
                 old_sha[sl] = '\0';
                 memcpy(old_fn, fb, fl);
                 old_fn[fl] = '\0';
+                memcpy(old_started, tb, tl);
+                old_started[tl] = '\0';
             }
             free(scope);
             if (strcmp(old_sha, entry_sha) == 0 &&
-                strcmp(old_fn, entry_fn) == 0) {
+                strcmp(old_fn, entry_fn) == 0 &&
+                old_size == entry_size &&
+                old_duration == entry_duration &&
+                manifest_start_times_compatible(old_started, entry_started)) {
                 // Exact duplicate (retry / duplicate sync): idempotent OK
                 // with the file untouched.
                 free(doc);
@@ -889,7 +1326,7 @@ device_manifest_result_t device_manifest_upsert_file(
                 return DEVICE_MANIFEST_ERROR;
             }
             if (doc_len - old_ts_len + new_ts_len + extra >
-                RECORDER_MANIFEST_MAX_BYTES) {
+                DEVICE_MANIFEST_ADMISSION_CEILING_BYTES) {
                 free(doc);
                 return DEVICE_MANIFEST_ERROR;
             }
@@ -926,75 +1363,167 @@ device_manifest_result_t device_manifest_upsert_file(
             free(doc);
             return DEVICE_MANIFEST_ERROR;
         }
+        // Candidate M1 already has an independent copy of every M0 entry.
+        // The transaction re-reads M0 from storage. Drop the now-unused
+        // in-memory M0 before write/readback so at most three full-sized
+        // manifest buffers coexist, rather than four.
+        free(doc);
+        doc = NULL;
         if (!write_tmp_and_rename(tmp_path, manifest_path, fresh, fresh_len)) {
             free(fresh);
-            free(doc);
             return DEVICE_MANIFEST_ERROR;
         }
         free(fresh);
-        free(doc);
         return DEVICE_MANIFEST_OK;
     }
 }
 
+// ENOENT alone proves absence. An I/O error is not authorization to
+// disregard a previously committed M0 or promote another candidate.
+static bool manifest_artifact_exists(const char *path, bool *exists) {
+    struct stat st;
+    if (path == NULL || exists == NULL) {
+        return false;
+    }
+    if (stat(path, &st) == 0) {
+        *exists = true;
+        return true;
+    }
+    if (errno == ENOENT) {
+        *exists = false;
+        return true;
+    }
+    return false;
+}
+
 bool device_manifest_recover_tmp(const char *manifest_path,
                                  const char *tmp_path, const char *device_id) {
-    struct stat st_dest;
-    struct stat st_tmp;
-    bool dest_exists;
-    bool tmp_exists;
-    char *tmp_doc = NULL;
-    size_t tmp_len = 0;
-    unsigned version = 0;
-    char stored[RECORDER_UUID_STR_LEN];
-    if (manifest_path == NULL || tmp_path == NULL || device_id == NULL) {
+    char backup[RECORDER_MAX_PATH_LEN];
+    bool final_exists, tmp_exists, backup_exists;
+    if (manifest_path == NULL || tmp_path == NULL ||
+        !device_identity_is_valid_uuid(device_id) ||
+        !manifest_backup_path(manifest_path, backup)) {
         return false;
     }
-    if (!device_identity_is_valid_uuid(device_id)) {
+    // Probe all three artifacts before any rename/remove. If even one
+    // probe is uncertain, preserve all bytes and fail closed.
+    if (!manifest_artifact_exists(manifest_path, &final_exists) ||
+        !manifest_artifact_exists(tmp_path, &tmp_exists) ||
+        !manifest_artifact_exists(backup, &backup_exists)) {
         return false;
     }
-    dest_exists = (stat(manifest_path, &st_dest) == 0);
-    tmp_exists = (stat(tmp_path, &st_tmp) == 0);
-    if (dest_exists) {
-        // Destination healthy: drop any stale tmp from an interrupted
-        // update (its content, if newer, is re-derivable via the next
-        // idempotent upsert).
-        if (tmp_exists) {
-            (void)remove(tmp_path);
+
+    if (backup_exists) {
+        if (!manifest_file_valid(backup, device_id)) {
+            return false;  // preserve evidence; no inferred healthy boot
+        }
+        if (!final_exists) {
+            // Transaction interrupted after M0 moved to backup.
+            if (rename(backup, manifest_path) != 0) {
+                return false;
+            }
+            final_exists = true;
+        } else if (!manifest_file_extends(manifest_path, backup, device_id)) {
+            return false;  // torn M1, missing M0 entry or identity fork
+        } else if (remove(backup) != 0) {
+            return false;
+        }
+    }
+    if (final_exists) {
+        if (!manifest_file_valid(manifest_path, device_id)) {
+            return false;
+        }
+        // A complete old/final M0 is authoritative; a temp from an
+        // interrupted pre-publish attempt must not displace it.
+        if (tmp_exists && remove(tmp_path) != 0) {
+            return false;
         }
         return true;
     }
-    if (!tmp_exists) {
+    if (!tmp_exists || !manifest_file_valid(tmp_path, device_id)) {
         return false;
     }
-    if (!read_file_bounded(tmp_path, &tmp_doc, &tmp_len,
-                            RECORDER_MANIFEST_MAX_BYTES)) {
+    // No M0 was present (first creation). Only a complete canonical tmp
+    // may be promoted. A partial or mismatched tmp is left untouched.
+    return rename(tmp_path, manifest_path) == 0 &&
+           manifest_file_valid(manifest_path, device_id);
+}
+
+
+bool device_manifest_has_append_room(const char *manifest_path,
+                                     const char *device_id) {
+    char *doc = NULL;
+    size_t len = 0;
+    bool ok = false;
+    // Two worst-case entries plus fixed-format delimiters are reserved:
+    // the segment being admitted and one recovery/rotation margin.
+    // This is metadata admission only; physical free clusters and the
+    // full replacement temp are independently checked before recording.
+    const size_t reserve = 2u * RECORDER_MANIFEST_ENTRY_MAX + 64u;
+    if (manifest_path == NULL || device_id == NULL ||
+        !read_file_bounded(manifest_path, &doc, &len,
+                           RECORDER_MANIFEST_MAX_BYTES)) {
         return false;
     }
-    if (!device_identity_parse_schema_version(tmp_doc, tmp_len, &version) ||
-        version != RECORDER_METADATA_SCHEMA_VERSION) {
-        free(tmp_doc);
-        return false;
+    ok = manifest_snapshot_valid(doc, len, device_id) &&
+         len <= DEVICE_MANIFEST_ADMISSION_CEILING_BYTES &&
+         reserve <= DEVICE_MANIFEST_ADMISSION_CEILING_BYTES - len;
+    free(doc);
+    return ok;
+}
+
+static device_manifest_scan_error_t s_scan_error = DEVICE_MANIFEST_SCAN_OK;
+static uint32_t s_scan_indexed = 0;
+
+uint32_t device_manifest_last_scan_indexed(void) { return s_scan_indexed; }
+
+device_manifest_scan_error_t device_manifest_last_scan_error(void) {
+    return s_scan_error;
+}
+
+const char *device_manifest_scan_error_name(device_manifest_scan_error_t e) {
+    switch (e) {
+        case DEVICE_MANIFEST_SCAN_OK: return "OK";
+        case DEVICE_MANIFEST_SCAN_INVALID_INPUT: return "INVALID_INPUT";
+        case DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR: return "DIRECTORY_ERROR";
+        case DEVICE_MANIFEST_SCAN_WAV_UNREADABLE: return "WAV_UNREADABLE";
+        case DEVICE_MANIFEST_SCAN_INDEX_CONFLICT: return "INDEX_CONFLICT";
+        case DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR: return "INDEX_WRITE_ERROR";
+        case DEVICE_MANIFEST_SCAN_MISSING_WAV: return "MISSING_WAV";
+        default: return "UNKNOWN";
     }
-    memset(stored, 0, sizeof(stored));
-    if (!device_identity_parse_device_id(tmp_doc, tmp_len, stored) ||
-        strcmp(stored, device_id) != 0) {
-        free(tmp_doc);
-        return false;
-    }
-    if (memfind(tmp_doc, tmp_len, "\"recordings\"") == NULL) {
-        free(tmp_doc);
-        return false;
-    }
-    free(tmp_doc);
-    return rename(tmp_path, manifest_path) == 0;
 }
 
 // --- Boot sync of finalized WAVs ------------------------------------------
 
-static bool path_is_dir_local(const char *path) {
-    struct stat st;
-    return path != NULL && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+// A successful disk-to-manifest scan must also prove the converse:
+// every committed entry has been visited as one valid canonical WAV.
+static bool manifest_recording_count(const char *path, const char *device_id,
+                                     uint32_t *out_count) {
+    char *doc = NULL;
+    size_t len = 0, offset = 0;
+    uint32_t count = 0;
+    bool ok = false;
+    if (out_count == NULL ||
+        !read_file_bounded(path, &doc, &len, RECORDER_MANIFEST_MAX_BYTES)) {
+        return false;
+    }
+    if (!manifest_snapshot_valid(doc, len, device_id)) {
+        goto done;
+    }
+    while (offset < len) {
+        const char *p = memfind(doc + offset, len - offset, "\"recordingId\":");
+        if (p == NULL) {
+            break;
+        }
+        count++;
+        offset = (size_t)(p - doc) + strlen("\"recordingId\":");
+    }
+    *out_count = count;
+    ok = true;
+done:
+    free(doc);
+    return ok;
 }
 
 static bool audience_wav_name(const char *name) {
@@ -1033,23 +1562,34 @@ static bool split_wav_name(const char *base, char time6[7]) {
     return true;
 }
 
-static bool valid_date_dir(const char *name) {
+static bool date_dir_has_shape(const char *name) {
     unsigned i;
-    if (name == NULL || strlen(name) != 10u) {
-        return false;
-    }
-    if (name[4] != '-' || name[7] != '-') {
+    if (name == NULL || strlen(name) != 10u ||
+        name[4] != '-' || name[7] != '-') {
         return false;
     }
     for (i = 0; i < 10u; ++i) {
-        if (i == 4u || i == 7u) {
-            continue;
-        }
-        if (name[i] < '0' || name[i] > '9') {
+        if (i != 4u && i != 7u && !is_digit(name[i])) {
             return false;
         }
     }
     return true;
+}
+
+static bool valid_date_dir(const char *name) {
+    unsigned year, mon, day;
+    if (!date_dir_has_shape(name)) {
+        return false;
+    }
+    year = (unsigned)(name[0] - '0') * 1000u +
+           (unsigned)(name[1] - '0') * 100u +
+           (unsigned)(name[2] - '0') * 10u +
+           (unsigned)(name[3] - '0');
+    mon = (unsigned)(name[5] - '0') * 10u +
+          (unsigned)(name[6] - '0');
+    day = (unsigned)(name[8] - '0') * 10u +
+          (unsigned)(name[9] - '0');
+    return valid_calendar_date(year, mon, day);
 }
 
 // Ensure one `.wav` has a manifest entry. Missing entries are appended;
@@ -1059,7 +1599,7 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
                            const char *date_dir_or_null, const char *base,
                            const char *manifest_path, const char *tmp_path,
                            const char *device_id, const char *updated_at,
-                           const char *state, uint32_t *added,
+                           const char *state, uint32_t *indexed,
                            uint32_t *skipped) {
     char rec_id[65];
     char sha[RECORDER_SHA256_HEX_LEN];
@@ -1120,27 +1660,26 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
             return true;
         }
     }
-    if (!device_manifest_hash_wav_file(wav_path, sha, &size_bytes)) {
+    if (!device_manifest_hash_wav_file(wav_path, sha, &size_bytes) ||
+        size_bytes < RECORDER_WAV_HEADER_SIZE) {
+        // A canonical UUID WAV that could not be hashed/parsed cannot be
+        // ignored as "legacy": the PC would otherwise sync a partial tree.
+        s_scan_error = DEVICE_MANIFEST_SCAN_WAV_UNREADABLE;
         if (skipped != NULL) {
             (*skipped)++;
         }
-        return true;
-    }
-    if (size_bytes < RECORDER_WAV_HEADER_SIZE) {
-        if (skipped != NULL) {
-            (*skipped)++;
-        }
-        return true;
+        return false;
     }
     pcm_bytes = size_bytes - RECORDER_WAV_HEADER_SIZE;
     pcm_bytes -= (pcm_bytes % RECORDER_BYTES_PER_SAMPLE);
     duration = device_manifest_duration_ms(pcm_bytes);
     entry = (char *)malloc(RECORDER_MANIFEST_ENTRY_MAX);
     if (entry == NULL) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
         if (skipped != NULL) {
             (*skipped)++;
         }
-        return true;
+        return false;
     }
     if (!device_manifest_build_entry(rec_id, rel_filename, started, duration,
                                      size_bytes, sha, RECORDER_SAMPLE_RATE_HZ,
@@ -1148,26 +1687,33 @@ static bool ensure_one_wav(const char *wav_path, const char *rel_filename,
                                      RECORDER_CHANNELS, state, NULL, entry,
                                      RECORDER_MANIFEST_ENTRY_MAX)) {
         free(entry);
+        s_scan_error = DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
         if (skipped != NULL) {
             (*skipped)++;
         }
-        return true;
+        return false;
     }
     r = device_manifest_upsert_file(manifest_path, tmp_path, device_id,
                                     updated_at, entry);
     free(entry);
+    if (r != DEVICE_MANIFEST_OK) {
+        s_scan_error = (r == DEVICE_MANIFEST_CONFLICT)
+            ? DEVICE_MANIFEST_SCAN_INDEX_CONFLICT
+            : DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
+    }
     if (r == DEVICE_MANIFEST_OK) {
-        if (added != NULL) {
-            (*added)++;
+        if (indexed != NULL) {
+            (*indexed)++;
         }
         return true;
     }
     if (skipped != NULL) {
         (*skipped)++;
     }
-    // CONFLICT and ERROR both preserve the manifest; a conflicting or
-    // unreadable file never fails the whole boot sync.
-    return true;
+    // CONFLICT/ERROR means a valid finalized/recovered WAV is not
+    // provably indexed. Preserve source RAW, but stop recording and
+    // prohibit a healthy USB publication until repaired.
+    return false;
 }
 
 bool device_manifest_sync_wav_dir(const char *recordings_dir,
@@ -1178,7 +1724,11 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
     DIR *dir = NULL;
     struct dirent *ent = NULL;
     uint32_t added = 0;
+    uint32_t indexed = 0;
+    uint32_t before_count = 0, after_count = 0;
     uint32_t skipped = 0;
+    s_scan_error = DEVICE_MANIFEST_SCAN_INVALID_INPUT;
+    s_scan_indexed = 0;
     if (out_added != NULL) {
         *out_added = 0;
     }
@@ -1198,23 +1748,55 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
                           strcmp(state, DEVICE_MANIFEST_STATE_RECOVERED) != 0)) {
         return false;
     }
-    dir = opendir(recordings_dir);
-    if (dir == NULL) {
+    if (!manifest_recording_count(manifest_path, device_id, &before_count)) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
         return false;
     }
-    while ((ent = readdir(dir)) != NULL) {
+    dir = opendir(recordings_dir);
+    if (dir == NULL) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+        return false;
+    }
+    s_scan_error = DEVICE_MANIFEST_SCAN_OK;
+    for (;;) {
         char child[RECORDER_MAX_PATH_LEN];
+        struct stat child_st;
         int needed;
+        errno = 0;
+        ent = readdir(dir);
+        if (ent == NULL) {
+            if (errno != 0) {
+                (void)closedir(dir);
+                s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+                return false;  // FAT enumeration/I/O fault
+            }
+            break;
+        }
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
             continue;
         }
         needed = snprintf(child, sizeof(child), "%s/%s", recordings_dir,
                           ent->d_name);
         if (needed < 0 || (size_t)needed >= sizeof(child)) {
-            skipped++;
-            continue;
+            // Unknown directory content cannot be classified as excluded;
+            // there may be a canonical UUID WAV hidden by path truncation.
+            (void)closedir(dir);
+            s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+            return false;
         }
-        if (path_is_dir_local(child)) {
+        // Exactly one checked stat for this child: a transient EIO is
+        // never equivalent to a legacy/non-directory exclusion.
+        if (stat(child, &child_st) != 0 ||
+            // A YYYY-MM-DD-shaped but impossible calendar directory
+            // is uncertain RAW history, not an ignorable legacy folder.
+            (date_dir_has_shape(ent->d_name) &&
+             (!valid_date_dir(ent->d_name) ||
+              !S_ISDIR(child_st.st_mode)))) {
+            (void)closedir(dir);
+            s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+            return false;
+        }
+        if (S_ISDIR(child_st.st_mode)) {
             DIR *sub = NULL;
             struct dirent *subent = NULL;
             if (!valid_date_dir(ent->d_name)) {
@@ -1222,11 +1804,23 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
             }
             sub = opendir(child);
             if (sub == NULL) {
-                skipped++;
-                continue;
+                (void)closedir(dir);
+                s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+                return false;  // eligible date subtree inaccessible
             }
-            while ((subent = readdir(sub)) != NULL) {
+            for (;;) {
                 char wav[RECORDER_MAX_PATH_LEN];
+                errno = 0;
+                subent = readdir(sub);
+                if (subent == NULL) {
+                    if (errno != 0) {
+                        (void)closedir(sub);
+                        (void)closedir(dir);
+                        s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+                        return false;
+                    }
+                    break;
+                }
                 char rel[192];
                 int n2;
                 int nr;
@@ -1240,20 +1834,39 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
                 n2 = snprintf(wav, sizeof(wav), "%s/%s", child,
                               subent->d_name);
                 if (n2 < 0 || (size_t)n2 >= sizeof(wav)) {
-                    skipped++;
-                    continue;
+                    (void)closedir(sub);
+                    (void)closedir(dir);
+                    s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+                    return false;
                 }
                 nr = snprintf(rel, sizeof(rel), "recordings/%s/%s",
                               ent->d_name, subent->d_name);
                 if (nr < 0 || (size_t)nr >= sizeof(rel)) {
-                    skipped++;
-                    continue;
+                    (void)closedir(sub);
+                    (void)closedir(dir);
+                    s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+                    return false;
                 }
-                ensure_one_wav(wav, rel, ent->d_name, subent->d_name,
-                               manifest_path, tmp_path, device_id, updated_at,
-                               state, &added, &skipped);
+                if (!ensure_one_wav(wav, rel, ent->d_name, subent->d_name,
+                                    manifest_path, tmp_path, device_id,
+                                    updated_at, state, &indexed, &skipped)) {
+                    // Existing RAW and manifest stay on SD for recovery.
+                    closedir(sub);
+                    closedir(dir);
+                    if (out_added != NULL) {
+                        *out_added = added;
+                    }
+                    if (out_skipped != NULL) {
+                        *out_skipped = skipped;
+                    }
+                    return false;
+                }
             }
-            closedir(sub);
+            if (closedir(sub) != 0) {
+                (void)closedir(dir);
+                s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+                return false;
+            }
         } else {
             // Top-level `.wav` without a date directory: skipped (no
             // trustworthy startedAt source; never fabricate timestamps).
@@ -1262,7 +1875,25 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
             }
         }
     }
-    closedir(dir);
+    if (closedir(dir) != 0) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
+        return false;
+    }
+    if (!manifest_recording_count(manifest_path, device_id, &after_count)) {
+        s_scan_error = DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR;
+        return false;
+    }
+    if (after_count != indexed || after_count < before_count) {
+        // Missing indexed RAW, an unscanned entry, or a noncanonical
+        // historical entry: never advertise a complete sync inventory.
+        s_scan_error = DEVICE_MANIFEST_SCAN_MISSING_WAV;
+        if (out_skipped != NULL) {
+            *out_skipped = skipped;
+        }
+        return false;
+    }
+    added = after_count - before_count;
+    s_scan_indexed = indexed;
     if (out_added != NULL) {
         *out_added = added;
     }

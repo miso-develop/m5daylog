@@ -1,16 +1,21 @@
+#include <dirent.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "esp_chip_info.h"
 #include "esp_flash.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -250,15 +255,16 @@ static bool recorder_new_recording_id(char out[RECORDER_UUID_STR_LEN]) {
     return true;
 }
 
-static bool recorder_current_iso8601(char out[RECORDER_ISO8601_STR_LEN]) {
-    char date[RECORDER_DATE_STR_LEN];
-    char time6[RECORDER_TIME_STR_LEN];
+// Path time and startedAt must refer to the same RTC observation.
+static bool recorder_iso8601_from_parts(
+    const char date[RECORDER_DATE_STR_LEN],
+    const char time6[RECORDER_TIME_STR_LEN],
+    char out[RECORDER_ISO8601_STR_LEN]) {
     int n;
-    if (out == NULL) {
+    if (out == NULL || date == NULL || time6 == NULL) {
         return false;
     }
     memset(out, 0, RECORDER_ISO8601_STR_LEN);
-    recorder_current_date_time(date, time6);
     n = snprintf(out, RECORDER_ISO8601_STR_LEN,
                  "%.4s-%.2s-%.2sT%.2s:%.2s:%.2s+00:00",
                  date, date + 5, date + 8, time6, time6 + 2, time6 + 4);
@@ -268,6 +274,13 @@ static bool recorder_current_iso8601(char out[RECORDER_ISO8601_STR_LEN]) {
         return false;
     }
     return true;
+}
+
+static bool recorder_current_iso8601(char out[RECORDER_ISO8601_STR_LEN]) {
+    char date[RECORDER_DATE_STR_LEN];
+    char time6[RECORDER_TIME_STR_LEN];
+    recorder_current_date_time(date, time6);
+    return recorder_iso8601_from_parts(date, time6, out);
 }
 
 static void recorder_set_events_ready(bool ready) {
@@ -429,33 +442,73 @@ static bool recorder_manifest_record_wav(const char *wav_path,
     }
 }
 
+// A blank manifest may be created only for a genuinely fresh recordings
+// tree. If all manifest artifacts vanished yet a dated recording directory
+// remains, prior M0 cannot be reconstructed byte-for-byte from WAV headers.
+// Do not silently certify a synthesized empty manifest as healthy history.
+static bool recorder_recordings_tree_pristine(void) {
+    DIR *dir = opendir(RECORDER_RECORDINGS_DIR);
+    struct dirent *entry;
+    bool pristine = true;
+    if (dir == NULL) {
+        return false;
+    }
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL) {
+            if (errno != 0) {
+                pristine = false;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            pristine = false;
+            break;
+        }
+    }
+    if (closedir(dir) != 0) {
+        pristine = false;
+    }
+    return pristine;
+}
+
 static bool recorder_ensure_manifest_exists(void) {
     FILE *probe = NULL;
     if (!recorder_current_iso8601(s_manifest_now)) {
         ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest time");
         return false;
     }
-    probe = fopen(RECORDER_MANIFEST_PATH, "rb");
-    if (probe != NULL) {
-        fclose(probe);
+    // Always validate/reconcile the full M0/M1 transaction, even when
+    // manifest.json exists: a staged .bak may be the only proven M0.
+    if (device_manifest_recover_tmp(RECORDER_MANIFEST_PATH,
+                                    RECORDER_MANIFEST_TMP_PATH,
+                                    s_device_id)) {
         return true;
     }
-    if (!device_manifest_recover_tmp(RECORDER_MANIFEST_PATH,
-                                     RECORDER_MANIFEST_TMP_PATH,
-                                     s_device_id)) {
-        FILE *tmp_probe = fopen(RECORDER_MANIFEST_TMP_PATH, "rb");
-        if (tmp_probe != NULL) {
-            fclose(tmp_probe);
-            ESP_LOGE(TAG,
-                     "stage: manifest, result: error, reason: manifest tmp");
-            return false;
+    {
+        struct stat st;
+        // A failed recovery with *any* surviving artifact is never a
+        // blank first boot. Never replace uncertain metadata with [].
+        const char *artifacts[] = {
+            RECORDER_MANIFEST_PATH,
+            RECORDER_MANIFEST_TMP_PATH,
+            RECORDER_MANIFEST_PATH ".bak"
+        };
+        size_t i;
+        for (i = 0; i < sizeof(artifacts) / sizeof(artifacts[0]); ++i) {
+            if (stat(artifacts[i], &st) == 0 || errno != ENOENT) {
+                ESP_LOGE(TAG,
+                         "stage: manifest, result: error, reason: MANIFEST_RECOVERY_REQUIRED");
+                return false;
+            }
         }
-    } else {
-        probe = fopen(RECORDER_MANIFEST_PATH, "rb");
-        if (probe != NULL) {
-            fclose(probe);
-            return true;
-        }
+    }
+    if (!recorder_recordings_tree_pristine()) {
+        ESP_LOGE(TAG,
+                 "stage: manifest, result: error, reason: MANIFEST_RECOVERY_REQUIRED");
+        return false;
     }
     {
         char empty[256];
@@ -483,8 +536,11 @@ static bool recorder_ensure_manifest_exists(void) {
         }
         {
             int fd = fileno(out);
-            if (fd >= 0) {
-                (void)fsync(fd);
+            if (fd < 0 || fsync(fd) != 0) {
+                (void)fclose(out);
+                ESP_LOGE(TAG,
+                         "stage: manifest, result: error, reason: manifest fsync");
+                return false;
             }
         }
         if (fclose(out) != 0) {
@@ -500,6 +556,45 @@ static bool recorder_ensure_manifest_exists(void) {
         ESP_LOGI(TAG, "stage: manifest, result: ok");
         return true;
     }
+}
+
+// Reserve enough physical space for the entire next 30-minute PCM WAV,
+// a full 128KiB temp manifest rewrite, and one additional rotation/error
+// margin. FAT free bytes are observed, not locked; any later exhaustion
+// still fails loud via the existing sink/finalize error path.
+static bool recorder_can_admit_segment(void) {
+    uint64_t total_bytes = 0;
+    uint64_t free_bytes = 0;
+    const uint64_t min_free =
+        (uint64_t)RECORDER_ROTATION_PAYLOAD_BYTES +
+        (uint64_t)RECORDER_WAV_HEADER_SIZE +
+        3u * (uint64_t)RECORDER_MANIFEST_MAX_BYTES +
+        (uint64_t)RECORDER_BUFFER_BYTES;
+    if (!device_manifest_has_append_room(RECORDER_MANIFEST_PATH,
+                                         s_device_id)) {
+        ESP_LOGE(TAG,
+                 "stage: manifest, result: error, reason: METADATA_FULL");
+        return false;
+    }
+    // FAT EEXIST append peaks at M1 and two read-back snapshots. Require
+    // aggregate heap and a contiguous snapshot allocation before admitting
+    // new RAW. Memory usage can change: the actual append remains fail-closed.
+    if (heap_caps_get_free_size(MALLOC_CAP_8BIT) <
+            DEVICE_MANIFEST_HEAP_ADMISSION_BYTES ||
+        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) <
+            DEVICE_MANIFEST_ADMISSION_CEILING_BYTES + 1u) {
+        ESP_LOGE(TAG,
+                 "stage: manifest, result: error, reason: METADATA_HEAP");
+        return false;
+    }
+    if (esp_vfs_fat_info(RECORDER_SD_MOUNT_POINT, &total_bytes,
+                         &free_bytes) != ESP_OK ||
+        total_bytes == 0u || free_bytes < min_free) {
+        ESP_LOGE(TAG,
+                 "stage: record, result: error, reason: STORAGE_FULL");
+        return false;
+    }
+    return true;
 }
 
 static void recorder_battery_task(void *arg) {
@@ -859,7 +954,9 @@ static void recorder_writer_task(void *arg) {
                     RECORDER_MANIFEST_TMP_PATH, s_device_id, s_manifest_now,
                     DEVICE_MANIFEST_STATE_RECOVERED, &added, &skipped)) {
                 ESP_LOGE(TAG,
-                         "stage: manifest, result: error, reason: manifest sync");
+                         "stage: manifest, result: error, reason: %s",
+                         device_manifest_scan_error_name(
+                             device_manifest_last_scan_error()));
                 recorder_enter_error(RECORDER_REASON_MANIFEST);
                 recorder_set_events_ready(false);
                 sd_mount_unmount();
@@ -867,10 +964,12 @@ static void recorder_writer_task(void *arg) {
                 vTaskDelete(NULL);
                 return;
             }
+            uint32_t indexed = device_manifest_last_scan_indexed();
             ESP_LOGI(TAG,
-                     "stage: manifest, result: ok, added: %" PRIu32
-                     ", skipped: %" PRIu32,
-                     added, skipped);
+                     "stage: manifest, result: ok, indexed: %" PRIu32
+                     ", already_indexed: %" PRIu32 ", added: %" PRIu32
+                     ", excluded: %" PRIu32,
+                     indexed, indexed - added, added, skipped);
         } else {
             ESP_LOGE(TAG,
                      "stage: manifest, result: error, reason: manifest time");
@@ -888,7 +987,7 @@ static void recorder_writer_task(void *arg) {
     memset(s_seg_rec_id, 0, sizeof(s_seg_rec_id));
     memset(s_seg_started, 0, sizeof(s_seg_started));
     if (!recorder_new_recording_id(rec_id) ||
-        !recorder_current_iso8601(s_seg_started)) {
+        !recorder_iso8601_from_parts(seg_date, cur_time, s_seg_started)) {
         ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest id");
         recorder_enter_error(RECORDER_REASON_MANIFEST);
         recorder_set_events_ready(false);
@@ -916,6 +1015,14 @@ static void recorder_writer_task(void *arg) {
         recorder_set_events_ready(false);
         sd_mount_unmount();
         recorder_log_writer_stack_hw("mkdir date");
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!recorder_can_admit_segment()) {
+        recorder_enter_error(RECORDER_REASON_MANIFEST);
+        recorder_set_events_ready(false);
+        sd_mount_unmount();
+        recorder_log_writer_stack_hw("capacity admission");
         vTaskDelete(NULL);
         return;
     }
@@ -1034,9 +1141,14 @@ static void recorder_writer_task(void *arg) {
                     running = false;
                     break;
                 }
+                // Finalization and hashing of the preceding WAV can take
+                // seconds. Sample the new segment's path time only after
+                // those operations, and reuse it for its committed startedAt.
+                recorder_current_date_time(now_date, now_time);
                 memset(rec_id, 0, sizeof(rec_id));
                 if (!recorder_new_recording_id(rec_id) ||
-                    !recorder_current_iso8601(s_seg_started)) {
+                    !recorder_iso8601_from_parts(now_date, now_time,
+                                                 s_seg_started)) {
                     ESP_LOGE(TAG,
                              "stage: manifest, result: error, reason: manifest id");
                     recorder_enter_error(RECORDER_REASON_MANIFEST);
@@ -1062,6 +1174,11 @@ static void recorder_writer_task(void *arg) {
                     ESP_LOGE(TAG,
                              "stage: rotate, result: error, reason: mkdir date");
                     recorder_enter_error(RECORDER_REASON_SD_WRITE);
+                    running = false;
+                    break;
+                }
+                if (!recorder_can_admit_segment()) {
+                    recorder_enter_error(RECORDER_REASON_MANIFEST);
                     running = false;
                     break;
                 }

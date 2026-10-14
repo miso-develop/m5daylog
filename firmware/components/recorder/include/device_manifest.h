@@ -9,17 +9,13 @@
 // entire (incremental chunked hash, lowercase hex 64 chars) and must match
 // a PC-side recomputation. Timestamps are offset ISO-8601.
 //
-// Durability: updates write the full document to `manifest.tmp`
-// (flush + fsync) then atomically rename to `manifest.json`. A crash
-// mid-write leaves the existing `manifest.json` intact (or a complete
-// `manifest.tmp` the next boot can promote); the old manifest is never
-// truncated in place. Unknown `schemaVersion` majors and `deviceId`
-// mismatches fail closed without writing. A duplicate `recordingId`
-// carrying a different hash reports CONFLICT and never overwrites.
-//
-// Portable: stdio/dir/stat only, no ESP-IDF dependency. Never deletes
-// audio: only rename() moves files (tmp -> manifest); no remove()/unlink()
-// path exists in this module except best-effort stale-tmp cleanup.
+// Durability: full manifest snapshots are staged in manifest.tmp. On
+// FAT an EEXIST rename is handled by preserving the committed M0 at
+// manifest.json.bak before publishing M1. Boot recovery must validate
+// both candidates and reject any M1 that loses an M0 recording entry.
+// Ambiguous/torn artifacts fail closed and are never silently replaced
+// by a new empty manifest. This is not a physical power-loss test result.
+// Source WAVs are never unlinked by this module.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -87,8 +83,9 @@ bool device_manifest_build_empty(const char *device_id, const char *updated_at,
 // Hash the WAV file bytes entire incrementally (4KB reads) into
 // lowercase hex (`out_hex` needs RECORDER_SHA256_HEX_LEN bytes) and
 // report the total file size in `out_size_bytes` (may be NULL).
-// Returns false on NULL input, missing/unreadable file, read error, or
-// invalid (non-`.wav`) suffix. The file content is never logged.
+// Returns false on NULL input, missing/unreadable file, read error,
+// invalid RIFF/WAVE/PCM format, truncated/odd payload, inconsistent
+// declared lengths, or invalid (non-`.wav`) suffix. The file content is never logged.
 bool device_manifest_hash_wav_file(const char *wav_path,
                                    char out_hex[RECORDER_SHA256_HEX_LEN],
                                    uint32_t *out_size_bytes);
@@ -126,15 +123,57 @@ device_manifest_result_t device_manifest_upsert_file(
     const char *manifest_path, const char *tmp_path, const char *device_id,
     const char *updated_at, const char *entry_json);
 
-// Boot promotion: when `manifest_path` is missing but `tmp_path` holds a
-// complete document for `device_id` (schemaVersion 1, parseable), rename
-// it into place and return true. When the destination already exists,
-// validates nothing and returns true after best-effort stale-tmp removal.
-// Returns false when there is nothing promotable or the tmp content is
-// invalid (both files are then left untouched, except an invalid tmp
-// alone is left for inspection, never promoted).
+// Boot recovery: check the complete final manifest and, when present,
+// its .bak snapshot. An interrupted update may restore M0 from .bak;
+// successful M1 must retain the exact canonical M0 entry prefix.
+// Unreadable, mismatched or regressed artifacts fail closed. A complete
+// .tmp may be promoted only when no final/backup is present.
 bool device_manifest_recover_tmp(const char *manifest_path,
                                  const char *tmp_path, const char *device_id);
+
+// Device #117: this is a deliberately smaller *runtime-admitted* maximum
+// than RECORDER_MANIFEST_MAX_BYTES (the 128 KiB on-disk parser ceiling).
+// ESP32-S3FN8 has no external PSRAM; 32 KiB keeps three concurrent snapshots
+// within a bounded 96 KiB envelope. Two additional worst-case entries must
+// fit before recording starts. Exceeding this limit stops admission safely;
+// historical larger manifests remain readable but cannot be appended.
+// The exact installed target heap and supported segment count must still be
+// measured at the separate physical release gate.
+#define DEVICE_MANIFEST_ADMISSION_CEILING_BYTES 32768u
+#define DEVICE_MANIFEST_PEAK_SNAPSHOT_BUFFERS 3u
+#define DEVICE_MANIFEST_HEAP_MARGIN_BYTES 32768u
+#define DEVICE_MANIFEST_HEAP_ADMISSION_BYTES \
+    (DEVICE_MANIFEST_PEAK_SNAPSHOT_BUFFERS * \
+         DEVICE_MANIFEST_ADMISSION_CEILING_BYTES + \
+     DEVICE_MANIFEST_HEAP_MARGIN_BYTES)
+
+// Fail-closed metadata admission check before a fresh segment/rotation:
+// require a valid committed manifest and headroom for two worst-case
+// appended entries. This does not measure SD free clusters; the caller
+// must independently reserve WAV data plus manifest temp space.
+bool device_manifest_has_append_room(const char *manifest_path,
+                                     const char *device_id);
+
+// Scan diagnostics are metadata-only; the first unresolved failure
+// is retained for boot ERROR reporting. These codes never authorize
+// recording/USB publication when the scan returned false.
+typedef enum {
+    DEVICE_MANIFEST_SCAN_OK = 0,
+    DEVICE_MANIFEST_SCAN_INVALID_INPUT,
+    DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR,
+    DEVICE_MANIFEST_SCAN_WAV_UNREADABLE,
+    DEVICE_MANIFEST_SCAN_INDEX_CONFLICT,
+    DEVICE_MANIFEST_SCAN_INDEX_WRITE_ERROR,
+    DEVICE_MANIFEST_SCAN_MISSING_WAV
+} device_manifest_scan_error_t;
+
+// Caller must inspect only after device_manifest_sync_wav_dir returns.
+// The recorder writer is the sole owner of this boot-time scan state.
+device_manifest_scan_error_t device_manifest_last_scan_error(void);
+// Number of canonical WAVs validated and matched to entries on last
+// successful scan; already-indexed = indexed - out_added.
+uint32_t device_manifest_last_scan_indexed(void);
+const char *device_manifest_scan_error_name(device_manifest_scan_error_t error);
 
 // Scan `recordings_dir` (top level plus one-level `YYYY-MM-DD/`
 // subdirectories, mirroring the recovery scan) for finalized `.wav`
@@ -143,10 +182,15 @@ bool device_manifest_recover_tmp(const char *manifest_path,
 // recordingId from the filename, startedAt from the date directory +
 // `HHMMSS` prefix (UTC), duration from the file size, and hash from an
 // incremental file read. Files whose names cannot yield an id, or whose
-// hash fails, are skipped without failing the scan (counted in
-// `out_skipped`). `out_added`/`out_skipped` may be NULL. Returns false
-// only on fatal input errors or when the manifest cannot be read or
-// written (nothing is deleted in any path).
+// hash fails are excluded only when the name cannot identify a canonical
+// UUID WAV. A canonical UUID WAV whose hash/index upsert fails returns
+// false (INDEX_INCOMPLETE); it is never silently skipped as healthy.
+// Scan must also validate the reverse direction: every durable manifest
+// entry must correspond to one validated canonical WAV; MISSING_WAV
+// forbids healthy recording/USB publication. out_added is actual new
+// inserts, out_skipped is excluded names, and the successful indexed
+// count includes already-indexed files. Either pointer may be NULL.
+// No WAV is deleted.
 bool device_manifest_sync_wav_dir(const char *recordings_dir,
                                   const char *manifest_path,
                                   const char *tmp_path, const char *device_id,
