@@ -944,10 +944,12 @@ static void recorder_writer_task(void *arg) {
                 vTaskDelete(NULL);
                 return;
             }
+            uint32_t indexed = device_manifest_last_scan_indexed();
             ESP_LOGI(TAG,
-                     "stage: manifest, result: ok, added: %" PRIu32
-                     ", skipped: %" PRIu32,
-                     added, skipped);
+                     "stage: manifest, result: ok, indexed: %" PRIu32
+                     ", already_indexed: %" PRIu32 ", added: %" PRIu32
+                     ", excluded: %" PRIu32,
+                     indexed, indexed - added, added, skipped);
         } else {
             ESP_LOGE(TAG,
                      "stage: manifest, result: error, reason: manifest time");
