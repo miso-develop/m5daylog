@@ -131,6 +131,22 @@ device_manifest_result_t device_manifest_upsert_file(
 bool device_manifest_recover_tmp(const char *manifest_path,
                                  const char *tmp_path, const char *device_id);
 
+// Device #117: this is a deliberately smaller *runtime-admitted* maximum
+// than RECORDER_MANIFEST_MAX_BYTES (the 128 KiB on-disk parser ceiling).
+// ESP32-S3FN8 has no external PSRAM; 32 KiB keeps three concurrent snapshots
+// within a bounded 96 KiB envelope. Two additional worst-case entries must
+// fit before recording starts. Exceeding this limit stops admission safely;
+// historical larger manifests remain readable but cannot be appended.
+// The exact installed target heap and supported segment count must still be
+// measured at the separate physical release gate.
+#define DEVICE_MANIFEST_ADMISSION_CEILING_BYTES 32768u
+#define DEVICE_MANIFEST_PEAK_SNAPSHOT_BUFFERS 3u
+#define DEVICE_MANIFEST_HEAP_MARGIN_BYTES 32768u
+#define DEVICE_MANIFEST_HEAP_ADMISSION_BYTES \
+    (DEVICE_MANIFEST_PEAK_SNAPSHOT_BUFFERS * \
+         DEVICE_MANIFEST_ADMISSION_CEILING_BYTES + \
+     DEVICE_MANIFEST_HEAP_MARGIN_BYTES)
+
 // Fail-closed metadata admission check before a fresh segment/rotation:
 // require a valid committed manifest and headroom for two worst-case
 // appended entries. This does not measure SD free clusters; the caller
