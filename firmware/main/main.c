@@ -255,15 +255,16 @@ static bool recorder_new_recording_id(char out[RECORDER_UUID_STR_LEN]) {
     return true;
 }
 
-static bool recorder_current_iso8601(char out[RECORDER_ISO8601_STR_LEN]) {
-    char date[RECORDER_DATE_STR_LEN];
-    char time6[RECORDER_TIME_STR_LEN];
+// Path time and startedAt must refer to the same RTC observation.
+static bool recorder_iso8601_from_parts(
+    const char date[RECORDER_DATE_STR_LEN],
+    const char time6[RECORDER_TIME_STR_LEN],
+    char out[RECORDER_ISO8601_STR_LEN]) {
     int n;
-    if (out == NULL) {
+    if (out == NULL || date == NULL || time6 == NULL) {
         return false;
     }
     memset(out, 0, RECORDER_ISO8601_STR_LEN);
-    recorder_current_date_time(date, time6);
     n = snprintf(out, RECORDER_ISO8601_STR_LEN,
                  "%.4s-%.2s-%.2sT%.2s:%.2s:%.2s+00:00",
                  date, date + 5, date + 8, time6, time6 + 2, time6 + 4);
@@ -273,6 +274,13 @@ static bool recorder_current_iso8601(char out[RECORDER_ISO8601_STR_LEN]) {
         return false;
     }
     return true;
+}
+
+static bool recorder_current_iso8601(char out[RECORDER_ISO8601_STR_LEN]) {
+    char date[RECORDER_DATE_STR_LEN];
+    char time6[RECORDER_TIME_STR_LEN];
+    recorder_current_date_time(date, time6);
+    return recorder_iso8601_from_parts(date, time6, out);
 }
 
 static void recorder_set_events_ready(bool ready) {
@@ -979,7 +987,7 @@ static void recorder_writer_task(void *arg) {
     memset(s_seg_rec_id, 0, sizeof(s_seg_rec_id));
     memset(s_seg_started, 0, sizeof(s_seg_started));
     if (!recorder_new_recording_id(rec_id) ||
-        !recorder_current_iso8601(s_seg_started)) {
+        !recorder_iso8601_from_parts(seg_date, cur_time, s_seg_started)) {
         ESP_LOGE(TAG, "stage: manifest, result: error, reason: manifest id");
         recorder_enter_error(RECORDER_REASON_MANIFEST);
         recorder_set_events_ready(false);
@@ -1133,9 +1141,14 @@ static void recorder_writer_task(void *arg) {
                     running = false;
                     break;
                 }
+                // Finalization and hashing of the preceding WAV can take
+                // seconds. Sample the new segment's path time only after
+                // those operations, and reuse it for its committed startedAt.
+                recorder_current_date_time(now_date, now_time);
                 memset(rec_id, 0, sizeof(rec_id));
                 if (!recorder_new_recording_id(rec_id) ||
-                    !recorder_current_iso8601(s_seg_started)) {
+                    !recorder_iso8601_from_parts(now_date, now_time,
+                                                 s_seg_started)) {
                     ESP_LOGE(TAG,
                              "stage: manifest, result: error, reason: manifest id");
                     recorder_enter_error(RECORDER_REASON_MANIFEST);
