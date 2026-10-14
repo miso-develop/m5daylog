@@ -1355,19 +1355,40 @@ device_manifest_result_t device_manifest_upsert_file(
     }
 }
 
+// ENOENT alone proves absence. An I/O error is not authorization to
+// disregard a previously committed M0 or promote another candidate.
+static bool manifest_artifact_exists(const char *path, bool *exists) {
+    struct stat st;
+    if (path == NULL || exists == NULL) {
+        return false;
+    }
+    if (stat(path, &st) == 0) {
+        *exists = true;
+        return true;
+    }
+    if (errno == ENOENT) {
+        *exists = false;
+        return true;
+    }
+    return false;
+}
+
 bool device_manifest_recover_tmp(const char *manifest_path,
                                  const char *tmp_path, const char *device_id) {
     char backup[RECORDER_MAX_PATH_LEN];
-    struct stat st;
     bool final_exists, tmp_exists, backup_exists;
     if (manifest_path == NULL || tmp_path == NULL ||
         !device_identity_is_valid_uuid(device_id) ||
         !manifest_backup_path(manifest_path, backup)) {
         return false;
     }
-    final_exists = stat(manifest_path, &st) == 0;
-    tmp_exists = stat(tmp_path, &st) == 0;
-    backup_exists = stat(backup, &st) == 0;
+    // Probe all three artifacts before any rename/remove. If even one
+    // probe is uncertain, preserve all bytes and fail closed.
+    if (!manifest_artifact_exists(manifest_path, &final_exists) ||
+        !manifest_artifact_exists(tmp_path, &tmp_exists) ||
+        !manifest_artifact_exists(backup, &backup_exists)) {
+        return false;
+    }
 
     if (backup_exists) {
         if (!manifest_file_valid(backup, device_id)) {
@@ -1480,11 +1501,6 @@ static bool manifest_recording_count(const char *path, const char *device_id,
 done:
     free(doc);
     return ok;
-}
-
-static bool path_is_dir_local(const char *path) {
-    struct stat st;
-    return path != NULL && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static bool audience_wav_name(const char *name) {
@@ -1710,6 +1726,7 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
     s_scan_error = DEVICE_MANIFEST_SCAN_OK;
     for (;;) {
         char child[RECORDER_MAX_PATH_LEN];
+        struct stat child_st;
         int needed;
         errno = 0;
         ent = readdir(dir);
@@ -1733,14 +1750,16 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
             s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
             return false;
         }
-        if (valid_date_dir(ent->d_name) && !path_is_dir_local(child)) {
-            // A canonical date subtree must be enumerable. A stat failure,
-            // reparse error or unexpected file type forbids healthy sync.
+        // Exactly one checked stat for this child: a transient EIO is
+        // never equivalent to a legacy/non-directory exclusion.
+        if (stat(child, &child_st) != 0 ||
+            (valid_date_dir(ent->d_name) &&
+             !S_ISDIR(child_st.st_mode))) {
             (void)closedir(dir);
             s_scan_error = DEVICE_MANIFEST_SCAN_DIRECTORY_ERROR;
             return false;
         }
-        if (path_is_dir_local(child)) {
+        if (S_ISDIR(child_st.st_mode)) {
             DIR *sub = NULL;
             struct dirent *subent = NULL;
             if (!valid_date_dir(ent->d_name)) {

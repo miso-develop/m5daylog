@@ -44,6 +44,7 @@ RENAME_EMULATOR = r"""
 #include <dirent.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 // Instrument allocations issued by the compiled production-C path.
 typedef union { max_align_t align; size_t bytes; } manifest_alloc_hdr;
@@ -76,10 +77,30 @@ void manifest_test_free(void *ptr) {
 static int calls = 0;
 static int flush_calls = 0, close_calls = 0, sync_calls = 0;
 static int remove_calls = 0, write_calls = 0, readdir_calls = 0;
+static int stat_match_calls = 0;
+int manifest_test_stat_match_calls(void) { return stat_match_calls; }
+
+// Intercept actual C stat() calls without rewriting the struct stat tag.
+// Fault only a selected exact path and nth match; libc calls stay intact.
+int __real_stat(const char *path, struct stat *st);
+int __wrap_stat(const char *path, struct stat *st) {
+    const char *match = getenv("M5_TEST_FAIL_STAT_MATCH");
+    if (match != NULL && strcmp(path, match) == 0) {
+        const char *at = getenv("M5_TEST_FAIL_STAT_AT");
+        stat_match_calls++;
+        if (at == NULL || atoi(at) == stat_match_calls) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    return __real_stat(path, st);
+}
+
 void manifest_test_reset(void) {
     calls = 0;
     flush_calls = close_calls = sync_calls = remove_calls = write_calls = 0;
     readdir_calls = 0;
+    stat_match_calls = 0;
 }
 int manifest_test_calls(void) { return calls; }
 
@@ -202,12 +223,15 @@ def native_manifest(tmp_path_factory):
     )
     dll = work / "manifest_117.so"
     subprocess.run(
-        [cc, "-shared", *objects, str(shim_obj), "-o", str(dll)],
+        [cc, "-shared", "-Wl,--wrap=stat", *objects, str(shim_obj),
+         "-o", str(dll)],
         check=True, capture_output=True, text=True,
     )
     lib = ctypes.CDLL(str(dll))
     lib.manifest_test_reset.argtypes = []
     lib.manifest_test_calls.restype = ctypes.c_int
+    lib.manifest_test_stat_match_calls.argtypes = []
+    lib.manifest_test_stat_match_calls.restype = ctypes.c_int
     lib.manifest_test_memory_limit.argtypes = [ctypes.c_size_t]
     lib.manifest_test_memory_peak.restype = ctypes.c_size_t
     lib.manifest_test_memory_live.restype = ctypes.c_size_t
@@ -868,3 +892,133 @@ def test_device_admission_checks_internal_heap_and_same_clock_snapshot():
         "recorder_current_date_time(now_date, now_time);"
     )
     assert "recorder_iso8601_from_parts(now_date, now_time," in rotation
+
+
+@pytest.mark.parametrize("artifact", [
+    "manifest.json", "manifest.tmp", "manifest.json.bak",
+])
+def test_artifact_stat_eio_is_not_interpreted_as_absence(
+    native_manifest, tmp_path, monkeypatch, artifact
+):
+    final, temp = _create(tmp_path, [_entry(1)])
+    backup = tmp_path / "manifest.json.bak"
+    backup.write_bytes(final.read_bytes())
+    temp.write_bytes(_manifest([_entry(1), _entry(2)]))
+    originals = {p: p.read_bytes() for p in (final, temp, backup)}
+
+    native_manifest.manifest_test_reset()
+    monkeypatch.setenv("M5_TEST_FAIL_STAT_MATCH",
+                       os.fspath(tmp_path / artifact))
+    monkeypatch.setenv("M5_TEST_FAIL_STAT_AT", "1")
+    assert not _recover(native_manifest, final, temp)
+    assert native_manifest.manifest_test_stat_match_calls() == 1
+    assert {p: p.read_bytes() for p in originals} == originals
+
+    monkeypatch.delenv("M5_TEST_FAIL_STAT_MATCH")
+    monkeypatch.delenv("M5_TEST_FAIL_STAT_AT")
+    native_manifest.manifest_test_reset()
+    assert _recover(native_manifest, final, temp)
+    assert final.read_bytes() == originals[final]
+    assert not backup.exists() and not temp.exists()
+
+
+def test_backup_stat_eio_cannot_hide_m0_regression(
+    native_manifest, tmp_path, monkeypatch
+):
+    # M0 proves that A+B were committed. A separately valid but regressed
+    # final A cannot supersede it even if the backup lookup hits EIO.
+    wav_data = _wav(b"\\0" * 64)
+    wav_hash = hashlib.sha256(wav_data).hexdigest()
+    rows = [_entry(i, wav_hash) for i in (1, 2)]
+    for row in rows:
+        row["sizeBytes"] = len(wav_data)
+        row["durationMs"] = 2
+    final, temp = _create(tmp_path, rows[:1])
+    backup = tmp_path / "manifest.json.bak"
+    backup.write_bytes(_manifest(rows))
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2026-10-13"
+    date_dir.mkdir(parents=True)
+    wav_a = date_dir / Path(rows[0]["filename"]).name
+    wav_a.write_bytes(wav_data)
+    final_before, backup_before = final.read_bytes(), backup.read_bytes()
+    native_manifest.manifest_test_reset()
+    monkeypatch.setenv("M5_TEST_FAIL_STAT_MATCH", os.fspath(backup))
+    monkeypatch.setenv("M5_TEST_FAIL_STAT_AT", "1")
+    assert not _recover(native_manifest, final, temp)
+    assert native_manifest.manifest_test_stat_match_calls() == 1
+    assert final.read_bytes() == final_before
+    assert backup.read_bytes() == backup_before
+    assert wav_a.read_bytes() == wav_data
+
+    monkeypatch.delenv("M5_TEST_FAIL_STAT_MATCH")
+    monkeypatch.delenv("M5_TEST_FAIL_STAT_AT")
+    native_manifest.manifest_test_reset()
+    assert not _recover(native_manifest, final, temp)  # proven regression
+    assert final.read_bytes() == final_before
+    assert backup.read_bytes() == backup_before
+    # The actual boot path must gate the WAV scan behind recovery.
+    main = (ROOT / "firmware/main/main.c").read_text(encoding="utf-8")
+    writer = main.split("static void recorder_writer_task(void *arg)", 1)[1]
+    assert writer.index("recorder_ensure_manifest_exists()") < writer.index(
+        "device_manifest_sync_wav_dir("
+    )
+
+
+@pytest.mark.parametrize("failure_occurrence", [1, 2])
+def test_date_subtree_stat_eio_vetoes_index_scan_on_replay(
+    native_manifest, tmp_path, monkeypatch, failure_occurrence
+):
+    final, temp = _create(tmp_path, [])
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2026-10-13"
+    date_dir.mkdir(parents=True)
+    wav_data = _wav(b"\\0" * 64)
+    wav_path = date_dir / Path(_entry(1)["filename"]).name
+    wav_path.write_bytes(wav_data)
+    native_manifest.manifest_test_reset()
+    monkeypatch.setenv("M5_TEST_FAIL_STAT_MATCH", os.fspath(date_dir))
+    monkeypatch.setenv("M5_TEST_FAIL_STAT_AT", str(failure_occurrence))
+    if failure_occurrence == 2:
+        # The first scan succeeds with exactly one stat of the date tree.
+        assert _scan(native_manifest, recordings, final, temp) == (True, 1, 0)
+        assert native_manifest.manifest_test_stat_match_calls() == 1
+        assert _recover(native_manifest, final, temp)
+    before = final.read_bytes()
+
+    ok, added, excluded = _scan(native_manifest, recordings, final, temp)
+    assert not ok and added == 0 and excluded == 0
+    assert native_manifest.device_manifest_last_scan_error() == 2
+    assert native_manifest.manifest_test_stat_match_calls() == failure_occurrence
+    assert final.read_bytes() == before
+    assert wav_path.read_bytes() == wav_data
+
+    monkeypatch.delenv("M5_TEST_FAIL_STAT_MATCH")
+    monkeypatch.delenv("M5_TEST_FAIL_STAT_AT")
+    native_manifest.manifest_test_reset()
+    assert _recover(native_manifest, final, temp)
+    assert _scan(native_manifest, recordings, final, temp)[0]
+    assert native_manifest.device_manifest_last_scan_indexed() == 1
+
+
+def test_noncanonical_child_stat_eio_is_not_silent_exclusion(
+    native_manifest, tmp_path, monkeypatch
+):
+    final, temp = _create(tmp_path, [])
+    recordings = tmp_path / "recordings"
+    recordings.mkdir()
+    legacy = recordings / "legacy"
+    legacy.mkdir()
+    native_manifest.manifest_test_reset()
+    monkeypatch.setenv("M5_TEST_FAIL_STAT_MATCH", os.fspath(legacy))
+    monkeypatch.setenv("M5_TEST_FAIL_STAT_AT", "1")
+    before = final.read_bytes()
+    assert not _scan(native_manifest, recordings, final, temp)[0]
+    assert native_manifest.device_manifest_last_scan_error() == 2
+    assert final.read_bytes() == before
+    assert legacy.exists()
+
+    monkeypatch.delenv("M5_TEST_FAIL_STAT_MATCH")
+    monkeypatch.delenv("M5_TEST_FAIL_STAT_AT")
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp) == (True, 0, 0)
