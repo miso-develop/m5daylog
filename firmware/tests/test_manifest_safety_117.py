@@ -235,6 +235,12 @@ def native_manifest(tmp_path_factory):
     lib.manifest_test_memory_limit.argtypes = [ctypes.c_size_t]
     lib.manifest_test_memory_peak.restype = ctypes.c_size_t
     lib.manifest_test_memory_live.restype = ctypes.c_size_t
+    lib.device_manifest_is_valid_iso8601_offset.argtypes = [ctypes.c_char_p]
+    lib.device_manifest_is_valid_iso8601_offset.restype = ctypes.c_bool
+    lib.device_manifest_format_iso8601_utc.argtypes = (
+        [ctypes.c_int] * 6 + [ctypes.c_void_p]
+    )
+    lib.device_manifest_format_iso8601_utc.restype = ctypes.c_bool
     lib.device_manifest_upsert_file.argtypes = [ctypes.c_char_p] * 5
     lib.device_manifest_upsert_file.restype = ctypes.c_int
     lib.device_manifest_recover_tmp.argtypes = [ctypes.c_char_p] * 3
@@ -1022,3 +1028,131 @@ def test_noncanonical_child_stat_eio_is_not_silent_exclusion(
     monkeypatch.delenv("M5_TEST_FAIL_STAT_AT")
     native_manifest.manifest_test_reset()
     assert _scan(native_manifest, recordings, final, temp) == (True, 0, 0)
+
+
+# REV117-I-08: The *compiled C* initial-commit validator and subsequent
+# UTC replay validator must agree on actual Gregorian dates and offsets.
+@pytest.mark.parametrize(
+    "stamp,expected",
+    [
+        (b"2024-02-29T12:00:00+00:00", True),
+        (b"2000-02-29T12:00:00+14:00", True),
+        (b"2024-02-29T12:00:00-14:00", True),
+        (b"2026-12-31T12:00:00+05:45", True),
+        (b"2026-02-31T12:00:00+00:00", False),
+        (b"2025-02-29T12:00:00+00:00", False),
+        (b"1900-02-29T12:00:00+00:00", False),
+        (b"2026-04-31T12:00:00+00:00", False),
+        (b"2026-13-01T12:00:00+00:00", False),
+        (b"2026-00-01T12:00:00+00:00", False),
+        (b"0000-01-01T12:00:00+00:00", False),
+        (b"2024-02-29T12:00:00+14:01", False),
+        (b"2024-02-29T12:00:00-14:01", False),
+        (b"2024-02-29T12:00:00+00:60", False),
+    ],
+)
+def test_calendar_and_offset_validation_matches_utc_replay_rules(
+    native_manifest, stamp, expected
+):
+    assert native_manifest.device_manifest_is_valid_iso8601_offset(
+        stamp
+    ) is expected
+
+
+@pytest.mark.parametrize(
+    "year,month,day,expected",
+    [
+        (2024, 2, 29, True),
+        (2025, 2, 29, False),
+        (2026, 2, 31, False),
+        (2000, 2, 29, True),
+        (1900, 2, 29, False),
+    ],
+)
+def test_generated_utc_timestamp_uses_same_calendar_rules(
+    native_manifest, year, month, day, expected
+):
+    buf = ctypes.create_string_buffer(26)
+    ok = native_manifest.device_manifest_format_iso8601_utc(
+        year, month, day, 12, 0, 0, ctypes.cast(buf, ctypes.c_void_p)
+    )
+    assert ok is expected
+    if expected:
+        assert buf.value == f"{year:04d}-{month:02d}-{day:02d}T12:00:00+00:00".encode()
+
+
+@pytest.mark.parametrize(
+    "bad_dir",
+    ["2026-02-31", "2025-02-29", "1900-02-29", "2026-04-31"],
+)
+def test_bad_calendar_date_tree_fails_loud_without_manifest_publish(
+    native_manifest, tmp_path, monkeypatch, bad_dir
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    final, temp = _create(tmp_path, [])
+    recordings = tmp_path / "recordings"
+    subtree = recordings / bad_dir
+    subtree.mkdir(parents=True)
+    wav_path = subtree / Path(_entry(1)["filename"]).name
+    raw = _wav(b"\\0" * 64)
+    wav_path.write_bytes(raw)
+    m0 = final.read_bytes()
+
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp) == (False, 0, 0)
+    assert native_manifest.device_manifest_last_scan_error() == 2  # DIRECTORY_ERROR
+    assert final.read_bytes() == m0
+    assert wav_path.read_bytes() == raw
+    assert not temp.exists()
+
+    # No intermittent successful first pass or new/healthy M1 on replay.
+    assert _recover(native_manifest, final, temp)
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp) == (False, 0, 0)
+    assert native_manifest.device_manifest_last_scan_error() == 2
+    assert final.read_bytes() == m0
+    assert wav_path.read_bytes() == raw
+
+
+def test_valid_feb29_canonical_wav_index_and_replay_converge(
+    native_manifest, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("M5_TEST_FAIL_RENAME", raising=False)
+    final, temp = _create(tmp_path, [])
+    recordings = tmp_path / "recordings"
+    date_dir = recordings / "2024-02-29"
+    date_dir.mkdir(parents=True)
+    raw = _wav(b"\\0" * 64)
+    wav = date_dir / Path(_entry(1)["filename"]).name
+    wav.write_bytes(raw)
+    native_manifest.manifest_test_reset()
+
+    assert _scan(native_manifest, recordings, final, temp) == (True, 1, 0)
+    assert native_manifest.device_manifest_last_scan_error() == 0
+    row, = json.loads(final.read_bytes())["recordings"]
+    assert row["startedAt"] == "2024-02-29T12:00:00+00:00"
+    assert row["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert row["filename"].startswith("recordings/2024-02-29/")
+    assert _recover(native_manifest, final, temp)
+    m1 = final.read_bytes()
+
+    native_manifest.manifest_test_reset()
+    assert _scan(native_manifest, recordings, final, temp) == (True, 0, 0)
+    assert native_manifest.device_manifest_last_scan_error() == 0
+    assert native_manifest.device_manifest_last_scan_indexed() == 1
+    assert final.read_bytes() == m1
+    assert wav.read_bytes() == raw
+
+
+def test_preexisting_impossible_started_at_manifest_is_not_rewritten(
+    native_manifest, tmp_path
+):
+    old = _entry(1)
+    old["startedAt"] = "2026-02-31T12:00:00+00:00"
+    final, temp = _create(tmp_path, [old])
+    m0 = final.read_bytes()
+    assert not _recover(native_manifest, final, temp)
+    assert final.read_bytes() == m0
+    assert not temp.exists()
+    assert _upsert(native_manifest, final, temp, _entry(2)) == 2
+    assert final.read_bytes() == m0
