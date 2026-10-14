@@ -69,6 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Canonical contracts directory (normally auto-detected).",
     )
+    release_parser = subparsers.add_parser(
+        "sync-release",
+        help="Durably sync, quiesce the exact Windows volume, then CDC release.",
+    )
+    release_parser.add_argument("device_root", help="Exact mounted drive root (e.g. E:\\\\).")
+    release_parser.add_argument("--cdc-port", required=True, help="Explicit CDC COM port.")
+    release_parser.add_argument("--library-root", default=None)
+    release_parser.add_argument("--db", default=None)
+    release_parser.add_argument("--data-dir", default=None)
+    release_parser.add_argument("--contracts-dir", default=None)
     return parser
 
 
@@ -129,6 +139,56 @@ def cmd_sync(
     return 2 if summary.conflicts else 0
 
 
+
+def cmd_sync_release(
+    device_root: str,
+    cdc_port: str,
+    library_root: str | None,
+    db_arg: str | None,
+    data_dir_arg: str | None,
+    contracts_dir: str | None,
+) -> int:
+    # This is opt-in, Windows-only and never falls back to shell/PnP eject.
+    if sys.platform != "win32":
+        print("error: sync-release requires Windows", file=sys.stderr)
+        return 1
+
+    from .release import SyncReleaseCoordinator, UsbSessionIoGate
+    from .windows_release import NativeWin32DeviceApi, WindowsHostReleasePort
+
+    try:
+        db_path = resolve_db_path(explicit_db=db_arg, data_dir=data_dir_arg)
+        library = resolve_library_root(library_root)
+        port = WindowsHostReleasePort(
+            NativeWin32DeviceApi(), contracts_dir=contracts_dir
+        )
+        gate = UsbSessionIoGate()
+        outcome = SyncReleaseCoordinator(port).run(
+            mount_root=device_root,
+            cdc_port=cdc_port,
+            device_id=lambda: inspect_device(
+                device_root, contracts_dir=contracts_dir
+            )["deviceId"],
+            sync=lambda: sync_device(
+                device_root,
+                library_root=library,
+                db_path=db_path,
+                contracts_dir=contracts_dir,
+            ),
+            gate=gate,
+            # #52 ACK flush and required CDC mutations are separate integration
+            # hooks; this command does not silently generate ACKs or SET_TIME.
+        )
+    except Exception as exc:
+        print(f"error: sync-release failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    print(
+        f"release: status={outcome.status} reason={outcome.reason} "
+        f"attempt_id={outcome.attempt_id or '-'}"
+    )
+    return 0 if outcome.success else (2 if outcome.status == "SYNC_INTERRUPTED" else 3)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -139,6 +199,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sync":
         return cmd_sync(
             args.device_root,
+            args.library_root,
+            args.db,
+            args.data_dir,
+            args.contracts_dir,
+        )
+    if args.command == "sync-release":
+        return cmd_sync_release(
+            args.device_root,
+            args.cdc_port,
             args.library_root,
             args.db,
             args.data_dir,
