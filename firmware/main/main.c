@@ -12,6 +12,7 @@
 
 #include "esp_chip_info.h"
 #include "esp_flash.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_vfs_fat.h"
@@ -565,6 +566,17 @@ static bool recorder_can_admit_segment(void) {
                                          s_device_id)) {
         ESP_LOGE(TAG,
                  "stage: manifest, result: error, reason: METADATA_FULL");
+        return false;
+    }
+    // FAT EEXIST append peaks at M1 and two read-back snapshots. Require
+    // aggregate heap and a contiguous snapshot allocation before admitting
+    // new RAW. Memory usage can change: the actual append remains fail-closed.
+    if (heap_caps_get_free_size(MALLOC_CAP_8BIT) <
+            DEVICE_MANIFEST_HEAP_ADMISSION_BYTES ||
+        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) <
+            DEVICE_MANIFEST_ADMISSION_CEILING_BYTES + 1u) {
+        ESP_LOGE(TAG,
+                 "stage: manifest, result: error, reason: METADATA_HEAP");
         return false;
     }
     if (esp_vfs_fat_info(RECORDER_SD_MOUNT_POINT, &total_bytes,
