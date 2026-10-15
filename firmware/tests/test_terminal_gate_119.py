@@ -200,7 +200,6 @@ def terminal_native(tmp_path_factory):
         cc, "-std=c11", "-O0", "-Wall", "-Wextra", "-Werror",
         "-I", str(INC),
         str(COMP / "pcm_pipeline.c"),
-        str(COMP / "recorder_terminal_gate.c"),
         str(COMP / "sd_pcm_sink.c"),
         str(COMP / "wav_part.c"),
         str(COMP / "wav_rotation.c"),
