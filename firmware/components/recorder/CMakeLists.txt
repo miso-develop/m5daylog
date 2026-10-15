@@ -3,6 +3,7 @@
 idf_component_register(
     SRCS
         "pcm_pipeline.c"
+        "recorder_terminal_gate.c"
         "wav_part.c"
         "wav_rotation.c"
         "wav_recovery.c"
