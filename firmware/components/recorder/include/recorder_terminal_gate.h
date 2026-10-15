@@ -15,8 +15,15 @@ typedef struct {
     bool capture_started;   // mic init succeeded; fresh RECORDING_READY
     bool capture_done;      // producer/I2S teardown completed
     bool writer_io_ok;      // sticky false after ANY earlier write/flush error
-    bool lifecycle_healthy; // no ERROR / invalid storage ownership
+    bool lifecycle_healthy; // no ERROR before FINALIZED publication
+    bool app_storage_owned; // explicit APP-owned SD/VFS, never USB/PC-owned
 } recorder_terminal_gate_t;
+
+// Salvage staged PCM into unindexed .part after a non-storage capture fault.
+// An uncertain SD write/flush or missing APP storage authority forbids even
+// salvage; the caller records the unpersisted staged bytes and fails loud.
+bool recorder_terminal_may_drain(const recorder_terminal_gate_t *gate,
+                                 const pcm_pipeline_t *pipeline);
 
 // Authorize healthy WAV+manifest publication. Valid genuinely empty sessions
 // are allowed only when capture actually started; a header alone proves none
