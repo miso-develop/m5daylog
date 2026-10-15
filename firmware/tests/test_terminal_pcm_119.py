@@ -159,3 +159,20 @@ def test_no_unapproved_usb_release_or_wav_source_rewrite():
     assert "recorder_request_usb_stop()" in (
         ROOT / "firmware/main/task49_runtime.c"
     ).read_text(encoding="utf-8")
+
+
+
+def test_inflight_i2s_read_is_not_discarded_on_usb_stop():
+    main = MAIN.read_text(encoding="utf-8")
+    capture = main[
+        main.index("static void recorder_capture_task(void *arg) {"):
+        main.index("static void recorder_log_diagnostics(void)")
+    ]
+    stop_branch = capture[
+        capture.index("if (recorder_stop_requested()) {"):
+        capture.index("// `if (got > 0)` is the producer gate")
+    ]
+    assert "pcm_pipeline_produce" in stop_branch
+    assert stop_branch.index("pcm_pipeline_produce") < stop_branch.index("break;")
+    assert "RECORDER_REASON_BUFFER_OVERFLOW" in stop_branch
+    assert "RECORDER_REASON_DMA_OVERRUN" in stop_branch
