@@ -41,6 +41,12 @@ def production_fragments():
     stop_start = capture.index("        if (recorder_stop_requested()) {", read_start)
     stop_stmt = c_block(capture, "        if (recorder_stop_requested()) {", read_start)
     capture_fragment = capture[read_start:stop_start] + stop_stmt
+    teardown_start = capture.index("    // Quiescent teardown:")
+    teardown_end = capture.index("\n}\n\nstatic void recorder_log_diagnostics", teardown_start)
+    teardown = capture[teardown_start:teardown_end]
+    assert "pdm_capture_stop_and_drain_final(capture, &snap)" in teardown
+    assert "pdm_capture_deinit(capture)" in teardown
+    assert "vTaskDelete(NULL)" in teardown
     mic_init = c_block(capture, "    if (pdm_capture_init(&cfg, &capture) != ESP_OK) {")
 
     writer = main[main.index("static void recorder_writer_task(void *arg) {"):]
@@ -66,11 +72,12 @@ def production_fragments():
     assert "recorder_request_usb_stop()" in usb
     assert "REC_TASK_DONE_MASK" in usb
     assert "REC_BIT_CAPTURE_DONE" in delete
-    return capture_fragment, mic_init, live_fragment, terminal_fragment, delete, usb
+    return capture_fragment, teardown, mic_init, live_fragment, terminal_fragment, delete, usb
 
 
 HARNESS = r"""
 #include <inttypes.h>
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -139,6 +146,12 @@ static const char *actor = "";
 static size_t next_read_len = 0, source_offset = 0;
 static int next_read_err = ESP_OK;
 static pdm_overflow_snapshot_t next_overflow = {0, 0};
+static jmp_buf deinit_boundary;
+static bool stop_io_error = false, final_dma_overflow = false;
+static bool pause_during_deinit = false, deinit_pending = false;
+static int deinit_failures = 0;
+static unsigned stop_calls = 0, deinit_calls = 0;
+static unsigned pre_done_delays = 0, coordinator_calls = 0;
 
 static void log_unused(const char *tag, const char *fmt, ...) {
     (void)tag; (void)fmt;
@@ -221,6 +234,29 @@ static int pdm_capture_read(pdm_capture_t handle, void *dst, size_t size,
 static void pdm_capture_drain_overflow(pdm_capture_t handle, pdm_overflow_snapshot_t *out) {
     (void)handle; *out = next_overflow;
 }
+static esp_err_t pdm_capture_stop_and_drain_final(pdm_capture_t handle,
+                                                  pdm_overflow_snapshot_t *out) {
+    (void)handle;
+    stop_calls++;
+    memset(out, 0, sizeof(*out));
+    if (final_dma_overflow) { out->events = 1; out->drop_bytes = 4096; }
+    return stop_io_error ? ESP_FAIL : ESP_OK;
+}
+static esp_err_t pdm_capture_deinit(pdm_capture_t handle) {
+    (void)handle; deinit_calls++;
+    if (deinit_failures > 0) { deinit_failures--; return ESP_FAIL; }
+    return ESP_OK;
+}
+static void vTaskDelay(unsigned ticks) {
+    (void)ticks;
+    if ((events & REC_BIT_CAPTURE_DONE) == 0) pre_done_delays++;
+    // Deterministically pause inside the *production* teardown retry loop.
+    // Unlike forcing the done bit, this models an uncompleted capture task.
+    if (pause_during_deinit) {
+        deinit_pending = true;
+        longjmp(deinit_boundary, 1);
+    }
+}
 static bool injected_write(sd_pcm_sink_t *sink, const uint8_t *data,
                            size_t len, uint32_t *latency) {
     if (fail_terminal_write || fail_live_write) {
@@ -237,6 +273,7 @@ static bool injected_flush(sd_pcm_sink_t *sink) {
     return sd_pcm_sink_flush(sink);
 }
 
+static void compiled_capture_init(void);
 static void compiled_capture_step(void);
 static void compiled_writer_terminal(void);
 static void recorder_task49_delete(TaskHandle_t task);
@@ -245,13 +282,16 @@ static EventBits_t xEventGroupWaitBits(void *group, EventBits_t mask,
     (void)group; (void)clear; (void)all; (void)timeout;
     if (mask == REC_TASK_DONE_MASK && !scheduled) {
         scheduled = true;
-        if (!mic_init_failed) {
-            actor = "rec_capture";
-            compiled_capture_step();
-            recorder_task49_delete(NULL);
-        } else {
-            actor = "rec_capture";
-            recorder_task49_delete(NULL);
+        actor = "rec_capture";
+        if (setjmp(deinit_boundary) == 0) {
+            if (mic_init_failed) compiled_capture_init();
+            else compiled_capture_step();
+        }
+        // A pending I2S deinit does not execute production vTaskDelete:
+        // CAPTURE_DONE, writer finalization and USB publication stay absent.
+        if (deinit_pending) {
+            actor = "";
+            return events & mask;
         }
         if (deny_ownership) released = true;
         actor = "rec_writer";
@@ -279,6 +319,7 @@ static void compiled_capture_step(void) {
     do {
 __CAPTURE__
     } while (0);
+__TEARDOWN__
 }
 static void compiled_live_writer_io(void) {
     const uint8_t *full = NULL;
@@ -294,7 +335,8 @@ static void compiled_writer_terminal(void) {
 __TERMINAL__
 }
 static void compiled_usb_attach(void) {
-    // Invokes the exact production coordinator body (not a hand-written model).
+    // Exercise even the early ERROR rejection branches, not a skipped call.
+    coordinator_calls++;
 __USB_BODY__
 }
 #undef sd_pcm_sink_flush
@@ -344,6 +386,15 @@ int main(int argc, char **argv) {
         next_read_len = 4096;
     } else if (!strcmp(scenario, "i2s_failure")) {
         next_read_err = ESP_FAIL;
+    } else if (!strcmp(scenario, "i2s_stop_failure")) {
+        next_read_len = 2048; stop_io_error = true;
+    } else if (!strcmp(scenario, "i2s_final_dma")) {
+        next_read_len = 2048; final_dma_overflow = true;
+    } else if (!strcmp(scenario, "i2s_deinit_retry")) {
+        next_read_len = 2048; deinit_failures = 1;
+    } else if (!strcmp(scenario, "i2s_deinit_pending")) {
+        next_read_len = 2048; deinit_failures = 1;
+        pause_during_deinit = true;
     } else if (!strcmp(scenario, "ownership_lost")) {
         next_read_len = 2048; deny_ownership = true;
     } else if (!strcmp(scenario, "terminal_write_failure")) {
@@ -360,26 +411,24 @@ int main(int argc, char **argv) {
         else { since_flush = RECORDER_FLUSH_EVERY_CHUNKS - 1; fail_live_flush = true; }
         actor = "rec_writer";
         compiled_live_writer_io();
-        actor = "rec_capture"; recorder_task49_delete(NULL);
+        actor = "rec_capture"; compiled_capture_step();
         actor = "rec_writer"; compiled_writer_terminal();
     } else {
         return 17;
     }
 
-    if (strcmp(scenario, "mic_init_failure") &&
-        strcmp(scenario, "live_write_failure") &&
-        strcmp(scenario, "live_flush_failure")) {
-        actor = "";
-        compiled_usb_attach();
-    }
+    actor = "";
+    compiled_usb_attach();
 
     printf("manifest=%u usb=%u captured=%" PRIu32 " dropped=%" PRIu32
            " dma=%" PRIu32 " sd=%" PRIu32 " errors=%u"
-           " done_capture=%u done_writer=%u pcm=%" PRIu32 "\n",
+           " done_capture=%u done_writer=%u pcm=%" PRIu32
+           " stop_calls=%u deinit_calls=%u pre_done_delay=%u coordinator=%u\n",
            manifest_writes, usb_published, s_pipeline.counters.samples_captured,
            s_pipeline.counters.buffer_drop_bytes, s_pipeline.counters.dma_drop_bytes,
            s_pipeline.counters.sd_write_errors, errors,
-           capture_delete, writer_delete, s_sink.wav.pcm_bytes);
+           capture_delete, writer_delete, s_sink.wav.pcm_bytes,
+           stop_calls, deinit_calls, pre_done_delays, coordinator_calls);
     return 0;
 }
 """
@@ -389,11 +438,12 @@ int main(int argc, char **argv) {
 def coordinator_native(tmp_path_factory):
     cc = shutil.which("cc") or shutil.which("gcc")
     assert cc, "No host C compiler: production runtime test must not skip"
-    capture, mic_init, live, terminal, delete, usb = production_fragments()
+    capture, teardown, mic_init, live, terminal, delete, usb = production_fragments()
     # All pieces below are copied directly from the actual revision under
     # test. If the production control flow changes, its exact C changes here.
     usb_body = usb[usb.index("{") + 1:usb.rindex("}")]
     harness = (HARNESS.replace("__CAPTURE__", capture)
+                     .replace("__TEARDOWN__", teardown)
                      .replace("__MIC_INIT__", mic_init)
                      .replace("__LIVE__", live)
                      .replace("__TERMINAL__", terminal)
@@ -434,6 +484,8 @@ def test_production_usb_stop_capture_writer_finalization(
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "manifest=1 usb=1" in result.stdout, result.stdout
     assert "done_capture=1 done_writer=1" in result.stdout, result.stdout
+    assert "stop_calls=1 deinit_calls=1" in result.stdout, result.stdout
+    assert "coordinator=1" in result.stdout, result.stdout
     assert f"pcm={expected_bytes}" in result.stdout
     assert not part.exists()
     with wave.open(str(tmp_path / "session.wav"), "rb") as wav:
@@ -448,7 +500,9 @@ def test_production_usb_stop_capture_writer_finalization(
 
 @pytest.mark.parametrize("scenario", [
     "mic_init_failure", "dma_overflow", "buffer_overflow",
-    "i2s_failure", "ownership_lost", "terminal_write_failure",
+    "i2s_failure", "i2s_stop_failure", "i2s_final_dma",
+    "i2s_deinit_retry", "i2s_deinit_pending",
+    "ownership_lost", "terminal_write_failure",
     "live_write_failure", "live_flush_failure",
 ])
 def test_production_usb_stop_errors_never_publish(
@@ -461,7 +515,19 @@ def test_production_usb_stop_errors_never_publish(
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "manifest=0 usb=0" in result.stdout, result.stdout
-    assert "done_writer=1" in result.stdout, result.stdout
+    assert "coordinator=1" in result.stdout, result.stdout
+    if scenario == "i2s_deinit_pending":
+        assert "done_capture=0 done_writer=0" in result.stdout, result.stdout
+        assert "stop_calls=1 deinit_calls=1 pre_done_delay=1" in result.stdout
+    else:
+        assert "done_writer=1" in result.stdout, result.stdout
+    if scenario == "i2s_deinit_retry":
+        assert "stop_calls=1 deinit_calls=2 pre_done_delay=1" in result.stdout
+        assert "errors=" in result.stdout
+    if scenario == "i2s_stop_failure":
+        assert "stop_calls=1 deinit_calls=1" in result.stdout
+    if scenario == "i2s_final_dma":
+        assert "dma=4096" in result.stdout
     assert part.exists()
     assert not (tmp_path / "session.wav").exists()
     # Faults that have staged PCM remain physically salvageable as .part,
