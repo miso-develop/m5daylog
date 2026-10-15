@@ -41,6 +41,7 @@ def production_fragments():
     stop_start = capture.index("        if (recorder_stop_requested()) {", read_start)
     stop_stmt = c_block(capture, "        if (recorder_stop_requested()) {", read_start)
     capture_fragment = capture[read_start:stop_start] + stop_stmt
+    mic_init = c_block(capture, "    if (pdm_capture_init(&cfg, &capture) != ESP_OK) {")
 
     writer = main[main.index("static void recorder_writer_task(void *arg) {"):]
     live_start = writer.index("            if (!sd_pcm_sink_write_chunk(&s_sink, full, full_len")
@@ -65,7 +66,7 @@ def production_fragments():
     assert "recorder_request_usb_stop()" in usb
     assert "REC_TASK_DONE_MASK" in usb
     assert "REC_BIT_CAPTURE_DONE" in delete
-    return capture_fragment, live_fragment, terminal_fragment, delete, usb
+    return capture_fragment, mic_init, live_fragment, terminal_fragment, delete, usb
 
 
 HARNESS = r"""
@@ -103,11 +104,13 @@ HARNESS = r"""
 #define RECORDER_REASON_FINALIZE 7
 #define RECORDER_REASON_MANIFEST 8
 #define RECORDER_REASON_USB 9
+#define RECORDER_REASON_MIC_INIT 10
 #define DEVICE_MANIFEST_STATE_FINALIZED "FINALIZED"
 
 typedef uint32_t EventBits_t;
 typedef void *TaskHandle_t;
 typedef void *pdm_capture_t;
+typedef int pdm_capture_config_t;
 typedef int esp_err_t;
 typedef enum { RECORDER_STATE_RECORDING = 1, RECORDER_STATE_USB_PREPARE = 2,
                RECORDER_STATE_ERROR = 3, RECORDER_STATE_LOW_BATTERY_STOP = 4 } recorder_state_t;
@@ -204,6 +207,9 @@ static void vTaskDelete(TaskHandle_t task) {
     if (!strcmp(actor, "rec_capture")) capture_delete++;
     if (!strcmp(actor, "rec_writer")) writer_delete++;
 }
+static int pdm_capture_init(const pdm_capture_config_t *cfg, pdm_capture_t *handle) {
+    (void)cfg; (void)handle; return mic_init_failed ? ESP_FAIL : ESP_OK;
+}
 static int pdm_capture_read(pdm_capture_t handle, void *dst, size_t size,
                             size_t *got) {
     (void)handle;
@@ -263,6 +269,11 @@ __DELETE__
 #define sd_pcm_sink_write_chunk injected_write
 #define sd_pcm_sink_flush injected_flush
 
+static void compiled_capture_init(void) {
+    pdm_capture_config_t cfg = 0;
+    pdm_capture_t capture = NULL;
+__MIC_INIT__
+}
 static void compiled_capture_step(void) {
     pdm_capture_t capture = (void *)1;
     do {
@@ -340,8 +351,7 @@ int main(int argc, char **argv) {
     } else if (!strcmp(scenario, "mic_init_failure")) {
         mic_init_failed = true;
         events &= ~REC_BIT_RECORDING_READY;
-        state = RECORDER_STATE_ERROR;
-        actor = "rec_capture"; recorder_task49_delete(NULL);
+        actor = "rec_capture"; compiled_capture_init();
         actor = "rec_writer"; compiled_writer_terminal();
     } else if (!strcmp(scenario, "live_write_failure") ||
                !strcmp(scenario, "live_flush_failure")) {
@@ -379,11 +389,12 @@ int main(int argc, char **argv) {
 def coordinator_native(tmp_path_factory):
     cc = shutil.which("cc") or shutil.which("gcc")
     assert cc, "No host C compiler: production runtime test must not skip"
-    capture, live, terminal, delete, usb = production_fragments()
+    capture, mic_init, live, terminal, delete, usb = production_fragments()
     # All pieces below are copied directly from the actual revision under
     # test. If the production control flow changes, its exact C changes here.
     usb_body = usb[usb.index("{") + 1:usb.rindex("}")]
     harness = (HARNESS.replace("__CAPTURE__", capture)
+                     .replace("__MIC_INIT__", mic_init)
                      .replace("__LIVE__", live)
                      .replace("__TERMINAL__", terminal)
                      .replace("__DELETE__", delete)
