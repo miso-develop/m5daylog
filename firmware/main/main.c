@@ -716,6 +716,9 @@ static void recorder_capture_task(void *arg) {
         if (recorder_stop_requested()) {
             bool timeout = (err == ESP_ERR_TIMEOUT);
             bool short_read = (err == ESP_OK && got < sizeof(s_dma_scratch));
+            // This I2S read began before STOP. A valid returned prefix is
+            // still capture data, not a silent discard at the USB boundary.
+            // The terminal writer joins this task before sealing its tail.
             if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
                 if ((timeout || short_read) && !snap_pending) {
                     pcm_pipeline_note_read_stall(&s_pipeline);
@@ -723,11 +726,26 @@ static void recorder_capture_task(void *arg) {
                 if (snap_pending) {
                     pcm_pipeline_note_driver_overflow(
                         &s_pipeline, snap.events, snap.drop_bytes);
+                } else if (got > 0) {
+                    size_t dropped = pcm_pipeline_produce(
+                        &s_pipeline, s_dma_scratch, got);
+                    if (dropped != 0) {
+                        buffer_loss = true;
+                    }
                 }
+                full = pcm_pipeline_has_full(&s_pipeline);
                 xSemaphoreGive(s_rec_lock);
+            }
+            if (full) {
+                xEventGroupSetBits(s_rec_events, REC_BIT_SLOT_FULL);
             }
             if (snap_pending) {
                 recorder_enter_error(RECORDER_REASON_DMA_OVERRUN);
+            }
+            if (buffer_loss) {
+                ESP_LOGE(TAG,
+                         "stage: record, result: error, reason: stop buffer loss");
+                recorder_enter_error(RECORDER_REASON_BUFFER_OVERFLOW);
             }
             break;
         }
