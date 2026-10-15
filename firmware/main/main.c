@@ -27,6 +27,7 @@
 #include "i2s_pdm_capture.h"
 #include "pcm_pipeline.h"
 #include "recorder_config.h"
+#include "recorder_terminal_gate.h"
 #include "recorder_power.h"
 #include "recorder_state.h"
 #include "recorder_status_led.h"
@@ -887,6 +888,7 @@ static void recorder_writer_task(void *arg) {
     uint32_t seg_bytes = 0;
     TickType_t seg_start_tick = 0;
     bool terminal_drain_ok = true;
+    bool writer_io_ok = true;
 
     (void)arg;
     if (sd_mount_recordings() != ESP_OK) {
@@ -1077,6 +1079,7 @@ static void recorder_writer_task(void *arg) {
             }
             if (!sd_pcm_sink_write_chunk(&s_sink, full, full_len,
                                          &latency_us)) {
+                writer_io_ok = false;  // sticky after any uncertain SD write
                 ESP_LOGE(TAG,
                          "stage: record, result: error, reason: sd write");
                 if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
@@ -1097,6 +1100,7 @@ static void recorder_writer_task(void *arg) {
             if (since_flush >= RECORDER_FLUSH_EVERY_CHUNKS) {
                 since_flush = 0;
                 if (!sd_pcm_sink_flush(&s_sink)) {
+                    writer_io_ok = false;  // failed checkpoint is permanent
                     ESP_LOGE(TAG,
                              "stage: record, result: error, reason: part flush");
                     if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
@@ -1234,8 +1238,16 @@ static void recorder_writer_task(void *arg) {
         EventBits_t capture_done = xEventGroupWaitBits(
             s_rec_events, REC_BIT_CAPTURE_DONE, pdFALSE, pdTRUE,
             portMAX_DELAY);
-        if ((capture_done & REC_BIT_CAPTURE_DONE) == 0) {
-            recorder_enter_error(RECORDER_REASON_INTERNAL);
+        EventBits_t ready = xEventGroupGetBits(s_rec_events);
+        recorder_terminal_gate_t gate = {
+            .capture_started = (ready & REC_BIT_RECORDING_READY) != 0,
+            .capture_done = (capture_done & REC_BIT_CAPTURE_DONE) != 0,
+            .writer_io_ok = writer_io_ok,
+            .lifecycle_healthy = recorder_current_state() != RECORDER_STATE_ERROR,
+        };
+        // MIC_INIT / DMA / SD faults must never become healthy zero-frame
+        // recordings. A header alone is not evidence of capture startup.
+        if (!recorder_terminal_can_finalize(&gate, &s_pipeline)) {
             terminal_drain_ok = false;
         } else if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) != pdTRUE) {
             recorder_enter_error(RECORDER_REASON_INTERNAL);
@@ -1283,7 +1295,22 @@ static void recorder_writer_task(void *arg) {
             }
         }
     }
+    // A terminal I/O failure might have physically persisted a prefix.
+    // Never retry that uncertain buffer or publish a healthy finalization.
+    if (terminal_drain_ok) {
+        const EventBits_t bits = xEventGroupGetBits(s_rec_events);
+        const recorder_terminal_gate_t gate = {
+            .capture_started = (bits & REC_BIT_RECORDING_READY) != 0,
+            .capture_done = (bits & REC_BIT_CAPTURE_DONE) != 0,
+            .writer_io_ok = writer_io_ok,
+            .lifecycle_healthy = recorder_current_state() != RECORDER_STATE_ERROR,
+        };
+        terminal_drain_ok = recorder_terminal_can_finalize(&gate, &s_pipeline);
+    }
     if (!terminal_drain_ok) {
+        if (recorder_current_state() != RECORDER_STATE_ERROR) {
+            recorder_enter_error(RECORDER_REASON_INTERNAL);
+        }
         // Leave the .part for recovery; never publish a healthy .wav or
         // manifest entry after an uncertain or failed terminal drain.
         (void)sd_pcm_sink_close(&s_sink);
