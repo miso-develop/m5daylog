@@ -131,6 +131,7 @@ static bool deny_ownership = false, mic_init_failed = false;
 static uint32_t since_flush = 0, seg_bytes = 0;
 static unsigned manifest_writes = 0, usb_published = 0, errors = 0;
 static unsigned capture_delete = 0, writer_delete = 0;
+static int s_last_battery_mv = 0;
 static const char *actor = "";
 static size_t next_read_len = 0, source_offset = 0;
 static int next_read_err = ESP_OK;
@@ -232,6 +233,7 @@ static bool injected_flush(sd_pcm_sink_t *sink) {
 
 static void compiled_capture_step(void);
 static void compiled_writer_terminal(void);
+static void recorder_task49_delete(TaskHandle_t task);
 static EventBits_t xEventGroupWaitBits(void *group, EventBits_t mask,
                                        int clear, int all, unsigned timeout) {
     (void)group; (void)clear; (void)all; (void)timeout;
