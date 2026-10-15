@@ -1244,10 +1244,14 @@ static void recorder_writer_task(void *arg) {
             .capture_done = (capture_done & REC_BIT_CAPTURE_DONE) != 0,
             .writer_io_ok = writer_io_ok,
             .lifecycle_healthy = recorder_current_state() != RECORDER_STATE_ERROR,
+            .app_storage_owned = sd_mount_is_mounted() &&
+                                 !sd_mount_device_fs_released(),
         };
-        // MIC_INIT / DMA / SD faults must never become healthy zero-frame
-        // recordings. A header alone is not evidence of capture startup.
-        if (!recorder_terminal_can_finalize(&gate, &s_pipeline)) {
+        // When APP still owns SD, preserve valid staged PCM even if the
+        // capture later reported DMA/I2S failure. An uncertain writer or
+        // ownership state forbids writes; healthy publication has a stricter
+        // independent gate after the drain.
+        if (!recorder_terminal_may_drain(&gate, &s_pipeline)) {
             terminal_drain_ok = false;
         } else if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) != pdTRUE) {
             recorder_enter_error(RECORDER_REASON_INTERNAL);
@@ -1310,6 +1314,19 @@ static void recorder_writer_task(void *arg) {
     if (!terminal_drain_ok) {
         if (recorder_current_state() != RECORDER_STATE_ERROR) {
             recorder_enter_error(RECORDER_REASON_INTERNAL);
+        }
+        // Capture admission is cumulative while a segment sink is current.
+        // SD close is allowed to leave .part metadata consistent, but failed
+        ///unpersisted staged bytes are explicitly reported, never silently
+        // attributed to a healthy WAV or replayed after an uncertain fwrite.
+        if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGE(TAG,
+                     "stage: record, result: terminal-abort, staged_pcm_bytes: %u,"
+                     " admitted_samples: %" PRIu32 ", sink_reported_pcm_bytes: %" PRIu32,
+                     (unsigned)(s_pipeline.fill[0] + s_pipeline.fill[1]),
+                     s_pipeline.counters.samples_captured,
+                     s_sink.wav.pcm_bytes);
+            xSemaphoreGive(s_rec_lock);
         }
         // Leave the .part for recovery; never publish a healthy .wav or
         // manifest entry after an uncertain or failed terminal drain.
