@@ -93,6 +93,7 @@ HARNESS = r"""
 #define pdFALSE 0
 #define pdTRUE 1
 #define portMAX_DELAY 0xffffffffu
+#define pdMS_TO_TICKS(ms) (ms)
 #define REC_BIT_SLOT_FULL (1u << 0)
 #define REC_BIT_STOP (1u << 1)
 #define REC_BIT_WRITER_READY (1u << 2)
