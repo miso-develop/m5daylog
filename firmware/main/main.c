@@ -110,6 +110,8 @@ static int s_last_battery_mv = 0;
 #define REC_BIT_STOP (1u << 1)
 #define REC_BIT_WRITER_READY (1u << 2)
 #define REC_BIT_RECORDING_READY (1u << 3)
+// Task #49's deletion wrapper announces capture quiescence after I2S teardown.
+#define REC_BIT_CAPTURE_DONE (1u << 5)
 
 // Flush the `.wav.part` header every N drained slots so the in-progress
 // file stays decodeable (about every 4s of audio at 32KB/s).
@@ -866,6 +868,7 @@ static void recorder_writer_task(void *arg) {
     char rec_id[RECORDER_UUID_STR_LEN];
     uint32_t seg_bytes = 0;
     TickType_t seg_start_tick = 0;
+    bool terminal_drain_ok = true;
 
     (void)arg;
     if (sd_mount_recordings() != ESP_OK) {
@@ -1206,6 +1209,73 @@ static void recorder_writer_task(void *arg) {
         }
     }
 
+    // The producer must complete I2S teardown before the terminal drain.
+    // Otherwise a STOP/USB attach can finalize a header-only WAV while
+    // already-captured PCM is still below the first 32KiB boundary.
+    {
+        EventBits_t capture_done = xEventGroupWaitBits(
+            s_rec_events, REC_BIT_CAPTURE_DONE, pdFALSE, pdTRUE,
+            portMAX_DELAY);
+        if ((capture_done & REC_BIT_CAPTURE_DONE) == 0) {
+            recorder_enter_error(RECORDER_REASON_INTERNAL);
+            terminal_drain_ok = false;
+        } else if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) != pdTRUE) {
+            recorder_enter_error(RECORDER_REASON_INTERNAL);
+            terminal_drain_ok = false;
+        } else {
+            size_t sealed = pcm_pipeline_seal_partial(&s_pipeline);
+            xSemaphoreGive(s_rec_lock);
+            ESP_LOGI(TAG, "stage: record, result: tail-sealed, pcm_bytes: %u",
+                     (unsigned)sealed);
+            // No concurrent producer after CAPTURE_DONE. Preserve FIFO and
+            // keep the slot occupied until its PCM has reached the sink.
+            for (;;) {
+                const uint8_t *pending = NULL;
+                size_t pending_len = 0;
+                uint32_t latency_us = 0;
+                if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) != pdTRUE) {
+                    recorder_enter_error(RECORDER_REASON_INTERNAL);
+                    terminal_drain_ok = false;
+                    break;
+                }
+                pending = pcm_pipeline_peek_full(&s_pipeline, &pending_len);
+                xSemaphoreGive(s_rec_lock);
+                if (pending == NULL) {
+                    break;
+                }
+                if (!sd_pcm_sink_write_chunk(&s_sink, pending, pending_len,
+                                             &latency_us)) {
+                    if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
+                        pcm_pipeline_note_sd_error(&s_pipeline);
+                        xSemaphoreGive(s_rec_lock);
+                    }
+                    recorder_enter_error(RECORDER_REASON_SD_WRITE);
+                    terminal_drain_ok = false;
+                    break;
+                }
+                if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) != pdTRUE) {
+                    recorder_enter_error(RECORDER_REASON_INTERNAL);
+                    terminal_drain_ok = false;
+                    break;
+                }
+                pcm_pipeline_note_sd_write(&s_pipeline, latency_us);
+                pcm_pipeline_release_full(&s_pipeline);
+                xSemaphoreGive(s_rec_lock);
+                seg_bytes += (uint32_t)pending_len;
+            }
+        }
+    }
+    if (!terminal_drain_ok) {
+        // Leave the .part for recovery; never publish a healthy .wav or
+        // manifest entry after an uncertain or failed terminal drain.
+        (void)sd_pcm_sink_close(&s_sink);
+        recorder_set_events_ready(false);
+        sd_mount_unmount();
+        recorder_log_writer_stack_hw("terminal drain failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
     if (!wav_rotation_finalize_once(&s_seg_state, &s_sink)) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: part close");
         if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
@@ -1305,6 +1375,8 @@ void app_main(void) {
                     ESP_LOGE(TAG,
                              "stage: record, result: error, reason: task spawn");
                     recorder_enter_error(RECORDER_REASON_INTERNAL);
+                    // A non-existent producer cannot signal CAPTURE_DONE.
+                    xEventGroupSetBits(s_rec_events, REC_BIT_CAPTURE_DONE);
                 } else if (xTaskCreate(recorder_battery_task, "rec_battery",
                                        3072, NULL, 3, NULL) != pdPASS) {
                     ESP_LOGE(TAG,
