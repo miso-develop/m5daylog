@@ -1308,6 +1308,8 @@ static void recorder_writer_task(void *arg) {
             .capture_done = (bits & REC_BIT_CAPTURE_DONE) != 0,
             .writer_io_ok = writer_io_ok,
             .lifecycle_healthy = recorder_current_state() != RECORDER_STATE_ERROR,
+            .app_storage_owned = sd_mount_is_mounted() &&
+                                 !sd_mount_device_fs_released(),
         };
         terminal_drain_ok = recorder_terminal_can_finalize(&gate, &s_pipeline);
     }
@@ -1317,7 +1319,7 @@ static void recorder_writer_task(void *arg) {
         }
         // Capture admission is cumulative while a segment sink is current.
         // SD close is allowed to leave .part metadata consistent, but failed
-        ///unpersisted staged bytes are explicitly reported, never silently
+        // Unpersisted staged bytes are explicitly reported, never silently
         // attributed to a healthy WAV or replayed after an uncertain fwrite.
         if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
             ESP_LOGE(TAG,
