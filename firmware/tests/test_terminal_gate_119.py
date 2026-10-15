@@ -57,7 +57,7 @@ static int drain(pcm_pipeline_t *p, sd_pcm_sink_t *sink, size_t *total) {
 int main(int argc, char **argv) {
     pcm_pipeline_t pipe;
     sd_pcm_sink_t sink;
-    recorder_terminal_gate_t gate = { true, true, true, true };
+    recorder_terminal_gate_t gate = { true, true, true, true, true };
     wav_rotation_state_t rotation;
     char wav_path[RECORDER_MAX_PATH_LEN];
     size_t part_len, expected = 0, written = 0;
@@ -117,6 +117,9 @@ int main(int argc, char **argv) {
                !strcmp(argv[2], "i2s_read_error") ||
                !strcmp(argv[2], "bad_usb_ownership")) {
         gate.lifecycle_healthy = false;
+        if (!strcmp(argv[2], "bad_usb_ownership")) {
+            gate.app_storage_owned = false;
+        }
         expected = 2048u;
         if (feed(&pipe, expected)) return 4;
     } else if (!strcmp(argv[2], "dma_overflow")) {
@@ -150,6 +153,7 @@ int main(int argc, char **argv) {
 
     expect_success = gate.capture_started && gate.capture_done &&
                      gate.writer_io_ok && gate.lifecycle_healthy &&
+                     gate.app_storage_owned &&
                      pipe.counters.buffer_overflow == 0 &&
                      pipe.counters.buffer_drop_bytes == 0 &&
                      pipe.counters.dma_overrun_events == 0 &&
@@ -174,8 +178,16 @@ int main(int argc, char **argv) {
             !wav_rotation_finalize_once(&rotation, &sink)) return 14;
         printf("published=1 pcm_bytes=%zu\n", written);
     } else {
-        // Error disposition: close the recoverable .part but DO NOT invoke
-        // wav_rotation_finalize_once or publish a healthy manifest entry.
+        // A capture fault alone need not discard already accepted PCM.
+        // The APP-owned .part may receive buffered samples even though
+        // healthy WAV/manifest publication is prohibited. Uncertain SD I/O
+        // or PC-owned storage, conversely, forbid even this salvage.
+        if (recorder_terminal_may_drain(&gate, &pipe)) {
+            (void)pcm_pipeline_seal_partial(&pipe);
+            rc = drain(&pipe, &sink, &written);
+            if (rc != 0) return rc;
+        }
+        if (recorder_terminal_can_finalize(&gate, &pipe)) return 17;
         if (!sd_pcm_sink_close(&sink)) return 15;
         FILE *fp = fopen(wav_path, "rb");
         if (fp != NULL) {
@@ -239,14 +251,21 @@ def test_healthy_capture_terminal_path(terminal_native, tmp_path, scenario, byte
     else:
         assert data == bytes(i % 251 for i in range(bytes_expected))
 
-@pytest.mark.parametrize("scenario", [
-    "mic_init_error", "usb_before_ready", "capture_not_done",
-    "i2s_teardown_error", "i2s_read_error", "bad_usb_ownership",
-    "dma_overflow", "software_overflow", "prior_sd_write_error",
-    "prior_flush_error", "terminal_sd_error",
+@pytest.mark.parametrize("scenario,staged_written,physical_part_pcm", [
+    ("mic_init_error", 0, 0),
+    ("usb_before_ready", 0, 0),
+    ("capture_not_done", 0, 0),
+    ("i2s_teardown_error", 2048, 2048),
+    ("i2s_read_error", 2048, 2048),
+    ("bad_usb_ownership", 0, 0),
+    ("dma_overflow", 0, 0),
+    ("software_overflow", 65536, 65536),
+    ("prior_sd_write_error", 0, 1024),
+    ("prior_flush_error", 0, 0),
+    ("terminal_sd_error", 0, 0),
 ])
 def test_faults_never_publish_healthy_wav(
-    terminal_native, tmp_path, scenario
+    terminal_native, tmp_path, scenario, staged_written, physical_part_pcm
 ):
     part = tmp_path / "capture.wav.part"
     wav_path = tmp_path / "capture.wav"
@@ -255,18 +274,25 @@ def test_faults_never_publish_healthy_wav(
         capture_output=True, text=True,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert result.stdout.strip() == "published=0 pcm_bytes=0"
+    assert result.stdout.strip() == f"published=0 pcm_bytes={staged_written}"
     assert not wav_path.exists(), scenario
     assert part.exists(), "original staged bytes must remain for recovery"
+    assert part.stat().st_size == 44 + physical_part_pcm
+    with wave.open(str(part), "rb") as partial:
+        assert partial.getnframes() == physical_part_pcm // 2
 
 def test_production_integration_has_sticky_failure_and_two_gate_checks():
     source = MAIN.read_text(encoding="utf-8")
     writer = source[source.index("static void recorder_writer_task(void *arg) {"):]
     assert "bool writer_io_ok = true" in writer
     assert writer.count("writer_io_ok = false") >= 2
-    assert writer.count("recorder_terminal_can_finalize(&gate, &s_pipeline)") == 2
-    assert writer.index("REC_BIT_CAPTURE_DONE") < writer.index("pcm_pipeline_seal_partial")
-    assert writer.index("pcm_pipeline_seal_partial") < writer.rindex("wav_rotation_finalize_once")
+    assert writer.count("recorder_terminal_may_drain(&gate, &s_pipeline)") == 1
+    assert writer.count("recorder_terminal_can_finalize(&gate, &s_pipeline)") == 1
+    assert writer.index("REC_BIT_CAPTURE_DONE") < writer.index("recorder_terminal_may_drain")
+    assert writer.index("recorder_terminal_may_drain") < writer.index("pcm_pipeline_seal_partial")
+    assert writer.index("pcm_pipeline_seal_partial") < writer.index("recorder_terminal_can_finalize")
+    assert writer.index("recorder_terminal_can_finalize") < writer.rindex("wav_rotation_finalize_once")
+    assert writer.count(".app_storage_owned =") == 2
     assert writer.index("if (!terminal_drain_ok)") < writer.rindex("wav_rotation_finalize_once")
     assert "REC_BIT_RECORDING_READY" in writer
     assert "RECORDER_STATE_ERROR" in writer
