@@ -41,6 +41,10 @@ def production_fragments():
     stop_start = capture.index("        if (recorder_stop_requested()) {", read_start)
     stop_stmt = c_block(capture, "        if (recorder_stop_requested()) {", read_start)
     capture_fragment = capture[read_start:stop_start] + stop_stmt
+    # Execute the real non-STOP capture loop repeatedly before USB attach.
+    # The existing coordinator test only executed a read with STOP already set.
+    running_end = capture.index("\n    }\n\n    // Quiescent teardown:", read_start)
+    running_fragment = capture[read_start:running_end]
     teardown_start = capture.index("    // Quiescent teardown:")
     teardown_end = capture.index("\n}\n\nstatic void recorder_log_diagnostics", teardown_start)
     teardown = capture[teardown_start:teardown_end]
@@ -63,6 +67,8 @@ def production_fragments():
     # The host harness refuses to silently revert to copy/pasted simulated
     # behavior if the real production entrypoints are refactored.
     assert "pdm_capture_read(capture" in capture_fragment
+    assert "pdm_capture_read(capture" in running_fragment
+    assert "if (recorder_stop_requested())" in running_fragment
     assert "pcm_pipeline_produce(" in stop_stmt
     assert "writer_io_ok = false" in live_fragment
     assert "sd_pcm_sink_flush(&s_sink)" in live_fragment
@@ -72,7 +78,7 @@ def production_fragments():
     assert "recorder_request_usb_stop()" in usb
     assert "REC_TASK_DONE_MASK" in usb
     assert "REC_BIT_CAPTURE_DONE" in delete
-    return capture_fragment, teardown, mic_init, live_fragment, terminal_fragment, delete, usb
+    return capture_fragment, running_fragment, teardown, mic_init, live_fragment, terminal_fragment, delete, usb
 
 
 HARNESS = r"""
@@ -276,6 +282,8 @@ static bool injected_flush(sd_pcm_sink_t *sink) {
 
 static void compiled_capture_init(void);
 static void compiled_capture_step(void);
+static void compiled_capture_running_step(void);
+static void compiled_live_writer_io(void);
 static void compiled_writer_terminal(void);
 static void recorder_task49_delete(TaskHandle_t task);
 static EventBits_t xEventGroupWaitBits(void *group, EventBits_t mask,
@@ -322,6 +330,12 @@ __CAPTURE__
     } while (0);
 __TEARDOWN__
 }
+static void compiled_capture_running_step(void) {
+    pdm_capture_t capture = (void *)1;
+    do {
+__RUNNING__
+    } while (0);
+}
 static void compiled_live_writer_io(void) {
     const uint8_t *full = NULL;
     size_t full_len = 0;
@@ -364,7 +378,30 @@ int main(int argc, char **argv) {
     events |= REC_BIT_RECORDING_READY;
     stopped = false;
 
-    if (!strcmp(scenario, "valid_zero")) {
+    if (!strcmp(scenario, "sustained_dwell_180") ||
+        !strcmp(scenario, "reconnect_640")) {
+        // Execute the real production non-STOP capture and live SD writer
+        // before the existing USB coordinator triggers STOP/teardown.
+        // 1406 * 4096 bytes = 179.968 s at 32,000 bytes/s.
+        // Short path: four live reads and fifth in-flight at USB STOP,
+        // precisely 20,480 bytes / 640 ms.
+        unsigned reads = !strcmp(scenario, "sustained_dwell_180") ? 1406u : 4u;
+        next_read_len = 4096;
+        for (unsigned i = 0; i < reads; i++) {
+            actor = "rec_capture";
+            compiled_capture_running_step();
+            if (state == RECORDER_STATE_ERROR || stopped) return 18;
+            actor = "rec_writer";
+            if (pcm_pipeline_has_full(&s_pipeline)) {
+                compiled_live_writer_io();
+                if (state == RECORDER_STATE_ERROR || stopped) return 19;
+            }
+        }
+        actor = "";
+        // A terminal read delivers no extra PCM in the sustained-dwell case.
+        // The short path admits the fifth buffer while STOP is in flight.
+        if (!strcmp(scenario, "sustained_dwell_180")) next_read_len = 0;
+    } else if (!strcmp(scenario, "valid_zero")) {
         next_read_len = 0;
     } else if (!strcmp(scenario, "valid_short")) {
         next_read_len = 2048;
@@ -439,11 +476,12 @@ int main(int argc, char **argv) {
 def coordinator_native(tmp_path_factory):
     cc = shutil.which("cc") or shutil.which("gcc")
     assert cc, "No host C compiler: production runtime test must not skip"
-    capture, teardown, mic_init, live, terminal, delete, usb = production_fragments()
+    capture, running, teardown, mic_init, live, terminal, delete, usb = production_fragments()
     # All pieces below are copied directly from the actual revision under
     # test. If the production control flow changes, its exact C changes here.
     usb_body = usb[usb.index("{") + 1:usb.rindex("}")]
     harness = (HARNESS.replace("__CAPTURE__", capture)
+                     .replace("__RUNNING__", running)
                      .replace("__TEARDOWN__", teardown)
                      .replace("__MIC_INIT__", mic_init)
                      .replace("__LIVE__", live)
@@ -497,6 +535,35 @@ def test_production_usb_stop_capture_writer_finalization(
         assert wav.readframes(wav.getnframes()) == bytes(
             x % 251 for x in range(expected_bytes)
         )
+
+
+@pytest.mark.parametrize("scenario,expected_bytes", [
+    ("sustained_dwell_180", 1406 * 4096),
+    ("reconnect_640", 5 * 4096),
+])
+def test_production_capture_dwell_vs_reconnect_short_path(
+    coordinator_native, tmp_path, scenario, expected_bytes
+):
+    """Software A/B counterfactual, not proof of the physical session."""
+    part = tmp_path / "session.wav.part"
+    result = subprocess.run(
+        [str(coordinator_native), str(part), scenario],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "manifest=1 usb=1" in result.stdout, result.stdout
+    assert "done_capture=1 done_writer=1" in result.stdout, result.stdout
+    assert "coordinator=1" in result.stdout, result.stdout
+    assert "errors=0" in result.stdout, result.stdout
+    assert f"pcm={expected_bytes}" in result.stdout, result.stdout
+    assert not part.exists()
+    wav_path = tmp_path / "session.wav"
+    assert wav_path.stat().st_size == expected_bytes + 44
+    with wave.open(str(wav_path), "rb") as wav:
+        assert wav.getnchannels() == 1
+        assert wav.getsampwidth() == 2
+        assert wav.getframerate() == 16000
+        assert wav.getnframes() == expected_bytes // 2
 
 
 @pytest.mark.parametrize("scenario", [
