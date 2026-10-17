@@ -1340,6 +1340,12 @@ static void recorder_writer_task(void *arg) {
         return;
     }
 
+    // Snapshot monotonic session-open time before hash/finalize overhead.
+    uint64_t elapsed_ms =
+        ((uint64_t)(xTaskGetTickCount() - seg_start_tick) * 1000u) /
+        configTICK_RATE_HZ;
+    uint32_t segment_open_elapsed_ms =
+        elapsed_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed_ms;
     if (!wav_rotation_finalize_once(&s_seg_state, &s_sink)) {
         ESP_LOGE(TAG, "stage: record, result: error, reason: part close");
         if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
@@ -1357,6 +1363,13 @@ static void recorder_writer_task(void *arg) {
                 xSemaphoreGive(s_rec_lock);
             }
             recorder_enter_error(RECORDER_REASON_MANIFEST);
+        } else if (recorder_current_state() == RECORDER_STATE_USB_PREPARE &&
+                   !recorder_state_append_usb_capture_accounting(
+                       RECORDER_EVENTS_PATH, s_seg_rec_id,
+                       segment_open_elapsed_ms, seg_bytes)) {
+            // Diagnostic append failure must not rewrite valid finalized WAV.
+            ESP_LOGW(TAG,
+                     "stage: diagnostics, result: append-failed, type: usb_capture_accounting");
         }
     }
     {

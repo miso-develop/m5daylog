@@ -209,3 +209,39 @@ bool recorder_state_append_event(const char *path,
     }
     return ok;
 }
+
+/* One metadata-only USB finalization event; never grants release authority. */
+bool recorder_state_append_usb_capture_accounting(
+    const char *path, const char *recording_id,
+    uint32_t segment_open_elapsed_ms, uint32_t pcm_bytes) {
+    char line[240];
+    size_t i;
+    int n;
+    FILE *f;
+    bool ok;
+    if (path == NULL || path[0] == '\0' || recording_id == NULL) {
+        return false;
+    }
+    for (i = 0; i < 36; ++i) {
+        char c = recording_id[i];
+        bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+        if (c == '\0' || (dash ? c != '-' :
+            !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F')))) {
+            return false;
+        }
+    }
+    if (recording_id[36] != '\0') return false;
+    n = snprintf(line, sizeof(line),
+                 "{\"event\":\"usb_capture_accounting\","
+                 "\"recordingId\":\"%s\","
+                 "\"segmentOpenElapsedMs\":%lu,\"pcmBytes\":%lu}\n",
+                 recording_id, (unsigned long)segment_open_elapsed_ms,
+                 (unsigned long)pcm_bytes);
+    if (n < 0 || (size_t)n >= sizeof(line)) return false;
+    f = fopen(path, "ab");
+    if (f == NULL) return false;
+    ok = fwrite(line, 1, (size_t)n, f) == (size_t)n && fflush(f) == 0;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}

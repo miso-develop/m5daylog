@@ -83,6 +83,12 @@ bool recorder_state_append_event(const char *path,
                                  recorder_reason_t reason,
                                  int battery_mv);
 
+/* Diagnostic only. Monotonic interval since the current segment was opened,
+ * NOT a substitute for measured PCM duration or proof of battery operation. */
+bool recorder_state_append_usb_capture_accounting(
+    const char *path, const char *recording_id,
+    uint32_t segment_open_elapsed_ms, uint32_t pcm_bytes);
+
 #ifdef __cplusplus
 }
 #endif
