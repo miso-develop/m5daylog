@@ -16,6 +16,7 @@ HEADERS = ROOT / "firmware/components/recorder/include"
 STUBS = {
     "esp_err.h": r"""
 #pragma once
+#include <stddef.h>
 typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_FAIL -1
