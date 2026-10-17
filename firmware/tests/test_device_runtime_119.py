@@ -100,6 +100,8 @@ HARNESS = r"""
 #define pdTRUE 1
 #define portMAX_DELAY 0xffffffffu
 #define pdMS_TO_TICKS(ms) (ms)
+#define configTICK_RATE_HZ 1000u
+#define RECORDER_EVENTS_PATH "events.jsonl"
 #define REC_BIT_SLOT_FULL (1u << 0)
 #define REC_BIT_STOP (1u << 1)
 #define REC_BIT_WRITER_READY (1u << 2)
@@ -122,6 +124,7 @@ HARNESS = r"""
 #define DEVICE_MANIFEST_STATE_FINALIZED "FINALIZED"
 
 typedef uint32_t EventBits_t;
+typedef uint32_t TickType_t;
 typedef void *TaskHandle_t;
 typedef void *pdm_capture_t;
 typedef int pdm_capture_config_t;
@@ -146,6 +149,9 @@ static bool running = true, scheduled = false;
 static bool fail_terminal_write = false, fail_live_write = false, fail_live_flush = false;
 static bool deny_ownership = false, mic_init_failed = false;
 static uint32_t since_flush = 0, seg_bytes = 0;
+static TickType_t seg_start_tick = 100;
+static TickType_t xTaskGetTickCount(void) { return 200; }
+static unsigned diagnostic_appends = 0;
 static unsigned manifest_writes = 0, usb_published = 0, errors = 0;
 static unsigned capture_delete = 0, writer_delete = 0;
 static int s_last_battery_mv = 0;
@@ -210,6 +216,14 @@ static bool recorder_manifest_record_wav(const char *path, const char *id,
     (void)path; (void)id; (void)started;
     if (strcmp(kind, DEVICE_MANIFEST_STATE_FINALIZED)) return false;
     manifest_writes++; return true;
+}
+static bool recorder_state_append_usb_capture_accounting(
+    const char *path, const char *id, uint32_t elapsed_ms, uint32_t pcm_bytes) {
+    // A source-extracted harness mock; real portable C is covered separately.
+    (void)path; (void)id; (void)elapsed_ms;
+    if (pcm_bytes != seg_bytes) return false;
+    diagnostic_appends++;
+    return true;
 }
 static void usb_cdc_protocol_reset_session(void) {}
 static int usb_msc_ownership_begin_prepare(void) { return ESP_OK; }
@@ -457,6 +471,10 @@ int main(int argc, char **argv) {
 
     actor = "";
     compiled_usb_attach();
+    // A healthy USB finalize emits exactly one diagnostic; all failed or
+    // interrupted terminal paths emit none.
+    if (manifest_writes == 1 && diagnostic_appends != 1) return 20;
+    if (manifest_writes == 0 && diagnostic_appends != 0) return 21;
 
     printf("manifest=%u usb=%u captured=%" PRIu32 " dropped=%" PRIu32
            " dma=%" PRIu32 " sd=%" PRIu32 " errors=%u"
