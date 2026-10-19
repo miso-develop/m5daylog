@@ -247,7 +247,7 @@ class CoordinatorTests(unittest.TestCase):
         self.calls.append("qualify")
         return GatePermit(119, proof.receipt_sha256, target, self.attempt, True)
 
-    def run(self, preflight=None, qualifier=None):
+    def run_case(self, preflight=None, qualifier=None):
         return self.coordinator.run(
             mount_root="E:\\", cdc_port="COM5", gate=self.gate,
             fresh_preflight=self.preflight if preflight is None else preflight,
@@ -255,7 +255,7 @@ class CoordinatorTests(unittest.TestCase):
             guard=self.guard)
 
     def test_qualified_success_only_maintenance_not_sync(self):
-        result = self.run()
+        result = self.run_case()
         self.assertTrue(result.success)
         self.assertEqual(result.status, "MAINTENANCE_RELEASE_ONLY")
         self.assertEqual(self.calls, ["preflight", "preflight", "qualify"])
@@ -272,7 +272,7 @@ class CoordinatorTests(unittest.TestCase):
                   GatePermit(119, "b" * 64, TARGET, self.attempt, True)):
             with self.subTest(permit=permit):
                 self.setUp()
-                result = self.run(qualifier=lambda *_: permit)
+                result = self.run_case(qualifier=lambda *_: permit)
                 self.assertEqual(result.status, "BLOCKED")
                 self.assertNotIn("lock", self.port.steps)
                 self.assertNotIn("release", self.port.steps)
@@ -284,7 +284,7 @@ class CoordinatorTests(unittest.TestCase):
             reads += 1
             return (self.proof if reads == 1 else
                     Preflight("b" * 64, "test-device", 117, 38))
-        result = self.run(preflight=changed)
+        result = self.run_case(preflight=changed)
         self.assertEqual(result.reason, "PREFLIGHT_DRIFT")
         self.assertNotIn("release", self.port.steps)
 
@@ -293,41 +293,41 @@ class CoordinatorTests(unittest.TestCase):
             with self.subTest(failure=failure):
                 self.setUp()
                 self.port.fail = failure
-                outcome = self.run()
+                outcome = self.run_case()
                 self.assertEqual(outcome.status, "BLOCKED")
                 self.assertNotIn("release", self.port.steps)
                 self.assertFalse(self.guard.path.exists())
 
     def test_transport_loss_consumes_attempt_no_replay(self):
         self.port.fail = "transport"
-        result = self.run()
+        result = self.run_case()
         self.assertEqual(result.status, "BLOCKED")
         self.assertTrue(self.guard.path.exists())
         self.assertEqual(self.port.steps.count("release"), 1)
         # A new synthetic process/USB admission gate cannot bypass host guard.
         self.gate = UsbSessionIoGate()
         self.port.fail = None
-        again = self.run()
+        again = self.run_case()
         self.assertEqual(again.reason, "ATTEMPT_ALREADY_CONSUMED")
         self.assertEqual(self.port.steps.count("release"), 1)
 
     def test_disappearance_without_correlated_acceptance_not_success(self):
         self.port.fail = "transport"
         self.port.disappear = True
-        result = self.run()
+        result = self.run_case()
         self.assertFalse(result.success)
         self.assertNotIn("observe", self.port.steps)
 
     def test_timeout_after_acceptance_remains_consumed(self):
         self.port.disappear = False
-        result = self.run()
+        result = self.run_case()
         self.assertEqual(result.reason, "POST_ACCEPT_TIMEOUT")
         self.assertEqual(self.gate.state, GateState.RELEASE_ACCEPTED)
         self.assertTrue(self.guard.path.exists())
         self.assertEqual(self.port.steps.count("release"), 1)
 
     def test_preflight_exception_never_seals_or_sends(self):
-        result = self.run(preflight=lambda: (_ for _ in ()).throw(
+        result = self.run_case(preflight=lambda: (_ for _ in ()).throw(
             MaintenanceBlocked("BLOCKED_PROVENANCE")))
         self.assertEqual(result.reason, "BLOCKED_PROVENANCE")
         self.assertEqual(self.gate.state, GateState.OPEN)
