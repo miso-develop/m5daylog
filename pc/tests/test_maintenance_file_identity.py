@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from m5daylog.maintenance_release import (
-    MaintenanceBlocked, _check_index, _hash_file,
+    MaintenanceBlocked, _check_index, _hash_file, _inventory, _read_pinned,
 )
 
 
@@ -33,6 +36,93 @@ class FileIdentityTests(unittest.TestCase):
         for entry, raw in ((self.first, b"backup-one"),
                            (self.second, b"backup-two")):
             (self.root / entry["path"]).write_bytes(raw)
+
+    def _with_reparse_attribute(self, selected: Path):
+        """Inject the Windows flag on Linux without depending on POSIX mode."""
+        real_lstat = Path.lstat
+
+        def lstat_with_reparse(path, *args, **kwargs):
+            original = real_lstat(path, *args, **kwargs)
+            if path != selected:
+                return original
+            return SimpleNamespace(
+                st_mode=original.st_mode,
+                st_file_attributes=getattr(
+                    stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
+                st_reparse_tag=0,
+                st_nlink=original.st_nlink,
+                st_size=original.st_size,
+                st_dev=original.st_dev,
+                st_ino=original.st_ino,
+                st_mtime_ns=original.st_mtime_ns,
+            )
+
+        return patch.object(Path, "lstat", lstat_with_reparse)
+
+    def test_reparse_flag_on_intermediate_directory_blocks_backup(self):
+        with self._with_reparse_attribute(self.root / "copies"):
+            with self.assertRaisesRegex(MaintenanceBlocked,
+                                        "EVIDENCE_DIRECTORY_UNSAFE"):
+                _check_index(self.root, [self.first], 1)
+
+    def test_reparse_flag_on_nominated_root_blocks_backup(self):
+        with self._with_reparse_attribute(self.root):
+            with self.assertRaisesRegex(MaintenanceBlocked,
+                                        "EVIDENCE_DIRECTORY_UNSAFE"):
+                _check_index(self.root, [self.first], 1)
+
+    def test_reparse_flag_on_regular_file_blocks_backup(self):
+        with self._with_reparse_attribute(self.root / self.first["path"]):
+            with self.assertRaisesRegex(MaintenanceBlocked,
+                                        "EVIDENCE_FILE_UNSAFE"):
+                _check_index(self.root, [self.first], 1)
+
+    def test_reparse_flag_blocks_media_inventory_descent(self):
+        with self._with_reparse_attribute(self.root / "copies"):
+            with self.assertRaisesRegex(MaintenanceBlocked,
+                                        "MEDIA_UNSAFE_ENTRY"):
+                _inventory(self.root)
+
+    def test_reparse_flag_on_evidence_parent_blocks_pinned_read(self):
+        proof = self.root / "copies" / "immutable-receipt.bin"
+        payload = b"synthetic pinned evidence"
+        proof.write_bytes(payload)
+        with self._with_reparse_attribute(self.root / "copies"):
+            with self.assertRaisesRegex(MaintenanceBlocked,
+                                        "EVIDENCE_DIRECTORY_UNSAFE"):
+                _read_pinned(proof, hashlib.sha256(payload).hexdigest())
+
+    @unittest.skipUnless(os.name == "nt", "Windows NTFS junction only")
+    def test_windows_ntfs_junction_outside_backup_tree_is_blocked(self):
+        # Source bytes and hash match exactly, so only containment protection
+        # prevents a false successful host backup evidence admission.
+        approved = self.root / "approved"
+        outside = self.root / "outside-approved"
+        approved.mkdir()
+        outside.mkdir()
+        payload = b"matching preserved content"
+        (outside / "backup.bin").write_bytes(payload)
+        junction = approved / "copies"
+        proc = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J",
+             str(junction), str(outside)],
+            capture_output=True, check=False,
+        )
+        if proc.returncode != 0:
+            self.skipTest("NTFS junction creation unavailable")
+        self.addCleanup(lambda: junction.rmdir() if junction.exists() else None)
+        self.assertTrue(
+            junction.lstat().st_file_attributes &
+            getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        with self.assertRaisesRegex(MaintenanceBlocked,
+                                    "EVIDENCE_DIRECTORY_UNSAFE"):
+            _check_index(approved, [record("copies/backup.bin", payload)], 1)
+        with self.assertRaisesRegex(MaintenanceBlocked,
+                                    "EVIDENCE_DIRECTORY_UNSAFE"):
+            _check_index(junction, [record("backup.bin", payload)], 1)
+        with self.assertRaisesRegex(MaintenanceBlocked,
+                                    "MEDIA_UNSAFE_ENTRY"):
+            _inventory(approved)
 
     def test_distinct_objects_with_distinct_ids_are_accepted(self):
         self.assertEqual(
