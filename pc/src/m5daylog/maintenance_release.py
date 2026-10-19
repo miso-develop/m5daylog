@@ -88,12 +88,56 @@ def _safe_relative(raw: object) -> Path:
     return Path(*path.parts)
 
 
+def _is_reparse(info: os.stat_result) -> bool:
+    """Windows junctions/mount-points may lstat() as directories, not links.
+
+    Some native filesystems do not expose a reparse tag. The attribute bit
+    alone must be enough to reject the entry; POSIX symlinks are also denied.
+    """
+    return (
+        stat.S_ISLNK(info.st_mode)
+        or bool(getattr(info, "st_file_attributes", 0) &
+                getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        or bool(getattr(info, "st_reparse_tag", 0))
+    )
+
+
+def _safe_directory(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except OSError:
+        raise MaintenanceBlocked("EVIDENCE_DIRECTORY_MISSING") from None
+    if _is_reparse(info) or not stat.S_ISDIR(info.st_mode):
+        raise MaintenanceBlocked("EVIDENCE_DIRECTORY_UNSAFE")
+
+
+def _safe_directory_chain(path: Path) -> None:
+    """Reject reparse ancestors, including the nominated root and its parents.
+
+    abspath is lexical: unlike resolve(), it does not silently follow a
+    junction before inspection. A trusted local operator must still exclude
+    concurrent adversarial namespace modification.
+    """
+    current = Path(os.path.abspath(path))
+    while True:
+        _safe_directory(current)
+        if current.parent == current:
+            break
+        current = current.parent
+
+
+def _same_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino, left.st_size, left.st_mtime_ns) == (
+        right.st_dev, right.st_ino, right.st_size, right.st_mtime_ns)
+
+
 def _regular(path: Path) -> os.stat_result:
+    _safe_directory_chain(path.parent)
     try:
         info = path.lstat()
     except OSError:
         raise MaintenanceBlocked("EVIDENCE_FILE_MISSING") from None
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+    if _is_reparse(info) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise MaintenanceBlocked("EVIDENCE_FILE_UNSAFE")
     return info
 
@@ -103,6 +147,10 @@ def _hash_file(path: Path) -> tuple[str, int, tuple[int, int]]:
     digest = hashlib.sha256()
     try:
         with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (_is_reparse(opened) or not stat.S_ISREG(opened.st_mode) or
+                    not _same_snapshot(before, opened)):
+                raise MaintenanceBlocked("EVIDENCE_CHANGED_DURING_READ")
             while True:
                 block = stream.read(1024 * 1024)
                 if not block:
@@ -111,8 +159,7 @@ def _hash_file(path: Path) -> tuple[str, int, tuple[int, int]]:
         after = _regular(path)
     except OSError:
         raise MaintenanceBlocked("EVIDENCE_READ_FAILED") from None
-    if (before.st_size, before.st_mtime_ns, before.st_dev, before.st_ino) != (
-            after.st_size, after.st_mtime_ns, after.st_dev, after.st_ino):
+    if not _same_snapshot(before, after):
         raise MaintenanceBlocked("EVIDENCE_CHANGED_DURING_READ")
     # Windows file identity is volume + file index, not a pathname.
     # Zero/unavailable file indices cannot establish 117 distinct backups.
@@ -124,6 +171,8 @@ def _hash_file(path: Path) -> tuple[str, int, tuple[int, int]]:
 def _check_index(root: Path, records: object, count: int) -> set[str]:
     if not isinstance(records, list) or len(records) != count:
         raise MaintenanceBlocked("EVIDENCE_COUNT_MISMATCH")
+    _safe_directory_chain(root)
+    resolved_root = root.resolve(strict=True)
     seen: set[str] = set()
     seen_file_ids: set[tuple[int, int]] = set()
     for record in records:
@@ -137,17 +186,15 @@ def _check_index(root: Path, records: object, count: int) -> set[str]:
         if type(size) is not int or size < 0:
             raise MaintenanceBlocked("INVALID_EVIDENCE_RECORD")
         candidate = root / rel
-        # Do not traverse junctions/symlinks in intermediate path segments.
-        node = root
-        for part in rel.parts[:-1]:
-            node = node / part
-            try:
-                mode = node.lstat().st_mode
-            except OSError:
-                raise MaintenanceBlocked("EVIDENCE_DIRECTORY_MISSING") from None
-            if not stat.S_ISDIR(mode):
-                raise MaintenanceBlocked("EVIDENCE_DIRECTORY_UNSAFE")
+        # Fail closed on root/ancestor junctions and on a resolved leaf that
+        # does not remain inside the authorized host backup/media boundary.
+        _safe_directory_chain(candidate.parent)
+        if not candidate.resolve(strict=True).is_relative_to(resolved_root):
+            raise MaintenanceBlocked("EVIDENCE_PATH_ESCAPED")
         actual_hash, actual_size, file_id = _hash_file(candidate)
+        _safe_directory_chain(candidate.parent)
+        if not candidate.resolve(strict=True).is_relative_to(resolved_root):
+            raise MaintenanceBlocked("EVIDENCE_PATH_ESCAPED")
         if actual_size != size or not hmac.compare_digest(actual_hash, record["sha256"]):
             raise MaintenanceBlocked("EVIDENCE_HASH_MISMATCH")
         # Case-folded names, 8.3 aliases and other path spellings can refer to
@@ -165,23 +212,27 @@ def _inventory(root: Path) -> tuple[set[str], set[str]]:
     def walk(folder: Path, depth: int = 0) -> None:
         if depth > 16 or len(files) + len(dirs) > 4096:
             raise MaintenanceBlocked("MEDIA_INVENTORY_LIMIT")
+        _safe_directory_chain(folder)
         try:
             entries = list(folder.iterdir())
         except OSError:
             raise MaintenanceBlocked("MEDIA_INVENTORY_FAILED") from None
         for path in entries:
             try:
-                mode = path.lstat().st_mode
+                info = path.lstat()
                 name = path.relative_to(root).as_posix()
             except (OSError, ValueError):
                 raise MaintenanceBlocked("MEDIA_INVENTORY_FAILED") from None
-            if stat.S_ISDIR(mode):
+            if _is_reparse(info):
+                raise MaintenanceBlocked("MEDIA_UNSAFE_ENTRY")
+            if stat.S_ISDIR(info.st_mode):
                 dirs.add(name)
                 walk(path, depth + 1)
-            elif stat.S_ISREG(mode):
+            elif stat.S_ISREG(info.st_mode):
                 files.add(name)
             else:
                 raise MaintenanceBlocked("MEDIA_UNSAFE_ENTRY")
+        _safe_directory_chain(folder)
     walk(root)
     return files, dirs
 
@@ -283,6 +334,10 @@ def verify_post_clear(
     backup = Path(backup_root)
     receipt_file = Path(receipt_path)
     try:
+        # Reject reparse ancestors BEFORE Path.resolve() could erase evidence
+        # that the submitted backup or Device root traverses a junction.
+        _safe_directory_chain(mount)
+        _safe_directory_chain(backup)
         if not mount.is_dir() or not backup.is_dir():
             raise MaintenanceBlocked("BASELINE_ROOT_MISSING")
         resolved_mount = mount.resolve(strict=True)
