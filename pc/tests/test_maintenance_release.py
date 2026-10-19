@@ -227,7 +227,7 @@ class MediaEvidenceTests(unittest.TestCase):
     def test_guard_must_be_host_local_and_replay_is_denied(self):
         guard = OneShotGuard(Path(self.temp.name))
         permit = GatePermit(119, self.fx.pin, TARGET, str(uuid.uuid4()), True,
-                            str(Path(self.temp.name).resolve()))
+                            str(Path(self.temp.name).resolve()), self.fx.history_pin)
         guard.consume(permit)
         obj = json.loads(guard.path.read_text(encoding="ascii"))
         self.assertTrue(obj["consumed"])
@@ -312,7 +312,7 @@ class CoordinatorTests(unittest.TestCase):
     def permit(self, proof, target):
         self.calls.append("qualify")
         return GatePermit(119, proof.receipt_sha256, target, self.attempt, True,
-                          str(Path(self.tmp.name).resolve()))
+                          str(Path(self.tmp.name).resolve()), proof.history_sha256)
 
     def run_case(self, preflight=None, qualifier=None):
         return self.coordinator.run(
@@ -402,9 +402,9 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_missing_provenance_or_approval_sends_no_release(self):
         for permit in (None, GatePermit(119, self.proof.receipt_sha256,
-                  TARGET, self.attempt, False, str(Path(self.tmp.name).resolve())),
+                  TARGET, self.attempt, False, str(Path(self.tmp.name).resolve()), self.proof.history_sha256),
                   GatePermit(119, "b" * 64, TARGET, self.attempt, True,
-                             str(Path(self.tmp.name).resolve()))):
+                             str(Path(self.tmp.name).resolve()), self.proof.history_sha256)):
             with self.subTest(permit=permit):
                 self.setUp()
                 result = self.run_case(qualifier=lambda *_: permit)
