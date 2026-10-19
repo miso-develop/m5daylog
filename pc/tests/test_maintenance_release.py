@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -117,6 +119,25 @@ class MediaEvidenceTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.fx = MediaFixture(Path(self.temp.name))
+
+    @unittest.skipUnless(os.name == "nt", "Windows NTFS junction only")
+    def test_windows_junction_preserving_all_117_hashes_still_blocks_preflight(self):
+        # All pinned historical bytes, file sizes and hashes remain valid.
+        # A junction must not silently relocate the 117 backups outside the
+        # operator-nominated backup root and return PREFLIGHT_ONLY.
+        old = self.fx.backup / "copy"
+        outside = self.fx.backup.parent / "outside-approved-backup"
+        old.rename(outside)
+        proc = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(old), str(outside)],
+            capture_output=True, check=False,
+        )
+        if proc.returncode != 0:
+            self.skipTest("NTFS junction creation unavailable")
+        self.addCleanup(lambda: old.rmdir() if old.exists() else None)
+        with self.assertRaisesRegex(MaintenanceBlocked,
+                                    "EVIDENCE_DIRECTORY_UNSAFE"):
+            self.fx.check()
 
     def test_valid_clear_receipt_checks_all_files_and_is_read_only(self):
         result = self.fx.check()
