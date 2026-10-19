@@ -437,6 +437,8 @@ class OneShotGuard:
 
     def consume(self, permit: GatePermit) -> None:
         try:
+            _safe_directory_chain(Path(permit.authorized_guard_directory))
+            _safe_directory_chain(self.directory)
             approved = Path(permit.authorized_guard_directory).resolve(strict=True)
             actual = self.directory.resolve(strict=True)
         except (OSError, ValueError):
@@ -491,6 +493,8 @@ class MaintenanceReleaseCoordinator:
             # The one-shot marker must be created on host-local storage,
             # never through PC-owned Device MSC. Resolve its parent before
             # sealing; failure cannot reach lock/dismount or CDC.
+            _safe_directory_chain(Path(mount_root))
+            _safe_directory_chain(guard.directory)
             root = Path(mount_root).resolve(strict=True)
             guard_parent = guard.directory.resolve(strict=True)
             if guard_parent == root or guard_parent.is_relative_to(root):
