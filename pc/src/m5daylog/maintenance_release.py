@@ -196,12 +196,24 @@ def verify_post_clear(
                 resolved_backup == resolved_mount or
                 resolved_backup.is_relative_to(resolved_mount)):
             raise MaintenanceBlocked("BACKUP_NOT_ISOLATED")
-        raw_hash, raw_size = _hash_file(receipt_file)
-        if raw_size > 1024 * 1024 or not hmac.compare_digest(
-            raw_hash, pinned_receipt_sha256
-        ):
+        # Hash and parse the *same* snapshot. A second file open after
+        # digest verification would admit receipt replacement at the boundary.
+        receipt_before = _regular(receipt_file)
+        if receipt_before.st_size > 1024 * 1024:
             raise MaintenanceBlocked("RECEIPT_PIN_MISMATCH")
-        document = json.loads(receipt_file.read_text(encoding="utf-8"))
+        with receipt_file.open("rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        receipt_after = _regular(receipt_file)
+        if (len(raw) > 1024 * 1024 or
+                (receipt_before.st_size, receipt_before.st_mtime_ns,
+                 receipt_before.st_ino) !=
+                (receipt_after.st_size, receipt_after.st_mtime_ns,
+                 receipt_after.st_ino)):
+            raise MaintenanceBlocked("RECEIPT_CHANGED_DURING_READ")
+        raw_hash = hashlib.sha256(raw).hexdigest()
+        if not hmac.compare_digest(raw_hash, pinned_receipt_sha256):
+            raise MaintenanceBlocked("RECEIPT_PIN_MISMATCH")
+        document = json.loads(raw.decode("utf-8"))
         if not isinstance(document, dict) or set(document) != {
             "schema_version", "issue", "device_id", "clear_guard_consumed",
             "deleted", "backups", "protected",
