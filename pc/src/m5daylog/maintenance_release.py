@@ -98,7 +98,7 @@ def _regular(path: Path) -> os.stat_result:
     return info
 
 
-def _hash_file(path: Path) -> tuple[str, int]:
+def _hash_file(path: Path) -> tuple[str, int, tuple[int, int]]:
     before = _regular(path)
     digest = hashlib.sha256()
     try:
