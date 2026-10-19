@@ -111,16 +111,21 @@ def _hash_file(path: Path) -> tuple[str, int]:
         after = _regular(path)
     except OSError:
         raise MaintenanceBlocked("EVIDENCE_READ_FAILED") from None
-    if (before.st_size, before.st_mtime_ns, before.st_ino) != (
-            after.st_size, after.st_mtime_ns, after.st_ino):
+    if (before.st_size, before.st_mtime_ns, before.st_dev, before.st_ino) != (
+            after.st_size, after.st_mtime_ns, after.st_dev, after.st_ino):
         raise MaintenanceBlocked("EVIDENCE_CHANGED_DURING_READ")
-    return digest.hexdigest(), after.st_size
+    # Windows file identity is volume + file index, not a pathname.
+    # Zero/unavailable file indices cannot establish 117 distinct backups.
+    if type(after.st_dev) is not int or type(after.st_ino) is not int or after.st_ino <= 0:
+        raise MaintenanceBlocked("EVIDENCE_FILE_ID_UNAVAILABLE")
+    return digest.hexdigest(), after.st_size, (after.st_dev, after.st_ino)
 
 
 def _check_index(root: Path, records: object, count: int) -> set[str]:
     if not isinstance(records, list) or len(records) != count:
         raise MaintenanceBlocked("EVIDENCE_COUNT_MISMATCH")
     seen: set[str] = set()
+    seen_file_ids: set[tuple[int, int]] = set()
     for record in records:
         if not isinstance(record, dict) or set(record) != {"path", "size", "sha256"}:
             raise MaintenanceBlocked("INVALID_EVIDENCE_RECORD")
@@ -142,9 +147,14 @@ def _check_index(root: Path, records: object, count: int) -> set[str]:
                 raise MaintenanceBlocked("EVIDENCE_DIRECTORY_MISSING") from None
             if not stat.S_ISDIR(mode):
                 raise MaintenanceBlocked("EVIDENCE_DIRECTORY_UNSAFE")
-        actual_hash, actual_size = _hash_file(candidate)
+        actual_hash, actual_size, file_id = _hash_file(candidate)
         if actual_size != size or not hmac.compare_digest(actual_hash, record["sha256"]):
             raise MaintenanceBlocked("EVIDENCE_HASH_MISMATCH")
+        # Case-folded names, 8.3 aliases and other path spellings can refer to
+        # one Windows file. Count unique physical objects, not JSON entries.
+        if file_id in seen_file_ids:
+            raise MaintenanceBlocked("EVIDENCE_DUPLICATE_FILE_ID")
+        seen_file_ids.add(file_id)
         seen.add(name)
     return seen
 
