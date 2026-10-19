@@ -35,6 +35,8 @@ The receipt schema is a locally prepared, intentionally narrow snapshot:
 }
 ```
 
+**Independent historical evidence (ENG-01 correction):** In addition to the maintenance receipt, the preflight requires three local evidence artifacts whose SHA-256 pins MUST be copied from an independent, already-approved private operator/Human Gate record: the original consumed clear journal, the original preserved backup/manifest evidence, and a separate signed-off historical attestation. The attestation is a UTF-8 JSON object with exactly these keys: `schema_version=1`, `issue=119`, `device_id`, `receipt_sha256`, `clear_journal_sha256`, `preservation_sha256`, `clear_guard_consumed=true`, `verified_manifest_wavs=76`, `verified_backups=117`, `verified_protected=38`, and `deleted` equal to the four historical deletion counts. Its attested claims MUST be verified against the **original private journal/preservation evidence by an independent operator before its hash is approved**. The old journal and preservation documents are treated as opaque immutable evidence; merely matching their hashes does not independently validate their semantics. The tool cannot sign, prepare or authorize this attestation. If independent original-history verification/pins are unavailable, `ORIGINAL_CLEAR_EVIDENCE_REQUIRED` or a historical mismatch is `BLOCKED`—never synthesize a new history to make the check pass.
+
 `backups` requires **exactly 117** distinct host-backup file entries. `protected` requires **exactly 38** distinct retained-Device file entries (including `M5DAYLOG/device.json`). Both are fully rehashed, not just counted. The recorded deletion counts, one-shot clear guard, and Device metadata must match. All currently visible media files must equal the protected inventory exactly. Unexpected files, directories, recordings, recovered/quarantined items, part files, manifest/events reappearance, unsafe symbolic links, missing/different files or unqualified target all block. The cleared `M5DAYLOG/recordings` directory must exist and be empty. Existing acknowledged protected files, if any, are included only by the exact pinned protected index. The CLI does not generate or change this receipt.
 
 These historical counts describe **one specifically authorized media clear**, not general release policy. If the retained inventory differs from this strict interpretation, stop and reconcile the original preserved evidence; do not edit the receipt merely to make preflight pass.
@@ -51,9 +53,15 @@ python -m m5daylog.maintenance_release
   --receipt-sha256 <externally-pinned-sha256>
   --cdc-port <qualified-com-port>
   --contracts-dir <repo-contracts-dir>
+  --history-attestation <private-approved-attestation-json>
+  --history-sha256 <independently-pinned-attestation-digest>
+  --clear-journal <original-immutable-clear-journal>
+  --clear-journal-sha256 <independently-pinned-clear-digest>
+  --preservation-receipt <original-immutable-preservation-evidence>
+  --preservation-sha256 <independently-pinned-preservation-digest>
 ```
 
-The command line above is a reference for the **preflight-only** program, not a direction to run against connected hardware without permission. It outputs no host paths, Device IDs, raw audio, receipt contents or private file names. The command has **no `--execute` option**. It validates Device metadata, qualified filesystem inventory, backup/protected hashes, exactly one target volume/disk and correlated CDC identity using pre-existing read-only host APIs. It does not prove firmware runtime identity, Device release capability, Device SD ownership or a separate one-shot attempt approval.
+The command line above is a reference for the **preflight-only** program, not a direction to run against connected hardware without permission. It outputs no host paths, Device IDs, raw audio, receipt contents or private file names. The command has **no `--execute` option**. It validates Device metadata, qualified filesystem inventory, backup/protected hashes, exactly one qualified target volume/disk and correlated CDC identity; additionally the tool rejects any other removable USB-storage disk candidate (including unrelated removable USB drives) rather than risk accepting a second qualified M5Daylog using pre-existing read-only host APIs. It does not prove firmware runtime identity, Device release capability, Device SD ownership or a separate one-shot attempt approval.
 
 Software tests (host-only, synthetic):
 
@@ -63,6 +71,8 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
 ## Future Human Gate boundary (not authorized here)
+
+**Rework safety boundaries:** A single canonical issue-119 host-only guard filename is derived within a separately approved, immutable guard directory returned by the trusted per-attempt permit. The permit also binds the detached historical-attestation SHA-256; supplying a different guard directory is denied. A second directory cannot be self-approved by ordinary operator CLI, which has no execution path. Before consuming the guard or sending any CDC byte, the coordinator requires an independently qualified `prove_locked_snapshot(target, preflight)` capability on the release adapter **while the exact volume lock remains held**. The merged #89 `WindowsHostReleasePort` does not provide this attested locked-media freshness capability; therefore real release is deliberately `BLOCKED` until a separate reviewed native implementation/Human Gate proves absence of new writes between inventory and lock. The synthetic FakePort simulates this condition but cannot certify a Windows/FAT32 volume.
 
 The `MaintenanceReleaseCoordinator` requires an externally trusted, independently reviewed **Human Gate authorization/qualification callback** returning a `GatePermit` for the exact verified receipt, frozen target and unique release attempt, including running handler evidence. The `GatePermit` dataclass is not itself trusted authorization. The coordinator then re-preflights, freezes/revalidates the exact host target, seals ordinary I/O, acquires the dedicated release lease, retains exact volume lock+dismount, consumes a host-only one-shot guard **before** any CDC command, and uses the existing #89 release port and volume-disappearance confirmation. Exception/timeout/replay blocks; successful outcome is only `MAINTENANCE_RELEASE_ONLY`.
 
