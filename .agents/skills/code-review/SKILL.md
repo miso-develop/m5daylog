@@ -20,6 +20,6 @@ Independent Engineering / Security Reviewが必要な場合、**実装セッシ�
 
 - GitHub loginがPR authorと同一であっても、別AIセッションの独立性は否定しない。別GitHub account作成やplatform approvalの偽装を要求しない。
 - PR author自身による`APPROVE`は不可。実質的なReview判定が揃い、権限が許す場合は、対象exact HEADとEngineering/Security disposition、証拠、limits、セッション独立性を本文に含め、正式なGitHub Pull Request Reviewを`COMMENT`で投稿する。
-- 投稿後、GitHub Review ID / URL、reviewer login、state=`COMMENTED`、review commit SHA、現行PR HEADを再取得して照合する。Issue/PR conversation commentはsubmitted Reviewではない。Draft/API/permission rejection時は`SUBMITTED`と主張せず、記録gateを未充足とする。
+- 投稿後、GitHub Review ID / URL、reviewer login、state=`COMMENTED`、review commit SHA、現行PR HEADを再取得して照合する。Issue/PR Conversation commentはsubmitted Reviewではない。Draft/API/permission rejection時は`SUBMITTED`と主張せず、記録gateを未充足とする。
 - Technical Engineering `CLEAR` / `SECURITY_CLEAR` とGitHub `APPROVED`は異なる。required approval、blocker、authentic checks、HEAD/baseの鮮度、exact-head/semantic merge safetyは独立したgateであり、`COMMENTED`で解除しない。
 - 投稿・関連Issue/PR更新・HEAD/base変更後はfreshnessとReview対象一致を確認し、不一致または新たなriskがあれば再Reviewする。Security reviewが必要かは実際の変更リスクと`SECURITY.md`に従い、実質評価を省略しない。
