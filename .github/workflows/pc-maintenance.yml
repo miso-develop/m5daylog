@@ -5,6 +5,7 @@ on:
     paths:
       - 'pc/src/m5daylog/maintenance_release.py'
       - 'pc/tests/test_maintenance_release.py'
+      - 'pc/tests/test_maintenance_file_identity.py'
       - '.github/workflows/pc-maintenance.yml'
   push:
     branches:
@@ -12,6 +13,7 @@ on:
     paths:
       - 'pc/src/m5daylog/maintenance_release.py'
       - 'pc/tests/test_maintenance_release.py'
+      - 'pc/tests/test_maintenance_file_identity.py'
       - '.github/workflows/pc-maintenance.yml'
 
 permissions:
