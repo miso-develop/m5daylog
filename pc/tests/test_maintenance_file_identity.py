@@ -8,13 +8,16 @@ import stat
 import subprocess
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from m5daylog.maintenance_release import (
-    MaintenanceBlocked, _check_index, _hash_file, _inventory, _read_pinned,
+    GatePermit, MaintenanceBlocked, OneShotGuard, _check_index, _hash_file,
+    _inventory, _read_pinned,
 )
+from m5daylog.release import EjectTarget
 
 
 def record(name: str, payload: bytes) -> dict:
@@ -37,7 +40,7 @@ class FileIdentityTests(unittest.TestCase):
                            (self.second, b"backup-two")):
             (self.root / entry["path"]).write_bytes(raw)
 
-    def _with_reparse_attribute(self, selected: Path):
+    def _with_reparse_attribute(self, selected: Path, *, tag_only=False):
         """Inject the Windows flag on Linux without depending on POSIX mode."""
         real_lstat = Path.lstat
 
@@ -47,9 +50,10 @@ class FileIdentityTests(unittest.TestCase):
                 return original
             return SimpleNamespace(
                 st_mode=original.st_mode,
-                st_file_attributes=getattr(
-                    stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
-                st_reparse_tag=0,
+                st_file_attributes=(
+                    0 if tag_only else getattr(
+                        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)),
+                st_reparse_tag=0xA0000003 if tag_only else 0,
                 st_nlink=original.st_nlink,
                 st_size=original.st_size,
                 st_dev=original.st_dev,
@@ -64,6 +68,27 @@ class FileIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(MaintenanceBlocked,
                                         "EVIDENCE_DIRECTORY_UNSAFE"):
                 _check_index(self.root, [self.first], 1)
+
+    def test_reparse_tag_without_attribute_still_blocks_backup(self):
+        with self._with_reparse_attribute(
+                self.root / "copies", tag_only=True):
+            with self.assertRaisesRegex(MaintenanceBlocked,
+                                        "EVIDENCE_DIRECTORY_UNSAFE"):
+                _check_index(self.root, [self.first], 1)
+
+    def test_reparse_guard_directory_cannot_consume_an_attempt(self):
+        guard = OneShotGuard(self.root / "copies")
+        target = EjectTarget("test-device", "E:\\\\", "volume", 8, "disk",
+                             "removable", "physical-usb")
+        permit = GatePermit(
+            119, self.first["sha256"], target, str(uuid.uuid4()), True,
+            str(guard.directory.resolve()), self.first["sha256"],
+        )
+        with self._with_reparse_attribute(guard.directory):
+            with self.assertRaisesRegex(MaintenanceBlocked,
+                                        "EVIDENCE_DIRECTORY_UNSAFE"):
+                guard.consume(permit)
+        self.assertFalse(guard.path.exists())
 
     def test_reparse_flag_on_nominated_root_blocks_backup(self):
         with self._with_reparse_attribute(self.root):
