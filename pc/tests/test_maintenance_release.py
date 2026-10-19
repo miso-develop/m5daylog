@@ -13,9 +13,10 @@ from unittest.mock import patch
 
 from m5daylog.maintenance_release import (
     GatePermit, MaintenanceBlocked, MaintenanceReleaseCoordinator,
-    OneShotGuard, Preflight, verify_post_clear,
+    OneShotGuard, Preflight, verify_post_clear, _require_unique_usb_target,
 )
 from m5daylog.release import EjectTarget, UsbSessionIoGate, GateState
+from m5daylog.windows_release import DiskInterface, WindowsHostReleasePort
 
 
 TARGET = EjectTarget(
@@ -287,6 +288,31 @@ class FakePort:
         return self.disappear
 
 
+
+class RealPortCandidateInventoryTests(unittest.TestCase):
+    """Exercise the actual WindowsHostReleasePort adapter's API seam."""
+
+    def test_single_removable_usb_disk_is_required(self):
+        disk = DiskInterface(8, "test-disk", "test-eject",
+                             "test-physical-usb")
+        other = DiskInterface(9, "another-disk", "other-eject",
+                              "other-physical-usb")
+
+        class Api:
+            def __init__(self, entries):
+                self.entries = entries
+            def disk_interfaces(self):
+                return self.entries
+
+        _require_unique_usb_target(WindowsHostReleasePort(Api([disk])), TARGET)
+        for entries in ([disk, other], [], [other]):
+            with self.subTest(entries=len(entries)):
+                with self.assertRaisesRegex(MaintenanceBlocked,
+                                            "AMBIGUOUS_USB_STORAGE"):
+                    _require_unique_usb_target(
+                        WindowsHostReleasePort(Api(entries)), TARGET)
+
+
 class CoordinatorTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -392,6 +418,31 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result.reason, "UNAUTHORIZED_GUARD_DIRECTORY")
         self.assertNotIn("release", self.port.steps)
         self.assertFalse(self.guard.path.exists())
+
+
+    def test_alternate_directory_cannot_replay_a_consumed_attempt(self):
+        accepted = self.permit(self.proof, TARGET)
+        first = self.run_case(qualifier=lambda *_: accepted)
+        self.assertTrue(first.success)
+        self.assertEqual(self.port.steps.count("release"), 1)
+        alternative = Path(self.tmp.name) / "other"
+        alternative.mkdir()
+        self.guard = OneShotGuard(alternative)
+        self.gate = UsbSessionIoGate()
+        result = self.run_case(qualifier=lambda *_: accepted)
+        self.assertEqual(result.reason, "UNAUTHORIZED_GUARD_DIRECTORY")
+        self.assertEqual(self.port.steps.count("release"), 1)
+        self.assertFalse(self.guard.path.exists())
+
+    def test_wrong_historical_pin_in_gate_permit_blocks(self):
+        qualified = self.permit(self.proof, TARGET)
+        wrong = GatePermit(
+            qualified.issue, qualified.receipt_sha256, qualified.target,
+            qualified.attempt_id, True, qualified.authorized_guard_directory,
+            "d" * 64)
+        result = self.run_case(qualifier=lambda *_: wrong)
+        self.assertEqual(result.reason, "BLOCKED_PROVENANCE_OR_APPROVAL")
+        self.assertNotIn("release", self.port.steps)
 
     def test_changed_cdc_target_prevents_quiescence(self):
         self.port.fail = "revalidate"
