@@ -268,6 +268,33 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(self.guard.path.exists())
         self.assertEqual(self.port.steps.count("release"), 1)
 
+    def test_guard_on_device_media_blocks_before_quiesce(self):
+        self.guard = OneShotGuard(self.mount / "forbidden-guard.json")
+        outcome = self.run_case()
+        self.assertEqual(outcome.reason, "GUARD_ON_DEVICE_MEDIA")
+        self.assertNotIn("lock", self.port.steps)
+        self.assertNotIn("release", self.port.steps)
+        self.assertFalse(self.guard.path.exists())
+
+    def test_guard_fsync_failure_never_sends_and_consumes_uncertain_attempt(self):
+        with patch("m5daylog.maintenance_release.os.fsync",
+                   side_effect=OSError("simulated fsync failure")):
+            outcome = self.run_case()
+        self.assertEqual(outcome.reason, "GUARD_DURABILITY_UNVERIFIED")
+        self.assertTrue(self.guard.path.exists())
+        self.assertNotIn("release", self.port.steps)
+        self.gate = UsbSessionIoGate()
+        second = self.run_case()
+        self.assertEqual(second.reason, "ATTEMPT_ALREADY_CONSUMED")
+        self.assertNotIn("release", self.port.steps)
+
+    def test_changed_cdc_target_prevents_quiescence(self):
+        self.port.fail = "revalidate"
+        outcome = self.run_case()
+        self.assertEqual(outcome.status, "BLOCKED")
+        self.assertNotIn("lock", self.port.steps)
+        self.assertNotIn("release", self.port.steps)
+
     def test_missing_provenance_or_approval_sends_no_release(self):
         for permit in (None, GatePermit(119, self.proof.receipt_sha256,
                   TARGET, self.attempt, False),
