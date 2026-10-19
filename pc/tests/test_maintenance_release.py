@@ -228,6 +228,8 @@ class CoordinatorTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.port = FakePort()
+        self.mount = Path(self.tmp.name) / "mounted-device"
+        self.mount.mkdir()
         self.guard = OneShotGuard(Path(self.tmp.name) / "guard.json")
         self.gate = UsbSessionIoGate()
         self.proof = Preflight("a" * 64, "test-device", 117, 38)
@@ -249,7 +251,7 @@ class CoordinatorTests(unittest.TestCase):
 
     def run_case(self, preflight=None, qualifier=None):
         return self.coordinator.run(
-            mount_root="E:\\", cdc_port="COM5", gate=self.gate,
+            mount_root=str(self.mount), cdc_port="COM5", gate=self.gate,
             fresh_preflight=self.preflight if preflight is None else preflight,
             trusted_human_gate_qualifier=self.permit if qualifier is None else qualifier,
             guard=self.guard)
