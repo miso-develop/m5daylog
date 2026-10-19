@@ -19,10 +19,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Mapping
+from typing import Callable
 
 from .release import (
-    EjectTarget, GateState, HostReleasePort, UsbSessionIoGate,
+    EjectTarget, HostReleasePort, UsbSessionIoGate,
 )
 from .sync import inspect_device
 
@@ -149,7 +149,9 @@ def _check_index(root: Path, records: object, count: int) -> set[str]:
 def _inventory(root: Path) -> tuple[set[str], set[str]]:
     files: set[str] = set()
     dirs: set[str] = set()
-    def walk(folder: Path) -> None:
+    def walk(folder: Path, depth: int = 0) -> None:
+        if depth > 16 or len(files) + len(dirs) > 4096:
+            raise MaintenanceBlocked("MEDIA_INVENTORY_LIMIT")
         try:
             entries = list(folder.iterdir())
         except OSError:
@@ -162,7 +164,7 @@ def _inventory(root: Path) -> tuple[set[str], set[str]]:
                 raise MaintenanceBlocked("MEDIA_INVENTORY_FAILED") from None
             if stat.S_ISDIR(mode):
                 dirs.add(name)
-                walk(path)
+                walk(path, depth + 1)
             elif stat.S_ISREG(mode):
                 files.add(name)
             else:
@@ -188,7 +190,11 @@ def verify_post_clear(
     try:
         if not mount.is_dir() or not backup.is_dir():
             raise MaintenanceBlocked("BASELINE_ROOT_MISSING")
-        if mount.resolve() == backup.resolve():
+        resolved_mount = mount.resolve(strict=True)
+        resolved_backup = backup.resolve(strict=True)
+        if (mount.is_symlink() or backup.is_symlink() or
+                resolved_backup == resolved_mount or
+                resolved_backup.is_relative_to(resolved_mount)):
             raise MaintenanceBlocked("BACKUP_NOT_ISOLATED")
         raw_hash, raw_size = _hash_file(receipt_file)
         if raw_size > 1024 * 1024 or not hmac.compare_digest(
@@ -295,6 +301,13 @@ class MaintenanceReleaseCoordinator:
         All injected host reads/approvals run before normal I/O admission seal.
         """
         try:
+            # The one-shot marker must be created on host-private storage,
+            # never through PC-owned Device MSC. Resolve its parent before
+            # sealing; failure cannot reach lock/dismount or CDC.
+            root = Path(mount_root).resolve(strict=True)
+            guard_parent = guard.path.parent.resolve(strict=True)
+            if guard_parent == root or guard_parent.is_relative_to(root):
+                raise MaintenanceBlocked("GUARD_ON_DEVICE_MEDIA")
             with gate.ordinary("msc"):
                 initial = fresh_preflight()
                 target = self.port.resolve_target(mount_root, initial.device_id)
