@@ -301,7 +301,7 @@ class MaintenanceReleaseCoordinator:
         All injected host reads/approvals run before normal I/O admission seal.
         """
         try:
-            # The one-shot marker must be created on host-private storage,
+            # The one-shot marker must be created on host-local storage,
             # never through PC-owned Device MSC. Resolve its parent before
             # sealing; failure cannot reach lock/dismount or CDC.
             root = Path(mount_root).resolve(strict=True)
