@@ -43,6 +43,7 @@ class Preflight:
     device_id: str
     verified_backups: int
     verified_protected: int
+    history_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class GatePermit:
     target: EjectTarget
     attempt_id: str
     running_handler_qualified: bool
+    authorized_guard_directory: str
 
 
 @dataclass(frozen=True)
@@ -173,10 +175,92 @@ def _inventory(root: Path) -> tuple[set[str], set[str]]:
     return files, dirs
 
 
+
+def _read_pinned(path: str | Path, digest: str) -> bytes:
+    """Read a bounded immutable private evidence artifact under a detached pin."""
+    if not _hex(digest):
+        raise MaintenanceBlocked("HISTORICAL_PIN_REQUIRED")
+    source = Path(path)
+    first = _regular(source)
+    if first.st_size > 1024 * 1024:
+        raise MaintenanceBlocked("HISTORICAL_EVIDENCE_TOO_LARGE")
+    try:
+        raw = source.read_bytes()
+    except OSError:
+        raise MaintenanceBlocked("HISTORICAL_EVIDENCE_UNREADABLE") from None
+    last = _regular(source)
+    if ((first.st_size, first.st_mtime_ns, first.st_ino) !=
+            (last.st_size, last.st_mtime_ns, last.st_ino) or
+            not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), digest)):
+        raise MaintenanceBlocked("HISTORICAL_EVIDENCE_MISMATCH")
+    return raw
+
+
+def _verify_original_clear(*, receipt_sha256: str, device_id: str,
+                           history_path: str | Path, history_pin: str,
+                           clear_journal_path: str | Path, clear_journal_pin: str,
+                           preservation_path: str | Path, preservation_pin: str) -> str:
+    """Trust requires detached, independently approved pins for ALL three artifacts.
+
+    The opaque historical files must be independently audited by Human Gate;
+    self-assertion in the new maintenance receipt is never sufficient.
+    """
+    _read_pinned(clear_journal_path, clear_journal_pin)
+    _read_pinned(preservation_path, preservation_pin)
+    try:
+        proof = json.loads(_read_pinned(history_path, history_pin).decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise MaintenanceBlocked("HISTORICAL_ATTESTATION_INVALID") from None
+    if not isinstance(proof, dict) or proof != {
+            "schema_version": 1, "issue": _ISSUE, "device_id": device_id,
+            "receipt_sha256": receipt_sha256,
+            "clear_journal_sha256": clear_journal_pin,
+            "preservation_sha256": preservation_pin,
+            "clear_guard_consumed": True,
+            "verified_manifest_wavs": 76,
+            "verified_backups": 117,
+            "verified_protected": 38,
+            "deleted": _EXPECTED_DELETIONS,
+    }:
+        raise MaintenanceBlocked("HISTORICAL_ATTESTATION_MISMATCH")
+    return history_pin
+
+
+def _require_unique_usb_target(port: HostReleasePort, target: EjectTarget) -> None:
+    """Conservatively exclude all other removable USB disks, even unrelated ones."""
+    api = getattr(port, "api", None)
+    if api is not None:
+        inventory = getattr(api, "disk_interfaces", None)
+        if not callable(inventory):
+            raise MaintenanceBlocked("USB_INVENTORY_UNAVAILABLE")
+        candidates = [entry for entry in inventory()
+                      if entry.removable_instance_id and
+                      entry.physical_usb_instance_id]
+        if (len(candidates) != 1 or
+                candidates[0].disk_number != target.disk_number or
+                candidates[0].instance_id != target.disk_instance_id or
+                candidates[0].physical_usb_instance_id !=
+                target.usb_physical_instance_id):
+            raise MaintenanceBlocked("AMBIGUOUS_USB_STORAGE")
+        return
+    # Production WindowsHostReleasePort has the native API. Only fake adapters
+    # can supply this test seam; a missing verifier MUST fail closed.
+    checker = getattr(port, "assert_single_usb_target", None)
+    if not callable(checker):
+        raise MaintenanceBlocked("USB_INVENTORY_UNAVAILABLE")
+    checker(target)
+
+
 def verify_post_clear(
     *, mount_root: str | Path, backup_root: str | Path,
     receipt_path: str | Path, pinned_receipt_sha256: str,
     contracts_dir: str | Path | None = None,
+    history_path: str | Path | None = None,
+    history_pin: str | None = None,
+    clear_journal_path: str | Path | None = None,
+    clear_journal_pin: str | None = None,
+    preservation_path: str | Path | None = None,
+    preservation_pin: str | None = None,
 ) -> Preflight:
     """Host read-only check. A SHA pin must come from independently retained approval.
 
@@ -231,6 +315,17 @@ def verify_post_clear(
         device = inspect_device(mount, contracts_dir=contracts_dir)
         if device["deviceId"] != expected_id:
             raise MaintenanceBlocked("DEVICE_ID_CHANGED")
+        if any(value is None for value in (
+                history_path, history_pin, clear_journal_path,
+                clear_journal_pin, preservation_path, preservation_pin)):
+            raise MaintenanceBlocked("ORIGINAL_CLEAR_EVIDENCE_REQUIRED")
+        history_hash = _verify_original_clear(
+            receipt_sha256=raw_hash, device_id=expected_id,
+            history_path=history_path, history_pin=history_pin,
+            clear_journal_path=clear_journal_path,
+            clear_journal_pin=clear_journal_pin,
+            preservation_path=preservation_path,
+            preservation_pin=preservation_pin)
         _check_index(backup, document["backups"], 117)
         protected_files = _check_index(mount, document["protected"], 38)
         if "M5DAYLOG/device.json" not in protected_files:
@@ -252,7 +347,7 @@ def verify_post_clear(
             expected_dirs.update(str(parent) for parent in p.parents if str(parent) != ".")
         if not dirs.issubset(expected_dirs):
             raise MaintenanceBlocked("UNEXPECTED_MEDIA_DIRECTORY")
-        return Preflight(raw_hash, expected_id, 117, 38)
+        return Preflight(raw_hash, expected_id, 117, 38, history_hash)
     except MaintenanceBlocked:
         raise
     except (OSError, ValueError, KeyError, TypeError, UnicodeError):
@@ -266,13 +361,27 @@ class OneShotGuard:
     semantics before authorizing native calls. Existing path always blocks.
     """
 
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
+    def __init__(self, directory: str | Path):
+        self.directory = Path(directory)
+
+    @property
+    def path(self) -> Path:
+        # A fixed per-issue marker, not an operator-selected attempt filename.
+        return self.directory / "issue-119-maintenance-release.guard"
 
     def consume(self, permit: GatePermit) -> None:
+        try:
+            approved = Path(permit.authorized_guard_directory).resolve(strict=True)
+            actual = self.directory.resolve(strict=True)
+        except (OSError, ValueError):
+            raise MaintenanceBlocked("GUARD_DIRECTORY_UNVERIFIED") from None
+        if actual != approved:
+            raise MaintenanceBlocked("UNAUTHORIZED_GUARD_DIRECTORY")
         content = json.dumps({
             "issue": permit.issue, "receipt_sha256": permit.receipt_sha256,
-            "attempt_id": permit.attempt_id, "consumed": True,
+            "attempt_id": permit.attempt_id,
+            "history_sha256": permit.receipt_sha256,
+            "consumed": True,
         }, sort_keys=True).encode("ascii") + b"\n"
         fd = None
         try:
@@ -317,19 +426,23 @@ class MaintenanceReleaseCoordinator:
             # never through PC-owned Device MSC. Resolve its parent before
             # sealing; failure cannot reach lock/dismount or CDC.
             root = Path(mount_root).resolve(strict=True)
-            guard_parent = guard.path.parent.resolve(strict=True)
+            guard_parent = guard.directory.resolve(strict=True)
             if guard_parent == root or guard_parent.is_relative_to(root):
                 raise MaintenanceBlocked("GUARD_ON_DEVICE_MEDIA")
             with gate.ordinary("msc"):
                 initial = fresh_preflight()
                 target = self.port.resolve_target(mount_root, initial.device_id)
                 self.port.revalidate_target(target, cdc_port)
+                _require_unique_usb_target(self.port, target)
                 if not self.port.volume_available(target):
                     raise MaintenanceBlocked("VOLUME_NOT_AVAILABLE")
                 final = fresh_preflight()
                 if final != initial:
                     raise MaintenanceBlocked("PREFLIGHT_DRIFT")
                 self.port.revalidate_target(target, cdc_port)
+                _require_unique_usb_target(self.port, target)
+                if not _hex(final.history_sha256):
+                    raise MaintenanceBlocked("ORIGINAL_CLEAR_EVIDENCE_REQUIRED")
                 permit = trusted_human_gate_qualifier(final, target)
                 if (not isinstance(permit, GatePermit) or permit.issue != _ISSUE or
                         permit.receipt_sha256 != final.receipt_sha256 or
@@ -342,6 +455,12 @@ class MaintenanceReleaseCoordinator:
             with gate.release_control():
                 with self.port.quiesce(target):
                     gate.host_quiesced()
+                    # The existing Win32 adapter has NO attested locked-media
+                    # freshness primitive. Do not turn this into a real release
+                    # until a separately reviewed native adapter can prove it.
+                    verifier = getattr(self.port, "prove_locked_snapshot", None)
+                    if not callable(verifier) or verifier(target, final) is not True:
+                        raise MaintenanceBlocked("LOCKED_MEDIA_FRESHNESS_UNPROVEN")
                     # Consume before the first byte can be transmitted, even
                     # if a later error means the request was never sent.
                     guard.consume(permit)
@@ -375,6 +494,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--receipt-sha256", required=True)
     parser.add_argument("--cdc-port", required=True)
     parser.add_argument("--contracts-dir")
+    parser.add_argument("--history-attestation", required=True)
+    parser.add_argument("--history-sha256", required=True)
+    parser.add_argument("--clear-journal", required=True)
+    parser.add_argument("--clear-journal-sha256", required=True)
+    parser.add_argument("--preservation-receipt", required=True)
+    parser.add_argument("--preservation-sha256", required=True)
     args = parser.parse_args(argv)
     if sys.platform != "win32":
         print("maintenance: BLOCKED reason=WINDOWS_REQUIRED")
@@ -384,11 +509,18 @@ def main(argv: list[str] | None = None) -> int:
         proof = verify_post_clear(
             mount_root=args.device_root, backup_root=args.backup_root,
             receipt_path=args.receipt, pinned_receipt_sha256=args.receipt_sha256,
-            contracts_dir=args.contracts_dir)
+            contracts_dir=args.contracts_dir,
+            history_path=args.history_attestation,
+            history_pin=args.history_sha256,
+            clear_journal_path=args.clear_journal,
+            clear_journal_pin=args.clear_journal_sha256,
+            preservation_path=args.preservation_receipt,
+            preservation_pin=args.preservation_sha256)
         port = WindowsHostReleasePort(NativeWin32DeviceApi(),
                                       contracts_dir=args.contracts_dir)
         target = port.resolve_target(args.device_root, proof.device_id)
         port.revalidate_target(target, args.cdc_port)
+        _require_unique_usb_target(port, target)
         if not port.volume_available(target):
             raise MaintenanceBlocked("VOLUME_NOT_AVAILABLE")
         print("maintenance: PREFLIGHT_ONLY reason=RUNNING_FIRMWARE_UNATTESTED "
