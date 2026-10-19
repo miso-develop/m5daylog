@@ -133,6 +133,8 @@ class MediaEvidenceTests(unittest.TestCase):
             capture_output=True, check=False,
         )
         if proc.returncode != 0:
+            if os.environ.get("M5DAYLOG_REQUIRE_NTFS_JUNCTION") == "1":
+                self.fail("required NTFS junction regression could not create a junction")
             self.skipTest("NTFS junction creation unavailable")
         self.addCleanup(lambda: old.rmdir() if old.exists() else None)
         with self.assertRaisesRegex(MaintenanceBlocked,
