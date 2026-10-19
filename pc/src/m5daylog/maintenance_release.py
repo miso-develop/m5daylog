@@ -60,6 +60,7 @@ class GatePermit:
     attempt_id: str
     running_handler_qualified: bool
     authorized_guard_directory: str
+    history_sha256: str
 
 
 @dataclass(frozen=True)
@@ -380,7 +381,7 @@ class OneShotGuard:
         content = json.dumps({
             "issue": permit.issue, "receipt_sha256": permit.receipt_sha256,
             "attempt_id": permit.attempt_id,
-            "history_sha256": permit.receipt_sha256,
+            "history_sha256": permit.history_sha256,
             "consumed": True,
         }, sort_keys=True).encode("ascii") + b"\n"
         fd = None
@@ -446,6 +447,7 @@ class MaintenanceReleaseCoordinator:
                 permit = trusted_human_gate_qualifier(final, target)
                 if (not isinstance(permit, GatePermit) or permit.issue != _ISSUE or
                         permit.receipt_sha256 != final.receipt_sha256 or
+                        permit.history_sha256 != final.history_sha256 or
                         permit.target != target or not permit.running_handler_qualified):
                     raise MaintenanceBlocked("BLOCKED_PROVENANCE_OR_APPROVAL")
                 if (not isinstance(permit.attempt_id, str) or
