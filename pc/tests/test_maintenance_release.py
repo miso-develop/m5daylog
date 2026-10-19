@@ -48,6 +48,13 @@ class MediaFixture:
             self.protected.append(self.write(
                 self.mount, f"root-file-{i:02d}", b"protected" + bytes([i])))
         self.receipt = root / "receipt.json"
+        self.clear_journal = root / "original-clear-journal.bin"
+        self.preservation = root / "original-preservation-receipt.bin"
+        self.history = root / "detached-history-attestation.json"
+        self.clear_journal.write_bytes(b"immutable synthetic clear guard journal")
+        self.preservation.write_bytes(b"independently preserved synthetic legacy index")
+        self.clear_pin = digest(self.clear_journal.read_bytes())
+        self.preservation_pin = digest(self.preservation.read_bytes())
         self.payload = {
             "schema_version": 1,
             "issue": 119,
@@ -73,6 +80,23 @@ class MediaFixture:
         data = json.dumps(self.payload, sort_keys=True).encode("utf-8")
         self.receipt.write_bytes(data)
         self.pin = digest(data)
+        attestation = {
+            "schema_version": 1,
+            "issue": 119, "device_id": "test-device",
+            "receipt_sha256": self.pin,
+            "clear_journal_sha256": self.clear_pin,
+            "preservation_sha256": self.preservation_pin,
+            "clear_guard_consumed": True,
+            "verified_manifest_wavs": 76,
+            "verified_backups": 117, "verified_protected": 38,
+            "deleted": {
+                "wav": 76, "manifests": 2, "events": 1,
+                "recording_directories": 10,
+            },
+        }
+        serialized = json.dumps(attestation, sort_keys=True).encode("utf-8")
+        self.history.write_bytes(serialized)
+        self.history_pin = digest(serialized)
 
     def check(self, pin=None):
         with patch("m5daylog.maintenance_release.inspect_device",
@@ -81,6 +105,9 @@ class MediaFixture:
                 mount_root=self.mount, backup_root=self.backup,
                 receipt_path=self.receipt,
                 pinned_receipt_sha256=self.pin if pin is None else pin,
+                history_path=self.history, history_pin=self.history_pin,
+                clear_journal_path=self.clear_journal, clear_journal_pin=self.clear_pin,
+                preservation_path=self.preservation, preservation_pin=self.preservation_pin,
             )
 
 
@@ -172,9 +199,35 @@ class MediaEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(MaintenanceBlocked, "INVALID_EVIDENCE_PATH"):
             self.fx.check()
 
+
+    def test_detached_original_clear_evidence_is_mandatory(self):
+        # A self-pinned replacement receipt cannot compensate for the absence
+        # of the independent historical attestation and original journal.
+        self.fx.clear_journal.write_bytes(b"forged historical journal")
+        with self.assertRaisesRegex(MaintenanceBlocked,
+                                    "HISTORICAL_EVIDENCE_MISMATCH"):
+            self.fx.check()
+        self.fx.clear_journal.write_bytes(
+            b"immutable synthetic clear guard journal")
+        self.fx.history.write_bytes(b"substituted new attestation")
+        with self.assertRaisesRegex(MaintenanceBlocked,
+                                    "HISTORICAL_EVIDENCE_MISMATCH"):
+            self.fx.check()
+
+    def test_original_proof_cannot_be_omitted(self):
+        with patch("m5daylog.maintenance_release.inspect_device",
+                   return_value={"deviceId": "test-device"}):
+            with self.assertRaisesRegex(MaintenanceBlocked,
+                                        "ORIGINAL_CLEAR_EVIDENCE_REQUIRED"):
+                verify_post_clear(
+                    mount_root=self.fx.mount, backup_root=self.fx.backup,
+                    receipt_path=self.fx.receipt,
+                    pinned_receipt_sha256=self.fx.pin)
+
     def test_guard_must_be_host_local_and_replay_is_denied(self):
-        guard = OneShotGuard(Path(self.temp.name) / "guard.json")
-        permit = GatePermit(119, self.fx.pin, TARGET, str(uuid.uuid4()), True)
+        guard = OneShotGuard(Path(self.temp.name))
+        permit = GatePermit(119, self.fx.pin, TARGET, str(uuid.uuid4()), True,
+                            str(Path(self.temp.name).resolve()))
         guard.consume(permit)
         obj = json.loads(guard.path.read_text(encoding="ascii"))
         self.assertTrue(obj["consumed"])
@@ -187,6 +240,17 @@ class FakePort:
         self.steps = []
         self.fail = None
         self.disappear = True
+        self.extra_usb = False
+        self.freshness = True
+
+    def assert_single_usb_target(self, target):
+        self.steps.append("unique")
+        if self.extra_usb:
+            raise RuntimeError("second removable USB target")
+
+    def prove_locked_snapshot(self, target, preflight):
+        self.steps.append("locked-proof")
+        return self.freshness
 
     def resolve_target(self, root, device_id):
         self.steps.append("resolve")
@@ -230,9 +294,9 @@ class CoordinatorTests(unittest.TestCase):
         self.port = FakePort()
         self.mount = Path(self.tmp.name) / "mounted-device"
         self.mount.mkdir()
-        self.guard = OneShotGuard(Path(self.tmp.name) / "guard.json")
+        self.guard = OneShotGuard(Path(self.tmp.name))
         self.gate = UsbSessionIoGate()
-        self.proof = Preflight("a" * 64, "test-device", 117, 38)
+        self.proof = Preflight("a" * 64, "test-device", 117, 38, "c" * 64)
         self.calls = []
         self.attempt = str(uuid.uuid4())
         self.now = 0.0
@@ -247,7 +311,8 @@ class CoordinatorTests(unittest.TestCase):
 
     def permit(self, proof, target):
         self.calls.append("qualify")
-        return GatePermit(119, proof.receipt_sha256, target, self.attempt, True)
+        return GatePermit(119, proof.receipt_sha256, target, self.attempt, True,
+                          str(Path(self.tmp.name).resolve()))
 
     def run_case(self, preflight=None, qualifier=None):
         return self.coordinator.run(
@@ -262,14 +327,14 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result.status, "MAINTENANCE_RELEASE_ONLY")
         self.assertEqual(self.calls, ["preflight", "preflight", "qualify"])
         self.assertEqual(self.port.steps, [
-            "resolve", "revalidate", "available", "revalidate",
-            "lock", "dismount", "release", "observe"])
+            "resolve", "revalidate", "unique", "available", "revalidate",
+            "unique", "lock", "dismount", "locked-proof", "release", "observe"])
         self.assertEqual(self.gate.state, GateState.RELEASED)
         self.assertTrue(self.guard.path.exists())
         self.assertEqual(self.port.steps.count("release"), 1)
 
     def test_guard_on_device_media_blocks_before_quiesce(self):
-        self.guard = OneShotGuard(self.mount / "forbidden-guard.json")
+        self.guard = OneShotGuard(self.mount)
         outcome = self.run_case()
         self.assertEqual(outcome.reason, "GUARD_ON_DEVICE_MEDIA")
         self.assertNotIn("lock", self.port.steps)
@@ -288,6 +353,46 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(second.reason, "ATTEMPT_ALREADY_CONSUMED")
         self.assertNotIn("release", self.port.steps)
 
+
+    def test_multiple_usb_targets_never_reach_quiescence(self):
+        self.port.extra_usb = True
+        outcome = self.run_case()
+        self.assertEqual(outcome.status, "BLOCKED")
+        self.assertNotIn("lock", self.port.steps)
+        self.assertNotIn("release", self.port.steps)
+
+    def test_locked_snapshot_must_be_provable(self):
+        self.port.freshness = False
+        outcome = self.run_case()
+        self.assertEqual(outcome.reason, "LOCKED_MEDIA_FRESHNESS_UNPROVEN")
+        self.assertNotIn("release", self.port.steps)
+        self.assertFalse(self.guard.path.exists())
+
+    def test_unverified_lock_adapter_never_sends(self):
+        with patch.object(FakePort, "prove_locked_snapshot", None):
+            outcome = self.run_case()
+        self.assertEqual(outcome.reason, "LOCKED_MEDIA_FRESHNESS_UNPROVEN")
+        self.assertNotIn("release", self.port.steps)
+
+    def test_post_final_inventory_race_aborts_locked_release(self):
+        def qualifier(proof, target):
+            self.port.freshness = False  # simulated late WAV before lock
+            return self.permit(proof, target)
+        outcome = self.run_case(qualifier=qualifier)
+        self.assertEqual(outcome.status, "BLOCKED")
+        self.assertNotIn("release", self.port.steps)
+        self.assertFalse(self.guard.path.exists())
+
+    def test_alternative_guard_location_rejected_by_original_permit(self):
+        first = self.permit(self.proof, TARGET)
+        alternative = Path(self.tmp.name) / "other"
+        alternative.mkdir()
+        self.guard = OneShotGuard(alternative)
+        result = self.run_case(qualifier=lambda *_: first)
+        self.assertEqual(result.reason, "UNAUTHORIZED_GUARD_DIRECTORY")
+        self.assertNotIn("release", self.port.steps)
+        self.assertFalse(self.guard.path.exists())
+
     def test_changed_cdc_target_prevents_quiescence(self):
         self.port.fail = "revalidate"
         outcome = self.run_case()
@@ -297,8 +402,9 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_missing_provenance_or_approval_sends_no_release(self):
         for permit in (None, GatePermit(119, self.proof.receipt_sha256,
-                  TARGET, self.attempt, False),
-                  GatePermit(119, "b" * 64, TARGET, self.attempt, True)):
+                  TARGET, self.attempt, False, str(Path(self.tmp.name).resolve())),
+                  GatePermit(119, "b" * 64, TARGET, self.attempt, True,
+                             str(Path(self.tmp.name).resolve()))):
             with self.subTest(permit=permit):
                 self.setUp()
                 result = self.run_case(qualifier=lambda *_: permit)
@@ -312,7 +418,7 @@ class CoordinatorTests(unittest.TestCase):
             nonlocal reads
             reads += 1
             return (self.proof if reads == 1 else
-                    Preflight("b" * 64, "test-device", 117, 38))
+                    Preflight("b" * 64, "test-device", 117, 38, "c" * 64))
         result = self.run_case(preflight=changed)
         self.assertEqual(result.reason, "PREFLIGHT_DRIFT")
         self.assertNotIn("release", self.port.steps)
