@@ -553,7 +553,8 @@ class MaintenanceReleaseCoordinator:
                 if (not isinstance(permit, GatePermit) or permit.issue != _ISSUE or
                         permit.receipt_sha256 != final.receipt_sha256 or
                         permit.history_sha256 != final.history_sha256 or
-                        permit.target != target or not permit.running_handler_qualified):
+                        permit.target != target or
+                        permit.running_handler_qualified is not True):
                     raise MaintenanceBlocked("BLOCKED_PROVENANCE_OR_APPROVAL")
                 if (not isinstance(permit.attempt_id, str) or
                         str(uuid.UUID(permit.attempt_id)) != permit.attempt_id):
