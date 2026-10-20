@@ -193,14 +193,18 @@ class SyntheticGuard:
         return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_SEND_ONLY")
 
     def simulate_restart(self) -> "SyntheticGuard":
-        """Conservatively preserve consumed state, including uncertain writes.
+        """Recover a consumed attempt as terminal, never transmit-admissible.
 
-        This does *not* prove an actual Windows process/power restart persists
-        the marker; native host journal recovery remains NOT_RUN.
+        A restart between guard consumption and possible send cannot prove
+        whether transmission occurred. Retain the synthetic consumption and
+        history, but never restore the in-process send capability. This does
+        not attest actual Windows crash/power-loss journal durability.
         """
         copy = SyntheticGuard()
         copy._claimed = self._claimed
         copy._consumed = self._consumed
         copy._transmissions = self._transmissions
-        copy._ready = self._ready
+        # Even zero counted transmissions cannot prove that a real send did
+        # not cross the crash boundary; in-process permission does not persist.
+        copy._ready = False
         return copy
