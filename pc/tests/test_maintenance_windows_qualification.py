@@ -15,6 +15,26 @@ B = "b" * 64
 ATTEMPT = "9b53a6e0-6ac5-4a29-a743-6f6875e8790c"
 
 
+class ForgedDigest:
+    """Malicious event datum: not a digest, but claims equality to every value."""
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
+class AlwaysEqualStr(str):
+    """Malicious string subtype overriding the identity comparison."""
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
 def target() -> TargetIdentity:
     return TargetIdentity(
         "synthetic-device", "synthetic-volume-guid", 3,
@@ -113,6 +133,43 @@ class SnapshotTests(unittest.TestCase):
                                  target=replace(disk_one, disk_number=True)),
                     "TARGET_UNQUALIFIED",
                 )
+
+    def test_later_stage_digest_cannot_be_counterfeited_by_equality(self):
+        for index in range(1, 6):
+            for malformed in (ForgedDigest(), AlwaysEqualStr(B), "not-a-digest"):
+                with self.subTest(index=index, malformed=type(malformed).__name__):
+                    self.assert_blocked(
+                        update_event(events(), index, media_digest=malformed),
+                        "INVENTORY_DIGEST_UNQUALIFIED",
+                    )
+        self.assert_blocked(
+            update_event(events(), 0, media_digest=AlwaysEqualStr(A)),
+            "INVENTORY_DIGEST_UNQUALIFIED",
+        )
+
+    def test_custom_string_equality_cannot_mask_target_identity_drift(self):
+        identity_fields = (
+            "device_id", "volume_guid", "disk_instance_id",
+            "removable_instance_id", "usb_physical_instance_id", "cdc_instance_id",
+        )
+        for index in range(1, 6):
+            for field in identity_fields:
+                with self.subTest(index=index, field=field):
+                    changed = replace(target(), **{field: AlwaysEqualStr("other-target")})
+                    self.assert_blocked(
+                        update_event(events(), index, target=changed),
+                        "TARGET_UNQUALIFIED",
+                    )
+
+    def test_custom_string_steps_and_lock_are_unqualified(self):
+        self.assert_blocked(
+            update_event(events(), 5, step=AlwaysEqualStr("post_lock_witness")),
+            "STEP_SEQUENCE_UNPROVEN",
+        )
+        self.assert_blocked(
+            update_event(events(), 5, lock_identity=AlwaysEqualStr("other-lock")),
+            "RETAINED_LOCK_LOST",
+        )
 
     def test_prelock_and_late_media_modification(self):
         for index in (1, 2, 3, 4, 5):
@@ -214,6 +271,39 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(guard.simulated_send(valid).verdict,
                          Verdict.SOURCE_TEST_ONLY)
         self.assertEqual(guard.transmissions, 1)
+
+    def test_custom_string_equality_cannot_consume_or_send_attempt(self):
+        for field, value in (
+            ("host_volume_identity", AlwaysEqualStr("other-host-volume")),
+            ("attempt_id", AlwaysEqualStr(ATTEMPT)),
+            ("original_clear_sha256", AlwaysEqualStr(A)),
+            ("receipt_sha256", AlwaysEqualStr(B)),
+        ):
+            with self.subTest(field=field):
+                valid = attempt()
+                forged = replace(valid, **{field: value})
+                invalid_guard = SyntheticGuard()
+                verdict = invalid_guard.consume(
+                    forged, create_exclusive=True, file_flushed=True,
+                    directory_durable=True,
+                )
+                self.assertEqual(verdict.reason, "ATTEMPT_UNQUALIFIED")
+                self.assertFalse(verdict.release_authorized)
+                self.assertEqual(verdict.native_qualification, "NOT_RUN")
+                self.assertFalse(invalid_guard.consumed)
+                self.assertEqual(invalid_guard.transmissions, 0)
+
+                valid_guard = SyntheticGuard()
+                valid_guard.consume(valid, create_exclusive=True,
+                                    file_flushed=True, directory_durable=True)
+                verdict = valid_guard.simulated_send(forged)
+                self.assertEqual(verdict.reason, "UNAUTHORIZED_ATTEMPT")
+                self.assertFalse(verdict.release_authorized)
+                self.assertEqual(verdict.native_qualification, "NOT_RUN")
+                self.assertEqual(valid_guard.transmissions, 0)
+                self.assertEqual(valid_guard.simulated_send(valid).verdict,
+                                 Verdict.SOURCE_TEST_ONLY)
+                self.assertEqual(valid_guard.transmissions, 1)
 
     def test_every_guard_write_failure_consumes_and_prevents_send(self):
         for which in ("create_exclusive", "file_flushed", "directory_durable"):
