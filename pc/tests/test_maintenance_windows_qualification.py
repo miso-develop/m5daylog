@@ -109,6 +109,14 @@ class SnapshotTests(unittest.TestCase):
                     "NAMESPACE_OR_MEDIA_DRIFT",
                 )
 
+    def test_untyped_lock_and_namespace_flags_block(self):
+        self.assert_blocked(update_event(events(), 3, lock_identity=37),
+                            "RETAINED_LOCK_UNPROVEN")
+        self.assert_blocked(update_event(events(), 4, lock_identity=37),
+                            "RETAINED_LOCK_LOST")
+        self.assert_blocked(update_event(events(), 5, namespace_changed=None),
+                            "NAMESPACE_OR_MEDIA_DRIFT")
+
     def test_lock_id_must_remain_bound_through_witness(self):
         self.assert_blocked(update_event(events(), 3, lock_identity=""),
                             "RETAINED_LOCK_UNPROVEN")
@@ -174,6 +182,23 @@ class GuardTests(unittest.TestCase):
                 self.assertEqual(restarted.consume(attempt(), **fields).reason,
                                  "ATTEMPT_ALREADY_CONSUMED")
                 self.assertEqual(restarted.transmissions, 0)
+
+    def test_guard_flags_require_real_boolean_values(self):
+        for key, expected in (
+            ("create_exclusive", "EXCLUSIVE_CREATE_UNPROVEN"),
+            ("file_flushed", "FILE_DURABILITY_UNPROVEN"),
+            ("directory_durable", "DIRECTORY_DURABILITY_UNPROVEN"),
+        ):
+            with self.subTest(key=key):
+                guard = SyntheticGuard()
+                fields = dict(create_exclusive=True, file_flushed=True,
+                              directory_durable=True)
+                fields[key] = "trusted"
+                result = guard.consume(attempt(), **fields)
+                self.assertEqual(result.reason, expected)
+                self.assertEqual(guard.transmissions, 0)
+                self.assertEqual(guard.simulated_send(attempt()).verdict,
+                                 Verdict.BLOCKED)
 
     def test_replay_with_different_attempt_path_identity(self):
         guard = SyntheticGuard()
