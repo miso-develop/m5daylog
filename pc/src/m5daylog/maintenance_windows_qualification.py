@@ -77,7 +77,7 @@ def assess_synthetic_snapshot(events: tuple[SnapshotEvent, ...]) -> Assessment:
     inventory. The future trusted Windows witness must be separately defined
     and independently qualified; a matching digest in this test is not one.
     """
-    if not isinstance(events, tuple) or len(events) != len(_STEPS):
+    if type(events) is not tuple or len(events) != len(_STEPS):
         return Assessment(Verdict.BLOCKED, "STEP_SEQUENCE_UNPROVEN")
     if not all(type(e) is SnapshotEvent and type(e.step) is str for e in events):
         return Assessment(Verdict.BLOCKED, "STEP_SEQUENCE_UNPROVEN")
