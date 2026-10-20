@@ -93,6 +93,27 @@ class SnapshotTests(unittest.TestCase):
                             target=replace(target(), disk_number=True)),
                             "TARGET_UNQUALIFIED")
 
+    def test_late_disk_number_numeric_equivalence_cannot_bypass_type_check(self):
+        for index in range(1, 6):
+            with self.subTest(index=index, value=3.0):
+                self.assert_blocked(
+                    update_event(events(), index,
+                                 target=replace(target(), disk_number=3.0)),
+                    "TARGET_UNQUALIFIED",
+                )
+        # Python considers True == 1; use a valid disk-1 trace as the baseline.
+        disk_one = replace(target(), disk_number=1)
+        baseline = tuple(replace(e, target=disk_one) for e in events())
+        self.assertEqual(assess_synthetic_snapshot(baseline).verdict,
+                         Verdict.SOURCE_TEST_ONLY)
+        for index in range(1, 6):
+            with self.subTest(index=index, value=True):
+                self.assert_blocked(
+                    update_event(baseline, index,
+                                 target=replace(disk_one, disk_number=True)),
+                    "TARGET_UNQUALIFIED",
+                )
+
     def test_prelock_and_late_media_modification(self):
         for index in (1, 2, 3, 4, 5):
             with self.subTest(index=index):
@@ -164,6 +185,20 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(result.reason, "ATTEMPT_UNQUALIFIED")
         self.assertFalse(guard.consumed)
         self.assertEqual(guard.transmissions, 0)
+
+    def test_noninteger_issue_numeric_equivalence_cannot_consume_guard(self):
+        for issue in (119.0, 119 + 0j):
+            with self.subTest(issue=issue):
+                guard = SyntheticGuard()
+                invalid = replace(attempt(), issue=issue)
+                result = guard.consume(invalid, create_exclusive=True,
+                                       file_flushed=True, directory_durable=True)
+                self.assertEqual(result.verdict, Verdict.BLOCKED)
+                self.assertEqual(result.reason, "ATTEMPT_UNQUALIFIED")
+                self.assertFalse(guard.consumed)
+                self.assertEqual(guard.transmissions, 0)
+                self.assertEqual(guard.simulated_send(invalid).verdict,
+                                 Verdict.BLOCKED)
 
     def test_every_guard_write_failure_consumes_and_prevents_send(self):
         for which in ("create_exclusive", "file_flushed", "directory_durable"):
