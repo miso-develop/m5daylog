@@ -62,6 +62,11 @@ class SnapshotTests(unittest.TestCase):
         self.assert_blocked(events()[:-1], "STEP_SEQUENCE_UNPROVEN")
         self.assert_blocked(events()[::-1], "STEP_SEQUENCE_UNPROVEN")
 
+    def test_untrusted_wrong_type_event_blocks_without_exception(self):
+        wrong = list(events())
+        wrong[3] = "forged-lock"
+        self.assert_blocked(tuple(wrong), "STEP_SEQUENCE_UNPROVEN")
+
     def test_target_drift_at_post_lock_stage(self):
         bad = replace(target(), cdc_instance_id="different-cdc")
         self.assert_blocked(update_event(events(), 5, target=bad),
