@@ -358,6 +358,77 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(guard.simulated_send(alternate).reason,
                          "UNAUTHORIZED_ATTEMPT")
 
+    def test_consumed_attempt_uses_detached_canonical_identity_snapshot(self):
+        # @dataclass(frozen=True) is not a security boundary: object.__setattr__
+        # can rewrite caller-owned evidence even after guard consumption.
+        mutations = (
+            ("attempt_id", "e5f8d87c-8d36-49ad-9c6a-8ae782b284e9"),
+            ("original_clear_sha256", "c" * 64),
+            ("receipt_sha256", "d" * 64),
+            ("host_volume_identity", "different-host-volume"),
+        )
+        for field, new_value in mutations:
+            with self.subTest(field=field):
+                caller_owned = attempt()
+                original = replace(caller_owned)
+                guard = SyntheticGuard()
+                claimed = guard.consume(
+                    caller_owned, create_exclusive=True, file_flushed=True,
+                    directory_durable=True,
+                )
+                self.assertEqual(claimed.verdict, Verdict.SOURCE_TEST_ONLY)
+                self.assertTrue(guard.consumed)
+                self.assertEqual(guard.transmissions, 0)
+
+                object.__setattr__(caller_owned, field, new_value)
+                forged_copy = replace(caller_owned)
+                self.assertIsNot(forged_copy, caller_owned)
+                self.assertTrue(caller_owned.qualified())
+                self.assertTrue(forged_copy.qualified())
+                for changed_request in (caller_owned, forged_copy):
+                    rejected = guard.simulated_send(changed_request)
+                    self.assertEqual(rejected.verdict, Verdict.BLOCKED)
+                    self.assertEqual(rejected.reason, "UNAUTHORIZED_ATTEMPT")
+                    self.assertFalse(rejected.release_authorized)
+                    self.assertEqual(rejected.native_qualification, "NOT_RUN")
+                    self.assertEqual(guard.transmissions, 0)
+
+                # The unchanged canonical claim is still valid exactly once
+                # in the uninterrupted synthetic process, not after restart.
+                allowed = guard.simulated_send(original)
+                self.assertEqual(allowed.verdict, Verdict.SOURCE_TEST_ONLY)
+                self.assertFalse(allowed.release_authorized)
+                self.assertEqual(guard.transmissions, 1)
+                self.assertEqual(guard.simulated_send(original).reason,
+                                 "ATTEMPT_ALREADY_SENT")
+                self.assertEqual(
+                    guard.simulate_restart().simulated_send(original).verdict,
+                    Verdict.BLOCKED,
+                )
+
+    def test_guard_write_failure_with_mutated_claim_remains_terminal(self):
+        caller_owned = attempt()
+        guard = SyntheticGuard()
+        self.assertEqual(
+            guard.consume(caller_owned, create_exclusive=True,
+                          file_flushed=True, directory_durable=False).reason,
+            "DIRECTORY_DURABILITY_UNPROVEN",
+        )
+        object.__setattr__(caller_owned, "host_volume_identity", "other-host")
+        object.__setattr__(caller_owned, "original_clear_sha256", "c" * 64)
+        self.assertTrue(guard.consumed)
+        self.assertEqual(guard.consume(attempt(), create_exclusive=True,
+                                       file_flushed=True,
+                                       directory_durable=True).reason,
+                         "ATTEMPT_ALREADY_CONSUMED")
+        self.assertEqual(guard.simulated_send(replace(caller_owned)).verdict,
+                         Verdict.BLOCKED)
+        self.assertEqual(
+            guard.simulate_restart().simulated_send(attempt()).verdict,
+            Verdict.BLOCKED,
+        )
+        self.assertEqual(guard.transmissions, 0)
+
     def test_restart_after_consumption_before_send_is_terminal(self):
         # A crash at this boundary cannot prove whether a CDC send escaped.
         # The restart model must never recover the in-process send privilege.
