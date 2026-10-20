@@ -63,6 +63,27 @@ class GatePermit:
     history_sha256: str
 
 
+
+@dataclass(frozen=True)
+class ControlledPocReadiness:
+    """External, per-attempt controlled-PoC gate observed while lock is held.
+
+    The calling Human Gate must independently qualify Device PC ownership,
+    absence of *known* competing writers, same-target LOCK/DISMOUNT and a
+    trusted operator-supervised session. This value is NOT a historical write
+    attestation, firmware attestation, or power-loss durability certificate.
+    No native or public-CLI adapter to produce it is provided by #121.
+    """
+    mode: str
+    target: EjectTarget
+    receipt_sha256: str
+    history_sha256: str
+    attempt_id: str
+    no_known_competing_writer: bool
+    device_pc_owned: bool
+    same_target_lock_dismounted: bool
+
+
 @dataclass(frozen=True)
 class MaintenanceOutcome:
     status: str
@@ -423,8 +444,10 @@ def verify_post_clear(
 class OneShotGuard:
     """Local *host-only* append-before-transmit record, never on Device storage.
 
-    An external Human Gate must qualify Windows durability/volume/one-shot
-    semantics before authorizing native calls. Existing path always blocks.
+    This fixed host-local marker is best-effort for a supervised PoC; file
+    fsync cannot certify directory-entry/controller persistence on power loss.
+    Missing/corrupt/uncertain markers deny automatic retry. The only public
+    CLI remains read-only, with no native release adapter provided.
     """
 
     def __init__(self, directory: str | Path):
@@ -449,6 +472,7 @@ class OneShotGuard:
             "issue": permit.issue, "receipt_sha256": permit.receipt_sha256,
             "attempt_id": permit.attempt_id,
             "history_sha256": permit.history_sha256,
+            "scope": "CONTROLLED_POC_MAINTENANCE_119",
             "consumed": True,
         }, sort_keys=True).encode("ascii") + b"\n"
         fd = None
@@ -459,6 +483,14 @@ class OneShotGuard:
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
+            # Read back the exact record, including its file identity and
+            # approved directory chain. Any ambiguity leaves the marker
+            # consumed; never remove or replace it to attempt again.
+            try:
+                if _read_pinned(self.path, hashlib.sha256(content).hexdigest()) != content:
+                    raise MaintenanceBlocked("GUARD_RECORD_UNVERIFIED")
+            except MaintenanceBlocked:
+                raise MaintenanceBlocked("GUARD_RECORD_UNVERIFIED") from None
         except FileExistsError:
             raise MaintenanceBlocked("ATTEMPT_ALREADY_CONSUMED") from None
         except OSError:
@@ -483,11 +515,15 @@ class MaintenanceReleaseCoordinator:
     def run(self, *, mount_root: str, cdc_port: str, gate: UsbSessionIoGate,
             fresh_preflight: Callable[[], Preflight],
             trusted_human_gate_qualifier: Callable[[Preflight, EjectTarget], GatePermit],
+            trusted_controlled_poc_qualifier: Callable[
+                [GatePermit, Preflight, EjectTarget], ControlledPocReadiness],
             guard: OneShotGuard) -> MaintenanceOutcome:
-        """Caller supplies separately authorized runtime/attempt proof.
+        """Source-only seam: two independent external qualifications are required.
 
-        Not a substitute for independent Windows physical Human Gate.
-        All injected host reads/approvals run before normal I/O admission seal.
+        The first authorizes history/runtime/attempt before sealing, the second
+        confirms the *controlled PoC* environmental assumptions while the
+        locked/dismounted target remains retained. Neither is available from
+        the public read-only CLI or from a production native qualifier here.
         """
         try:
             # The one-shot marker must be created on host-local storage,
@@ -526,12 +562,26 @@ class MaintenanceReleaseCoordinator:
             with gate.release_control():
                 with self.port.quiesce(target):
                     gate.host_quiesced()
-                    # The existing Win32 adapter has NO attested locked-media
-                    # freshness primitive. Do not turn this into a real release
-                    # until a separately reviewed native adapter can prove it.
-                    verifier = getattr(self.port, "prove_locked_snapshot", None)
-                    if not callable(verifier) or verifier(target, final) is not True:
-                        raise MaintenanceBlocked("LOCKED_MEDIA_FRESHNESS_UNPROVEN")
+                    # Human-approved #119 controlled PoC does not require a
+                    # mathematically complete prior-write history or native
+                    # post-lock FAT32 raw witness. It DOES require a distinct,
+                    # externally qualified and identity-bound supervised-PoC
+                    # observation. A boolean, mock locked snapshot or absent
+                    # callback must never authorize this boundary.
+                    if not callable(trusted_controlled_poc_qualifier):
+                        raise MaintenanceBlocked("CONTROLLED_POC_QUALIFICATION_REQUIRED")
+                    readiness = trusted_controlled_poc_qualifier(
+                        permit, final, target)
+                    if (type(readiness) is not ControlledPocReadiness or
+                            readiness.mode != "CONTROLLED_POC_MAINTENANCE_119" or
+                            readiness.target != target or
+                            readiness.receipt_sha256 != final.receipt_sha256 or
+                            readiness.history_sha256 != final.history_sha256 or
+                            readiness.attempt_id != permit.attempt_id or
+                            readiness.no_known_competing_writer is not True or
+                            readiness.device_pc_owned is not True or
+                            readiness.same_target_lock_dismounted is not True):
+                        raise MaintenanceBlocked("CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
                     # Consume before the first byte can be transmitted, even
                     # if a later error means the request was never sent.
                     guard.consume(permit)

@@ -14,8 +14,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from m5daylog.maintenance_release import (
-    GatePermit, MaintenanceBlocked, MaintenanceReleaseCoordinator,
-    OneShotGuard, Preflight, verify_post_clear, _require_unique_usb_target,
+    ControlledPocReadiness, GatePermit, MaintenanceBlocked,
+    MaintenanceReleaseCoordinator, OneShotGuard, Preflight,
+    verify_post_clear, _require_unique_usb_target,
 )
 from m5daylog.release import EjectTarget, UsbSessionIoGate, GateState
 from m5daylog.windows_release import DiskInterface, WindowsHostReleasePort
@@ -265,16 +266,11 @@ class FakePort:
         self.fail = None
         self.disappear = True
         self.extra_usb = False
-        self.freshness = True
 
     def assert_single_usb_target(self, target):
         self.steps.append("unique")
         if self.extra_usb:
             raise RuntimeError("second removable USB target")
-
-    def prove_locked_snapshot(self, target, preflight):
-        self.steps.append("locked-proof")
-        return self.freshness
 
     def resolve_target(self, root, device_id):
         self.steps.append("resolve")
@@ -349,6 +345,10 @@ class CoordinatorTests(unittest.TestCase):
         self.calls = []
         self.attempt = str(uuid.uuid4())
         self.now = 0.0
+        self.no_known_competing_writer = True
+        self.device_pc_owned = True
+        self.same_target_lock_dismounted = True
+        self.poc_mode = "CONTROLLED_POC_MAINTENANCE_119"
         self.coordinator = MaintenanceReleaseCoordinator(
             self.port, timeout_s=1,
             clock=lambda: self.now,
@@ -363,11 +363,20 @@ class CoordinatorTests(unittest.TestCase):
         return GatePermit(119, proof.receipt_sha256, target, self.attempt, True,
                           str(Path(self.tmp.name).resolve()), proof.history_sha256)
 
-    def run_case(self, preflight=None, qualifier=None):
+    def poc_readiness(self, permit, proof, target):
+        self.port.steps.append("controlled-poc")
+        return ControlledPocReadiness(
+            self.poc_mode, target, proof.receipt_sha256, proof.history_sha256,
+            permit.attempt_id, self.no_known_competing_writer,
+            self.device_pc_owned, self.same_target_lock_dismounted)
+
+    def run_case(self, preflight=None, qualifier=None, readiness=None):
         return self.coordinator.run(
             mount_root=str(self.mount), cdc_port="COM5", gate=self.gate,
             fresh_preflight=self.preflight if preflight is None else preflight,
             trusted_human_gate_qualifier=self.permit if qualifier is None else qualifier,
+            trusted_controlled_poc_qualifier=(
+                self.poc_readiness if readiness is None else readiness),
             guard=self.guard)
 
     def test_qualified_success_only_maintenance_not_sync(self):
@@ -377,7 +386,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(self.calls, ["preflight", "preflight", "qualify"])
         self.assertEqual(self.port.steps, [
             "resolve", "revalidate", "unique", "available", "revalidate",
-            "unique", "lock", "dismount", "locked-proof", "release", "observe"])
+            "unique", "lock", "dismount", "controlled-poc", "release", "observe"])
         self.assertEqual(self.gate.state, GateState.RELEASED)
         self.assertTrue(self.guard.path.exists())
         self.assertEqual(self.port.steps.count("release"), 1)
@@ -410,27 +419,82 @@ class CoordinatorTests(unittest.TestCase):
         self.assertNotIn("lock", self.port.steps)
         self.assertNotIn("release", self.port.steps)
 
-    def test_locked_snapshot_must_be_provable(self):
-        self.port.freshness = False
+    def test_controlled_poc_requires_positive_writer_exclusion(self):
+        self.no_known_competing_writer = False
         outcome = self.run_case()
-        self.assertEqual(outcome.reason, "LOCKED_MEDIA_FRESHNESS_UNPROVEN")
+        self.assertEqual(outcome.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
         self.assertNotIn("release", self.port.steps)
         self.assertFalse(self.guard.path.exists())
 
-    def test_unverified_lock_adapter_never_sends(self):
-        with patch.object(FakePort, "prove_locked_snapshot", None):
-            outcome = self.run_case()
-        self.assertEqual(outcome.reason, "LOCKED_MEDIA_FRESHNESS_UNPROVEN")
+    def test_absent_controlled_poc_qualifier_never_sends(self):
+        outcome = self.run_case(readiness=False)
+        self.assertEqual(outcome.reason, "CONTROLLED_POC_QUALIFICATION_REQUIRED")
         self.assertNotIn("release", self.port.steps)
 
     def test_post_final_inventory_race_aborts_locked_release(self):
         def qualifier(proof, target):
-            self.port.freshness = False  # simulated late WAV before lock
+            self.no_known_competing_writer = False  # late writer observed
             return self.permit(proof, target)
         outcome = self.run_case(qualifier=qualifier)
-        self.assertEqual(outcome.status, "BLOCKED")
+        self.assertEqual(outcome.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
         self.assertNotIn("release", self.port.steps)
         self.assertFalse(self.guard.path.exists())
+
+    def test_controlled_poc_no_trust_by_boolean_or_unqualified_session(self):
+        for bad in (True, False, None, "approved"):
+            with self.subTest(bad=bad):
+                self.setUp()
+                result = self.run_case(readiness=lambda *_: bad)
+                self.assertEqual(result.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
+                self.assertNotIn("release", self.port.steps)
+                self.assertFalse(self.guard.path.exists())
+
+    def test_controlled_poc_scope_and_device_ownership_are_required(self):
+        for field, value in (
+                ("poc_mode", "PRODUCTION"), ("device_pc_owned", False),
+                ("same_target_lock_dismounted", False)):
+            with self.subTest(field=field):
+                self.setUp()
+                setattr(self, field, value)
+                result = self.run_case()
+                self.assertEqual(result.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
+                self.assertNotIn("release", self.port.steps)
+                self.assertFalse(self.guard.path.exists())
+
+    def test_controlled_poc_exact_target_receipt_history_and_attempt_bound(self):
+        valid = self.permit(self.proof, TARGET)
+        actual = self.poc_readiness(valid, self.proof, TARGET)
+        for changes in (
+                {"target": EjectTarget("other", "F:\\\\", "other-volume", 9,
+                                       "other-disk", "other-eject", "other-usb")},
+                {"receipt_sha256": "d" * 64},
+                {"history_sha256": "e" * 64},
+                {"attempt_id": str(uuid.uuid4())}):
+            with self.subTest(changes=changes):
+                self.setUp()
+                altered = ControlledPocReadiness(**(dict(
+                    mode=actual.mode, target=actual.target,
+                    receipt_sha256=actual.receipt_sha256,
+                    history_sha256=actual.history_sha256,
+                    attempt_id=actual.attempt_id,
+                    no_known_competing_writer=actual.no_known_competing_writer,
+                    device_pc_owned=actual.device_pc_owned,
+                    same_target_lock_dismounted=actual.same_target_lock_dismounted) | changes))
+                result = self.run_case(readiness=lambda *_: altered)
+                self.assertEqual(result.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
+                self.assertNotIn("release", self.port.steps)
+
+    def test_guard_readback_ambiguity_blocks_before_send(self):
+        with patch("m5daylog.maintenance_release._read_pinned",
+                   side_effect=MaintenanceBlocked("simulated record swap")):
+            result = self.run_case()
+        self.assertEqual(result.reason, "GUARD_RECORD_UNVERIFIED")
+        self.assertTrue(self.guard.path.exists())
+        self.assertNotIn("release", self.port.steps)
+        self.gate = UsbSessionIoGate()
+        again = self.run_case()
+        self.assertEqual(again.reason, "ATTEMPT_ALREADY_CONSUMED")
+        self.assertNotIn("release", self.port.steps)
 
     def test_alternative_guard_location_rejected_by_original_permit(self):
         first = self.permit(self.proof, TARGET)

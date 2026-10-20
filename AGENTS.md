@@ -47,6 +47,14 @@ Task が存在しない場合は production change を推測して開始しな�
 10. Merge 直前に latest `main`、open/draft PR、branch HEAD、semantic overlap を再確認し、必要なら branch update + affected checks rerun を行う。
 11. PR merge により Task が close されて初めて iteration 完了とする。同じ iteration で次 Task に進まない。
 
+## Independent Engineering / Security Review and GitHub record
+
+ProjectのTask / Spec / Integration gateが独立Engineering ReviewまたはSecurity Reviewを要求する場合、その独立性は**実装を行ったAI会話・セッションとは別のAI会話・セッション**で実施することを意味する。ReviewerはGitHubから現行のexact PR HEAD、live base、全差分、関連Issue/Spec、project/security規約、真正な検証結果、並列作業状況を新たに取得し、実装セッションの自己評価をCLEARの根拠にしない。EngineeringとSecurityは各々のリスクを実質的に分析し、findingと未検証範囲を区別する。
+
+同一GitHubアカウントを使用しても、別AIセッションでの実質Reviewの独立性は成立する。ただしGitHubのPR authorは自己`APPROVE`できない。正式なReview投稿が可能なら`COMMENT`型の**GitHub Pull Request Review**を提出し、対象exact HEAD、Engineering disposition、Security necessity/result、根拠、limits、別セッションでの実施を記録する。通常のIssue/PR Conversation commentを正式Reviewとして扱わない。
+
+投稿後にGitHubからReview ID / URL、reviewer、`COMMENTED` state、review commit SHAと現行PR HEADをread-backする。Draft・API・権限制約などで提出できなければ`SUBMITTED`と記録しない。技術的`CLEAR` / `SECURITY_CLEAR`はGitHubの`APPROVED`ではなく、server-side required approving reviewの代用にならない。Blocking finding、未充足check、HEAD/base変更、未Reviewの追加変更がある場合は従来のmerge gateと再評価を維持し、bypassしない。実施手順は`.agents/skills/code-review/SKILL.md`を参照する。
+
 ## Security-sensitive behavior
 
 - Real token / password / API key / PAT / OAuth credential / cookie / private key / recovery material を要求しない、表示しない、保存しない。

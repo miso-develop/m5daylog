@@ -1,0 +1,56 @@
+name: 'PC #126 Source Qualification'
+
+on:
+  pull_request:
+    paths:
+      - 'pc/src/m5daylog/maintenance_windows_qualification.py'
+      - 'pc/tests/test_maintenance_windows_qualification.py'
+      - 'pc/MAINTENANCE_WINDOWS_126.md'
+      - '.github/workflows/pc-qualification-126.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'pc/src/m5daylog/maintenance_windows_qualification.py'
+      - 'pc/tests/test_maintenance_windows_qualification.py'
+      - 'pc/MAINTENANCE_WINDOWS_126.md'
+      - '.github/workflows/pc-qualification-126.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  pc-qualification:
+    name: pc:qualification-126 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Check out exact PR head or push revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - name: Verify tested revision
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python -c "import os, subprocess; actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(); print('TESTED_HEAD=' + actual); assert actual == os.environ['EXPECTED_HEAD'], 'checkout revision mismatch'"
+      - name: Synthetic qualification regressions
+        working-directory: pc
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -p 'test_maintenance_windows_qualification.py' -v
+      - name: Full PC stdlib regression
+        working-directory: pc
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
+      - name: Repository security scan
+        run: python scripts/security_scan.py
