@@ -200,6 +200,21 @@ class GuardTests(unittest.TestCase):
                 self.assertEqual(guard.simulated_send(invalid).verdict,
                                  Verdict.BLOCKED)
 
+    def test_untyped_issue_alias_cannot_send_after_valid_consumption(self):
+        guard = SyntheticGuard()
+        valid = attempt()
+        guard.consume(valid, create_exclusive=True, file_flushed=True,
+                      directory_durable=True)
+        for issue in (119.0, 119 + 0j):
+            with self.subTest(issue=issue):
+                result = guard.simulated_send(replace(valid, issue=issue))
+                self.assertEqual(result.verdict, Verdict.BLOCKED)
+                self.assertEqual(result.reason, "UNAUTHORIZED_ATTEMPT")
+                self.assertEqual(guard.transmissions, 0)
+        self.assertEqual(guard.simulated_send(valid).verdict,
+                         Verdict.SOURCE_TEST_ONLY)
+        self.assertEqual(guard.transmissions, 1)
+
     def test_every_guard_write_failure_consumes_and_prevents_send(self):
         for which in ("create_exclusive", "file_flushed", "directory_durable"):
             with self.subTest(which=which):
