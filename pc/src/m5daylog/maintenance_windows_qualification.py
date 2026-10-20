@@ -143,11 +143,25 @@ class AttemptIdentity:
                 and _qualified_digest(self.receipt_sha256))
 
 
+def _qualified_attempt_key(value: object) -> tuple[int, str, str, str, str] | None:
+    """Capture built-in immutable scalar values before checking the claim.
+
+    Never retain the caller's frozen dataclass instance: object.__setattr__
+    can still mutate it after consumption. Checking the captured values also
+    prevents validation-to-capture mutation of the input object.
+    """
+    if type(value) is not AttemptIdentity:
+        return None
+    key = (value.issue, value.attempt_id, value.original_clear_sha256,
+           value.receipt_sha256, value.host_volume_identity)
+    return key if AttemptIdentity(*key).qualified() else None
+
+
 class SyntheticGuard:
     """In-memory fault model only: no host journal, I/O or CDC transport."""
 
     def __init__(self) -> None:
-        self._claimed: AttemptIdentity | None = None
+        self._claimed: tuple[int, str, str, str, str] | None = None
         self._consumed = False
         self._transmissions = 0
         self._ready = False
@@ -164,10 +178,11 @@ class SyntheticGuard:
                 file_flushed: bool, directory_durable: bool) -> Assessment:
         if self._consumed:
             return Assessment(Verdict.BLOCKED, "ATTEMPT_ALREADY_CONSUMED")
-        if type(attempt) is not AttemptIdentity or not attempt.qualified():
+        key = _qualified_attempt_key(attempt)
+        if key is None:
             return Assessment(Verdict.BLOCKED, "ATTEMPT_UNQUALIFIED")
-        # Reserve before any potentially ambiguous create/write operation.
-        self._claimed = attempt
+        # Reserve a detached canonical value snapshot before any uncertain I/O.
+        self._claimed = key
         self._consumed = True
         if type(create_exclusive) is not bool or not create_exclusive:
             return Assessment(Verdict.BLOCKED, "EXCLUSIVE_CREATE_UNPROVEN")
@@ -180,11 +195,11 @@ class SyntheticGuard:
         return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_GUARD_ONLY")
 
     def simulated_send(self, attempt: AttemptIdentity) -> Assessment:
-        # Never let dataclass numeric equality launder an unqualified attempt
-        # into the already-consumed identity at the simulated send boundary.
-        if (type(attempt) is not AttemptIdentity or not attempt.qualified()
-                or not self._ready or not self._consumed
-                or attempt != self._claimed):
+        # Compare two detached, exactly typed value snapshots; neither a
+        # caller-held dataclass alias nor custom equality may change the claim.
+        key = _qualified_attempt_key(attempt)
+        if (key is None or not self._ready or not self._consumed
+                or key != self._claimed):
             return Assessment(Verdict.BLOCKED, "UNAUTHORIZED_ATTEMPT")
         if self._transmissions:
             return Assessment(Verdict.BLOCKED, "ATTEMPT_ALREADY_SENT")
