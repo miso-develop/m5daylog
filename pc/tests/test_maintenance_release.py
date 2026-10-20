@@ -1,0 +1,632 @@
+"""#121 synthetic-only maintenance release matrix (no Device or Windows calls)."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from unittest.mock import patch
+
+from m5daylog.maintenance_release import (
+    ControlledPocReadiness, GatePermit, MaintenanceBlocked,
+    MaintenanceReleaseCoordinator, OneShotGuard, Preflight,
+    verify_post_clear, _require_unique_usb_target,
+)
+from m5daylog.release import EjectTarget, UsbSessionIoGate, GateState
+from m5daylog.windows_release import DiskInterface, WindowsHostReleasePort
+
+
+TARGET = EjectTarget(
+    "test-device", "E:\\", "test-volume", 8, "test-disk",
+    "test-eject", "test-physical-usb",
+)
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class MediaFixture:
+    def __init__(self, root: Path):
+        self.mount = root / "device"
+        self.backup = root / "backup"
+        self.mount.mkdir()
+        self.backup.mkdir()
+        (self.mount / "M5DAYLOG" / "recordings").mkdir(parents=True)
+        (self.mount / "M5DAYLOG" / "acks").mkdir()
+        (self.mount / "M5DAYLOG" / "quarantine").mkdir()
+        self.backups = []
+        self.protected = []
+        for i in range(117):
+            rel = f"copy/{i:03d}.bin"
+            self.backups.append(self.write(self.backup, rel, b"old-pcm" + bytes([i])))
+        self.protected.append(self.write(
+            self.mount, "M5DAYLOG/device.json", b"synthetic-device"))
+        for i in range(37):
+            self.protected.append(self.write(
+                self.mount, f"root-file-{i:02d}", b"protected" + bytes([i])))
+        self.receipt = root / "receipt.json"
+        self.clear_journal = root / "original-clear-journal.bin"
+        self.preservation = root / "original-preservation-receipt.bin"
+        self.history = root / "detached-history-attestation.json"
+        self.clear_journal.write_bytes(b"immutable synthetic clear guard journal")
+        self.preservation.write_bytes(b"independently preserved synthetic legacy index")
+        self.clear_pin = digest(self.clear_journal.read_bytes())
+        self.preservation_pin = digest(self.preservation.read_bytes())
+        self.payload = {
+            "schema_version": 1,
+            "issue": 119,
+            "device_id": "test-device",
+            "clear_guard_consumed": True,
+            "deleted": {
+                "wav": 76, "manifests": 2, "events": 1,
+                "recording_directories": 10,
+            },
+            "backups": self.backups,
+            "protected": self.protected,
+        }
+        self.save()
+
+    @staticmethod
+    def write(root: Path, name: str, data: bytes) -> dict:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return {"path": name, "size": len(data), "sha256": digest(data)}
+
+    def save(self):
+        data = json.dumps(self.payload, sort_keys=True).encode("utf-8")
+        self.receipt.write_bytes(data)
+        self.pin = digest(data)
+        attestation = {
+            "schema_version": 1,
+            "issue": 119, "device_id": "test-device",
+            "receipt_sha256": self.pin,
+            "clear_journal_sha256": self.clear_pin,
+            "preservation_sha256": self.preservation_pin,
+            "clear_guard_consumed": True,
+            "verified_manifest_wavs": 76,
+            "verified_backups": 117, "verified_protected": 38,
+            "deleted": {
+                "wav": 76, "manifests": 2, "events": 1,
+                "recording_directories": 10,
+            },
+        }
+        serialized = json.dumps(attestation, sort_keys=True).encode("utf-8")
+        self.history.write_bytes(serialized)
+        self.history_pin = digest(serialized)
+
+    def check(self, pin=None):
+        with patch("m5daylog.maintenance_release.inspect_device",
+                   return_value={"deviceId": "test-device"}):
+            return verify_post_clear(
+                mount_root=self.mount, backup_root=self.backup,
+                receipt_path=self.receipt,
+                pinned_receipt_sha256=self.pin if pin is None else pin,
+                history_path=self.history, history_pin=self.history_pin,
+                clear_journal_path=self.clear_journal, clear_journal_pin=self.clear_pin,
+                preservation_path=self.preservation, preservation_pin=self.preservation_pin,
+            )
+
+
+class MediaEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.fx = MediaFixture(Path(self.temp.name))
+
+    @unittest.skipUnless(os.name == "nt", "Windows NTFS junction only")
+    def test_windows_junction_preserving_all_117_hashes_still_blocks_preflight(self):
+        # All pinned historical bytes, file sizes and hashes remain valid.
+        # A junction must not silently relocate the 117 backups outside the
+        # operator-nominated backup root and return PREFLIGHT_ONLY.
+        old = self.fx.backup / "copy"
+        outside = self.fx.backup.parent / "outside-approved-backup"
+        old.rename(outside)
+        proc = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(old), str(outside)],
+            capture_output=True, check=False,
+        )
+        if proc.returncode != 0:
+            if os.environ.get("M5DAYLOG_REQUIRE_NTFS_JUNCTION") == "1":
+                self.fail("required NTFS junction regression could not create a junction")
+            self.skipTest("NTFS junction creation unavailable")
+        self.addCleanup(lambda: old.rmdir() if old.exists() else None)
+        with self.assertRaisesRegex(MaintenanceBlocked,
+                                    "EVIDENCE_DIRECTORY_UNSAFE"):
+            self.fx.check()
+
+    def test_valid_clear_receipt_checks_all_files_and_is_read_only(self):
+        result = self.fx.check()
+        self.assertEqual((result.verified_backups, result.verified_protected),
+                         (117, 38))
+        self.assertEqual(result.receipt_sha256, self.fx.pin)
+        self.assertFalse((self.fx.mount / "M5DAYLOG/manifest.json").exists())
+
+    def test_missing_or_changed_receipt_fails_before_success(self):
+        with self.assertRaises(MaintenanceBlocked):
+            self.fx.check("0" * 64)
+        self.fx.payload["clear_guard_consumed"] = False
+        self.fx.save()
+        with self.assertRaisesRegex(MaintenanceBlocked, "CLEAR_NOT_PROVEN"):
+            self.fx.check()
+
+    def test_prohibited_deletion_counts_and_duplicate_entries(self):
+        self.fx.payload["deleted"]["wav"] = 75
+        self.fx.save()
+        with self.assertRaisesRegex(MaintenanceBlocked, "CLEAR_NOT_PROVEN"):
+            self.fx.check()
+        self.fx.payload["deleted"]["wav"] = 76
+        self.fx.payload["backups"][1] = dict(self.fx.payload["backups"][0])
+        self.fx.save()
+        with self.assertRaisesRegex(MaintenanceBlocked, "INVALID_EVIDENCE_RECORD"):
+            self.fx.check()
+
+    def test_backup_hash_and_protected_hash_mismatch(self):
+        (self.fx.backup / self.fx.backups[1]["path"]).write_bytes(b"altered")
+        with self.assertRaisesRegex(MaintenanceBlocked, "EVIDENCE_HASH_MISMATCH"):
+            self.fx.check()
+        self.fx.write(self.fx.backup, self.fx.backups[1]["path"], b"old-pcm" + bytes([1]))
+        (self.fx.mount / self.fx.protected[0]["path"]).write_bytes(b"changed")
+        with self.assertRaisesRegex(MaintenanceBlocked, "EVIDENCE_HASH_MISMATCH"):
+            self.fx.check()
+
+    def test_new_wav_part_quarantine_or_recovered_directory_fails(self):
+        additions = [
+            "M5DAYLOG/recordings/2026-10-19/clip.wav",
+            "M5DAYLOG/recordings/new.wav.part",
+            "M5DAYLOG/quarantine/new.part",
+            "M5DAYLOG/manifest.json",
+            "M5DAYLOG/events.jsonl",
+            "new-metadata.bin",
+        ]
+        for relative in additions:
+            with self.subTest(path=relative):
+                f = self.fx.mount / relative
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(b"new")
+                with self.assertRaises(MaintenanceBlocked):
+                    self.fx.check()
+                f.unlink()
+                if f.parent.name == "2026-10-19":
+                    f.parent.rmdir()
+
+    def test_empty_unexpected_folder_and_symlink_denied(self):
+        suspect = self.fx.mount / "unlisted-dir"
+        suspect.mkdir()
+        with self.assertRaisesRegex(MaintenanceBlocked, "UNEXPECTED_MEDIA_DIRECTORY"):
+            self.fx.check()
+        suspect.rmdir()
+        try:
+            (self.fx.mount / "strange-link").symlink_to(self.fx.receipt)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable on this host")
+        with self.assertRaisesRegex(MaintenanceBlocked, "MEDIA_UNSAFE_ENTRY"):
+            self.fx.check()
+
+    def test_wrong_device_id_or_unsafe_receipt_path(self):
+        with patch("m5daylog.maintenance_release.inspect_device",
+                   return_value={"deviceId": "swapped"}):
+            with self.assertRaisesRegex(MaintenanceBlocked, "DEVICE_ID_CHANGED"):
+                verify_post_clear(
+                    mount_root=self.fx.mount, backup_root=self.fx.backup,
+                    receipt_path=self.fx.receipt,
+                    pinned_receipt_sha256=self.fx.pin,
+                )
+        self.fx.payload["backups"][0]["path"] = "../secret"
+        self.fx.save()
+        with self.assertRaisesRegex(MaintenanceBlocked, "INVALID_EVIDENCE_PATH"):
+            self.fx.check()
+
+
+    def test_detached_original_clear_evidence_is_mandatory(self):
+        # A self-pinned replacement receipt cannot compensate for the absence
+        # of the independent historical attestation and original journal.
+        self.fx.clear_journal.write_bytes(b"forged historical journal")
+        with self.assertRaisesRegex(MaintenanceBlocked,
+                                    "HISTORICAL_EVIDENCE_MISMATCH"):
+            self.fx.check()
+        self.fx.clear_journal.write_bytes(
+            b"immutable synthetic clear guard journal")
+        self.fx.history.write_bytes(b"substituted new attestation")
+        with self.assertRaisesRegex(MaintenanceBlocked,
+                                    "HISTORICAL_EVIDENCE_MISMATCH"):
+            self.fx.check()
+
+    def test_original_proof_cannot_be_omitted(self):
+        with patch("m5daylog.maintenance_release.inspect_device",
+                   return_value={"deviceId": "test-device"}):
+            with self.assertRaisesRegex(MaintenanceBlocked,
+                                        "ORIGINAL_CLEAR_EVIDENCE_REQUIRED"):
+                verify_post_clear(
+                    mount_root=self.fx.mount, backup_root=self.fx.backup,
+                    receipt_path=self.fx.receipt,
+                    pinned_receipt_sha256=self.fx.pin)
+
+    def test_guard_must_be_host_local_and_replay_is_denied(self):
+        guard = OneShotGuard(Path(self.temp.name))
+        permit = GatePermit(119, self.fx.pin, TARGET, str(uuid.uuid4()), True,
+                            str(Path(self.temp.name).resolve()), self.fx.history_pin)
+        guard.consume(permit)
+        obj = json.loads(guard.path.read_text(encoding="ascii"))
+        self.assertTrue(obj["consumed"])
+        with self.assertRaisesRegex(MaintenanceBlocked, "ATTEMPT_ALREADY_CONSUMED"):
+            guard.consume(permit)
+
+
+class FakePort:
+    def __init__(self):
+        self.steps = []
+        self.fail = None
+        self.disappear = True
+        self.extra_usb = False
+
+    def assert_single_usb_target(self, target):
+        self.steps.append("unique")
+        if self.extra_usb:
+            raise RuntimeError("second removable USB target")
+
+    def resolve_target(self, root, device_id):
+        self.steps.append("resolve")
+        if self.fail == "resolve":
+            raise RuntimeError("changed")
+        return TARGET
+
+    def revalidate_target(self, target, cdc_port):
+        self.steps.append("revalidate")
+        if self.fail == "revalidate":
+            raise RuntimeError("target changed")
+
+    def volume_available(self, target):
+        self.steps.append("available")
+        return True
+
+    @contextmanager
+    def quiesce(self, target):
+        self.steps.append("lock")
+        if self.fail == "lock":
+            raise RuntimeError("lock failed")
+        self.steps.append("dismount")
+        if self.fail == "dismount":
+            raise RuntimeError("dismount failed")
+        yield
+
+    def release_storage(self, cdc_port, attempt_id, target):
+        self.steps.append("release")
+        if self.fail == "transport":
+            raise RuntimeError("response lost")
+
+    def volume_disappeared(self, target):
+        self.steps.append("observe")
+        return self.disappear
+
+
+
+class RealPortCandidateInventoryTests(unittest.TestCase):
+    """Exercise the actual WindowsHostReleasePort adapter's API seam."""
+
+    def test_single_removable_usb_disk_is_required(self):
+        disk = DiskInterface(8, "test-disk", "test-eject",
+                             "test-physical-usb")
+        other = DiskInterface(9, "another-disk", "other-eject",
+                              "other-physical-usb")
+
+        class Api:
+            def __init__(self, entries):
+                self.entries = entries
+            def disk_interfaces(self):
+                return self.entries
+
+        _require_unique_usb_target(WindowsHostReleasePort(Api([disk])), TARGET)
+        for entries in ([disk, other], [], [other]):
+            with self.subTest(entries=len(entries)):
+                with self.assertRaisesRegex(MaintenanceBlocked,
+                                            "AMBIGUOUS_USB_STORAGE"):
+                    _require_unique_usb_target(
+                        WindowsHostReleasePort(Api(entries)), TARGET)
+
+
+class CoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.port = FakePort()
+        self.mount = Path(self.tmp.name) / "mounted-device"
+        self.mount.mkdir()
+        self.guard = OneShotGuard(Path(self.tmp.name))
+        self.gate = UsbSessionIoGate()
+        self.proof = Preflight("a" * 64, "test-device", 117, 38, "c" * 64)
+        self.calls = []
+        self.attempt = str(uuid.uuid4())
+        self.now = 0.0
+        self.no_known_competing_writer = True
+        self.device_pc_owned = True
+        self.same_target_lock_dismounted = True
+        self.poc_mode = "CONTROLLED_POC_MAINTENANCE_119"
+        self.coordinator = MaintenanceReleaseCoordinator(
+            self.port, timeout_s=1,
+            clock=lambda: self.now,
+            sleep=lambda seconds: setattr(self, "now", self.now + seconds))
+
+    def preflight(self):
+        self.calls.append("preflight")
+        return self.proof
+
+    def permit(self, proof, target):
+        self.calls.append("qualify")
+        return GatePermit(119, proof.receipt_sha256, target, self.attempt, True,
+                          str(Path(self.tmp.name).resolve()), proof.history_sha256)
+
+    def poc_readiness(self, permit, proof, target):
+        self.port.steps.append("controlled-poc")
+        return ControlledPocReadiness(
+            self.poc_mode, target, proof.receipt_sha256, proof.history_sha256,
+            permit.attempt_id, self.no_known_competing_writer,
+            self.device_pc_owned, self.same_target_lock_dismounted)
+
+    def run_case(self, preflight=None, qualifier=None, readiness=None):
+        return self.coordinator.run(
+            mount_root=str(self.mount), cdc_port="COM5", gate=self.gate,
+            fresh_preflight=self.preflight if preflight is None else preflight,
+            trusted_human_gate_qualifier=self.permit if qualifier is None else qualifier,
+            trusted_controlled_poc_qualifier=(
+                self.poc_readiness if readiness is None else readiness),
+            guard=self.guard)
+
+    def test_qualified_success_only_maintenance_not_sync(self):
+        result = self.run_case()
+        self.assertTrue(result.success)
+        self.assertEqual(result.status, "MAINTENANCE_RELEASE_ONLY")
+        self.assertEqual(self.calls, ["preflight", "preflight", "qualify"])
+        self.assertEqual(self.port.steps, [
+            "resolve", "revalidate", "unique", "available", "revalidate",
+            "unique", "lock", "dismount", "controlled-poc", "release", "observe"])
+        self.assertEqual(self.gate.state, GateState.RELEASED)
+        self.assertTrue(self.guard.path.exists())
+        self.assertEqual(self.port.steps.count("release"), 1)
+
+    def test_guard_on_device_media_blocks_before_quiesce(self):
+        self.guard = OneShotGuard(self.mount)
+        outcome = self.run_case()
+        self.assertEqual(outcome.reason, "GUARD_ON_DEVICE_MEDIA")
+        self.assertNotIn("lock", self.port.steps)
+        self.assertNotIn("release", self.port.steps)
+        self.assertFalse(self.guard.path.exists())
+
+    def test_guard_fsync_failure_never_sends_and_consumes_uncertain_attempt(self):
+        with patch("m5daylog.maintenance_release.os.fsync",
+                   side_effect=OSError("simulated fsync failure")):
+            outcome = self.run_case()
+        self.assertEqual(outcome.reason, "GUARD_DURABILITY_UNVERIFIED")
+        self.assertTrue(self.guard.path.exists())
+        self.assertNotIn("release", self.port.steps)
+        self.gate = UsbSessionIoGate()
+        second = self.run_case()
+        self.assertEqual(second.reason, "ATTEMPT_ALREADY_CONSUMED")
+        self.assertNotIn("release", self.port.steps)
+
+
+    def test_multiple_usb_targets_never_reach_quiescence(self):
+        self.port.extra_usb = True
+        outcome = self.run_case()
+        self.assertEqual(outcome.status, "BLOCKED")
+        self.assertNotIn("lock", self.port.steps)
+        self.assertNotIn("release", self.port.steps)
+
+    def test_controlled_poc_requires_positive_writer_exclusion(self):
+        self.no_known_competing_writer = False
+        outcome = self.run_case()
+        self.assertEqual(outcome.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
+        self.assertNotIn("release", self.port.steps)
+        self.assertFalse(self.guard.path.exists())
+
+    def test_absent_controlled_poc_qualifier_never_sends(self):
+        outcome = self.run_case(readiness=False)
+        self.assertEqual(outcome.reason, "CONTROLLED_POC_QUALIFICATION_REQUIRED")
+        self.assertNotIn("release", self.port.steps)
+
+    def test_post_final_inventory_race_aborts_locked_release(self):
+        def qualifier(proof, target):
+            self.no_known_competing_writer = False  # late writer observed
+            return self.permit(proof, target)
+        outcome = self.run_case(qualifier=qualifier)
+        self.assertEqual(outcome.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
+        self.assertNotIn("release", self.port.steps)
+        self.assertFalse(self.guard.path.exists())
+
+    def test_controlled_poc_no_trust_by_boolean_or_unqualified_session(self):
+        for bad in (True, False, None, "approved"):
+            with self.subTest(bad=bad):
+                self.setUp()
+                result = self.run_case(readiness=lambda *_: bad)
+                self.assertEqual(result.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
+                self.assertNotIn("release", self.port.steps)
+                self.assertFalse(self.guard.path.exists())
+
+    def test_controlled_poc_scope_and_device_ownership_are_required(self):
+        for field, value in (
+                ("poc_mode", "PRODUCTION"), ("device_pc_owned", False),
+                ("same_target_lock_dismounted", False)):
+            with self.subTest(field=field):
+                self.setUp()
+                setattr(self, field, value)
+                result = self.run_case()
+                self.assertEqual(result.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
+                self.assertNotIn("release", self.port.steps)
+                self.assertFalse(self.guard.path.exists())
+
+    def test_controlled_poc_exact_target_receipt_history_and_attempt_bound(self):
+        valid = self.permit(self.proof, TARGET)
+        actual = self.poc_readiness(valid, self.proof, TARGET)
+        for changes in (
+                {"target": EjectTarget("other", "F:\\\\", "other-volume", 9,
+                                       "other-disk", "other-eject", "other-usb")},
+                {"receipt_sha256": "d" * 64},
+                {"history_sha256": "e" * 64},
+                {"attempt_id": str(uuid.uuid4())}):
+            with self.subTest(changes=changes):
+                self.setUp()
+                altered = ControlledPocReadiness(**(dict(
+                    mode=actual.mode, target=actual.target,
+                    receipt_sha256=actual.receipt_sha256,
+                    history_sha256=actual.history_sha256,
+                    attempt_id=actual.attempt_id,
+                    no_known_competing_writer=actual.no_known_competing_writer,
+                    device_pc_owned=actual.device_pc_owned,
+                    same_target_lock_dismounted=actual.same_target_lock_dismounted) | changes))
+                result = self.run_case(readiness=lambda *_: altered)
+                self.assertEqual(result.reason, "CONTROLLED_POC_QUALIFICATION_UNVERIFIED")
+                self.assertNotIn("release", self.port.steps)
+
+    def test_guard_readback_ambiguity_blocks_before_send(self):
+        with patch("m5daylog.maintenance_release._read_pinned",
+                   side_effect=MaintenanceBlocked("simulated record swap")):
+            result = self.run_case()
+        self.assertEqual(result.reason, "GUARD_RECORD_UNVERIFIED")
+        self.assertTrue(self.guard.path.exists())
+        self.assertNotIn("release", self.port.steps)
+        self.gate = UsbSessionIoGate()
+        again = self.run_case()
+        self.assertEqual(again.reason, "ATTEMPT_ALREADY_CONSUMED")
+        self.assertNotIn("release", self.port.steps)
+
+    def test_alternative_guard_location_rejected_by_original_permit(self):
+        first = self.permit(self.proof, TARGET)
+        alternative = Path(self.tmp.name) / "other"
+        alternative.mkdir()
+        self.guard = OneShotGuard(alternative)
+        result = self.run_case(qualifier=lambda *_: first)
+        self.assertEqual(result.reason, "UNAUTHORIZED_GUARD_DIRECTORY")
+        self.assertNotIn("release", self.port.steps)
+        self.assertFalse(self.guard.path.exists())
+
+
+    def test_alternate_directory_cannot_replay_a_consumed_attempt(self):
+        accepted = self.permit(self.proof, TARGET)
+        first = self.run_case(qualifier=lambda *_: accepted)
+        self.assertTrue(first.success)
+        self.assertEqual(self.port.steps.count("release"), 1)
+        alternative = Path(self.tmp.name) / "other"
+        alternative.mkdir()
+        self.guard = OneShotGuard(alternative)
+        self.gate = UsbSessionIoGate()
+        result = self.run_case(qualifier=lambda *_: accepted)
+        self.assertEqual(result.reason, "UNAUTHORIZED_GUARD_DIRECTORY")
+        self.assertEqual(self.port.steps.count("release"), 1)
+        self.assertFalse(self.guard.path.exists())
+
+    def test_wrong_historical_pin_in_gate_permit_blocks(self):
+        qualified = self.permit(self.proof, TARGET)
+        wrong = GatePermit(
+            qualified.issue, qualified.receipt_sha256, qualified.target,
+            qualified.attempt_id, True, qualified.authorized_guard_directory,
+            "d" * 64)
+        result = self.run_case(qualifier=lambda *_: wrong)
+        self.assertEqual(result.reason, "BLOCKED_PROVENANCE_OR_APPROVAL")
+        self.assertNotIn("release", self.port.steps)
+
+    def test_changed_cdc_target_prevents_quiescence(self):
+        self.port.fail = "revalidate"
+        outcome = self.run_case()
+        self.assertEqual(outcome.status, "BLOCKED")
+        self.assertNotIn("lock", self.port.steps)
+        self.assertNotIn("release", self.port.steps)
+
+    def test_missing_provenance_or_approval_sends_no_release(self):
+        for permit in (None, GatePermit(119, self.proof.receipt_sha256,
+                  TARGET, self.attempt, False, str(Path(self.tmp.name).resolve()), self.proof.history_sha256),
+                  GatePermit(119, "b" * 64, TARGET, self.attempt, True,
+                             str(Path(self.tmp.name).resolve()), self.proof.history_sha256)):
+            with self.subTest(permit=permit):
+                self.setUp()
+                result = self.run_case(qualifier=lambda *_: permit)
+                self.assertEqual(result.status, "BLOCKED")
+                self.assertNotIn("lock", self.port.steps)
+                self.assertNotIn("release", self.port.steps)
+
+    def test_malformed_running_handler_qualification_fails_closed(self):
+        # Runtime type hints on GatePermit do not authenticate external facts.
+        # A truthy non-Boolean value must never qualify the running handler.
+        for evidence in ("UNVERIFIED", "false", 1, 0, None, False,
+                         {"qualified": True}):
+            with self.subTest(evidence=evidence):
+                self.setUp()
+                valid = self.permit(self.proof, TARGET)
+                malformed = GatePermit(
+                    valid.issue, valid.receipt_sha256, valid.target,
+                    valid.attempt_id, evidence, valid.authorized_guard_directory,
+                    valid.history_sha256)
+                outcome = self.run_case(qualifier=lambda *_: malformed)
+                self.assertEqual(outcome.status, "BLOCKED")
+                self.assertEqual(outcome.reason, "BLOCKED_PROVENANCE_OR_APPROVAL")
+                self.assertEqual(self.gate.state, GateState.OPEN)
+                self.assertNotIn("lock", self.port.steps)
+                self.assertNotIn("dismount", self.port.steps)
+                self.assertNotIn("release", self.port.steps)
+                self.assertFalse(self.guard.path.exists())
+
+    def test_media_changed_between_inventory_and_final_check(self):
+        reads = 0
+        def changed():
+            nonlocal reads
+            reads += 1
+            return (self.proof if reads == 1 else
+                    Preflight("b" * 64, "test-device", 117, 38, "c" * 64))
+        result = self.run_case(preflight=changed)
+        self.assertEqual(result.reason, "PREFLIGHT_DRIFT")
+        self.assertNotIn("release", self.port.steps)
+
+    def test_lock_and_dismount_failure_never_consume_or_send(self):
+        for failure in ("lock", "dismount"):
+            with self.subTest(failure=failure):
+                self.setUp()
+                self.port.fail = failure
+                outcome = self.run_case()
+                self.assertEqual(outcome.status, "BLOCKED")
+                self.assertNotIn("release", self.port.steps)
+                self.assertFalse(self.guard.path.exists())
+
+    def test_transport_loss_consumes_attempt_no_replay(self):
+        self.port.fail = "transport"
+        result = self.run_case()
+        self.assertEqual(result.status, "BLOCKED")
+        self.assertTrue(self.guard.path.exists())
+        self.assertEqual(self.port.steps.count("release"), 1)
+        # A new synthetic process/USB admission gate cannot bypass host guard.
+        self.gate = UsbSessionIoGate()
+        self.port.fail = None
+        again = self.run_case()
+        self.assertEqual(again.reason, "ATTEMPT_ALREADY_CONSUMED")
+        self.assertEqual(self.port.steps.count("release"), 1)
+
+    def test_disappearance_without_correlated_acceptance_not_success(self):
+        self.port.fail = "transport"
+        self.port.disappear = True
+        result = self.run_case()
+        self.assertFalse(result.success)
+        self.assertNotIn("observe", self.port.steps)
+
+    def test_timeout_after_acceptance_remains_consumed(self):
+        self.port.disappear = False
+        result = self.run_case()
+        self.assertEqual(result.reason, "POST_ACCEPT_TIMEOUT")
+        self.assertEqual(self.gate.state, GateState.RELEASE_ACCEPTED)
+        self.assertTrue(self.guard.path.exists())
+        self.assertEqual(self.port.steps.count("release"), 1)
+
+    def test_preflight_exception_never_seals_or_sends(self):
+        result = self.run_case(preflight=lambda: (_ for _ in ()).throw(
+            MaintenanceBlocked("BLOCKED_PROVENANCE")))
+        self.assertEqual(result.reason, "BLOCKED_PROVENANCE")
+        self.assertEqual(self.gate.state, GateState.OPEN)
+        self.assertEqual(self.port.steps, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
