@@ -358,6 +358,51 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(guard.simulated_send(alternate).reason,
                          "UNAUTHORIZED_ATTEMPT")
 
+    def test_restart_after_consumption_before_send_is_terminal(self):
+        # A crash at this boundary cannot prove whether a CDC send escaped.
+        # The restart model must never recover the in-process send privilege.
+        guard = SyntheticGuard()
+        fields = dict(create_exclusive=True, file_flushed=True,
+                      directory_durable=True)
+        result = guard.consume(attempt(), **fields)
+        self.assertEqual(result.verdict, Verdict.SOURCE_TEST_ONLY)
+        self.assertEqual(guard.transmissions, 0)
+
+        restarted = guard.simulate_restart()
+        self.assertTrue(restarted.consumed)
+        self.assertEqual(restarted.transmissions, 0)
+        blocked = restarted.simulated_send(attempt())
+        self.assertEqual(blocked.verdict, Verdict.BLOCKED)
+        self.assertEqual(blocked.reason, "UNAUTHORIZED_ATTEMPT")
+        self.assertFalse(blocked.release_authorized)
+        self.assertEqual(blocked.native_qualification, "NOT_RUN")
+        self.assertEqual(restarted.transmissions, 0)
+        self.assertEqual(restarted.consume(attempt(), **fields).reason,
+                         "ATTEMPT_ALREADY_CONSUMED")
+        self.assertEqual(restarted.simulate_restart().simulated_send(
+            attempt()).verdict, Verdict.BLOCKED)
+
+        # An uninterrupted in-process attempt may still send once (synthetic).
+        self.assertEqual(guard.simulated_send(attempt()).verdict,
+                         Verdict.SOURCE_TEST_ONLY)
+        self.assertEqual(guard.transmissions, 1)
+
+    def test_recovered_failed_guard_write_never_sends(self):
+        fields = dict(create_exclusive=True, file_flushed=True,
+                      directory_durable=True)
+        for failed in fields:
+            with self.subTest(failed=failed):
+                guard = SyntheticGuard()
+                failure = dict(fields)
+                failure[failed] = False
+                self.assertEqual(guard.consume(attempt(), **failure).verdict,
+                                 Verdict.BLOCKED)
+                recovered = guard.simulate_restart()
+                self.assertTrue(recovered.consumed)
+                self.assertEqual(recovered.simulated_send(attempt()).verdict,
+                                 Verdict.BLOCKED)
+                self.assertEqual(recovered.transmissions, 0)
+
     def test_simulated_send_at_most_once_even_after_restart(self):
         guard = SyntheticGuard()
         self.assertEqual(guard.simulated_send(attempt()).verdict, Verdict.BLOCKED)
