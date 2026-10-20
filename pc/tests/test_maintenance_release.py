@@ -550,6 +550,27 @@ class CoordinatorTests(unittest.TestCase):
                 self.assertNotIn("lock", self.port.steps)
                 self.assertNotIn("release", self.port.steps)
 
+    def test_malformed_running_handler_qualification_fails_closed(self):
+        # Runtime type hints on GatePermit do not authenticate external facts.
+        # A truthy non-Boolean value must never qualify the running handler.
+        for evidence in ("UNVERIFIED", "false", 1, 0, None, False,
+                         {"qualified": True}):
+            with self.subTest(evidence=evidence):
+                self.setUp()
+                valid = self.permit(self.proof, TARGET)
+                malformed = GatePermit(
+                    valid.issue, valid.receipt_sha256, valid.target,
+                    valid.attempt_id, evidence, valid.authorized_guard_directory,
+                    valid.history_sha256)
+                outcome = self.run_case(qualifier=lambda *_: malformed)
+                self.assertEqual(outcome.status, "BLOCKED")
+                self.assertEqual(outcome.reason, "BLOCKED_PROVENANCE_OR_APPROVAL")
+                self.assertEqual(self.gate.state, GateState.OPEN)
+                self.assertNotIn("lock", self.port.steps)
+                self.assertNotIn("dismount", self.port.steps)
+                self.assertNotIn("release", self.port.steps)
+                self.assertFalse(self.guard.path.exists())
+
     def test_media_changed_between_inventory_and_final_check(self):
         reads = 0
         def changed():
