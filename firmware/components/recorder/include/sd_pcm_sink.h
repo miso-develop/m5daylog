@@ -2,7 +2,7 @@
 
 // microSD `.wav.part` file sink + write-latency diagnostics — Tasks #44/#45.
 //
-// Owns one open `.wav.part` file (see wav_part.h). Each drained 32KB slot
+// Owns one open `.wav.part` file (see wav_part.h). Each drained sample-aligned slot
 // from the double buffer is appended via sd_pcm_sink_write_chunk(), which
 // returns false on any I/O failure so the caller goes fail-loud (ERROR,
 // never a silent recording state). Per-chunk latency is reported so the
@@ -35,8 +35,8 @@ typedef struct {
 // WAV header. False = fail-loud open error.
 bool sd_pcm_sink_open(sd_pcm_sink_t *sink, const char *path);
 
-// Append one drained pipeline slot. `len` must equal
-// RECORDER_BUFFER_BYTES. On success increments chunks_written, tracks the
+// Append one drained pipeline slot. `len` must be nonzero, sample-aligned
+// and no greater than RECORDER_BUFFER_BYTES (terminal tail may be short). On success increments chunks_written, tracks the
 // worst latency in max_latency_us, and returns true. On failure increments
 // write_errors and returns false.
 bool sd_pcm_sink_write_chunk(sd_pcm_sink_t *sink, const uint8_t *data,
