@@ -1,4 +1,4 @@
-name: PC #126 Source Qualification
+name: 'PC #126 Source Qualification'
 
 on:
   pull_request:
