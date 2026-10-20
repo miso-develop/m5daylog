@@ -77,7 +77,7 @@ def assess_synthetic_snapshot(events: tuple[SnapshotEvent, ...]) -> Assessment:
     if tuple(getattr(e, "step", None) for e in events) != _STEPS:
         return Assessment(Verdict.BLOCKED, "STEP_SEQUENCE_UNPROVEN")
     first = events[0]
-    if not isinstance(first, SnapshotEvent) or not first.target.qualified():
+    if not isinstance(first, SnapshotEvent) or not isinstance(first.target, TargetIdentity) or not first.target.qualified():
         return Assessment(Verdict.BLOCKED, "TARGET_UNQUALIFIED")
     if not isinstance(first.media_digest, str) or not _SHA256.fullmatch(first.media_digest):
         return Assessment(Verdict.BLOCKED, "INVENTORY_DIGEST_UNQUALIFIED")
@@ -113,14 +113,16 @@ class AttemptIdentity:
     host_volume_identity: str
 
     def qualified(self) -> bool:
-        if self.issue != 119 or not self.host_volume_identity.strip():
+        if self.issue != 119 or not isinstance(self.host_volume_identity, str) or not self.host_volume_identity.strip():
             return False
         try:
             parsed = uuid.UUID(self.attempt_id)
         except (ValueError, AttributeError, TypeError):
             return False
         return (str(parsed) == self.attempt_id
+                and isinstance(self.original_clear_sha256, str)
                 and bool(_SHA256.fullmatch(self.original_clear_sha256))
+                and isinstance(self.receipt_sha256, str)
                 and bool(_SHA256.fullmatch(self.receipt_sha256)))
 
 
@@ -131,6 +133,7 @@ class SyntheticGuard:
         self._claimed: AttemptIdentity | None = None
         self._consumed = False
         self._transmissions = 0
+        self._ready = False
 
     @property
     def transmissions(self) -> int:
@@ -156,10 +159,11 @@ class SyntheticGuard:
         if not directory_durable:
             return Assessment(Verdict.BLOCKED, "DIRECTORY_DURABILITY_UNPROVEN")
         # This is a simulated claim, not Windows power-loss assurance.
+        self._ready = True
         return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_GUARD_ONLY")
 
     def simulated_send(self, attempt: AttemptIdentity) -> Assessment:
-        if not self._consumed or attempt != self._claimed:
+        if not self._ready or not self._consumed or attempt != self._claimed:
             return Assessment(Verdict.BLOCKED, "UNAUTHORIZED_ATTEMPT")
         if self._transmissions:
             return Assessment(Verdict.BLOCKED, "ATTEMPT_ALREADY_SENT")
@@ -177,4 +181,5 @@ class SyntheticGuard:
         copy._claimed = self._claimed
         copy._consumed = self._consumed
         copy._transmissions = self._transmissions
+        copy._ready = self._ready
         return copy
