@@ -9,6 +9,8 @@ idf_component_register(
         "sha256.c"
         "device_identity.c"
         "device_manifest.c"
+        "processed_ack.c"
+        "processed_ack_policy.c"
         "recorder_state.c"
         "recorder_power.c"
         "recorder_status_led.c"
