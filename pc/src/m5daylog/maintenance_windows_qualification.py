@@ -89,7 +89,7 @@ def assess_synthetic_snapshot(events: tuple[SnapshotEvent, ...]) -> Assessment:
     for idx, event in enumerate(events):
         if not isinstance(event, SnapshotEvent) or event.target != first.target:
             return Assessment(Verdict.BLOCKED, "TARGET_IDENTITY_DRIFT")
-        if event.namespace_changed:
+        if type(event.namespace_changed) is not bool or event.namespace_changed:
             return Assessment(Verdict.BLOCKED, "NAMESPACE_OR_MEDIA_DRIFT")
         if event.media_digest != first.media_digest:
             return Assessment(Verdict.BLOCKED, "MEDIA_SNAPSHOT_DRIFT")
@@ -101,7 +101,8 @@ def assess_synthetic_snapshot(events: tuple[SnapshotEvent, ...]) -> Assessment:
             return Assessment(Verdict.BLOCKED, "ORDINARY_LEASE_REMAINING")
         if idx >= 2 and event.pending_host_writes:
             return Assessment(Verdict.BLOCKED, "HOST_WRITE_REMAINING")
-        if idx >= 3 and event.lock_identity != lock_identity:
+        if idx >= 3 and (not isinstance(event.lock_identity, str)
+                         or event.lock_identity != lock_identity):
             return Assessment(Verdict.BLOCKED, "RETAINED_LOCK_LOST")
     return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_ORDERING_ONLY")
 
@@ -154,11 +155,11 @@ class SyntheticGuard:
         # Reserve before any potentially ambiguous create/write operation.
         self._claimed = attempt
         self._consumed = True
-        if not create_exclusive:
+        if type(create_exclusive) is not bool or not create_exclusive:
             return Assessment(Verdict.BLOCKED, "EXCLUSIVE_CREATE_UNPROVEN")
-        if not file_flushed:
+        if type(file_flushed) is not bool or not file_flushed:
             return Assessment(Verdict.BLOCKED, "FILE_DURABILITY_UNPROVEN")
-        if not directory_durable:
+        if type(directory_durable) is not bool or not directory_durable:
             return Assessment(Verdict.BLOCKED, "DIRECTORY_DURABILITY_UNPROVEN")
         # This is a simulated claim, not Windows power-loss assurance.
         self._ready = True
