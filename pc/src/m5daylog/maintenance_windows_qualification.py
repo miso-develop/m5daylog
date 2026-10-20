@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import re
+import threading
 import uuid
 
 
@@ -161,6 +162,9 @@ class SyntheticGuard:
     """In-memory fault model only: no host journal, I/O or CDC transport."""
 
     def __init__(self) -> None:
+        # Serialize claim, send, and recovery snapshots within this synthetic instance.
+        # This does not establish cross-process or Windows journal atomicity.
+        self._state_lock = threading.Lock()
         self._claimed: tuple[int, str, str, str, str] | None = None
         self._consumed = False
         self._transmissions = 0
@@ -168,44 +172,50 @@ class SyntheticGuard:
 
     @property
     def transmissions(self) -> int:
-        return self._transmissions
+        with self._state_lock:
+            return self._transmissions
 
     @property
     def consumed(self) -> bool:
-        return self._consumed
+        with self._state_lock:
+            return self._consumed
 
     def consume(self, attempt: AttemptIdentity, *, create_exclusive: bool,
                 file_flushed: bool, directory_durable: bool) -> Assessment:
-        if self._consumed:
-            return Assessment(Verdict.BLOCKED, "ATTEMPT_ALREADY_CONSUMED")
-        key = _qualified_attempt_key(attempt)
-        if key is None:
-            return Assessment(Verdict.BLOCKED, "ATTEMPT_UNQUALIFIED")
-        # Reserve a detached canonical value snapshot before any uncertain I/O.
-        self._claimed = key
-        self._consumed = True
-        if type(create_exclusive) is not bool or not create_exclusive:
-            return Assessment(Verdict.BLOCKED, "EXCLUSIVE_CREATE_UNPROVEN")
-        if type(file_flushed) is not bool or not file_flushed:
-            return Assessment(Verdict.BLOCKED, "FILE_DURABILITY_UNPROVEN")
-        if type(directory_durable) is not bool or not directory_durable:
-            return Assessment(Verdict.BLOCKED, "DIRECTORY_DURABILITY_UNPROVEN")
-        # This is a simulated claim, not Windows power-loss assurance.
-        self._ready = True
-        return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_GUARD_ONLY")
+        # Keep identity validation and the consume/write-state transition in
+        # one critical section: parallel calls must not both claim success.
+        with self._state_lock:
+            if self._consumed:
+                return Assessment(Verdict.BLOCKED, "ATTEMPT_ALREADY_CONSUMED")
+            key = _qualified_attempt_key(attempt)
+            if key is None:
+                return Assessment(Verdict.BLOCKED, "ATTEMPT_UNQUALIFIED")
+            # Reserve a detached canonical value snapshot before uncertain I/O.
+            self._claimed = key
+            self._consumed = True
+            if type(create_exclusive) is not bool or not create_exclusive:
+                return Assessment(Verdict.BLOCKED, "EXCLUSIVE_CREATE_UNPROVEN")
+            if type(file_flushed) is not bool or not file_flushed:
+                return Assessment(Verdict.BLOCKED, "FILE_DURABILITY_UNPROVEN")
+            if type(directory_durable) is not bool or not directory_durable:
+                return Assessment(Verdict.BLOCKED, "DIRECTORY_DURABILITY_UNPROVEN")
+            # This is a simulated claim, not Windows power-loss assurance.
+            self._ready = True
+            return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_GUARD_ONLY")
 
     def simulated_send(self, attempt: AttemptIdentity) -> Assessment:
-        # Compare two detached, exactly typed value snapshots; neither a
-        # caller-held dataclass alias nor custom equality may change the claim.
-        key = _qualified_attempt_key(attempt)
-        if (key is None or not self._ready or not self._consumed
-                or key != self._claimed):
-            return Assessment(Verdict.BLOCKED, "UNAUTHORIZED_ATTEMPT")
-        if self._transmissions:
-            return Assessment(Verdict.BLOCKED, "ATTEMPT_ALREADY_SENT")
-        # A source test counter is not a CDC transmission.
-        self._transmissions += 1
-        return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_SEND_ONLY")
+        # Send admission and increment must be atomic with guard consumption
+        # and with other sends, not just protected by the Python GIL.
+        with self._state_lock:
+            key = _qualified_attempt_key(attempt)
+            if (key is None or not self._ready or not self._consumed
+                    or key != self._claimed):
+                return Assessment(Verdict.BLOCKED, "UNAUTHORIZED_ATTEMPT")
+            if self._transmissions:
+                return Assessment(Verdict.BLOCKED, "ATTEMPT_ALREADY_SENT")
+            # A source test counter is not a CDC transmission.
+            self._transmissions += 1
+            return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_SEND_ONLY")
 
     def simulate_restart(self) -> "SyntheticGuard":
         """Recover a consumed attempt as terminal, never transmit-admissible.
@@ -215,11 +225,12 @@ class SyntheticGuard:
         history, but never restore the in-process send capability. This does
         not attest actual Windows crash/power-loss journal durability.
         """
-        copy = SyntheticGuard()
-        copy._claimed = self._claimed
-        copy._consumed = self._consumed
-        copy._transmissions = self._transmissions
-        # Even zero counted transmissions cannot prove that a real send did
-        # not cross the crash boundary; in-process permission does not persist.
-        copy._ready = False
-        return copy
+        with self._state_lock:
+            copy = SyntheticGuard()
+            copy._claimed = self._claimed
+            copy._consumed = self._consumed
+            copy._transmissions = self._transmissions
+            # Zero counted sends cannot prove that no real send escaped.
+            # Never persist the original process's in-memory permission.
+            copy._ready = False
+            return copy

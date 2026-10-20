@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import sys
+import threading
 import unittest
+from unittest.mock import patch
+
+from m5daylog import maintenance_windows_qualification as qualification
 
 from m5daylog.maintenance_windows_qualification import (
     Assessment, AttemptIdentity, SnapshotEvent, SyntheticGuard, TargetIdentity,
@@ -488,6 +493,144 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(restarted.simulated_send(attempt()).reason,
                          "UNAUTHORIZED_ATTEMPT")
         self.assertEqual(restarted.transmissions, 1)
+
+
+class GuardConcurrencyTests(unittest.TestCase):
+    """Event-gated races, not GIL/scheduler luck."""
+
+    def _contend(self, guard, first_call, second_call, second_method):
+        first_at_key = threading.Event()
+        second_at_key = threading.Event()
+        release_first = threading.Event()
+        second_in_method = threading.Event()
+        second_finished = threading.Event()
+        calls_lock = threading.Lock()
+        calls = [0]
+        results: dict[str, object] = {}
+        errors: list[str] = []
+        real_key = qualification._qualified_attempt_key
+
+        def paused_key(candidate):
+            with calls_lock:
+                calls[0] += 1
+                number = calls[0]
+            if number == 1:
+                first_at_key.set()
+                if not release_first.wait(timeout=5):
+                    raise TimeoutError("first key remained paused")
+            else:
+                second_at_key.set()
+            return real_key(candidate)
+
+        def on_call(frame, event, arg):
+            if (event == "call" and frame.f_code.co_name == second_method
+                    and frame.f_code.co_filename == qualification.__file__):
+                second_in_method.set()
+            return None
+
+        def first():
+            try:
+                results["first"] = first_call()
+            except BaseException as error:
+                errors.append("first:" + repr(error))
+
+        def second():
+            sys.settrace(on_call)
+            try:
+                results["second"] = second_call()
+            except BaseException as error:
+                errors.append("second:" + repr(error))
+            finally:
+                sys.settrace(None)
+                second_finished.set()
+
+        t1 = threading.Thread(target=first)
+        t2 = threading.Thread(target=second)
+        with patch.object(qualification, "_qualified_attempt_key", side_effect=paused_key):
+            try:
+                t1.start()
+                self.assertTrue(first_at_key.wait(3), "first call did not enter key capture")
+                t2.start()
+                self.assertTrue(second_in_method.wait(3), "second call not entered")
+                self.assertFalse(second_at_key.wait(0.2),
+                                 "second identity check escaped guarded critical section")
+                self.assertFalse(second_finished.is_set(),
+                                 "second transition completed while first was pending")
+            finally:
+                release_first.set()
+                if t1.ident is not None:
+                    t1.join(timeout=4)
+                if t2.ident is not None:
+                    t2.join(timeout=4)
+        self.assertFalse(t1.is_alive())
+        self.assertFalse(t2.is_alive())
+        self.assertEqual(errors, [])
+        return results
+
+    def test_concurrent_claim_only_one_synthetic_success(self):
+        guard = SyntheticGuard()
+        inputs = dict(create_exclusive=True, file_flushed=True, directory_durable=True)
+        results = self._contend(
+            guard,
+            lambda: guard.consume(attempt(), **inputs),
+            lambda: guard.consume(attempt(), **inputs), "consume",
+        )
+        self.assertEqual(results["first"].verdict, Verdict.SOURCE_TEST_ONLY)
+        self.assertEqual(results["second"].reason, "ATTEMPT_ALREADY_CONSUMED")
+        self.assertTrue(guard.consumed)
+        self.assertEqual(guard.transmissions, 0)
+        for r in results.values():
+            self.assertIsInstance(r, Assessment)
+            self.assertFalse(r.release_authorized)
+            self.assertEqual(r.native_qualification, "NOT_RUN")
+
+    def test_concurrent_send_never_increments_twice(self):
+        guard = SyntheticGuard()
+        guard.consume(attempt(), create_exclusive=True, file_flushed=True,
+                      directory_durable=True)
+        results = self._contend(
+            guard, lambda: guard.simulated_send(attempt()),
+            lambda: guard.simulated_send(attempt()), "simulated_send",
+        )
+        self.assertEqual(results["first"].verdict, Verdict.SOURCE_TEST_ONLY)
+        self.assertEqual(results["second"].reason, "ATTEMPT_ALREADY_SENT")
+        self.assertEqual(guard.transmissions, 1)
+        self.assertEqual(guard.simulated_send(attempt()).verdict, Verdict.BLOCKED)
+        self.assertEqual(guard.simulate_restart().simulated_send(attempt()).verdict,
+                         Verdict.BLOCKED)
+
+    def test_uncertain_failed_guard_claim_blocks_parallel_send(self):
+        guard = SyntheticGuard()
+        results = self._contend(
+            guard,
+            lambda: guard.consume(attempt(), create_exclusive=True,
+                                  file_flushed=False, directory_durable=True),
+            lambda: guard.simulated_send(attempt()), "simulated_send",
+        )
+        self.assertEqual(results["first"].reason, "FILE_DURABILITY_UNPROVEN")
+        self.assertEqual(results["second"].verdict, Verdict.BLOCKED)
+        self.assertEqual(results["second"].reason, "UNAUTHORIZED_ATTEMPT")
+        self.assertTrue(guard.consumed)
+        self.assertEqual(guard.transmissions, 0)
+        self.assertEqual(guard.simulate_restart().simulated_send(attempt()).verdict,
+                         Verdict.BLOCKED)
+
+    def test_restart_during_uncertain_guard_write_never_recovers_permission(self):
+        guard = SyntheticGuard()
+        results = self._contend(
+            guard,
+            lambda: guard.consume(attempt(), create_exclusive=True,
+                                  file_flushed=False, directory_durable=True),
+            guard.simulate_restart, "simulate_restart",
+        )
+        recovered = results["second"]
+        self.assertTrue(recovered.consumed)
+        self.assertEqual(recovered.transmissions, 0)
+        self.assertEqual(recovered.simulated_send(attempt()).verdict, Verdict.BLOCKED)
+        self.assertEqual(recovered.consume(attempt(), create_exclusive=True,
+                                           file_flushed=True,
+                                           directory_durable=True).reason,
+                         "ATTEMPT_ALREADY_CONSUMED")
 
 
 if __name__ == "__main__":
