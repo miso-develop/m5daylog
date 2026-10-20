@@ -82,6 +82,13 @@ class SnapshotTests(unittest.TestCase):
         self.assert_blocked(events()[:-1], "STEP_SEQUENCE_UNPROVEN")
         self.assert_blocked(events()[::-1], "STEP_SEQUENCE_UNPROVEN")
 
+    def test_trace_tuple_subclasses_are_untrusted(self):
+        class MaliciousTuple(tuple):
+            def __iter__(self):
+                return iter(events())
+
+        self.assert_blocked(MaliciousTuple(events()), "STEP_SEQUENCE_UNPROVEN")
+
     def test_untrusted_wrong_type_event_blocks_without_exception(self):
         wrong = list(events())
         wrong[3] = "forged-lock"
