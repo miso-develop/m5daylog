@@ -15,6 +15,11 @@ import uuid
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
+def _qualified_digest(value: object) -> bool:
+    """Reject non-string or custom-equality evidence, even at later stages."""
+    return type(value) is str and bool(_SHA256.fullmatch(value))
+
+
 class Verdict(str, Enum):
     BLOCKED = "BLOCKED"
     SOURCE_TEST_ONLY = "SOURCE_TEST_ONLY"
@@ -41,7 +46,7 @@ class TargetIdentity:
     def qualified(self) -> bool:
         # Presence is necessary but never sufficient for real-world identity.
         return (
-            all(isinstance(v, str) and bool(v.strip()) for v in (
+            all(type(v) is str and bool(v.strip()) for v in (
                 self.device_id, self.volume_guid, self.disk_instance_id,
                 self.removable_instance_id, self.usb_physical_instance_id,
                 self.cdc_instance_id,
@@ -74,27 +79,29 @@ def assess_synthetic_snapshot(events: tuple[SnapshotEvent, ...]) -> Assessment:
     """
     if not isinstance(events, tuple) or len(events) != len(_STEPS):
         return Assessment(Verdict.BLOCKED, "STEP_SEQUENCE_UNPROVEN")
-    if not all(isinstance(e, SnapshotEvent) for e in events):
+    if not all(type(e) is SnapshotEvent and type(e.step) is str for e in events):
         return Assessment(Verdict.BLOCKED, "STEP_SEQUENCE_UNPROVEN")
     if tuple(e.step for e in events) != _STEPS:
         return Assessment(Verdict.BLOCKED, "STEP_SEQUENCE_UNPROVEN")
     first = events[0]
-    if not isinstance(first, SnapshotEvent) or not isinstance(first.target, TargetIdentity) or not first.target.qualified():
+    if type(first.target) is not TargetIdentity or not first.target.qualified():
         return Assessment(Verdict.BLOCKED, "TARGET_UNQUALIFIED")
-    if not isinstance(first.media_digest, str) or not _SHA256.fullmatch(first.media_digest):
+    if not _qualified_digest(first.media_digest):
         return Assessment(Verdict.BLOCKED, "INVENTORY_DIGEST_UNQUALIFIED")
     lock_identity = events[3].lock_identity
-    if not isinstance(lock_identity, str) or not lock_identity.strip():
+    if type(lock_identity) is not str or not lock_identity.strip():
         return Assessment(Verdict.BLOCKED, "RETAINED_LOCK_UNPROVEN")
     for idx, event in enumerate(events):
         # Dataclass equality alone accepts numerically equal but mistyped IDs
         # (e.g. 3 == 3.0 or 1 == True); qualify every trace stage first.
-        if not isinstance(event.target, TargetIdentity) or not event.target.qualified():
+        if type(event.target) is not TargetIdentity or not event.target.qualified():
             return Assessment(Verdict.BLOCKED, "TARGET_UNQUALIFIED")
         if event.target != first.target:
             return Assessment(Verdict.BLOCKED, "TARGET_IDENTITY_DRIFT")
         if type(event.namespace_changed) is not bool or event.namespace_changed:
             return Assessment(Verdict.BLOCKED, "NAMESPACE_OR_MEDIA_DRIFT")
+        if not _qualified_digest(event.media_digest):
+            return Assessment(Verdict.BLOCKED, "INVENTORY_DIGEST_UNQUALIFIED")
         if event.media_digest != first.media_digest:
             return Assessment(Verdict.BLOCKED, "MEDIA_SNAPSHOT_DRIFT")
         if type(event.open_ordinary_leases) is not int or event.open_ordinary_leases < 0:
@@ -105,8 +112,9 @@ def assess_synthetic_snapshot(events: tuple[SnapshotEvent, ...]) -> Assessment:
             return Assessment(Verdict.BLOCKED, "ORDINARY_LEASE_REMAINING")
         if idx >= 2 and event.pending_host_writes:
             return Assessment(Verdict.BLOCKED, "HOST_WRITE_REMAINING")
-        if idx >= 3 and (not isinstance(event.lock_identity, str)
-                         or event.lock_identity != lock_identity):
+        if type(event.lock_identity) is not str:
+            return Assessment(Verdict.BLOCKED, "RETAINED_LOCK_LOST")
+        if idx >= 3 and event.lock_identity != lock_identity:
             return Assessment(Verdict.BLOCKED, "RETAINED_LOCK_LOST")
     return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_ORDERING_ONLY")
 
@@ -121,18 +129,18 @@ class AttemptIdentity:
 
     def qualified(self) -> bool:
         if (type(self.issue) is not int or self.issue != 119
-                or not isinstance(self.host_volume_identity, str)
+                or type(self.host_volume_identity) is not str
                 or not self.host_volume_identity.strip()):
+            return False
+        if type(self.attempt_id) is not str:
             return False
         try:
             parsed = uuid.UUID(self.attempt_id)
         except (ValueError, AttributeError, TypeError):
             return False
         return (str(parsed) == self.attempt_id
-                and isinstance(self.original_clear_sha256, str)
-                and bool(_SHA256.fullmatch(self.original_clear_sha256))
-                and isinstance(self.receipt_sha256, str)
-                and bool(_SHA256.fullmatch(self.receipt_sha256)))
+                and _qualified_digest(self.original_clear_sha256)
+                and _qualified_digest(self.receipt_sha256))
 
 
 class SyntheticGuard:
@@ -156,7 +164,7 @@ class SyntheticGuard:
                 file_flushed: bool, directory_durable: bool) -> Assessment:
         if self._consumed:
             return Assessment(Verdict.BLOCKED, "ATTEMPT_ALREADY_CONSUMED")
-        if not isinstance(attempt, AttemptIdentity) or not attempt.qualified():
+        if type(attempt) is not AttemptIdentity or not attempt.qualified():
             return Assessment(Verdict.BLOCKED, "ATTEMPT_UNQUALIFIED")
         # Reserve before any potentially ambiguous create/write operation.
         self._claimed = attempt
@@ -174,7 +182,7 @@ class SyntheticGuard:
     def simulated_send(self, attempt: AttemptIdentity) -> Assessment:
         # Never let dataclass numeric equality launder an unqualified attempt
         # into the already-consumed identity at the simulated send boundary.
-        if (not isinstance(attempt, AttemptIdentity) or not attempt.qualified()
+        if (type(attempt) is not AttemptIdentity or not attempt.qualified()
                 or not self._ready or not self._consumed
                 or attempt != self._claimed):
             return Assessment(Verdict.BLOCKED, "UNAUTHORIZED_ATTEMPT")
