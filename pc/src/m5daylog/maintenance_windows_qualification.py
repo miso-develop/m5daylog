@@ -12,7 +12,7 @@ import re
 import uuid
 
 
-_SHA256 = re.compile(r"[0-9a-f]{64}\\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class Verdict(str, Enum):
