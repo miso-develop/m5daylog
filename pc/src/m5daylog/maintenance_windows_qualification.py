@@ -74,7 +74,9 @@ def assess_synthetic_snapshot(events: tuple[SnapshotEvent, ...]) -> Assessment:
     """
     if not isinstance(events, tuple) or len(events) != len(_STEPS):
         return Assessment(Verdict.BLOCKED, "STEP_SEQUENCE_UNPROVEN")
-    if tuple(getattr(e, "step", None) for e in events) != _STEPS:
+    if not all(isinstance(e, SnapshotEvent) for e in events):
+        return Assessment(Verdict.BLOCKED, "STEP_SEQUENCE_UNPROVEN")
+    if tuple(e.step for e in events) != _STEPS:
         return Assessment(Verdict.BLOCKED, "STEP_SEQUENCE_UNPROVEN")
     first = events[0]
     if not isinstance(first, SnapshotEvent) or not isinstance(first.target, TargetIdentity) or not first.target.qualified():
