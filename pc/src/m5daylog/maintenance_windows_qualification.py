@@ -87,7 +87,11 @@ def assess_synthetic_snapshot(events: tuple[SnapshotEvent, ...]) -> Assessment:
     if not isinstance(lock_identity, str) or not lock_identity.strip():
         return Assessment(Verdict.BLOCKED, "RETAINED_LOCK_UNPROVEN")
     for idx, event in enumerate(events):
-        if not isinstance(event, SnapshotEvent) or event.target != first.target:
+        # Dataclass equality alone accepts numerically equal but mistyped IDs
+        # (e.g. 3 == 3.0 or 1 == True); qualify every trace stage first.
+        if not isinstance(event.target, TargetIdentity) or not event.target.qualified():
+            return Assessment(Verdict.BLOCKED, "TARGET_UNQUALIFIED")
+        if event.target != first.target:
             return Assessment(Verdict.BLOCKED, "TARGET_IDENTITY_DRIFT")
         if type(event.namespace_changed) is not bool or event.namespace_changed:
             return Assessment(Verdict.BLOCKED, "NAMESPACE_OR_MEDIA_DRIFT")
@@ -116,7 +120,9 @@ class AttemptIdentity:
     host_volume_identity: str
 
     def qualified(self) -> bool:
-        if self.issue != 119 or not isinstance(self.host_volume_identity, str) or not self.host_volume_identity.strip():
+        if (type(self.issue) is not int or self.issue != 119
+                or not isinstance(self.host_volume_identity, str)
+                or not self.host_volume_identity.strip()):
             return False
         try:
             parsed = uuid.UUID(self.attempt_id)
