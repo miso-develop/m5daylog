@@ -172,7 +172,11 @@ class SyntheticGuard:
         return Assessment(Verdict.SOURCE_TEST_ONLY, "SYNTHETIC_GUARD_ONLY")
 
     def simulated_send(self, attempt: AttemptIdentity) -> Assessment:
-        if not self._ready or not self._consumed or attempt != self._claimed:
+        # Never let dataclass numeric equality launder an unqualified attempt
+        # into the already-consumed identity at the simulated send boundary.
+        if (not isinstance(attempt, AttemptIdentity) or not attempt.qualified()
+                or not self._ready or not self._consumed
+                or attempt != self._claimed):
             return Assessment(Verdict.BLOCKED, "UNAUTHORIZED_ATTEMPT")
         if self._transmissions:
             return Assessment(Verdict.BLOCKED, "ATTEMPT_ALREADY_SENT")
