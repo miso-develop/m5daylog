@@ -413,8 +413,9 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(guard.simulated_send(attempt()).reason,
                          "ATTEMPT_ALREADY_SENT")
         restarted = guard.simulate_restart()
+        # The recovered send capability is absent even for a known sent attempt.
         self.assertEqual(restarted.simulated_send(attempt()).reason,
-                         "ATTEMPT_ALREADY_SENT")
+                         "UNAUTHORIZED_ATTEMPT")
         self.assertEqual(restarted.transmissions, 1)
 
 
