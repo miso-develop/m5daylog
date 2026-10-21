@@ -49,6 +49,10 @@ class AckSafetyError(RuntimeError):
     """ACK delivery prerequisites failed; never send a release-success signal."""
 
 
+class AckLocalStateUnavailable(AckSafetyError):
+    """The PC ACK database is unavailable; no Device handles were opened."""
+
+
 class AckAdmissionDenied(AckSafetyError):
     """#89 gate sealed: defer without opening Device storage."""
 
@@ -99,7 +103,7 @@ def _snapshot_pending(db_path: Path, device_id: str) -> tuple[str, ...]:
     IDs retained in ack_carryover are retried independently of this PC's AI.
     """
     if not Path(db_path).is_file():
-        raise AckSafetyError("local state database is missing")
+        raise AckLocalStateUnavailable("local state database is missing")
     connection = sqlite3.connect(str(db_path), timeout=5)
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -298,7 +302,7 @@ def flush_pre_release_acks(
     db = Path(db_path)
     try:
         ids = _snapshot_pending(db, barrier.device_id)
-    except (sqlite3.Error, AckSafetyError):
+    except (sqlite3.Error, AckLocalStateUnavailable):
         # Local ACK-state failure before acquiring the Device lease is
         # retryable and must not independently prevent #89 safe release.
         # Sync-barrier failures above remain release-blocking.
