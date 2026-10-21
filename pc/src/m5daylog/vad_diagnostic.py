@@ -346,6 +346,13 @@ def aggregate_annotated(results: Sequence[DiagnosticResult]) -> dict:
     keys = [(r.source_sha256, r.total_samples) for r in results]
     if len(keys) != len(set(keys)):
         raise VadError("duplicate diagnostic source in pool")
+    # A pooled measurement cannot mix inference models, dependency locks,
+    # or code revisions. Missing labels remain unqualified manual evidence.
+    identity = (results[0].producer_version, results[0].model_sha256,
+                results[0].lock_sha256, results[0].code_revision)
+    if any((r.producer_version, r.model_sha256,
+            r.lock_sha256, r.code_revision) != identity for r in results[1:]):
+        raise VadError("pooled diagnostic inference identity mismatch")
     variants = {}
     for name in (RAW, DC):
         metrics = [r.raw.metrics if name == RAW else r.dc.metrics for r in results]

@@ -143,6 +143,38 @@ class VadCase(unittest.TestCase):
         self.assertEqual(self.runtime.calls, 2)
         self.assertEqual(second.sha256, first.sha256)
 
+    def test_wrong_json_types_cannot_skip_or_crash_adopt(self):
+        self.execute()
+        mutations = (
+            ("meta", "schema_version", True),
+            ("meta", "sample_rate", 16000.0),
+            ("params", "return_seconds", 0),
+            ("params", "window_size_samples", 512.0),
+            ("params", "use_max_poss_sil_at_max_speech", 1),
+        )
+        for section, field, value in mutations:
+            for previous_status in ("SUCCEEDED", "RECOVERABLE"):
+                with self.subTest(section=section, field=field, status=previous_status):
+                    records = [json.loads(line) for line in
+                               self.outfile().read_text().splitlines()]
+                    if section == "params":
+                        records[0]["params"][field] = value
+                    else:
+                        records[0][field] = value
+                    forged = ("\n".join(canonical_json(item) for item in records)
+                              + "\n").encode("utf-8")
+                    self.outfile().write_bytes(forged)
+                    self.con.execute("UPDATE artifacts SET sha256=?",
+                                     (hashlib.sha256(forged).hexdigest(),))
+                    self.con.execute("UPDATE recordings SET vad_status=?",
+                                     (previous_status,))
+                    self.con.commit()
+                    before = self.runtime.calls
+                    result = self.execute()
+                    self.assertEqual(result.status, "SUCCEEDED")
+                    self.assertEqual(self.runtime.calls, before + 1)
+                    self.assertEqual(self.raw.read_bytes(), self.original)
+
     def test_model_behavior_identity_changes_recompute(self):
         first = self.execute()
         other = StubRuntime([{"start": 2, "end": 100}])
@@ -353,6 +385,9 @@ class PureContractTests(unittest.TestCase):
         for field, key, replacement in (
                 ("model", "torch_version", "999.0"),
                 ("params", "min_silence_ms", 0),
+                ("params", "return_seconds", 0),
+                ("params", "window_size_samples", 512.0),
+                ("params", "use_max_poss_sil_at_max_speech", 1),
                 ("params", "unexpected_parameter", True)):
             with self.subTest(field=field, key=key):
                 forged = [dict(item) for item in base]

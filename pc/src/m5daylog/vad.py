@@ -297,7 +297,9 @@ def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str,
         head = records[0]
         if not isinstance(head, dict):
             raise ValueError("bad metadata")
-        if (head.get("type") != "meta" or head.get("schema_version") != 1
+        if (head.get("type") != "meta"
+                or type(head.get("schema_version")) is not int
+                or head["schema_version"] != SCHEMA_VERSION
                 or head.get("recording_id") != rid
                 or head.get("source_sha256") != source_sha
                 or not isinstance(head.get("model"), dict)
@@ -305,14 +307,17 @@ def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str,
                 or head.get("started_at") is None
                 or head.get("producer") != PRODUCER
                 or head.get("producer_version") != version
-                or head.get("sample_rate") != SAMPLE_RATE
+                or type(head.get("sample_rate")) is not int
+                or head["sample_rate"] != SAMPLE_RATE
                 or type(head.get("total_samples")) is not int):
             raise ValueError("bad meta identity")
         _safe_date(head["started_at"])
         if started_at is not None and head["started_at"] != started_at:
             raise ValueError("stale artifact timeline")
         n = head["total_samples"]
-        if (head["params"] != _canonical_params()
+        # Dict equality silently accepts bool/int and int/float substitutions.
+        # Compare canonical serialized JSON to preserve RAW-v1 field types.
+        if (canonical_json(head["params"]) != canonical_json(_canonical_params())
                 or fingerprint(head["model"]) != version):
             raise ValueError("artifact producer metadata mismatch")
         if ((total_samples is not None and n != total_samples) or n < 0

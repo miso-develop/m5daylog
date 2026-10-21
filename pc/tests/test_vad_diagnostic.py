@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from dataclasses import replace
 import sqlite3
 import struct
 import unittest
@@ -237,6 +238,28 @@ class DiagnosticsTests(unittest.TestCase):
                          "MEASUREMENTS_ONLY_MANUAL_EV018_REVIEW_REQUIRED")
         with self.assertRaisesRegex(VadError, "duplicate"):
             aggregate_annotated([result, result])
+
+    def test_pooled_pair_rejects_mixed_inference_identity(self):
+        annotation = {
+            "fixture_id": "synthetic", "category": "quiet",
+            "source_sha256": hashlib.sha256(self.raw_path.read_bytes()).hexdigest(),
+            "total_samples": 5, "reference": ((0, 4),),
+        }
+        first = self.run_diag(annotation=annotation, annotation_sha256="f" * 64)
+        second = replace(first, source_sha256="e" * 64)
+        pooled = aggregate_annotated([first, second])
+        self.assertEqual(pooled["variants"][RAW]["fixtures"], 2)
+        changes = (
+            ("producer_version", "v1:" + "b" * 64),
+            ("model_sha256", "b" * 64),
+            ("lock_sha256", "d" * 64),
+            ("code_revision", "c" * 40),
+        )
+        for field, changed in changes:
+            with self.subTest(field=field):
+                altered = replace(second, **{field: changed})
+                with self.assertRaisesRegex(VadError, "identity"):
+                    aggregate_annotated([first, altered])
 
     def test_annotation_rejects_bad_reference_structure(self):
         file = Path(self.tmp.name) / "reference.json"
