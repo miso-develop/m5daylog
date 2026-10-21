@@ -296,9 +296,13 @@ def flush_pre_release_acks(
     if not barrier.device_id:
         raise AckSafetyError("validated Device ID is missing")
     db = Path(db_path)
-    ids = _snapshot_pending(db, barrier.device_id)
-    if not ids:
-        return AckFlushResult("NO_OP")
+    try:
+        ids = _snapshot_pending(db, barrier.device_id)
+    except (sqlite3.Error, AckSafetyError):
+        # Local ACK-state failure before acquiring the Device lease is
+        # retryable and must not independently prevent #89 safe release.
+        # Sync-barrier failures above remain release-blocking.
+        return AckFlushResult("DEFERRED", reason="local-ack-state-unavailable")
 
     mount = Path(mount_root)
     contracts = Path(contracts_dir) if contracts_dir is not None else default_contracts_dir()
@@ -350,12 +354,16 @@ def flush_pre_release_acks(
             # Every omitted outbox/carryover ID stays durable and is retried
             # fairly by least-recently-delivered time on subsequent sessions.
             selected = tuple(dict.fromkeys((*new_prior_ids, *ids)))[:_ACK_MAX_IDS]
-            payload["recordingIds"] = sorted(selected)
-            validate_contract_document(payload, contracts / "processed-ack.schema.json")
-            data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-            if len(data) > _ACK_MAX_BYTES:
-                raise AckSafetyError("ACK exceeds Device byte limit")
-            _commit_file(final, data, atomic_port)
+            # If neither queue has deliverable IDs, leave the authoritative
+            # final untouched. Inspecting a legacy final requires a bounded
+            # read under the #89 lease even when local queues were empty.
+            if selected:
+                payload["recordingIds"] = sorted(selected)
+                validate_contract_document(payload, contracts / "processed-ack.schema.json")
+                data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                if len(data) > _ACK_MAX_BYTES:
+                    raise AckSafetyError("ACK exceeds Device byte limit")
+                _commit_file(final, data, atomic_port)
         except Exception as exc:
             write_error = exc
     finally:
@@ -367,6 +375,8 @@ def flush_pre_release_acks(
         raise write_error
     if write_error is not None:
         return AckFlushResult("DEFERRED", len(ids), type(write_error).__name__)
+    if not selected:
+        return AckFlushResult("NO_OP")
 
     try:
         _mark_delivered(db, selected, barrier.device_id)
