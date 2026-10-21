@@ -163,11 +163,15 @@ class VadCase(unittest.TestCase):
         original_detect = self.runtime.detect
 
         def conflicting_sync(samples):
-            with sqlite3.connect(self.db_path) as other:
-                other.execute(
-                    "UPDATE recordings SET sync_status='CONFLICT' WHERE recording_id=?",
-                    (RID,),
-                )
+            other = sqlite3.connect(self.db_path)
+            try:
+                with other:
+                    other.execute(
+                        "UPDATE recordings SET sync_status='CONFLICT' WHERE recording_id=?",
+                        (RID,),
+                    )
+            finally:
+                other.close()
             return original_detect(samples)
 
         self.runtime.detect = conflicting_sync
