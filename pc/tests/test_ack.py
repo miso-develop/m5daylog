@@ -495,6 +495,61 @@ class AckTests(unittest.TestCase):
         self.assertEqual(second.attempted, 1024)
         self.assertEqual(self.pending_state()[0][0], RID)
 
+    def test_prior_carryover_cannot_override_later_failed_outbox(self):
+        # First recover a published legacy ID for which this PC has no
+        # processing state. Its delivery debt remains in ack_carryover.
+        final = self.ackdir / "processed.json"
+        final.write_text(json.dumps({
+            "schemaVersion": 1, "deviceId": DEVICE,
+            "processedAt": "2026-10-09T00:00:00Z", "recordingIds": [OLD_RID],
+        }))
+        self.assertEqual(self.flush().status, "DELIVERED")
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM ack_carryover WHERE recording_id=?", (OLD_RID,)
+            ).fetchone()[0], 1)
+        finally:
+            conn.close()
+
+        # A later local processing result claims the same ID in ack_outbox.
+        self.insert_recording(rid=OLD_RID)
+        self.assertEqual(self.flush().status, "DELIVERED")
+        self.assertEqual(set(json.loads(final.read_text())["recordingIds"]),
+                         {RID, OLD_RID})
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM ack_outbox WHERE recording_id=?", (OLD_RID,)
+            ).fetchone()[0], 1)
+            conn.execute(
+                "UPDATE recordings SET day_status='FAILED' WHERE recording_id=?", (OLD_RID,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Carryover must not requalify a known, now-ineligible outbox ID.
+        self.assertEqual(self.flush().status, "DELIVERED")
+        self.assertEqual(json.loads(final.read_text())["recordingIds"], [RID])
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM ack_carryover WHERE recording_id=?", (OLD_RID,)
+            ).fetchone()[0], 1)
+            conn.execute(
+                "UPDATE recordings SET day_status='SUCCEEDED' WHERE recording_id=?",
+                (OLD_RID,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Eligibility restored: resend by the validated outbox route.
+        self.assertEqual(self.flush().status, "DELIVERED")
+        self.assertEqual(set(json.loads(final.read_text())["recordingIds"]),
+                         {RID, OLD_RID})
+
     def test_invalidated_pending_does_not_bypass_stage_gate(self):
         self.assertEqual(self.flush(lease=Lease(reject=True)).status, "DEFERRED")
         conn = sqlite3.connect(self.db)
