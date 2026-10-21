@@ -1,6 +1,14 @@
 name: PC VAD verification
 
 on:
+  # A diverged Draft PR may not receive pull_request checks until conflicts
+  # are resolved. Verify the exact head independently of the merge result.
+  push:
+    branches:
+      - task/54
+    paths:
+      - 'pc/**'
+      - '.github/workflows/pc-vad.yml'
   pull_request:
     paths:
       - 'pc/**'
