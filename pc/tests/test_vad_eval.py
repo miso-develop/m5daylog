@@ -45,6 +45,12 @@ class EV018Tests(unittest.TestCase):
         self.assertEqual(aggregate_speech([missed])["missed_utterances"], 1)
         self.assertFalse(aggregate_speech([missed])["onset_pass"])
 
+    def test_false_positive_ratio_is_over_annotated_nonspeech(self):
+        result = score_fixture("mix", "quiet", total_samples=1000,
+                               reference=[(0, 400)], predicted=[(0, 500)])
+        self.assertEqual(result.false_positive_samples, 100)
+        self.assertAlmostEqual(result.false_positive_ratio, 100 / 600)
+
     def test_silence_excluded_from_recall_and_false_positive_reported(self):
         silence = score_fixture("silence", "digital-silence",
                                 total_samples=16000, reference=[],

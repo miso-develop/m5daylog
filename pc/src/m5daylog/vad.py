@@ -181,6 +181,26 @@ def _inside(root: Path, path: Path) -> bool:
     return path.is_relative_to(root)
 
 
+def _declared_pcm_bytes(raw: bytes) -> int:
+    """Read the RIFF data chunk length without flooring partial PCM frames."""
+    if len(raw) < 12 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise VadError("unsupported WAV format")
+    riff_end = 8 + int.from_bytes(raw[4:8], "little")
+    if riff_end < 12 or riff_end > len(raw):
+        raise VadError("unsupported/corrupt WAV format")
+    offset = 12
+    while offset + 8 <= riff_end:
+        name = raw[offset:offset + 4]
+        size = int.from_bytes(raw[offset + 4:offset + 8], "little")
+        end = offset + 8 + size
+        if end > riff_end:
+            raise VadError("truncated WAV data chunk")
+        if name == b"data":
+            return size
+        offset = end + (size & 1)
+    raise VadError("WAV data chunk missing")
+
+
 def _source(row: sqlite3.Row, root: Path) -> tuple[bytes, int, str, Path]:
     rid = row["recording_id"]
     if not isinstance(rid, str) or not _UUID.fullmatch(rid):
@@ -213,7 +233,8 @@ def _source(row: sqlite3.Row, root: Path) -> tuple[bytes, int, str, Path]:
                 raise VadError("unsupported WAV format")
             total = wav.getnframes()
             pcm = wav.readframes(total)
-            if len(pcm) != total * 2:
+            if (len(pcm) != total * 2
+                    or _declared_pcm_bytes(raw) != total * 2):
                 raise VadError("truncated WAV frames")
             declared_ms = row["duration_ms"]
             if declared_ms is not None:
@@ -266,7 +287,8 @@ def _artifact_bytes(row: sqlite3.Row, model: dict, version: str,
 
 
 def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str,
-                  total_samples: int | None = None) -> int:
+                  total_samples: int | None = None,
+                  started_at: str | None = None) -> int:
     try:
         if not data.endswith(b"\n"):
             raise ValueError("missing newline")
@@ -286,6 +308,9 @@ def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str,
                 or head.get("sample_rate") != SAMPLE_RATE
                 or type(head.get("total_samples")) is not int):
             raise ValueError("bad meta identity")
+        _safe_date(head["started_at"])
+        if started_at is not None and head["started_at"] != started_at:
+            raise ValueError("stale artifact timeline")
         n = head["total_samples"]
         if (head["params"] != _canonical_params()
                 or fingerprint(head["model"]) != version):
@@ -376,25 +401,43 @@ def _publish(path: Path, data: bytes, rid: str, source: str, version: str) -> st
             temp.unlink()
 
 
+def _assert_current_source(db: sqlite3.Connection, row: sqlite3.Row,
+                           resolved: Path, source_sha: str) -> None:
+    """Called inside BEGIN IMMEDIATE: sync must not alter this identity."""
+    current = db.execute(
+        "SELECT * FROM recordings WHERE recording_id=?", (row["recording_id"],)
+    ).fetchone()
+    fields = ("device_id", "started_at", "duration_ms", "source_filename",
+              "source_sha256", "size_bytes", "local_path", "sync_status")
+    if (current is None or current["sync_status"] != "SYNCED"
+            or any(current[field] != row[field] for field in fields)):
+        raise VadError("recording changed during VAD")
+    try:
+        if (Path(current["local_path"]).resolve(strict=True) != resolved
+                or hashlib.sha256(resolved.read_bytes()).hexdigest() != source_sha):
+            raise VadError("source changed during VAD")
+    except OSError:
+        raise VadError("source changed during VAD") from None
+
+
 def _save_success(db: sqlite3.Connection, row: sqlite3.Row, path: Path,
-                  digest: str, version: str) -> None:
+              digest: str, version: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    with db:
-        db.execute("""INSERT INTO artifacts
-            (artifact_id,recording_id,target_date,artifact_type,path,sha256,
-             producer,producer_version,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(artifact_id) DO UPDATE SET
-              target_date=excluded.target_date,path=excluded.path,
-              sha256=excluded.sha256,producer=excluded.producer,
-              producer_version=excluded.producer_version,created_at=excluded.created_at""",
-            ("vad:" + row["recording_id"], row["recording_id"],
-             _safe_date(row["started_at"]), "vad", str(path), digest,
-             PRODUCER, version, now))
-        db.execute("UPDATE recordings SET vad_status='SUCCEEDED' WHERE recording_id=?",
-                   (row["recording_id"],))
-        db.execute("""UPDATE jobs SET status='SUCCEEDED',completed_at=?,
-                      last_error=NULL WHERE job_id=?""", (now, "vad:" + row["recording_id"]))
+    db.execute("""INSERT INTO artifacts
+        (artifact_id,recording_id,target_date,artifact_type,path,sha256,
+         producer,producer_version,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(artifact_id) DO UPDATE SET
+          target_date=excluded.target_date,path=excluded.path,
+          sha256=excluded.sha256,producer=excluded.producer,
+          producer_version=excluded.producer_version,created_at=excluded.created_at""",
+        ("vad:" + row["recording_id"], row["recording_id"],
+         _safe_date(row["started_at"]), "vad", str(path), digest,
+         PRODUCER, version, now))
+    db.execute("UPDATE recordings SET vad_status='SUCCEEDED' WHERE recording_id=?",
+               (row["recording_id"],))
+    db.execute("""UPDATE jobs SET status='SUCCEEDED',completed_at=?,
+                  last_error=NULL WHERE job_id=?""", (now, "vad:" + row["recording_id"]))
 
 
 
@@ -457,7 +500,8 @@ def run_vad(recording_id: str, *, db_path: str | Path,
                 try:
                     data = out.read_bytes()
                     valid = (validate_jsonl(
-                        data, recording_id, source_sha, version, total),
+                        data, recording_id, source_sha, version, total,
+                        row["started_at"]),
                         hashlib.sha256(data).hexdigest())
                 except VadError:
                     valid = None
@@ -467,6 +511,13 @@ def run_vad(recording_id: str, *, db_path: str | Path,
                     and existing["sha256"] == valid[1]
                     and existing["producer"] == PRODUCER
                     and existing["producer_version"] == version):
+                try:
+                    with db:
+                        db.execute("BEGIN IMMEDIATE")
+                        _assert_current_source(db, row, resolved, source_sha)
+                except Exception as exc:
+                    fail_safe(exc)
+                    raise
                 return VadResult("SKIPPED", valid[0], valid[1])
 
             started = datetime.now(timezone.utc).isoformat()
@@ -482,17 +533,21 @@ def run_vad(recording_id: str, *, db_path: str | Path,
                            (recording_id,))
             try:
                 if valid is not None:
-                    _save_success(db, row, out, valid[1], version)
+                    with db:
+                        db.execute("BEGIN IMMEDIATE")
+                        _assert_current_source(db, row, resolved, source_sha)
+                        _save_success(db, row, out, valid[1], version)
                     return VadResult("RECOVERED", valid[0], valid[1])
                 detected = model_runtime.detect(pcm)
                 ranges = normalize_ranges(detected, total)
                 payload = _artifact_bytes(row, model, version, source_sha, total, ranges)
-                if hashlib.sha256(resolved.read_bytes()).hexdigest() != source_sha:
-                    raise VadError("source changed during VAD")
-                if not _inside(root, out.parent.resolve(strict=False)):
-                    raise VadError("VAD output path escapes library")
-                digest = _publish(out, payload, recording_id, source_sha, version)
-                _save_success(db, row, out, digest, version)
+                with db:
+                    db.execute("BEGIN IMMEDIATE")
+                    _assert_current_source(db, row, resolved, source_sha)
+                    if not _inside(root, out.parent.resolve(strict=False)):
+                        raise VadError("VAD output path escapes library")
+                    digest = _publish(out, payload, recording_id, source_sha, version)
+                    _save_success(db, row, out, digest, version)
                 return VadResult("SUCCEEDED", len(ranges), digest)
             except Exception as exc:
                 fail_safe(exc)

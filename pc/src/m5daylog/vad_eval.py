@@ -93,7 +93,8 @@ def score_fixture(fixture_id: str, category: str, *, total_samples: int,
         _percentile(late, 0.5) if late else None,
         _percentile(late, 0.95) if late else None,
         false_positive,
-        false_positive / total_samples if total_samples else None,
+        (false_positive / (total_samples - ref_samples)
+         if total_samples > ref_samples else None),
         tuple(late),
     )
 

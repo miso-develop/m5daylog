@@ -159,6 +159,70 @@ class VadCase(unittest.TestCase):
         self.assertEqual(result.status, "SUCCEEDED")
         self.assertEqual(self.runtime.calls, 2)
 
+    def test_concurrent_sync_conflict_never_commits_vad_success(self):
+        original_detect = self.runtime.detect
+
+        def conflicting_sync(samples):
+            with sqlite3.connect(self.db_path) as other:
+                other.execute(
+                    "UPDATE recordings SET sync_status='CONFLICT' WHERE recording_id=?",
+                    (RID,),
+                )
+            return original_detect(samples)
+
+        self.runtime.detect = conflicting_sync
+        with self.assertRaisesRegex(VadError, "recording changed during VAD"):
+            self.execute()
+        self.assertEqual(self.con.execute(
+            "SELECT sync_status, vad_status FROM recordings").fetchone(),
+            ("CONFLICT", "FAILED"))
+        self.assertEqual(self.con.execute(
+            "SELECT count(*) FROM artifacts").fetchone()[0], 0)
+        self.assertEqual(self.con.execute(
+            "SELECT status FROM jobs").fetchone()[0], "FAILED")
+        self.assertEqual(self.raw.read_bytes(), self.original)
+
+    def test_same_day_timestamp_change_invalidates_cached_artifact(self):
+        first = self.execute()
+        changed = "2026-10-04T08:00:05+09:00"
+        self.con.execute("UPDATE recordings SET started_at=?", (changed,))
+        self.con.commit()
+        result = self.execute()
+        self.assertEqual(result.status, "SUCCEEDED")
+        self.assertNotEqual(result.sha256, first.sha256)
+        self.assertEqual(self.runtime.calls, 2)
+        meta = json.loads(self.outfile().read_text().splitlines()[0])
+        self.assertEqual(meta["started_at"], changed)
+
+    def test_corrupt_cached_timestamp_cannot_be_adopted(self):
+        self.execute()
+        lines = [json.loads(line) for line in self.outfile().read_text().splitlines()]
+        lines[0]["started_at"] = "not-a-timestamp"
+        forged = ("\n".join(canonical_json(item) for item in lines) + "\n").encode()
+        self.outfile().write_bytes(forged)
+        self.con.execute("UPDATE artifacts SET sha256=?",
+                         (hashlib.sha256(forged).hexdigest(),))
+        self.con.commit()
+        self.assertEqual(self.execute().status, "SUCCEEDED")
+        self.assertEqual(self.runtime.calls, 2)
+
+    def test_partial_pcm16_data_chunk_is_rejected(self):
+        raw = bytearray(wav_bytes(frames=1))
+        raw[40:44] = (3).to_bytes(4, "little")
+        raw.extend(b"\x00\x00")  # third half-sample, plus RIFF padding
+        raw[4:8] = (len(raw) - 8).to_bytes(4, "little")
+        self.raw.write_bytes(raw)
+        self.con.execute(
+            "UPDATE recordings SET size_bytes=?,source_sha256=?",
+            (len(raw), hashlib.sha256(raw).hexdigest()))
+        self.con.commit()
+        with wave.open(io.BytesIO(raw), "rb") as wav:
+            self.assertEqual(wav.getnframes(), 1)
+            self.assertEqual(len(wav.readframes(1)), 2)
+        with self.assertRaisesRegex(VadError, "truncated WAV frames"):
+            self.execute()
+        self.assertEqual(self.runtime.calls, 0)
+
     def test_input_hash_mismatch_is_fail_closed(self):
         self.raw.write_bytes(self.original + b"X")
         with self.assertRaisesRegex(VadError, "integrity"):
