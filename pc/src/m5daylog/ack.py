@@ -336,8 +336,9 @@ def flush_pre_release_acks(
                 validate_contract_document(existing, contracts / "processed-ack.schema.json")
                 if existing["deviceId"] != barrier.device_id:
                     raise AckSafetyError("existing ACK Device identity mismatch")
-                if len(existing["recordingIds"]) > _ACK_MAX_IDS:
-                    raise AckSafetyError("existing ACK exceeds Device ID limit")
+                # Schema v1 has no ID cap: a legacy final may be too large
+                # for the Device receiver. Preserve *all* its ID debt locally
+                # before replacing it with one bounded, replayable batch.
                 # Commit any previously published, locally untracked IDs to
                 # SQLite *before* replacing the only authoritative copy.
                 new_prior_ids = _remember_prior_ids(
