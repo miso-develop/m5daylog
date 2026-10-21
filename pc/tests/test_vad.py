@@ -341,6 +341,35 @@ class VadCase(unittest.TestCase):
         self.assertEqual(protected.read_bytes(), b"must not change")
         self.assertFalse(temp.exists())
 
+    def test_cli_unexpected_inference_failure_does_not_leak_private_details(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest.mock import patch
+        from m5daylog.cli import main
+
+        private_details = "SYNTHETIC_PRIVATE_MARKER " + str(self.raw)
+
+        class FailingRuntime(StubRuntime):
+            def detect(self, samples):
+                raise RuntimeError(private_details)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("m5daylog.vad.SileroCPU", return_value=FailingRuntime()):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main([
+                    "vad", RID, "--library-root", str(self.root),
+                    "--db", str(self.db_path),
+                ])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "error: vad failed: RuntimeError\n")
+        self.assertEqual(self.con.execute(
+            "SELECT vad_status FROM recordings").fetchone()[0], "FAILED")
+        self.assertEqual(self.con.execute(
+            "SELECT status FROM jobs").fetchone()[0], "FAILED")
+        self.assertFalse(self.outfile().exists())
+        self.assertEqual(self.raw.read_bytes(), self.original)
+
     def test_invalid_model_output_sets_failure_status(self):
         self.runtime.output = [{"start": 400, "end": 0}]
         with self.assertRaises(VadError):

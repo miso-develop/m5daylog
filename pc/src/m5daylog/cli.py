@@ -102,7 +102,8 @@ def cmd_vad(recording_id: str, library_root: str | None,
             db_path=resolve_db_path(explicit_db=db_arg, data_dir=data_dir_arg),
             library_root=library_root,
         )
-    except (VadError, OSError, sqlite3.Error, ImportError) as exc:
+    except Exception as exc:
+        # Third-party runtime errors can embed private paths; print class only.
         print(f"error: vad failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(f"vad: status={result.status} ranges={result.ranges} sha256={result.sha256}")
