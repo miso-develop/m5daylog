@@ -229,8 +229,8 @@ def _source(row: sqlite3.Row, root: Path) -> tuple[bytes, int, str, Path]:
 def _canonical_params() -> dict:
     """Exact schema-v1 parameters tied to the RAW v1 producer identity."""
     return {
-params": {
-        "threshold": PARAMS["threshold"], "neg_threshold": PARAMS["neg_threshold"],
+        "threshold": PARAMS["threshold"],
+        "neg_threshold": PARAMS["neg_threshold"],
         "min_speech_ms": PARAMS["min_speech_duration_ms"],
         "min_silence_ms": PARAMS["min_silence_duration_ms"],
         "speech_pad_ms": PARAMS["speech_pad_ms"],
@@ -242,7 +242,6 @@ params": {
         "min_silence_at_max_speech": PARAMS["min_silence_at_max_speech"],
         "use_max_poss_sil_at_max_speech": PARAMS["use_max_poss_sil_at_max_speech"],
         "time_resolution": PARAMS["time_resolution"],
-
     }
 
 
