@@ -137,7 +137,15 @@ def _snapshot_pending(db_path: Path, device_id: str) -> tuple[str, ...]:
                   AND r.day_status='SUCCEEDED'
                 UNION ALL
                 SELECT c.recording_id, c.pending_since, c.last_delivered_at
-                FROM ack_carryover c WHERE c.device_id=?
+                FROM ack_carryover c
+                WHERE c.device_id=?
+                  AND NOT EXISTS (
+                      -- A known outbox ID must pass its own stage/hash gate.
+                      -- Legacy carryover is authoritative only while no
+                      -- local outbox has claimed that recording ID.
+                      SELECT 1 FROM ack_outbox a
+                      WHERE a.recording_id=c.recording_id
+                  )
             )
             GROUP BY recording_id
             ORDER BY MIN(CASE WHEN last_delivered_at IS NULL THEN 0 ELSE 1 END),
