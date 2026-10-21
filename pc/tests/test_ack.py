@@ -261,7 +261,9 @@ class AckTests(unittest.TestCase):
         self.assertEqual(first_ids | next_ids, all_ids)
         self.assertEqual(len(self.pending_state()), 1025)
 
-    def test_existing_final_over_capacity_is_preserved(self):
+    def test_oversized_legacy_final_is_replayed_in_bounded_batches(self):
+        # Canonical schema v1 permits this old payload, but the Device
+        # receiver cannot ingest more than 1,024 IDs per WAKE.
         old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"prior-{i}"))
                for i in range(1025)]
         final = self.ackdir / "processed.json"
@@ -269,11 +271,87 @@ class AckTests(unittest.TestCase):
             "schemaVersion": 1, "deviceId": DEVICE,
             "processedAt": "2026-10-09T00:00:00Z", "recordingIds": old,
         }))
+        first = self.flush()
+        first_bytes = final.read_bytes()
+        first_ids = set(json.loads(first_bytes)["recordingIds"])
+        self.assertEqual((first.status, first.attempted), ("DELIVERED", 1024))
+        self.assertEqual(len(first_ids), 1024)
+        self.assertLessEqual(len(first_bytes), 128 * 1024)
+        self.assertTrue(first_ids.issubset(set(old)))
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM ack_carryover WHERE device_id=?", (DEVICE,)
+            ).fetchone()[0], 1025)
+        finally:
+            conn.close()
+
+        second = self.flush()
+        second_bytes = final.read_bytes()
+        second_ids = set(json.loads(second_bytes)["recordingIds"])
+        self.assertEqual((second.status, second.attempted), ("DELIVERED", 1024))
+        self.assertLessEqual(len(second_bytes), 128 * 1024)
+        self.assertEqual(first_ids | second_ids, set(old) | {RID})
+        self.assertEqual(len(self.pending_state()), 1)
+
+    def test_oversized_legacy_replace_failure_preserves_final_and_debt(self):
+        old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"failure-prior-{i}"))
+               for i in range(1025)]
+        final = self.ackdir / "processed.json"
+        final.write_text(json.dumps({
+            "schemaVersion": 1, "deviceId": DEVICE,
+            "processedAt": "2026-10-09T00:00:00Z", "recordingIds": old,
+        }))
         before = final.read_bytes()
-        result = self.flush()
-        self.assertEqual(result.status, "DEFERRED")
+        lease = Lease()
+        failed = self.flush(port=Port(failure="replace"), lease=lease)
+        self.assertEqual(failed.status, "DEFERRED")
+        self.assertTrue(lease.closed)
         self.assertEqual(final.read_bytes(), before)
         self.assertEqual(self.pending_state(), [(RID, None)])
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ack_carryover").fetchone()[0], 1025)
+        finally:
+            conn.close()
+
+        published = set()
+        for _ in range(2):
+            self.assertEqual(self.flush().status, "DELIVERED")
+            current = final.read_bytes()
+            self.assertLessEqual(len(current), 128 * 1024)
+            current_ids = json.loads(current)["recordingIds"]
+            self.assertLessEqual(len(current_ids), 1024)
+            published.update(current_ids)
+        self.assertEqual(published, set(old) | {RID})
+
+    def test_oversized_legacy_post_replace_local_commit_failure_recovers(self):
+        old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"crash-prior-{i}"))
+               for i in range(1025)]
+        final = self.ackdir / "processed.json"
+        final.write_text(json.dumps({
+            "schemaVersion": 1, "deviceId": DEVICE,
+            "processedAt": "2026-10-09T00:00:00Z", "recordingIds": old,
+        }))
+        published = set()
+        with patch.object(ack, "_mark_delivered",
+                          side_effect=sqlite3.OperationalError("synthetic crash")):
+            self.assertEqual(self.flush().status, "DEFERRED")
+        published.update(json.loads(final.read_text())["recordingIds"])
+        self.assertEqual(self.pending_state(), [(RID, None)])
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ack_carryover").fetchone()[0], 1025)
+        finally:
+            conn.close()
+        for _ in range(3):
+            self.assertEqual(self.flush().status, "DELIVERED")
+            current = final.read_bytes()
+            self.assertLessEqual(len(current), 128 * 1024)
+            current_ids = json.loads(current)["recordingIds"]
+            self.assertLessEqual(len(current_ids), 1024)
+            published.update(current_ids)
+        self.assertEqual(published, set(old) | {RID})
 
     def test_prior_only_ids_are_durable_and_fair_under_capacity(self):
         old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"prior-{i}"))
