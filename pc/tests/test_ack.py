@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import unittest
+import uuid
 from contextlib import AbstractContextManager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -109,11 +110,18 @@ class AckTests(unittest.TestCase):
 
     def test_fsync_failure_keeps_old_final_and_outbox_pending(self):
         final = self.ackdir / "processed.json"
-        final.write_bytes(b"previous-authoritative")
+        old = {
+            "schemaVersion": 1, "deviceId": DEVICE,
+            "processedAt": "2026-10-09T00:00:00Z", "recordingIds": [OLD_RID],
+        }
+        final.write_text(json.dumps(old), encoding="utf-8")
         before = final.read_bytes()
-        with patch.object(ack.os, "fsync", side_effect=OSError("synthetic fsync")):
-            result = self.flush()
+        lease = Lease()
+        with patch.object(ack.os, "fsync", side_effect=OSError("synthetic fsync")) as failed:
+            result = self.flush(lease=lease)
+        failed.assert_called_once()
         self.assertEqual(result.status, "DEFERRED")
+        self.assertTrue(lease.closed)
         self.assertEqual(final.read_bytes(), before)
         self.assertEqual(self.pending_state(), [(RID, None)])
 
@@ -224,6 +232,125 @@ class AckTests(unittest.TestCase):
     def test_close_failure_blocks_release(self):
         with self.assertRaises(ack.AckHandleUnsafeError):
             self.flush(lease=Lease(fail_close=True))
+
+    def test_bounded_fair_retry_for_1025_pending_ids(self):
+        extra = [str(uuid.uuid5(uuid.NAMESPACE_DNS, f"ack-recording-{i}"))
+                 for i in range(1024)]
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.executemany(
+                "INSERT INTO recordings(recording_id,device_id,source_sha256,sync_status,"
+                "vad_status,stt_status,diarization_status,day_status) "
+                "VALUES(?,?,?,'SYNCED','SUCCEEDED','SUCCEEDED','SUCCEEDED','SUCCEEDED')",
+                ((rid, DEVICE, SHA) for rid in extra),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        all_ids = {RID, *extra}
+        first = self.flush()
+        content = (self.ackdir / "processed.json").read_bytes()
+        first_ids = set(json.loads(content)["recordingIds"])
+        self.assertEqual((first.status, first.attempted), ("DELIVERED", 1024))
+        self.assertEqual(len(first_ids), 1024)
+        self.assertLessEqual(len(content), 128 * 1024)
+        second = self.flush()
+        next_ids = set(json.loads((self.ackdir / "processed.json").read_text())["recordingIds"])
+        self.assertEqual(second.status, "DELIVERED")
+        self.assertEqual(len(next_ids), 1024)
+        self.assertEqual(first_ids | next_ids, all_ids)
+        self.assertEqual(len(self.pending_state()), 1025)
+
+    def test_existing_final_over_capacity_is_preserved(self):
+        old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"prior-{i}"))
+               for i in range(1025)]
+        final = self.ackdir / "processed.json"
+        final.write_text(json.dumps({
+            "schemaVersion": 1, "deviceId": DEVICE,
+            "processedAt": "2026-10-09T00:00:00Z", "recordingIds": old,
+        }))
+        before = final.read_bytes()
+        result = self.flush()
+        self.assertEqual(result.status, "DEFERRED")
+        self.assertEqual(final.read_bytes(), before)
+        self.assertEqual(self.pending_state(), [(RID, None)])
+
+    def test_prior_only_ids_are_durable_and_fair_under_capacity(self):
+        old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"prior-{i}"))
+               for i in range(1024)]
+        final = self.ackdir / "processed.json"
+        final.write_text(json.dumps({
+            "schemaVersion": 1, "deviceId": DEVICE,
+            "processedAt": "2026-10-09T00:00:00Z", "recordingIds": old,
+        }))
+        first = self.flush()
+        self.assertEqual(first.attempted, 1024)
+        self.assertNotIn(RID, json.loads(final.read_text())["recordingIds"])
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM ack_carryover"
+            ).fetchone()[0], 1024)
+        finally:
+            conn.close()
+        second = self.flush()
+        self.assertIn(RID, json.loads(final.read_text())["recordingIds"])
+        self.assertEqual(second.attempted, 1024)
+        self.assertEqual(self.pending_state()[0][0], RID)
+
+    def test_invalidated_pending_does_not_bypass_stage_gate(self):
+        self.assertEqual(self.flush(lease=Lease(reject=True)).status, "DEFERRED")
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE recordings SET day_status='FAILED' WHERE recording_id=?", (RID,))
+            conn.commit()
+        finally:
+            conn.close()
+        lease = Lease()
+        self.assertEqual(self.flush(lease=lease).status, "NO_OP")
+        self.assertFalse(lease.opened)
+        self.assertEqual(self.pending_state(), [(RID, None)])
+
+    def test_invalidated_prior_outbox_id_is_not_carried_as_legacy(self):
+        self.assertEqual(self.flush().status, "DELIVERED")
+        self.insert_recording(rid=OLD_RID)
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE recordings SET stt_status='FAILED' WHERE recording_id=?", (RID,))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self.flush().status, "DELIVERED")
+        published = json.loads((self.ackdir / "processed.json").read_text())["recordingIds"]
+        self.assertEqual(published, [OLD_RID])
+        self.assertEqual(self.pending_state()[0][0], RID)
+
+    def test_byte_cap_failure_never_publishes(self):
+        with patch.object(ack, "_ACK_MAX_BYTES", 64):
+            result = self.flush()
+        self.assertEqual(result.status, "DEFERRED")
+        self.assertFalse((self.ackdir / "processed.json").exists())
+        self.assertEqual(self.pending_state(), [(RID, None)])
+
+    def test_failed_fdopen_and_cleanup_close_blocks_release(self):
+        lease = Lease()
+        with patch.object(ack.os, "open", return_value=123456), \
+             patch.object(ack.os, "fdopen", side_effect=OSError("fdopen failed")), \
+             patch.object(ack.os, "close", side_effect=OSError("cleanup close failed")):
+            with self.assertRaises(ack.AckHandleUnsafeError):
+                self.flush(lease=lease)
+        self.assertTrue(lease.closed)
+        self.assertEqual(self.pending_state(), [(RID, None)])
+
+    def test_fdopen_failure_with_verified_close_is_retryable(self):
+        lease = Lease()
+        with patch.object(ack.os, "fdopen", side_effect=OSError("fdopen failed")), \
+             patch.object(ack.os, "close", wraps=os.close) as cleaned:
+            result = self.flush(lease=lease)
+        cleaned.assert_called_once()
+        self.assertEqual(result.status, "DEFERRED")
+        self.assertTrue(lease.closed)
+        self.assertEqual(self.pending_state(), [(RID, None)])
 
     def test_snapshot_does_not_wait_for_later_processing(self):
         conn = sqlite3.connect(self.db)
