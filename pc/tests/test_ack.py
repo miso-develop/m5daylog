@@ -353,6 +353,32 @@ class AckTests(unittest.TestCase):
             published.update(current_ids)
         self.assertEqual(published, set(old) | {RID})
 
+    def test_legacy_file_larger_than_receiver_byte_limit_recovers(self):
+        old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"byte-prior-{i}"))
+               for i in range(4096)]
+        final = self.ackdir / "processed.json"
+        final.write_text(json.dumps({
+            "schemaVersion": 1, "deviceId": DEVICE,
+            "processedAt": "2026-10-09T00:00:00Z", "recordingIds": old,
+        }))
+        self.assertGreater(len(final.read_bytes()), 128 * 1024)
+
+        published = set()
+        for _ in range(5):
+            result = self.flush()
+            self.assertEqual(result.status, "DELIVERED")
+            current = final.read_bytes()
+            self.assertLessEqual(len(current), 128 * 1024)
+            payload = json.loads(current)
+            self.assertLessEqual(len(payload["recordingIds"]), 1024)
+            published.update(payload["recordingIds"])
+        self.assertEqual(published, set(old) | {RID})
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ack_carryover").fetchone()[0], 4096)
+        finally:
+            conn.close()
+
     def test_prior_only_ids_are_durable_and_fair_under_capacity(self):
         old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"prior-{i}"))
                for i in range(1024)]
