@@ -129,6 +129,20 @@ class VadCase(unittest.TestCase):
         self.assertEqual(len(self.outfile().read_text().splitlines()), 1)
         self.assertEqual(result.status, "SUCCEEDED")
 
+    def test_canonical_but_tampered_metadata_never_skips_inference(self):
+        first = self.execute()
+        records = [json.loads(line) for line in self.outfile().read_text().splitlines()]
+        records[0]["params"]["threshold"] = 0.99
+        forged = ("\n".join(canonical_json(item) for item in records) + "\n").encode("utf-8")
+        self.outfile().write_bytes(forged)
+        self.con.execute("UPDATE artifacts SET sha256=?",
+                         (hashlib.sha256(forged).hexdigest(),))
+        self.con.commit()
+        second = self.execute()
+        self.assertEqual(second.status, "SUCCEEDED")
+        self.assertEqual(self.runtime.calls, 2)
+        self.assertEqual(second.sha256, first.sha256)
+
     def test_model_behavior_identity_changes_recompute(self):
         first = self.execute()
         other = StubRuntime([{"start": 2, "end": 100}])
@@ -256,6 +270,30 @@ class PureContractTests(unittest.TestCase):
         self.assertTrue(text.startswith("v1:"))
         self.assertEqual(text, fingerprint(meta))
         self.assertNotIn("Infinity", canonical_json({"model": meta}))
+
+    def test_schema_v1_rejects_forged_canonical_producer_metadata(self):
+        from m5daylog.vad import _artifact_bytes
+        model = metadata(StubRuntime())
+        version = fingerprint(model)
+        source_sha = "0" * 64
+        generated = _artifact_bytes(
+            {"recording_id": RID, "started_at": STARTED},
+            model, version, source_sha, 10, [(1, 8)],
+        )
+        self.assertEqual(validate_jsonl(generated, RID, source_sha, version, 10), 1)
+        base = [json.loads(line) for line in generated.splitlines()]
+        for field, key, replacement in (
+                ("model", "torch_version", "999.0"),
+                ("params", "min_silence_ms", 0),
+                ("params", "unexpected_parameter", True)):
+            with self.subTest(field=field, key=key):
+                forged = [dict(item) for item in base]
+                forged[0][field] = dict(forged[0][field])
+                forged[0][field][key] = replacement
+                serialized = ("\n".join(canonical_json(item) for item in forged)
+                              + "\n").encode("utf-8")
+                with self.assertRaises(VadError):
+                    validate_jsonl(serialized, RID, source_sha, version, 10)
 
     def test_corrupt_jsonl_rejected(self):
         with self.assertRaises(VadError):
