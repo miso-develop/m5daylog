@@ -140,7 +140,8 @@ class AckTests(unittest.TestCase):
         conn.close()
         lease = Lease()
         self.assertEqual(self.flush(lease=lease).status, "NO_OP")
-        self.assertFalse(lease.opened)
+        self.assertTrue(lease.opened)
+        self.assertTrue(lease.closed)
         self.assertFalse((self.ackdir / "processed.json").exists())
         self.assertEqual(self.pending_state(), [])
 
@@ -227,7 +228,8 @@ class AckTests(unittest.TestCase):
         conn.close()
         lease = Lease()
         self.assertEqual(self.flush(lease=lease).status, "NO_OP")
-        self.assertFalse(lease.opened)
+        self.assertTrue(lease.opened)
+        self.assertTrue(lease.closed)
 
     def test_close_failure_blocks_release(self):
         with self.assertRaises(ack.AckHandleUnsafeError):
@@ -379,6 +381,97 @@ class AckTests(unittest.TestCase):
         finally:
             conn.close()
 
+
+    def test_legacy_oversized_final_recovers_without_any_eligible_local_rows(self):
+        # A rebuilt/migrated PC has the Device's prior final but no processing rows.
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("DELETE FROM recordings")
+            conn.commit()
+        finally:
+            conn.close()
+        old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"only-prior-{i}"))
+               for i in range(1025)]
+        final = self.ackdir / "processed.json"
+        final.write_text(json.dumps({
+            "schemaVersion": 1, "deviceId": DEVICE,
+            "processedAt": "2026-10-09T00:00:00Z", "recordingIds": old,
+        }))
+        published = set()
+        for _ in range(2):
+            result = self.flush()
+            data = final.read_bytes()
+            self.assertEqual(result.status, "DELIVERED")
+            ids = json.loads(data)["recordingIds"]
+            self.assertLessEqual(len(ids), 1024)
+            self.assertLessEqual(len(data), 128 * 1024)
+            published.update(ids)
+        self.assertEqual(published, set(old))
+        self.assertEqual(self.pending_state(), [])
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM ack_carryover").fetchone()[0], 1025
+            )
+        finally:
+            conn.close()
+
+    def test_no_local_debt_or_existing_final_is_no_op_without_publication(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("DELETE FROM recordings")
+            conn.commit()
+        finally:
+            conn.close()
+        lease, port = Lease(), Port()
+        result = self.flush(lease=lease, port=port)
+        self.assertEqual(result.status, "NO_OP")
+        self.assertTrue(lease.opened)  # A prior-final existence check needs MSC admission.
+        self.assertTrue(lease.closed)
+        self.assertEqual(port.events, [])
+        self.assertFalse((self.ackdir / "processed.json").exists())
+
+    def test_prior_final_with_only_invalidated_outbox_ids_is_not_rewritten(self):
+        self.assertEqual(self.flush().status, "DELIVERED")
+        final = self.ackdir / "processed.json"
+        previous = final.read_bytes()
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("UPDATE recordings SET day_status='FAILED' WHERE recording_id=?",
+                         (RID,))
+            conn.commit()
+        finally:
+            conn.close()
+        port = Port()
+        self.assertEqual(self.flush(port=port).status, "NO_OP")
+        self.assertEqual(port.events, [])
+        self.assertEqual(final.read_bytes(), previous)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM ack_carryover").fetchone()[0], 0
+            )
+        finally:
+            conn.close()
+
+    def test_missing_local_state_defers_before_device_lease(self):
+        self.db.unlink()
+        lease = Lease()
+        result = self.flush(lease=lease)
+        self.assertEqual((result.status, result.reason),
+                         ("DEFERRED", "local-ack-state-unavailable"))
+        self.assertFalse(lease.opened)
+
+    def test_busy_local_state_defers_before_device_lease(self):
+        lease = Lease()
+        with patch.object(ack, "_snapshot_pending",
+                          side_effect=sqlite3.OperationalError("database is locked")):
+            result = self.flush(lease=lease)
+        self.assertEqual((result.status, result.reason),
+                         ("DEFERRED", "local-ack-state-unavailable"))
+        self.assertFalse(lease.opened)
+        self.assertFalse((self.ackdir / "processed.json").exists())
+
     def test_prior_only_ids_are_durable_and_fair_under_capacity(self):
         old = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"prior-{i}"))
                for i in range(1024)]
@@ -412,7 +505,8 @@ class AckTests(unittest.TestCase):
             conn.close()
         lease = Lease()
         self.assertEqual(self.flush(lease=lease).status, "NO_OP")
-        self.assertFalse(lease.opened)
+        self.assertTrue(lease.opened)
+        self.assertTrue(lease.closed)
         self.assertEqual(self.pending_state(), [(RID, None)])
 
     def test_invalidated_prior_outbox_id_is_not_carried_as_legacy(self):
