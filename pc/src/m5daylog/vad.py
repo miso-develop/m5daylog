@@ -226,6 +226,26 @@ def _source(row: sqlite3.Row, root: Path) -> tuple[bytes, int, str, Path]:
     return pcm, total, digest, resolved
 
 
+def _canonical_params() -> dict:
+    """Exact schema-v1 parameters tied to the RAW v1 producer identity."""
+    return {
+params": {
+        "threshold": PARAMS["threshold"], "neg_threshold": PARAMS["neg_threshold"],
+        "min_speech_ms": PARAMS["min_speech_duration_ms"],
+        "min_silence_ms": PARAMS["min_silence_duration_ms"],
+        "speech_pad_ms": PARAMS["speech_pad_ms"],
+        "window_size_samples": PARAMS["window_size_samples"],
+        "merge_gap_samples": 0,
+        "max_speech_duration_s": "inf",
+        "sampling_rate": SAMPLE_RATE,
+        "return_seconds": False,
+        "min_silence_at_max_speech": PARAMS["min_silence_at_max_speech"],
+        "use_max_poss_sil_at_max_speech": PARAMS["use_max_poss_sil_at_max_speech"],
+        "time_resolution": PARAMS["time_resolution"],
+
+    }
+
+
 def _artifact_bytes(row: sqlite3.Row, model: dict, version: str,
                     source_sha: str, total: int, ranges: list[tuple[int, int]]) -> bytes:
     meta = {
@@ -234,20 +254,7 @@ def _artifact_bytes(row: sqlite3.Row, model: dict, version: str,
         "started_at": row["started_at"], "sample_rate": SAMPLE_RATE,
         "total_samples": total, "producer": PRODUCER,
         "producer_version": version, "model": model,
-        "params": {
-            "threshold": PARAMS["threshold"], "neg_threshold": PARAMS["neg_threshold"],
-            "min_speech_ms": PARAMS["min_speech_duration_ms"],
-            "min_silence_ms": PARAMS["min_silence_duration_ms"],
-            "speech_pad_ms": PARAMS["speech_pad_ms"],
-            "window_size_samples": PARAMS["window_size_samples"],
-            "merge_gap_samples": 0,
-            "max_speech_duration_s": "inf",
-            "sampling_rate": SAMPLE_RATE,
-            "return_seconds": False,
-            "min_silence_at_max_speech": PARAMS["min_silence_at_max_speech"],
-            "use_max_poss_sil_at_max_speech": PARAMS["use_max_poss_sil_at_max_speech"],
-            "time_resolution": PARAMS["time_resolution"],
-        },
+        "params": _canonical_params(),
     }
     records = [meta]
     for index, (start, end) in enumerate(ranges):
@@ -281,6 +288,9 @@ def validate_jsonl(data: bytes, rid: str, source_sha: str, version: str,
                 or type(head.get("total_samples")) is not int):
             raise ValueError("bad meta identity")
         n = head["total_samples"]
+        if (head["params"] != _canonical_params()
+                or fingerprint(head["model"]) != version):
+            raise ValueError("artifact producer metadata mismatch")
         if ((total_samples is not None and n != total_samples) or n < 0
                 or any(canonical_json(record) != line for record, line in zip(records, lines))):
             raise ValueError("noncanonical JSONL")
