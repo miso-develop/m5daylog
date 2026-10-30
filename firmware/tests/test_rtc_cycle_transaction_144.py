@@ -252,18 +252,7 @@ bool release_cycle_fence_host_owned_qualified(void) { return g_host_fence; }
 
 /* INSERT_EXACT_PRODUCTION_STATUS_PROVIDER */
 
-static usb_cdc_set_time_result_t actual_set_time(
-    const char *requested, char *normalized, size_t n, void *ctx) {
-    (void)ctx;
-    rtc_correction_result_t result = rtc_correction_apply(requested, normalized, n);
-    switch (result) {
-        case RTC_CORRECTION_OK: return USB_CDC_SET_TIME_OK;
-        case RTC_CORRECTION_INVALID_ARGS: return USB_CDC_SET_TIME_INVALID_ARGS;
-        case RTC_CORRECTION_RANGE_ERROR: return USB_CDC_SET_TIME_RANGE_ERROR;
-        case RTC_CORRECTION_BUSY: return USB_CDC_SET_TIME_BUSY;
-        default: return USB_CDC_SET_TIME_INTERNAL_ERROR;
-    }
-}
+/* INSERT_EXACT_PRODUCTION_SET_TIME_CALLBACK */
 static void request(const usb_cdc_protocol_config_t *cfg, const char *raw,
                     const char *expected, const char *missing) {
     char out[768] = {0};
@@ -299,7 +288,7 @@ int main(int argc, char **argv) {
     usb_cdc_protocol_config_t cfg = {0};
     cfg.device_id = A;
     cfg.status_provider = recorder_cdc_status; /* actual production function */
-    cfg.set_time = actual_set_time;              /* calls real RTC transaction */
+    cfg.set_time = recorder_cdc_set_time;              /* calls real RTC transaction */
     request(&cfg, STATUS, NULL, g_invalid_boot_rtc ? NO_ID : NULL);
     if (!g_invalid_boot_rtc) request(&cfg, STATUS, ID_FIELD, NULL);
 
@@ -390,7 +379,13 @@ def transaction_binary(tmp_path_factory):
     assert "release_cycle_fence_host_owned_qualified()" in provider
     assert "usb_msc_ownership_is_host_owned()" in provider
     harness = tmp / "transaction.c"
-    harness.write_text(HARNESS.replace(marker, provider), encoding="utf-8")
+    setter_start = runtime.index("static usb_cdc_set_time_result_t recorder_cdc_set_time(", end)
+    setter_end = runtime.index("static void recorder_task49_delete(", setter_start)
+    setter = runtime[setter_start:setter_end].strip()
+    assert "rtc_correction_apply(requested_time, normalized, normalized_size)" in setter
+    generated = HARNESS.replace(marker, provider).replace(
+        "/* INSERT_EXACT_PRODUCTION_SET_TIME_CALLBACK */", setter)
+    harness.write_text(generated, encoding="utf-8")
 
     exe = tmp / "transaction"
     args = [
