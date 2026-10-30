@@ -75,6 +75,51 @@ causes no Device read/copy.
 - No ACK, AI, raw deletion, automatic retention, cloud, firmware or schema
   changes. No privileged service, no persistent Device I/O.
 
+## #135 source-only release prerequisites added (not wired to auto-release)
+
+The canonical `release.py::SyncReleaseCoordinator` now validates the exact
+MSC/CDC target **before** any optional RTC CDC mutation, supports an optional
+`before_seal_observation(target, gate)` callback after #51 sync and before
+the final identity revalidation/seal, and supports
+`before_release_send(attempt_id, target)` **inside** the volume lock/dismount
+lease and **before** the first possible `RELEASE_STORAGE` send. Failure of
+either callback blocks the send; historical #89 manual callers without these
+new hooks remain unchanged. This is an interface seam, not release clearance.
+A capacity-only API error may be advisory, but a changed/unverified session
+must veto release.
+
+The canonical Windows adapter now supports bounded `SET_TIME` with an
+exact previously frozen CDC endpoint and strict matching response, including
+`eventPending:true`. Invalid timestamp, changed endpoint, negative response,
+or indeterminate transport cannot produce RTC success. **No automatic consumer
+or existing manual CLI has yet been wired to call this mutation**; merely
+having the source does not satisfy the RTC prerequisite.
+
+`release_fence.py::DeviceAttemptFence` implements an intentionally
+conservative SQLite `synchronous=FULL`, process-serialized, durable
+pre-send reservation **on host media only**. It stores hashes instead of
+plain Device IDs and rejects duplicates or any uncertain journal outcome.
+Its key is **Device-scoped for all time**, NOT a fabricated USB session key.
+A second process, power-cycle or restart cannot claim the same Device after
+a potentially sent command. **This cannot provide repeatable daily release**,
+and it must not be adopted as a permanent v0.1 workflow or automatically reset
+without a separately approved, provable new Device session. It is only a
+source-only fail-closed building block tested with fake objects. It is not
+currently wired into the manual or automated command. The existing CLI
+overlap with paused PR #110 has been permitted by Integration for narrow
+future coordination; **no CLI behavior has been changed in this iteration**.
+
+**Blocking product/spec issue:** CDC v1 `GET_INFO` reports deviceId, and
+`GET_STATUS` reports USB_SYNC and RTC pending, but neither reports a
+durable unique fresh session generation. The host's random
+`VerifiedSession.session_epoch`, COM number, Volume GUID, or new
+`releaseAttemptId` cannot distinguish a genuinely new Device session
+from a re-enumeration after a possibly accepted release. A safe repeatable
+daily automatic release therefore requires a Specification decision and
+an independently approved cross-domain session authority or equivalent
+proof. Until then, do not enable the release sender, clear the journal or
+claim PC-A03/V01-RELEASE acceptance.
+
 ## Next work required before reviewable end-to-end auto-release
 
 1. Qualify the new Windows-only observer, opt-in/at-login startup, session
