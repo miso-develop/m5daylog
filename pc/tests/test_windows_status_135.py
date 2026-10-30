@@ -80,16 +80,6 @@ class ReadOnlyStatusTests(unittest.TestCase):
                 self.assertEqual(k.closed, 1)
                 self.assertEqual(k.request["cmd"], "GET_STATUS")
 
-    def test_endpoint_switch_before_status_blocks_send(self):
-        api, k = self.make_api()
-        first = CdcInterface("synthetic-cdc-A", "cdc-A", "parent")
-        second = CdcInterface("synthetic-cdc-B", "cdc-B", "parent")
-        bindings = iter([first, second])
-        api._cdc_interface = lambda port: next(bindings)
-        with self.assertRaises(HostQuiesceError):
-            # WrongTarget is distinct from HostQuiesceError and is checked below.
-            api.read_status("COM7")
-
     def test_changed_endpoint_is_never_written(self):
         from m5daylog.release import WrongTarget
 
