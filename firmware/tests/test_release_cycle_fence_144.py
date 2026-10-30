@@ -159,3 +159,78 @@ def test_rearm_failure_cannot_retry_same_boot(fence_binary, failure, expected_ma
         # was reported. The previous host release was already accepted; this
         # simulates a *new* physical WAKE, not an unattended retry.
         assert observation(fence_binary, "claim", 1, 83)["qualified"] == "1"
+
+# R3 DC-03d: full source-linked NVS state interleavings with both the real
+# shutdown_armed.c lifecycle and release_cycle_fence.c (one process per boot).
+# The 1/83 seed denotes a previously ACCEPTED release, not first-use setup.
+@pytest.fixture(scope="module")
+def lifecycle_binary(fence_binary):
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    assert cc is not None
+    root = Path(fence_binary).parent
+    exe = root / "release_cycle_lifecycle"
+    build = subprocess.run(
+        [cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-DESP_PLATFORM",
+         "-I", str(root / "include"), "-I", str(COMP / "include"),
+         str(COMP / "release_cycle_fence.c"),
+         str(COMP / "shutdown_armed.c"),
+         str(ROOT / "firmware/tests/native/release_cycle_lifecycle_harness.c"),
+         "-o", str(exe)],
+        capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    return exe
+
+
+def lifecycle_run(exe, lifecycle=1, fence=83, fault_write=0, phase="none", mode="cycle"):
+    result = subprocess.run(
+        [str(exe), mode, str(lifecycle), str(fence), str(fault_write), phase],
+        capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr + result.stdout
+    return {k: int(v) for k, v in (part.split("=", 1)
+                                    for part in result.stdout.strip().split())}
+
+
+@pytest.mark.parametrize("write", [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("phase", ["set", "before", "after"])
+def test_each_production_lifecycle_nvs_boundary_fails_closed(lifecycle_binary, write, phase):
+    # 1 BOOT_ACTIVE, 2 PENDING, 3 NORMAL, 4 HOST_UNRESOLVED,
+    # 5 SHUTDOWN_ARMED after accepted D-031, 6 READY_AFTER_RELEASE.
+    stopped = lifecycle_run(lifecycle_binary, fault_write=write, phase=phase)
+    assert stopped["result"] != 0
+    assert stopped["writes"] == write
+    # A reset discards ALL volatile boot latches; a newly asserted WAKE
+    # cannot borrow BOOT_ACTIVE, PENDING, or a stale committed ARMED.
+    next_boot = lifecycle_run(lifecycle_binary,
+                              lifecycle=stopped["lifecycle"],
+                              fence=stopped["fence"], mode="reboot")
+    permit_present = (stopped["lifecycle"] == 1 and stopped["fence"] == 83)
+    assert (next_boot["qualified"] == 1) == permit_present
+    if not permit_present:
+        assert next_boot["result"] != 0
+    # An untouched initial READY (write 1 pre-commit failure) permits an
+    # actual NEW physical WAKE; phase 6 post-commit READY follows accepted
+    # host release. No interrupted BOOT_ACTIVE is ever requalified.
+
+
+def test_two_separate_accepted_daily_cycles(lifecycle_binary):
+    day1 = lifecycle_run(lifecycle_binary)
+    assert day1 == {"result": 0, "lifecycle": 1, "fence": 83,
+                    "writes": 6, "qualified": 1, "host": 1, "live": 0}
+    # New process boot and a newly asserted manual WAKE, not rotation.
+    day2 = lifecycle_run(lifecycle_binary, day1["lifecycle"], day1["fence"])
+    assert day2 == day1
+    stale = lifecycle_run(lifecycle_binary, 1, 82, mode="reboot")
+    assert stale["qualified"] == 0 and stale["result"] != 0
+    interrupted = lifecycle_run(lifecycle_binary, 3, 82, mode="reboot")
+    assert interrupted["qualified"] == 0 and interrupted["result"] != 0
+    normal = lifecycle_run(lifecycle_binary, 0, 82, mode="reboot")
+    assert normal["qualified"] == 0 and normal["result"] != 0
+
+
+def test_no_auto_release_authority_beyond_device_fence():
+    runtime = (ROOT / "firmware/main/task49_runtime.c").read_text(encoding="utf-8")
+    release = runtime[runtime.index("static void recorder_handle_usb_release("):
+                      runtime.index("static void recorder_shutdown_armed_now(")]
+    assert release.index("usb_msc_ownership_complete_release_quiesce()") < release.index(
+        "release_cycle_fence_note_release_completed()")
+    assert "release_cycle_witness_frozen_id() != NULL" in release
