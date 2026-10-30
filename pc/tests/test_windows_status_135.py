@@ -26,6 +26,14 @@ class FakeKernel:
             "id": self.request["id"], "ok": True,
             "result": {"state": "USB_SYNC", "rtcCorrectionPending": False},
         }
+        if self.request["cmd"] == "SET_TIME":
+            response["result"] = {
+                "time": self.request["args"]["time"], "eventPending": True,
+            }
+            if self.mode == "event-not-pending":
+                response["result"]["eventPending"] = False
+            if self.mode == "wrong-time":
+                response["result"]["time"] = "2026-01-01T00:00:00Z"
         if self.mode == "wrong-id":
             response["id"] = "unrelated"
         elif self.mode == "invalid-pending":
@@ -93,6 +101,52 @@ class ReadOnlyStatusTests(unittest.TestCase):
         self.assertIsNone(k.request)
         self.assertEqual(k.closed, 1)
 
+
+
+class RtcAdapterTests(ReadOnlyStatusTests):
+    """#50 RTC write frame is synthetic; no native COM connection is opened."""
+
+    UTC = "2026-10-30T10:00:00Z"
+
+    def frozen(self):
+        return CdcInterface("synthetic-cdc-interface", "cdc7", "parent")
+
+    def test_qualified_time_event_is_required(self):
+        api, kernel = self.make_api()
+        api.set_time("COM7", self.frozen(), self.UTC)
+        self.assertEqual(kernel.request["cmd"], "SET_TIME")
+        self.assertEqual(kernel.request["args"], {"time": self.UTC})
+        self.assertEqual(kernel.closed, 1)
+
+    def test_no_write_if_rtc_input_or_endpoint_invalid(self):
+        from m5daylog.release import WrongTarget, ReleaseRejected
+        for candidate in ("2026-10-30T10:00:00+00:00",
+                          "2026-02-30T10:00:00Z", "invalid", ""):
+            with self.subTest(value=candidate):
+                api, kernel = self.make_api()
+                with self.assertRaises(ReleaseRejected):
+                    api.set_time("COM7", self.frozen(), candidate)
+                self.assertIsNone(kernel.request)
+        api, kernel = self.make_api()
+        with self.assertRaises(WrongTarget):
+            api.set_time(
+                "COM7", CdcInterface("another", "changed", "parent"), self.UTC
+            )
+        self.assertIsNone(kernel.request)
+
+    def test_rejected_and_uncertain_rtc_never_prove_completion(self):
+        from m5daylog.release import ReleaseIndeterminate, ReleaseRejected
+        for mode, error in (
+            ("not-ok", ReleaseRejected),
+            ("wrong-id", ReleaseIndeterminate),
+            ("wrong-time", ReleaseIndeterminate),
+            ("event-not-pending", ReleaseIndeterminate),
+        ):
+            with self.subTest(mode=mode):
+                api, kernel = self.make_api(mode)
+                with self.assertRaises(error):
+                    api.set_time("COM7", self.frozen(), self.UTC)
+                self.assertEqual(kernel.closed, 1)
 
 if __name__ == "__main__":
     unittest.main()
