@@ -1,18 +1,22 @@
 # M5Daylog PC PoC (`pc/`)
 
-Python 3.11 / `uv` based local-first CLI. Task #43 provides the SQLite scaffold; Task #51 adds manifest-based Device inspection and incremental raw-audio sync using the canonical Integration-owned schemas under `../contracts/`.
+Python 3.12 / `uv` based local-first v0.1 raw-WAV CLI. The Python 3.11 Torch/ONNX AI pipeline is deferred and separately qualified (#54). Task #43 provides the SQLite scaffold; Task #51 adds manifest-based Device inspection and incremental raw-audio sync using the canonical Integration-owned schemas under `../contracts/`.
 
 ## Windows 10 baseline
 
-Prerequisites: Python 3.11.x and `uv`.
+Prerequisites: CPython 3.12.x and `uv` (v0.1 raw-only). Lock freshness and exact-head Python are checked by PC CI.
 
 ```powershell
 cd pc
-uv sync
-uv run m5daylog --help
-uv run m5daylog init
-uv run python -m unittest discover -s tests -v
+uv lock --check
+uv sync --frozen
+uv run --frozen python --version
+uv run --frozen m5daylog --help
+uv run --frozen m5daylog init
+uv run --frozen python -m unittest discover -s tests -v
 ```
+
+The `uv lock --check` step validates lock freshness; `--frozen` alone does not. A successful CLI smoke is not a Windows USB/Device Human Gate.
 
 Default state DB: `state\m5daylog.db` relative to the working directory. `pc\state\` is local-only and ignored.
 
