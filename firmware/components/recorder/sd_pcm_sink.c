@@ -36,7 +36,8 @@ bool sd_pcm_sink_write_chunk(sd_pcm_sink_t *sink, const uint8_t *data,
     if (sink == NULL || !sink->open) {
         return false;
     }
-    if (data == NULL || len != RECORDER_BUFFER_BYTES) {
+    if (data == NULL || len == 0 || len > RECORDER_BUFFER_BYTES ||
+        (len % RECORDER_BYTES_PER_SAMPLE) != 0) {
         sink->write_errors++;
         return false;
     }
