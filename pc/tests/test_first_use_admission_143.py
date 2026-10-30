@@ -17,7 +17,7 @@ DEVICE = "00000000-0000-4000-8000-000000000001"
 OTHER_DEVICE = "00000000-0000-4000-8000-000000000002"
 ATTEMPT = "00000000-0000-4000-8000-000000000003"
 OTHER_ATTEMPT = "00000000-0000-4000-8000-000000000004"
-CYCLE = "00000000-0000-4000-8000-000000000005"
+CYCLE = "aaaaaaaa-0000-4000-8000-000000000005"
 
 
 class FirstUseContractTests(unittest.TestCase):
@@ -90,7 +90,7 @@ class FirstUseContractTests(unittest.TestCase):
                 with self.assertRaises(PreconditionBlocked):
                     parse_cycle_origin(status)
                 with self.assertRaises(PreconditionBlocked):
-                    self.assess(status={**self.status, **status})
+                    self.assess(status=status)
         for origin in ("NORMAL_WAKE", "normal_wake", None):
             with self.subTest(origin=origin):
                 with self.assertRaises(PreconditionBlocked):
