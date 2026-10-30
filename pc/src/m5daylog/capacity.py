@@ -95,7 +95,9 @@ class CapacityResult:
             ),
             "observed_at_utc": self.observed_at_utc,
             "observation_kind": (
-                "last-verified-session" if last_verified_session else "current-session"
+                "unverified" if self.status is CapacityStatus.UNKNOWN
+                else "last-verified-session" if last_verified_session
+                else "current-session"
             ),
             "guaranteed_16h": False,
             "unacked_raw_auto_reclaim": False,
