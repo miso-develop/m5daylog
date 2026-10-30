@@ -74,7 +74,7 @@ def observation(exe, mode, lifecycle, fence, failure="none"):
 def test_no_stale_or_unauthorized_boot_witness(fence_binary, lifecycle, fence, manual):
     result = observation(fence_binary, manual, lifecycle, fence)
     assert result["qualified"] == "0"
-    assert result["fence"] == str(fence)
+    assert result["fence"] == ("-1" if fence == "missing" else str(fence))
 
 
 def test_only_fresh_armed_manual_wake_consumes_permit(fence_binary):
