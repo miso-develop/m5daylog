@@ -395,7 +395,7 @@ def transaction_binary(tmp_path_factory):
 
     exe = tmp / "transaction"
     args = [
-        cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-DESP_PLATFORM",
+        cc, "-std=c11", "-D_DEFAULT_SOURCE", "-D_POSIX_C_SOURCE=200809L", "-DESP_PLATFORM",
         "-Dsettimeofday=rtc_test_settimeofday",
         "-Wall", "-Wextra", "-Werror", "-include", "stdio.h",
         "-I", str(tmp / "include"), "-I", str(COMP / "include"),
