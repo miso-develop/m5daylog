@@ -4,12 +4,14 @@ import ctypes
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
+from threading import Event, Thread
+from time import monotonic, sleep
 
 from m5daylog.capacity import (
     CapacityStatus, FreeSpace64, VerifiedSession, classify_free_space,
     probe_capacity, RESERVE_BYTES, WARNING_THRESHOLD_BYTES, UINT64_MAX,
 )
-from m5daylog.release import EjectTarget, UsbSessionIoGate
+from m5daylog.release import EjectTarget, GateState, ReleaseTimeout, UsbSessionIoGate
 from m5daylog.windows_capacity import WindowsCapacityReader
 
 TARGET = EjectTarget(
@@ -161,6 +163,181 @@ class CapacityTests(unittest.TestCase):
         self.assertFalse(view["capacity"]["release_blocked_by_capacity_or_identity"])
 
 
+
+    def test_unrecognized_shapes_never_query_a_drive(self):
+        bad_targets = (
+            replace(TARGET, mount_root="E:\\nested\\"),
+            replace(TARGET, volume_guid="E:\\"),
+            replace(TARGET, disk_number=True),
+            replace(TARGET, disk_instance_id=""),
+            replace(TARGET, usb_physical_instance_id=""),
+        )
+        for bad in bad_targets:
+            with self.subTest(target=bad.disk_number):
+                self.setUp()
+                self.binding = VerifiedSession(bad, "COM7", self.epoch)
+                result = self.probe()
+                self.assertEqual(result.status, CapacityStatus.UNKNOWN)
+                self.assertTrue(result.release_blocked)
+                self.assertEqual(self.reader.calls, [])
+
+    def test_lost_volume_before_or_after_query_blocks_release(self):
+        class AvailabilityValidator(Validator):
+            available = True
+
+            def volume_available(self, target):
+                return self.available
+
+        for disappear_after_read in (False, True):
+            with self.subTest(after_read=disappear_after_read):
+                self.setUp()
+                self.validator = AvailabilityValidator()
+                if disappear_after_read:
+                    self.reader.side_effect = lambda: setattr(
+                        self.validator, "available", False
+                    )
+                else:
+                    self.validator.available = False
+                result = self.probe()
+                self.assertEqual(result.status, CapacityStatus.UNKNOWN)
+                self.assertTrue(result.release_blocked)
+                self.assertIsNone(result.estimated_seconds)
+                self.assertEqual(
+                    self.reader.calls,
+                    [TARGET.volume_guid] if disappear_after_read else [],
+                )
+
+    def test_remount_or_changed_parent_after_query_blocks_release(self):
+        class TopologyValidator(Validator):
+            current_target = TARGET
+
+            def revalidate_target(self, target, cdc_port):
+                super().revalidate_target(target, cdc_port)
+                if target != self.current_target:
+                    raise ValueError("topology changed")
+
+        changes = (
+            {"volume_guid": "\\\\?\\Volume{00000000-0000-0000-0000-000000000138}\\"},
+            {"usb_physical_instance_id": "replacement-parent"},
+            {"disk_number": 9},
+            {"mount_root": "F:\\"},
+        )
+        for fields in changes:
+            with self.subTest(fields=tuple(fields)):
+                self.setUp()
+                self.validator = TopologyValidator()
+                self.reader.side_effect = lambda fields=fields: setattr(
+                    self.validator, "current_target", replace(TARGET, **fields)
+                )
+                result = self.probe()
+                self.assertEqual(result.status, CapacityStatus.UNKNOWN)
+                self.assertEqual(result.reason, "IDENTITY_CHANGED")
+                self.assertTrue(result.release_blocked)
+                self.assertIsNone(result.usable_free_bytes)
+                self.assertEqual(self.reader.calls, [TARGET.volume_guid])
+
+    def test_unknown_notice_is_action_needed_without_fake_duration(self):
+        self.reader.err = True
+        result = self.probe()
+        notice = result.public_notice(last_verified_session=True)
+        self.assertEqual(result.status, CapacityStatus.UNKNOWN)
+        self.assertFalse(result.release_blocked)
+        self.assertEqual(notice["source"], "Device SD (not PC disk)")
+        self.assertTrue(notice["action_required"])
+        self.assertEqual(notice["observation_kind"], "last-verified-session")
+        self.assertIsNone(notice["usable_free_bytes"])
+        self.assertIsNone(notice["estimated_minutes"])
+        self.assertFalse(notice["guaranteed_16h"])
+        self.assertFalse(notice["unacked_raw_auto_reclaim"])
+        self.assertFalse(result.valid_for(session_epoch=self.epoch, session_open=True))
+
+    def test_seal_started_in_preflight_denies_capacity_read(self):
+        class SealDuringValidation(Validator):
+            def revalidate_target(inner_self, target, cdc_port):
+                super().revalidate_target(target, cdc_port)
+                # A seal during an outstanding ordinary lease times out
+                # but transitions admission to SEALED_FOR_RELEASE.
+                try:
+                    self.gate.seal(timeout_s=0)
+                except ReleaseTimeout:
+                    pass
+
+        self.validator = SealDuringValidation()
+        result = self.probe()
+        self.assertTrue(result.release_blocked)
+        self.assertEqual(result.status, CapacityStatus.UNKNOWN)
+        self.assertEqual(self.reader.calls, [])
+        self.assertEqual(self.gate.state, GateState.SEALED_FOR_RELEASE)
+
+    def test_seal_waits_for_inflight_query_and_invalidates_observation(self):
+        read_entered = Event()
+        allow_read_complete = Event()
+        seal_finished = Event()
+        recorded = {}
+
+        class BlockingReader(Reader):
+            def query(inner_self, root):
+                inner_self.calls.append(root)
+                recorded["gate_at_query_start"] = self.gate.state
+                read_entered.set()
+                if not allow_read_complete.wait(timeout=3):
+                    raise TimeoutError("synthetic reader timed out")
+                return inner_self.data
+
+        self.reader = BlockingReader()
+
+        def run_probe():
+            recorded["result"] = self.probe()
+
+        def run_seal():
+            try:
+                self.gate.seal(timeout_s=3)
+                recorded["seal_outcome"] = "complete"
+            except Exception as exc:
+                recorded["seal_outcome"] = type(exc).__name__
+            finally:
+                seal_finished.set()
+
+        probe_thread = Thread(target=run_probe, daemon=True)
+        seal_thread = Thread(target=run_seal, daemon=True)
+        probe_thread.start()
+        try:
+            self.assertTrue(read_entered.wait(timeout=3))
+            seal_thread.start()
+            deadline = monotonic() + 3
+            while self.gate.state is GateState.OPEN and monotonic() < deadline:
+                sleep(0.001)
+            self.assertEqual(self.gate.state, GateState.SEALED_FOR_RELEASE)
+            self.assertFalse(seal_finished.is_set())
+        finally:
+            allow_read_complete.set()
+            probe_thread.join(timeout=3)
+            if seal_thread.ident is not None:
+                seal_thread.join(timeout=3)
+        self.assertFalse(probe_thread.is_alive())
+        self.assertFalse(seal_thread.is_alive())
+        self.assertEqual(recorded["gate_at_query_start"], GateState.OPEN)
+        self.assertEqual(recorded["seal_outcome"], "complete")
+        self.assertEqual(self.reader.calls, [TARGET.volume_guid])
+        self.assertEqual(recorded["result"].status, CapacityStatus.UNKNOWN)
+        self.assertTrue(recorded["result"].release_blocked)
+        self.assertIsNone(recorded["result"].estimated_seconds)
+
+    def test_epoch_change_during_observation_clock_fails_closed(self):
+        def clock():
+            self.epoch = "resumed"
+            return datetime(2026, 10, 30, tzinfo=timezone.utc)
+
+        result = probe_capacity(
+            self.binding, gate=self.gate, validator=self.validator,
+            reader=self.reader, durable_sync_complete=lambda: self.sync,
+            current_session_epoch=lambda: self.epoch, clock=clock,
+        )
+        self.assertEqual(result.status, CapacityStatus.UNKNOWN)
+        self.assertTrue(result.release_blocked)
+        self.assertIsNone(result.usable_free_bytes)
+
+
 class FakeFn:
     def __init__(self):
         self.calls = []
@@ -187,6 +364,26 @@ class AdapterTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 adapter.query(value)
         self.assertEqual(len(Kernel.GetDiskFreeSpaceExW.calls), 1)
+
+
+
+    def test_win32_failure_and_exception_never_return_counters(self):
+        class ReturnFalse:
+            def __call__(self, root, a, t, f):
+                return False
+
+        class Throws:
+            def __call__(self, root, a, t, f):
+                raise OSError("synthetic Win32 failure")
+
+        for fn in (ReturnFalse(), Throws()):
+            with self.subTest(fn=type(fn).__name__):
+                class Kernel:
+                    GetDiskFreeSpaceExW = fn
+
+                adapter = WindowsCapacityReader(Kernel())
+                with self.assertRaises(OSError):
+                    adapter.query(TARGET.volume_guid)
 
 
 if __name__ == "__main__":
