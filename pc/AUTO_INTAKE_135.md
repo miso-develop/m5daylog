@@ -200,3 +200,47 @@ Matched whole-host rollback, malicious same-user bypass, and hostile USB
 impersonation are **excluded limitations**, not security tests passed or
 cryptographic guarantees. No user/device identifiers or private paths may be
 logged or embedded in public evidence.
+
+
+## #143 R5-FU bounded first-use preflight (source-only, no release sender)
+
+\`first_use_admission.py\` models only a **negative admission check** for the
+independently reviewed and Integration-adopted R5-FU *single #119 Device* initial
+enrollment design. It accepts synthetic evidence bundles representing a
+separately authorized supervised staging intent, exact prior #105 maintenance
+attempt/accepted host and Device release witnesses, an independently verified
+never-enrolled host, and a distinct subsequent qualified first-use recording
+boot. Its result is a planning tuple, **not** enrollment, permission, durable
+intent consumption, or authorization to transmit a CDC command.
+
+- An R5-capable host must distinguish \`SUPERVISED_FIRST_USE\` from
+  \`NORMAL_WAKE\`. Unknown/missing origin and legacy cycleId-only status cannot
+  authorize an unattended release. The enum names here are **provisional
+  source-only fixtures**, pending Integration-owned exact CDC wire freeze.
+- A pre-existing enrolled, mismatched, indeterminate or partially restored host
+  cannot enroll again, including when both host witnesses appear absent. An
+  independently retained supervised never-enrolled receipt is required.
+- A consumed/uncertain intent, absent human permit, unqualified running image,
+  unverified protected-media state, wrong maintenance attempt/session,
+  unaccepted release, missing durable SHUTDOWN_ARMED, stale/uncorrelated
+  subsequent session, non-final PCM, invalid RTC, or incomplete sync fails
+  closed. Host status booleans/strings alone are **not provenance**: the
+  integrator must establish all positive fields from independent evidence.
+- The R5 preflight deliberately has **no filesystem, Registry, USB, CDC, NVS or
+  Device-media IO**, does not call \`CycleAttemptFence.enroll\`, and is **not
+  wired** to the watcher or existing manual CLI. Source-only tests
+  (\`test_first_use_admission_143.py\`) use synthetic identifiers only.
+
+**Remaining mandatory implementation** (not silently complete): persist and
+single-use-consume exact host intent/approved attempt; durably initialize/re-read
+the SQLite and independent Windows continuity witnesses and consume the first
+cycle tuple **under the same global lock before any possible CDC send**;
+distinguish already-enrolled *on transaction entry* from the state created by
+the supervised first-enrollment transaction; fail permanently closed on
+split/unknown commits, restart, one-sided rollback and uncertain CDC response.
+Implement and independently review the shared manual CLI+watcher guard,
+provisional CDC origin compatibility, real Windows fault/durability tests and
+Device-side qualified first-use source. Do not use this prototype as evidence
+for PC-A03, physical #119 operations, RELEASE_STORAGE, merge or unattended
+release. #119/#130 firmware provenance and separately permitted physical Human
+Gates remain BLOCKED / NOT_RUN; the canonical \`#134\` daily objective is unchanged.
