@@ -244,3 +244,68 @@ Device-side qualified first-use source. Do not use this prototype as evidence
 for PC-A03, physical #119 operations, RELEASE_STORAGE, merge or unattended
 release. #119/#130 firmware provenance and separately permitted physical Human
 Gates remain BLOCKED / NOT_RUN; the canonical \`#134\` daily objective is unchanged.
+
+
+## R5-FU initial host transaction — isolated source-only model
+
+The new `first_use_transaction.py` is NOT installed into the watcher,
+`sync-release`, release sender, or real supervised enrollment process.
+It consumes an **externally issued** one-use #119-bound host-intent file
+and invokes `CycleAttemptFence.initialize_first_cycle_locked` under
+the existing R3 cooperating OS-wide lock. The latter initializes SQLite
+with the **first consumed cycle tuple in the same database commit**, then
+flushes/re-reads the independent anchor. This prevents a locally created
+first enrollment from being misclassified as a pre-existing one and avoids
+an unfenced empty-ledger window. No new R3 ledger schema, CDC contract, or
+Device/media mutation is introduced. The legacy `enroll(supervised=True)`
+remains a separate unwired R3 placeholder; it must not serve as the R5
+initial-enrollment transaction.
+
+The source-only ordering is:
+
+1. Lock, check actual SQLite/anchor absence **and independently verified
+   never-enrolled history**, original Device/Human/#119 evidence, and strict
+   provisional first-use origin and manifest/RTC/target proof. Empty stores
+   alone are **never** a permission or independent continuity proof.
+2. Read the externally supplied persisted intent, require exact original
+   #119 Device/physical-parent/session/maintenance-attempt binding and an
+   unconsumed one-shot state. The production-grade supervised *issuer*,
+   current running-image/custody attestation and exact operator permit remain
+   unimplemented. Host-local SHA-256 fields only avoid exposing raw IDs in
+   the prototype; they are not signatures, encrypted receipts, or guarantees
+   against malicious same-user writers.
+3. Consume the intent via an exclusively created, fsynced pending-replacement
+   marker; any stale partial marker, missing/invalid receipt, uncertain write
+   or post-consumption crash blocks without self-repair or automatic retry.
+   A deliberately separate intent file is not the independent HKCU continuity
+   witness. A source-only file fsync/rename is **not** qualified Windows
+   power-failure durability.
+4. Initialize the SQLite chain with the first consumed
+   `(deviceId, releaseCycleId, releaseAttemptId)` tuple, update/flush HKCU
+   anchor, reread both and verify exactly the same tuple before a return.
+   A SQLite/anchor split, process crash, previous enrollment, rollback of
+   either witness, or competing process blocks; no recovery or second
+   first-use authorization is inferred. The synthetic model returns **no
+   authorization token** and does not transmit SET_TIME/RELEASE_STORAGE.
+
+`test_first_use_transaction_143.py` exercises the positive *synthetic*
+first-cycle state, a distinct subsequent R3 tuple, missing or consumed
+receipt, stale #119 attempt, invalid origin/PCM/RTC predicates, already
+enrolled/corrupt host states, interruption after intent consumption,
+SQLite/anchor split commit, crash after both writes, one-sided SQLite
+rollback, and two independently spawned contending processes. The fixtures
+stage a sample intent directly and use a fake file anchor; **they do not
+provide a real #119 supervised receipt, real HKCU/RegFlushKey power-loss
+qualification, actual Windows at-login UX, current Device firmware or a
+Human Gate**. Additional fault tests at actual Windows persistence/USB/CDC
+boundaries remain mandatory for production release acceptance.
+
+**STOP lines unchanged:** R5 `releaseCycleOrigin` is provisional pending
+the separate #143 CDC compatibility review. No caller may treat the source
+model or its caller-provided `*_verified` booleans as independent proof.
+Real Device #144, #119/#130 preservation/provenance, exact manifest
+terminal-segment/RTC validation, CLI+watch single full-call coordinator,
+unattended release sender, Windows crash durability, exact-head independent
+Engineering/Security and separately authorized physical Human Gates are
+outstanding. PR #142 remains Draft; watcher `RELEASE_BLOCKED` is unchanged;
+no merge, CDC release, RTC/SD/NVS action or claimed PC-A03 PASS is permitted.
