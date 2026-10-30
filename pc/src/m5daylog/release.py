@@ -216,6 +216,7 @@ AckFn = Callable[[], AckFlushResult]
 MutationFn = Callable[[], None]
 ObservationFn = Callable[[EjectTarget, UsbSessionIoGate], bool]
 PreSendFn = Callable[[str, EjectTarget], None]
+PreMutationFn = Callable[[EjectTarget], None]
 
 
 class SyncReleaseCoordinator:
@@ -240,6 +241,7 @@ class SyncReleaseCoordinator:
         gate: UsbSessionIoGate,
         ack_flush: AckFn | None = None,
         cdc_mutations: MutationFn | None = None,
+        before_cdc_mutations: PreMutationFn | None = None,
         before_seal_observation: ObservationFn | None = None,
         before_release_send: PreSendFn | None = None,
     ) -> ReleaseOutcome:
@@ -271,6 +273,14 @@ class SyncReleaseCoordinator:
                 self.port.revalidate_target(target, cdc_port)
                 if not self.port.volume_available(target):
                     raise AlreadyRemoved("exact volume absent before release")
+
+            # R3: a possibly sent SET_TIME is an irreversible CDC mutation
+            # for unattended replay accounting. The caller may durably
+            # consume the qualified cycle *before* the first mutation byte.
+            # A failed/uncertain reservation aborts without any mutation
+            # or RELEASE_STORAGE; it is never implicitly retried.
+            if before_cdc_mutations is not None:
+                before_cdc_mutations(target)
 
             # Required RTC/other pre-release mutations must complete while
             # admission is open, on the already frozen exact CDC endpoint.
