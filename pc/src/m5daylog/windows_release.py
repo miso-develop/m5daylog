@@ -639,3 +639,61 @@ class NativeWin32DeviceApi:
                 raise ReleaseIndeterminate("CDC release acceptance unproven")
         finally:
             self.k.CloseHandle(handle)
+
+    def read_status(self, port: str) -> dict[str, object]:
+        """#135 read-only GET_STATUS; no release authority or filesystem write.
+
+        Exact present CDC interface is frozen before open and verified again
+        after CreateFile. The caller separately validates its MSC physical
+        parent and treats every uncertain response as unqualified.
+        """
+        endpoint = self._cdc_interface(port)
+        request_id = str(uuid.uuid4())
+        request = (json.dumps({
+            "id": request_id, "cmd": "GET_STATUS", "args": {},
+        }, separators=(",", ":")) + "\n").encode("ascii")
+        handle = self._open(endpoint.device_path, GENERIC_READ | GENERIC_WRITE, 0)
+        try:
+            if self._cdc_interface(port) != endpoint:
+                raise WrongTarget("CDC endpoint changed before status query")
+            timeouts = COMMTIMEOUTS(0xFFFFFFFF, 0, 250, 0, 1000)
+            if not self.k.SetCommTimeouts(handle, ctypes.byref(timeouts)):
+                raise HostQuiesceError("CDC status timeout configuration failed")
+            out = ctypes.create_string_buffer(request)
+            written = wintypes.DWORD()
+            if not self.k.WriteFile(handle, out, len(request), ctypes.byref(written), None):
+                raise HostQuiesceError("CDC status write failed")
+            if written.value != len(request):
+                raise HostQuiesceError("CDC status short write")
+            deadline = time.monotonic() + 5.0
+            reply = bytearray()
+            while time.monotonic() < deadline and len(reply) < MAX_CDC_REPLY:
+                buf = ctypes.create_string_buffer(1)
+                got = wintypes.DWORD()
+                if not self.k.ReadFile(handle, buf, 1, ctypes.byref(got), None):
+                    raise HostQuiesceError("CDC status response lost")
+                if got.value:
+                    reply.extend(buf.raw[:got.value])
+                    if reply.endswith(b"\n"):
+                        break
+            else:
+                raise HostQuiesceError("CDC status response incomplete")
+            try:
+                response = json.loads(reply.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                raise HostQuiesceError("CDC status invalid envelope") from None
+            if (not isinstance(response, dict)
+                    or response.get("id") != request_id
+                    or response.get("ok") is not True
+                    or not isinstance(response.get("result"), dict)):
+                raise HostQuiesceError("CDC status not qualified")
+            result = response["result"]
+            if (not isinstance(result.get("state"), str)
+                    or not isinstance(result.get("rtcCorrectionPending"), bool)):
+                raise HostQuiesceError("CDC status invalid fields")
+            return {
+                "state": result["state"],
+                "rtcCorrectionPending": result["rtcCorrectionPending"],
+            }
+        finally:
+            self.k.CloseHandle(handle)
