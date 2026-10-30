@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 from multiprocessing import get_context
+from contextlib import closing
 from pathlib import Path
 
 from m5daylog.release import PreconditionBlocked
@@ -98,7 +99,7 @@ class CycleFenceTests(unittest.TestCase):
                 restarted.reserve_locked(DEVICE, CYCLE1, ATTEMPT2)
             with self.assertRaises(PreconditionBlocked):
                 restarted.reserve_locked(DEVICE, CYCLE2, ATTEMPT1)
-        with sqlite3.connect(self.root / "ledger.sqlite") as db:
+        with closing(sqlite3.connect(self.root / "ledger.sqlite")) as db:
             data = str(db.execute("SELECT * FROM consumed").fetchall())
         self.assertNotIn(DEVICE, data)
         self.assertNotIn(CYCLE1, data)
@@ -141,7 +142,7 @@ class CycleFenceTests(unittest.TestCase):
     def test_chain_corruption_with_unchanged_tip_detected(self):
         self.enroll()
         self.reserve(CYCLE1, ATTEMPT1)
-        with sqlite3.connect(self.root / "ledger.sqlite") as db:
+        with closing(sqlite3.connect(self.root / "ledger.sqlite")) as db:
             db.execute("UPDATE consumed SET attempt=? WHERE seq=1", ("0" * 64,))
         with self.assertRaises(PreconditionBlocked):
             self.reserve(CYCLE2, ATTEMPT2)
