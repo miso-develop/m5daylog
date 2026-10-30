@@ -216,7 +216,7 @@ AckFn = Callable[[], AckFlushResult]
 MutationFn = Callable[[], None]
 ObservationFn = Callable[[EjectTarget, UsbSessionIoGate], bool]
 PreSendFn = Callable[[str, EjectTarget], None]
-PreMutationFn = Callable[[EjectTarget], None]
+PreMutationFn = Callable[[str, EjectTarget], None]
 
 
 class SyncReleaseCoordinator:
@@ -280,7 +280,10 @@ class SyncReleaseCoordinator:
             # A failed/uncertain reservation aborts without any mutation
             # or RELEASE_STORAGE; it is never implicitly retried.
             if before_cdc_mutations is not None:
-                before_cdc_mutations(target)
+                # Correlate the durable pre-RTC tombstone with the *same*
+                # releaseAttemptId later used by canonical CDC release.
+                attempt_id = str(uuid.uuid4())
+                before_cdc_mutations(attempt_id, target)
 
             # Required RTC/other pre-release mutations must complete while
             # admission is open, on the already frozen exact CDC endpoint.
@@ -303,7 +306,8 @@ class SyncReleaseCoordinator:
                     raise AlreadyRemoved("exact volume absent before seal")
 
             gate.seal(timeout_s=self.timeout_s, clock=self.clock)
-            attempt_id = str(uuid.uuid4())
+            if attempt_id is None:
+                attempt_id = str(uuid.uuid4())
             with gate.release_control():
                 # Lock stays held until response and disappearance observation.
                 with self.port.quiesce(target):
