@@ -127,7 +127,10 @@ def test_production_seam_is_not_a_release_enable():
     assert runtime.index("release_cycle_fence_begin_boot(manual_wake)") < runtime.index("task87_wake_recovery_init(")
     assert runtime.index("release_cycle_fence_note_host_owned()") < runtime.index("usb_cdc_protocol_open_session();", runtime.index("static void recorder_handle_usb_host_owned"))
     assert runtime.index("usb_msc_ownership_complete_release_quiesce()") < runtime.index("release_cycle_fence_note_release_completed()")
-    # The qualified final-manifest snapshot is not wired yet; the status
-    # provider must not emit releaseCycleId or set a release-cycle pointer.
+    # The dependent #119 + #144 composite now wires only a proven frozen
+    # final-manifest witness; invalid USB / RTC / boot / host states omit it.
     body = runtime[runtime.index("static bool recorder_cdc_status("):runtime.index("static usb_cdc_set_time_result_t")]
-    assert "release_cycle_id" not in body
+    assert "out->release_cycle_id = NULL;" in body
+    assert "release_cycle_fence_host_owned_qualified()" in body
+    assert "release_cycle_witness_frozen_id()" in body
+    assert "state == RECORDER_STATE_USB_SYNC" in body
