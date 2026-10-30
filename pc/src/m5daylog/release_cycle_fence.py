@@ -311,6 +311,29 @@ class CycleAttemptFence:
         except (sqlite3.Error, OSError):
             raise PreconditionBlocked("release attempt persistence uncertain") from None
 
+    def verify_reserved_locked(self, device_id: str,
+                               release_cycle_id: str, attempt_id: str) -> None:
+        """Pre-send proof of the *exact* already-consumed cycle/attempt tuple.
+
+        Only valid inside the same serialized() lease spanning RTC and CDC.
+        This operation never inserts, repairs or re-arms the journal.
+        """
+        if not getattr(self._serialized_thread, "held", False):
+            raise PreconditionBlocked("release OS lock required")
+        device = _hash(_uuid(device_id))
+        cycle = _hash(_uuid(release_cycle_id))
+        attempt = _hash(_uuid(attempt_id))
+        try:
+            with closing(self._connection()) as db:
+                self._verify(db, device)
+                row = db.execute(
+                    "SELECT attempt FROM consumed WHERE cycle=?", (cycle,)
+                ).fetchone()
+                if row != (attempt,):
+                    raise PreconditionBlocked("release attempt correlation mismatch")
+        except (sqlite3.Error, OSError):
+            raise PreconditionBlocked("release attempt verification uncertain") from None
+
     def check_locked(self, device_id: str) -> None:
         """Verify enrolled host witnesses under serialized() without mutation."""
         if not getattr(self._serialized_thread, "held", False):
