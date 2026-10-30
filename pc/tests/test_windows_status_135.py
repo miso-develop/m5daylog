@@ -103,7 +103,8 @@ class ReadOnlyStatusTests(unittest.TestCase):
 
 
 
-class RtcAdapterTests(ReadOnlyStatusTests):
+class RtcAdapterTests(unittest.TestCase):
+    make_api = ReadOnlyStatusTests.make_api
     """#50 RTC write frame is synthetic; no native COM connection is opened."""
 
     UTC = "2026-10-30T10:00:00Z"
