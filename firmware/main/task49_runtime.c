@@ -23,6 +23,7 @@ static void recorder_task49_delete(TaskHandle_t task);
 
 #include "shutdown_armed.h"
 #include "release_cycle_fence.h"
+#include "release_cycle_witness.h"
 #include "rtc_correction.h"
 #include "recorder_nvs.h"
 #include "task87_wake_recovery.h"
@@ -108,6 +109,19 @@ static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
     out->battery_mv = battery_mv;
     out->battery_valid = battery_mv > 0;
     out->rtc_correction_pending = rtc_correction_is_pending();
+    // Writer and USB tasks are serialized by the existing finalization and
+    // APP->PC ownership barrier: status can read only the immutable first
+    // proven current-run UUID, never a mutable recording ID or Device SD.
+    out->release_cycle_id = NULL;
+    if (state == RECORDER_STATE_USB_SYNC &&
+        !out->rtc_correction_pending &&
+        !sd_mount_is_mounted() &&
+        usb_msc_ownership_is_host_owned() &&
+        usb_msc_ownership_release_command_admission_open() &&
+        release_cycle_fence_boot_qualified() &&
+        release_cycle_fence_host_owned_qualified()) {
+        out->release_cycle_id = release_cycle_witness_frozen_id();
+    }
     return out->state != NULL && out->reason != NULL;
 }
 
@@ -343,6 +357,7 @@ static void recorder_handle_usb_release(void) {
     // authority. A failed next-day re-arm cannot undo an accepted release;
     // it must remain a visible fail-closed condition, never a retry.
     if (release_cycle_fence_boot_qualified() &&
+        release_cycle_witness_frozen_id() != NULL &&
         release_cycle_fence_note_release_completed() != ESP_OK) {
         ESP_LOGE(TAG,
                  "stage: release-cycle, result: nvs-rearm-error, action: fail-closed");

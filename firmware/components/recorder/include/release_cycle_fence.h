@@ -36,6 +36,8 @@ bool release_cycle_fence_boot_qualified(void);
 // Call once after PC-owned USB_SYNC and durable HOST_UNRESOLVED are proven.
 // It cannot be invoked simply because a stale boot marker was found.
 esp_err_t release_cycle_fence_note_host_owned(void);
+// RAM-only proof of the current-boot durable HOST_UNRESOLVED observation.
+bool release_cycle_fence_host_owned_qualified(void);
 
 // Call only AFTER #87 has completed release quiescence, committed
 // SHUTDOWN_ARMED, and proven the preceding host release was accepted.

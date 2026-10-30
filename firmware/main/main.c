@@ -23,6 +23,9 @@
 
 #include "device_identity.h"
 #include "device_manifest.h"
+#include "release_cycle_fence.h"
+#include "release_cycle_witness.h"
+#include "rtc_correction.h"
 #include "esp_random.h"
 #include "i2s_pdm_capture.h"
 #include "pcm_pipeline.h"
@@ -431,6 +434,15 @@ static bool recorder_manifest_record_wav(const char *wav_path,
             RECORDER_MANIFEST_PATH, RECORDER_MANIFEST_TMP_PATH, s_device_id,
             s_manifest_now, s_manifest_entry);
         if (r == DEVICE_MANIFEST_OK) {
+            // #144: only a current-boot, SHA-checked nonempty FINALIZED WAV
+            // whose manifest was durably committed can supply one immutable
+            // cycle UUID. Recovered/old entries never execute this writer hook.
+            // The RTC/boot gate is independent from segment rotation.
+            if (strcmp(state, DEVICE_MANIFEST_STATE_FINALIZED) == 0 &&
+                release_cycle_fence_boot_qualified() &&
+                !rtc_correction_is_pending()) {
+                (void)release_cycle_witness_note_committed(rec_id, pcm_bytes);
+            }
             ESP_LOGI(TAG, "stage: manifest, result: ok");
             return true;
         }

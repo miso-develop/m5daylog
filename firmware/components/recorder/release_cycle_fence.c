@@ -170,6 +170,10 @@ esp_err_t release_cycle_fence_note_host_owned(void) {
     return err;
 }
 
+bool release_cycle_fence_host_owned_qualified(void) {
+    return s_this_boot_qualified && s_saw_host_owned;
+}
+
 esp_err_t release_cycle_fence_note_release_completed(void) {
     nvs_handle_t handle = 0;
     uint8_t lifecycle = 0;
@@ -236,6 +240,9 @@ bool release_cycle_fence_boot_qualified(void) {
 }
 esp_err_t release_cycle_fence_note_host_owned(void) {
     return ESP_ERR_NOT_SUPPORTED;
+}
+bool release_cycle_fence_host_owned_qualified(void) {
+    return false;
 }
 esp_err_t release_cycle_fence_note_release_completed(void) {
     return ESP_ERR_NOT_SUPPORTED;
