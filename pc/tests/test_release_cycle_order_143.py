@@ -62,13 +62,15 @@ class PreRtcReservationTests(unittest.TestCase):
     def test_reservation_precedes_rtc_and_release(self):
         events = self.port.events
         result = self.run_coordinator(
-            before_cdc_mutations=lambda target: events.append("reserve"),
+            before_cdc_mutations=lambda attempt_id, target: events.append(("reserve", attempt_id)),
             cdc_mutations=lambda: events.append("rtc"),
             before_release_send=lambda attempt_id, target: events.append("verify"),
         )
         self.assertTrue(result.success)
-        self.assertLess(events.index("revalidate"), events.index("reserve"))
-        self.assertLess(events.index("reserve"), events.index("rtc"))
+        reserved = next(x for x in events if isinstance(x, tuple) and x[0] == "reserve")
+        self.assertEqual(reserved[1], result.attempt_id)
+        self.assertLess(events.index("revalidate"), events.index(reserved))
+        self.assertLess(events.index(reserved), events.index("rtc"))
         self.assertLess(events.index("rtc"), events.index("lock"))
         self.assertLess(events.index("dismount"), events.index("verify"))
         self.assertLess(events.index("verify"), events.index("release"))
@@ -78,7 +80,7 @@ class PreRtcReservationTests(unittest.TestCase):
         def deny(_target):
             raise PreconditionBlocked("cycle already reserved")
         result = self.run_coordinator(
-            before_cdc_mutations=deny,
+            before_cdc_mutations=lambda attempt_id, target: deny(target),
             cdc_mutations=lambda: self.port.events.append("rtc"),
         )
         self.assertEqual(result.reason, "PRECONDITION_BLOCKED")
@@ -89,7 +91,7 @@ class PreRtcReservationTests(unittest.TestCase):
         def rtc():
             raise ReleaseIndeterminate("lost SET_TIME reply")
         result = self.run_coordinator(
-            before_cdc_mutations=lambda target: self.port.events.append("reserve"),
+            before_cdc_mutations=lambda attempt_id, target: self.port.events.append("reserve"),
             cdc_mutations=rtc,
         )
         self.assertEqual(result.reason, "INDETERMINATE")
