@@ -109,13 +109,11 @@ static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
     out->battery_mv = battery_mv;
     out->battery_valid = battery_mv > 0;
     out->rtc_correction_pending = rtc_correction_is_pending();
-    // Writer and USB tasks are serialized by the existing finalization and
-    // APP->PC ownership barrier: status can read only the immutable first
-    // proven current-run UUID, never a mutable recording ID or Device SD.
+    // Writer and USB tasks are serialized by the finalization/ownership
+    // barrier: status reads only the immutable terminal current-run UUID.
     out->release_cycle_id = NULL;
     if (state == RECORDER_STATE_USB_SYNC &&
-        rtc_correction_boot_clock_verified() &&
-        !out->rtc_correction_pending &&
+        rtc_correction_cycle_status_qualified() &&
         !sd_mount_is_mounted() &&
         usb_msc_ownership_is_host_owned() &&
         usb_msc_ownership_release_command_admission_open() &&
