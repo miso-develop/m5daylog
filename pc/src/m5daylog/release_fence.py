@@ -10,10 +10,10 @@ this ledger as an automatic recovery or after an uncertain CDC response.
 from __future__ import annotations
 
 import hashlib
-import os
 import sqlite3
 import uuid
 from pathlib import Path
+from contextlib import closing
 
 from .release import EjectTarget, PreconditionBlocked
 
@@ -55,8 +55,11 @@ class DeviceAttemptFence:
             # sqlite3 EXCLUSIVE transaction/UNIQUE constraint arbitrates
             # independent Python processes; a lock file alone cannot persist
             # an attempted send through process termination.
-            with sqlite3.connect(self.database, timeout=1.0,
-                                 isolation_level=None) as db:
+            # sqlite3.Connection.__exit__ commits but does NOT close. The
+            # explicit closing guard is required on Windows to release the
+            # handle before another process or test deletes the DB.
+            with closing(sqlite3.connect(self.database, timeout=1.0,
+                                         isolation_level=None)) as db:
                 db.execute("PRAGMA synchronous=FULL")
                 db.execute("PRAGMA journal_mode=DELETE")
                 db.execute(
