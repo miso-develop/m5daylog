@@ -657,6 +657,23 @@ class WindowsAdapterTests(unittest.TestCase):
                    create=True, side_effect=[259, 2]):
             self.assertTrue(observer.volume_disappeared(TARGET))
 
+    def test_set_time_requires_prior_frozen_cdc_binding(self):
+        self.api.set_time = lambda port, binding, stamp: self.api.calls.append(
+            ("rtc", port, binding, stamp)
+        )
+        stamp = "2026-10-30T10:00:00Z"
+        with self.assertRaises(WrongTarget):
+            self.adapter.set_time("COM5", stamp)
+        with patch("m5daylog.windows_release.inspect_device",
+                   return_value={"deviceId": "test-device"}):
+            self.adapter.revalidate_target(TARGET, "COM5")
+        self.adapter.set_time("COM5", stamp)
+        self.assertEqual(self.api.calls[0][0], "rtc")
+        self.api.cdc_instance = "changed-port"
+        with self.assertRaises(WrongTarget):
+            self.adapter.set_time("COM5", stamp)
+        self.assertEqual(len(self.api.calls), 1)
+
     def test_no_other_volume_is_chosen_on_bad_mount(self):
         for root in ("F:\\M5DAYLOG", ".", "E:", "\\\\server\\share"):
             with self.subTest(root=root), self.assertRaises(Exception):
