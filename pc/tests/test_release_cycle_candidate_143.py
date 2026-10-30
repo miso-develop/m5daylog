@@ -10,7 +10,7 @@ from m5daylog.release_cycle_candidate import (
 )
 
 DEVICE = "00000000-0000-4000-8000-000000000001"
-CYCLE = "00000000-0000-4000-8000-000000000002"
+CYCLE = "aaaaaaaa-0000-4000-8000-000000000002"
 TARGET = EjectTarget(
     DEVICE, "E:\\",
     "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\",
