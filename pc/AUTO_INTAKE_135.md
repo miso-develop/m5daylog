@@ -152,3 +152,51 @@ arrival, physical USB, CDC or Device.
 
 The correct completion state of #135 after this limited patch remains
 **IN PROGRESS**, not V01-AUTO/V01-RELEASE PASS.
+
+## #143 R3 source-only continuation: cycle witness + dual local continuity
+
+Human-approved #143 R3 Option A replaces the earlier *device-scoped-for-life*
+placeholder as the **future** normal-path release design. The older
+`DeviceAttemptFence` class remains unused for compatibility with existing
+source-only tests; it is **not** a daily-session authority.
+
+- `windows_release.py::read_status` now recognizes optional
+  `GET_STATUS.result.releaseCycleId` only when a strictly lowercase canonical
+  UUID. Missing or malformed tokens permit independent read-only intake but
+  provide **zero release authorization**. This parse step does not establish
+  Device current-WAKE provenance, final nonzero PCM, durable manifest binding,
+  or valid session ownership: all remain mandatory before use.
+- `release_cycle_fence.py::CycleAttemptFence` is an **unwired** host-owned
+  release-cycle reservation prototype. It has a SQLite `synchronous=FULL`,
+  sequence + SHA-256 chain of hashed consumed tuples, a separately stored
+  per-user Windows HKCU continuity anchor with `RegFlushKey`, explicit
+  nonautomatic supervised-initialization entrypoint, and a cooperating
+  per-user OS file lock. The canonical Windows factory selects a single fixed
+  LOCALAPPDATA ledger/lock for future CLI and watcher integration. If either
+  witness is absent, corrupt, rewound alone, or mismatched after a partial
+  commit, normal release is blocked without auto-repair. A consumed tuple is
+  not cleared after no-send exceptions, lost response or a new host epoch.
+- Synthetic unit tests cover two distinct eligible IDs, duplicate denial,
+  independent process competition, each one-sided rollback, interrupted
+  anchor update, missing anchor, corrupted chain, and optional CDC status
+  decoding. They **do not** establish Windows physical power-loss durability.
+
+**Not yet implemented / STOP:** Neither this new ledger nor the existing
+`release.py` pre-send hook is wired into `sync-release` or the monitor.
+The current manual command has no R3 cycle gate; the Draft PR must not merge
+as a release-capable change while this bypass exists. The Device-side
+releaseCycleId producer is #144, and no accepted Device proof is available
+yet. Canonical manifest/witness binding, RTC-before-seal failure journal,
+CLI+watcher shared full-lifetime coordinator lock, pre-send consumed
+reservation, supervised enrollment/recovery UX, positive two-day integration,
+real Windows HKCU/SQLite flush/crash qualification and exact-Device Human
+Gates remain outstanding. **Auto-release stays OFF, all watcher post-sync
+results remain RELEASE_BLOCKED, and no CDC release or real Device operation
+was exercised.**
+
+The approved Option A security boundary is deliberately bounded to one
+cooperative enrolled Windows user and physically controlled known Device.
+Matched whole-host rollback, malicious same-user bypass, and hostile USB
+impersonation are **excluded limitations**, not security tests passed or
+cryptographic guarantees. No user/device identifiers or private paths may be
+logged or embedded in public evidence.
