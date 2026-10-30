@@ -3,7 +3,7 @@ name = "m5daylog"
 version = "0.1.0"
 description = "M5Daylog PoC Python CLI (local-first audio lifelog scaffold)"
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.12,<3.13"
 license = { text = "MIT" }
 dependencies = []
 
