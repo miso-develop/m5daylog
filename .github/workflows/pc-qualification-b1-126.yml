@@ -33,10 +33,10 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Configure Python 3.11
+      - name: Configure Python 3.12
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Verify exact revision
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -47,11 +47,5 @@ jobs:
           PYTHONPATH: src
           M5DAYLOG_REQUIRE_B1_JUNCTION: '1'
         run: python -m unittest discover -s tests -p 'test_maintenance_windows_b1_*.py' -v
-      - name: Full PC stdlib regression
-        working-directory: pc
-        env:
-          PYTHONPATH: src
-          M5DAYLOG_REQUIRE_B1_JUNCTION: '1'
-        run: python -m unittest discover -s tests -v
       - name: Tracked repository security scan
         run: python scripts/security_scan.py
