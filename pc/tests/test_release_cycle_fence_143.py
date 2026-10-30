@@ -148,7 +148,7 @@ class CycleFenceTests(unittest.TestCase):
 
     def test_uncanonical_identity_never_creates_reservation(self):
         self.enroll()
-        for bad in ("", "not-a-uuid", CYCLE1.upper(), CYCLE1 + " "):
+        for bad in ("", "not-a-uuid", "AAAAAAAA-0000-4000-8000-000000000002", CYCLE1 + " "):
             with self.subTest(bad=bad):
                 with self.assertRaises(PreconditionBlocked):
                     self.reserve(bad, ATTEMPT1)
