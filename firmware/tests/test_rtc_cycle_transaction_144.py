@@ -103,7 +103,6 @@ STUB_HEADERS = {
 # This retains its real USB/ownership/RTC/fence/manifest predicates without
 # compiling the unrelated recorder tasks and TinyUSB application entry point.
 HARNESS = r"""
-#define _POSIX_C_SOURCE 200809L
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -160,7 +159,7 @@ bool device_identity_is_valid_uuid(const char *s) {
     return s != NULL && strlen(s) == 36;
 }
 
-int rtc_test_settimeofday(const struct timeval *tv, const void *tz) {
+int rtc_test_settimeofday(const struct timeval *tv, const struct timezone *tz) {
     (void)tv; (void)tz;
     g_clock_calls++;
     return (g_fail_system_clock && g_clock_calls > 1) ? -1 : 0;
