@@ -88,6 +88,21 @@ class CycleFenceTests(unittest.TestCase):
         with self.assertRaises(PreconditionBlocked):
             self.fence.enroll(DEVICE, supervised=True)
 
+    def test_reservation_cannot_bypass_process_serialization(self):
+        self.enroll()
+        with self.assertRaises(PreconditionBlocked):
+            self.fence.reserve_locked(DEVICE, CYCLE1, ATTEMPT1)
+        with self.assertRaises(PreconditionBlocked):
+            self.fence.check_locked(DEVICE)
+        with self.fence.serialized():
+            with self.assertRaises(PreconditionBlocked):
+                with self.fence.serialized():
+                    pass
+            self.fence.check_locked(DEVICE)
+            self.fence.reserve_locked(DEVICE, CYCLE1, ATTEMPT1)
+        with self.assertRaises(PreconditionBlocked):
+            self.reserve(CYCLE1, ATTEMPT2)
+
     def test_two_distinct_cycles_and_repeat_attempt_are_durable(self):
         self.enroll()
         self.reserve(CYCLE1, ATTEMPT1)
