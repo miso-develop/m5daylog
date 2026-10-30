@@ -157,6 +157,7 @@ class AutoIntakeTests(unittest.TestCase):
         self.assertEqual(self.intake().reason, "STALE_SESSION")
         self.assertEqual(self.events, [])
         self.epoch = self.binding.session_epoch
+        self.port.calls.clear()  # independent fault phase; fail the first revalidation
         self.port.reject_at = 1
         self.assertEqual(self.intake().status, "SYNC_FAILED")
         self.assertEqual(self.events, [])
