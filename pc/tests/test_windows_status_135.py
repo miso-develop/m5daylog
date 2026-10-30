@@ -26,6 +26,12 @@ class FakeKernel:
             "id": self.request["id"], "ok": True,
             "result": {"state": "USB_SYNC", "rtcCorrectionPending": False},
         }
+        if self.mode == "qualified-cycle":
+            response["result"]["releaseCycleId"] = "aaaaaaaa-0000-4000-8000-000000000002"
+        elif self.mode == "noncanonical-cycle":
+            response["result"]["releaseCycleId"] = "AAAAAAAA-0000-4000-8000-000000000002"
+        elif self.mode == "invalid-cycle":
+            response["result"]["releaseCycleId"] = "not-a-release-cycle"
         if self.request["cmd"] == "SET_TIME":
             response["result"] = {
                 "time": self.request["args"]["time"], "eventPending": True,
@@ -78,6 +84,23 @@ class ReadOnlyStatusTests(unittest.TestCase):
         self.assertEqual(k.request["cmd"], "GET_STATUS")
         self.assertEqual(k.request["args"], {})
         self.assertEqual(k.closed, 1)
+
+    def test_optional_device_release_cycle_is_strict_and_intake_compatible(self):
+        expected = "aaaaaaaa-0000-4000-8000-000000000002"
+        api, kernel = self.make_api("qualified-cycle")
+        self.assertEqual(api.read_status("COM7"), {
+            "state": "USB_SYNC", "rtcCorrectionPending": False,
+            "releaseCycleId": expected,
+        })
+        self.assertEqual(kernel.request["cmd"], "GET_STATUS")
+        # Invalid/missing witness must NEVER be forwarded as a release key.
+        # Status can still qualify independent read-only raw intake.
+        for mode in ("valid", "noncanonical-cycle", "invalid-cycle"):
+            with self.subTest(mode=mode):
+                api, _ = self.make_api(mode)
+                self.assertEqual(api.read_status("COM7"), {
+                    "state": "USB_SYNC", "rtcCorrectionPending": False,
+                })
 
     def test_invalid_status_is_not_usb_sync_proof(self):
         for mode in ("wrong-id", "invalid-pending", "not-ok", "missing-state"):
