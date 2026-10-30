@@ -134,3 +134,28 @@ def test_production_seam_is_not_a_release_enable():
     assert "release_cycle_fence_host_owned_qualified()" in body
     assert "release_cycle_witness_frozen_id()" in body
     assert "state == RECORDER_STATE_USB_SYNC" in body
+
+
+@pytest.mark.parametrize("failure,expected_marker", [
+    ("rearm_commit_before", "82"),
+    ("rearm_commit_after", "83"),
+    ("rearm_set", "82"),
+    ("rearm_lock", "82"),
+])
+def test_rearm_failure_cannot_retry_same_boot(fence_binary, failure, expected_marker):
+    r = observation(fence_binary, "complete", 1, 83, failure)
+    assert r["begin"] == "0"
+    assert r["host"] == "0"
+    assert r["release"] != "0"
+    assert r["duplicate"] == "3"
+    assert r["qualified"] == "0"
+    assert r["fence"] == expected_marker
+    if expected_marker == "82":
+        # A crash/failed write leaves used BOOT_ACTIVE and cannot requalify,
+        # even if stale SHUTDOWN_ARMED and a new physical WAKE are observed.
+        assert observation(fence_binary, "claim", 1, 82)["qualified"] == "0"
+    else:
+        # The hardware may have durably committed READY before an I/O error
+        # was reported. The previous host release was already accepted; this
+        # simulates a *new* physical WAKE, not an unattended retry.
+        assert observation(fence_binary, "claim", 1, 83)["qualified"] == "1"

@@ -94,6 +94,12 @@ int main(int argc, char **argv) {
         g_lifecycle = 2;  /* #87 committed HOST_UNRESOLVED */
         host = release_cycle_fence_note_host_owned();
         g_lifecycle = 1;  /* #87 accepted release and committed ARMED */
+        /* Fault injection at the second NVS transaction (rearm), not the
+           preceding boot-consumption transaction. */
+        g_commit_before = strcmp(argv[4], "rearm_commit_before") == 0;
+        g_commit_after = strcmp(argv[4], "rearm_commit_after") == 0;
+        g_fail_set = strcmp(argv[4], "rearm_set") == 0;
+        g_fail_lock = strcmp(argv[4], "rearm_lock") == 0;
         release = release_cycle_fence_note_release_completed();
         duplicate = release_cycle_fence_note_release_completed();
     } else if (strcmp(argv[1], "nohost") == 0) {
