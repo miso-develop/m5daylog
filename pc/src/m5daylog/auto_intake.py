@@ -124,8 +124,10 @@ class IntakeCoordinator:
         library_root: Path, db_path: Path, contracts_dir: Path | None = None,
         preflight: Callable[[str], str] | None = None,
         sync: Callable[[str], SyncSummary] | None = None,
+        port_factory: Callable[[], AdmissionPort] | None = None,
     ) -> None:
         self.port = port
+        self._port_factory = port_factory or (lambda: port)
         self.capacity_reader = capacity_reader
         self.trusted_device_ids = trusted_device_ids
         self.local_lock_file = Path(local_lock_file)
@@ -183,16 +185,17 @@ class IntakeCoordinator:
                 if not acquired:
                     return IntakeResult("RELEASE_BLOCKED", "OTHER_INTAKE_ACTIVE")
                 gate = UsbSessionIoGate()
+                session_port = self._port_factory()
                 with gate.ordinary("msc"):
                     if current_session_epoch() != epoch:
                         return IntakeResult("RELEASE_BLOCKED", "STALE_SESSION")
-                    self.port.revalidate_target(target, binding.cdc_port)
-                    if not self.port.volume_available(target):
+                    session_port.revalidate_target(target, binding.cdc_port)
+                    if not session_port.volume_available(target):
                         return IntakeResult("RELEASE_BLOCKED", "TARGET_UNAVAILABLE")
                     if self._preflight(target.mount_root) != target.expected_device_id:
                         return IntakeResult("RELEASE_BLOCKED", "DEVICE_IDENTITY_MISMATCH")
                     # Check the exact same target again before starting any copy.
-                    self.port.revalidate_target(target, binding.cdc_port)
+                    session_port.revalidate_target(target, binding.cdc_port)
                     if current_session_epoch() != epoch:
                         return IntakeResult("RELEASE_BLOCKED", "STALE_SESSION")
                 with gate.ordinary("msc"):
@@ -200,7 +203,7 @@ class IntakeCoordinator:
                 if not isinstance(summary, SyncSummary) or summary.conflicts:
                     return IntakeResult("SYNC_FAILED", "SYNC_CONFLICT")
                 capacity = probe_capacity(
-                    binding, gate=gate, validator=self.port,
+                    binding, gate=gate, validator=session_port,
                     reader=self.capacity_reader,
                     durable_sync_complete=lambda: True,
                     current_session_epoch=current_session_epoch,
