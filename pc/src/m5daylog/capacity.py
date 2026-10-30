@@ -227,9 +227,16 @@ def probe_capacity(
                 return _unknown("STALE_OR_SEALED_SESSION", epoch, block=True)
             if raw is None or usable is None:
                 return _unknown("CAPACITY_API_UNAVAILABLE", epoch, block=False)
-            observed = clock()
+            try:
+                observed = clock()
+            except Exception:
+                return _unknown("CAPACITY_TIMESTAMP_UNAVAILABLE", epoch, block=False)
             if not isinstance(observed, datetime) or observed.tzinfo is None:
                 return _unknown("CAPACITY_TIMESTAMP_UNAVAILABLE", epoch, block=False)
+            # A resume/re-enumeration during observation assembly invalidates
+            # the snapshot even when both identity checks previously passed.
+            if gate.state is not GateState.OPEN or current_session_epoch() != epoch:
+                return _unknown("STALE_OR_SEALED_SESSION", epoch, block=True)
             return classify_free_space(
                 raw, epoch=epoch,
                 observed_at_utc=observed.astimezone(timezone.utc).isoformat(),
