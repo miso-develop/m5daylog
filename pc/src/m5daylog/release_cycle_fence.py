@@ -275,6 +275,67 @@ class CycleAttemptFence:
             except (sqlite3.Error, OSError):
                 raise PreconditionBlocked("release enrollment uncertain") from None
 
+    def check_unenrolled_locked(self) -> None:
+        """Recheck the *actual* two-store absence under the global OS lock.
+
+        Absence is necessary but NEVER proof of a previously unenrolled host.
+        A separate, independently retained #119 evidence baseline is required.
+        """
+        if not getattr(self._serialized_thread, "held", False):
+            raise PreconditionBlocked("release OS lock required")
+        try:
+            if self.database.exists() or self.anchor.read() is not None:
+                raise PreconditionBlocked("existing or incomplete host enrollment")
+        except OSError:
+            raise PreconditionBlocked("host enrollment state uncertain") from None
+
+    def initialize_first_cycle_locked(self, device_id: str,
+                                      release_cycle_id: str,
+                                      attempt_id: str) -> None:
+        """Source-only: first enrollment AND first consumed tuple in one DB commit.
+
+        MUST be invoked only after a separately supplied, independently proven
+        one-use supervised #119 intent has been durably consumed under the
+        same serialized() lease. This primitive does not validate that intent,
+        grant release authority, or make an unattended CDC sender available.
+
+        SQLite commits first, HKCU anchor second. A crash/uncertainty after
+        SQLite but before anchor leaves a mismatch and blocks future actions.
+        Do not call legacy enroll() here: its empty ledger is not sufficient.
+        """
+        if not getattr(self._serialized_thread, "held", False):
+            raise PreconditionBlocked("release OS lock required")
+        device = _hash(_uuid(device_id))
+        cycle = _hash(_uuid(release_cycle_id))
+        attempt = _hash(_uuid(attempt_id))
+        self.check_unenrolled_locked()
+        prior_tip = _hash("m5daylog:r3:enrolled:" + device)
+        tip = _tip(prior_tip, 1, device, cycle, attempt)
+        state = {"v": 1, "device": device, "seq": 1, "tip": tip}
+        try:
+            self.database.parent.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(self.database, isolation_level=None)) as db:
+                db.execute("PRAGMA journal_mode=DELETE")
+                db.execute("PRAGMA synchronous=FULL")
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("CREATE TABLE ledger_state "
+                           "(v INTEGER NOT NULL, device TEXT NOT NULL, "
+                           "seq INTEGER NOT NULL, tip TEXT NOT NULL)")
+                db.execute("CREATE TABLE consumed "
+                           "(seq INTEGER PRIMARY KEY, cycle TEXT UNIQUE NOT NULL, "
+                           "attempt TEXT NOT NULL, tip TEXT NOT NULL)")
+                db.execute("INSERT INTO consumed VALUES (?,?,?,?)",
+                           (1, cycle, attempt, tip))
+                db.execute("INSERT INTO ledger_state VALUES (?,?,?,?)",
+                           (1, device, 1, tip))
+                db.execute("COMMIT")
+            self.anchor.write(state)
+            with closing(self._connection()) as db:
+                if self._verify(db, device) != state:
+                    raise PreconditionBlocked("first enrollment verification failed")
+        except (sqlite3.Error, OSError):
+            raise PreconditionBlocked("first enrollment persistence uncertain") from None
+
     def reserve_locked(self, device_id: str, release_cycle_id: str,
                        attempt_id: str) -> None:
         """Called ONLY while serialized() remains held through CDC outcome.
