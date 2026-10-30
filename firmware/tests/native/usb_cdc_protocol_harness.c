@@ -135,6 +135,14 @@ static void test_commands(const usb_cdc_protocol_config_t *cfg) {
     expect_without(cfg, "\"releaseCycleId\"");
     s_release_cycle = NULL;
 
+    // #144: a frozen terminal cycle is visible before a valid SET_TIME.
+    // The production RTC gate (tested separately) must preserve that UUID
+    // even though #50 sets rtcCorrectionPending for the deferred audit.
+    s_release_cycle = "01234567-89ab-4def-8123-456789abcdef";
+    expect(cfg, "{\"id\":\"pre\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
+           "\"releaseCycleId\":\"01234567-89ab-4def-8123-456789abcdef\"",
+           NULL);
+
     expect(cfg, "{", "\"code\":\"INVALID_JSON\"", NULL);
     expect(cfg, "[]", "\"code\":\"INVALID_REQUEST\"", NULL);
     expect(cfg, "{\"id\":\"u\",\"cmd\":\"NOPE\",\"args\":{}}",
@@ -152,6 +160,14 @@ static void test_commands(const usb_cdc_protocol_config_t *cfg) {
     CHECK(s_pending);
     expect(cfg, "{\"id\":\"s2\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
            "\"rtcCorrectionPending\":true", NULL);
+    expect(cfg, "{\"id\":\"post\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
+           "\"releaseCycleId\":\"01234567-89ab-4def-8123-456789abcdef\"",
+           NULL);
+    // Reopened CDC application session must not create a new cycle identity.
+    expect(cfg, "{\"id\":\"reattach\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
+           "\"releaseCycleId\":\"01234567-89ab-4def-8123-456789abcdef\"",
+           NULL);
+    s_release_cycle = NULL;
     expect(cfg,
            "{\"id\":\"t2\",\"cmd\":\"SET_TIME\",\"args\":{"
            "\"time\":\"2026-10-03T02:00:00Z\"}}",
