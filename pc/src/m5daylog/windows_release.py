@@ -78,6 +78,7 @@ class Win32DeviceApi(Protocol):
     def lock_and_dismount(self, volume_guid: str) -> ContextManager[None]: ...
     def release_cdc(self, port: str, attempt_id: str, binding: CdcInterface) -> None: ...
     def cdc_interface(self, port: str) -> CdcInterface: ...
+    def set_time(self, port: str, binding: CdcInterface, utc_text: str) -> None: ...
 
 
 class WindowsHostReleasePort:
@@ -148,6 +149,18 @@ class WindowsHostReleasePort:
                 or self.api.cdc_interface(cdc_port) != binding[2]):
             raise WrongTarget("CDC endpoint changed identity before release")
         self.api.release_cdc(cdc_port, attempt_id, binding[2])
+
+    def set_time(self, cdc_port: str, utc_text: str) -> None:
+        """Current-session #50 pre-release SET_TIME on the frozen CDC path.
+
+        Must only be called between ordinary target validation and I/O seal.
+        The native adapter rejects missing/changed endpoint identity.
+        """
+        binding = self._cdc_binding
+        if (binding is None or binding[1] != cdc_port.upper()
+                or self.api.cdc_interface(cdc_port) != binding[2]):
+            raise WrongTarget("RTC CDC endpoint not frozen")
+        self.api.set_time(cdc_port, binding[2], utc_text)
 
     def volume_disappeared(self, target: EjectTarget) -> bool:
         # No post-acceptance CreateFile, storage IOCTL, or filesystem query.
