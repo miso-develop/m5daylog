@@ -100,11 +100,12 @@ class WindowsArrivalProvider:
     def __init__(
         self, *, trusted: frozenset[str], api: NativeWin32DeviceApi,
         port: WindowsHostReleasePort,
-        roots=None, ports=None, status=None, preflight=None,
+        roots=None, ports=None, status=None, preflight=None, port_factory=None,
     ) -> None:
         self.trusted = trusted
         self.api = api
         self.port = port
+        self.port_factory = port_factory or (lambda: port)
         self.roots = roots or (lambda: enumerate_removable_roots(self.api.k))
         self.ports = ports or enumerate_com_ports
         self.status = status or self.api.read_status
@@ -125,7 +126,8 @@ class WindowsArrivalProvider:
                 device_id = self.preflight(root)
                 if device_id not in self.trusted:
                     continue
-                target = self.port.resolve_target(root, device_id)
+                session_port = self.port_factory()
+                target = session_port.resolve_target(root, device_id)
                 # Require exactly one current CDC on the same USB physical parent.
                 matched = []
                 for com in com_ports:
@@ -138,16 +140,16 @@ class WindowsArrivalProvider:
                 if len(matched) != 1:
                     continue
                 com = matched[0]
-                self.port.revalidate_target(target, com)
-                if not self.port.volume_available(target):
+                session_port.revalidate_target(target, com)
+                if not session_port.volume_available(target):
                     continue
                 result = self.status(com)
                 if (not isinstance(result, dict)
                         or result.get("state") != "USB_SYNC"
                         or not isinstance(result.get("rtcCorrectionPending"), bool)):
                     continue
-                self.port.revalidate_target(target, com)
-                if not self.port.volume_available(target):
+                session_port.revalidate_target(target, com)
+                if not session_port.volume_available(target):
                     continue
                 key = (target.volume_guid, target.usb_physical_instance_id, com)
                 epoch = self._epochs.setdefault(key, str(uuid.uuid4()))
@@ -187,7 +189,10 @@ def run_monitor(*, once: bool = False, output=None) -> int:
         trusted = read_opt_in(root)
         api = NativeWin32DeviceApi()
         port = WindowsHostReleasePort(api)
-        provider = WindowsArrivalProvider(trusted=trusted, api=api, port=port)
+        provider = WindowsArrivalProvider(
+            trusted=trusted, api=api, port=port,
+            port_factory=lambda: WindowsHostReleasePort(api),
+        )
         local_state = root.parent / "state"
         coordinator = IntakeCoordinator(
             port=port, capacity_reader=WindowsCapacityReader(),
@@ -195,6 +200,7 @@ def run_monitor(*, once: bool = False, output=None) -> int:
             local_lock_file=local_state / "intake.lock",
             library_root=Path.home() / "Documents" / "M5Daylog",
             db_path=resolve_db_path(data_dir=str(root.parent)),
+            port_factory=lambda: WindowsHostReleasePort(api),
         )
         def report(notice: dict[str, object]) -> None:
             # One bounded, sanitized local status file. Never log the root,
