@@ -244,7 +244,7 @@ class CapacityTests(unittest.TestCase):
         self.assertFalse(result.release_blocked)
         self.assertEqual(notice["source"], "Device SD (not PC disk)")
         self.assertTrue(notice["action_required"])
-        self.assertEqual(notice["observation_kind"], "last-verified-session")
+        self.assertEqual(notice["observation_kind"], "unverified")
         self.assertIsNone(notice["usable_free_bytes"])
         self.assertIsNone(notice["estimated_minutes"])
         self.assertFalse(notice["guaranteed_16h"])
@@ -322,6 +322,22 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(recorded["result"].status, CapacityStatus.UNKNOWN)
         self.assertTrue(recorded["result"].release_blocked)
         self.assertIsNone(recorded["result"].estimated_seconds)
+
+    def test_unavailable_observation_clock_is_capacity_only_unknown(self):
+        def clock():
+            raise RuntimeError("synthetic timestamp provider failure")
+
+        result = probe_capacity(
+            self.binding, gate=self.gate, validator=self.validator,
+            reader=self.reader, durable_sync_complete=lambda: self.sync,
+            current_session_epoch=lambda: self.epoch, clock=clock,
+        )
+        self.assertEqual(result.status, CapacityStatus.UNKNOWN)
+        self.assertEqual(result.reason, "CAPACITY_TIMESTAMP_UNAVAILABLE")
+        self.assertFalse(result.release_blocked)
+        self.assertIsNone(result.public_notice()["estimated_minutes"])
+        self.assertEqual(result.public_notice()["observation_kind"], "unverified")
+        self.assertEqual(self.reader.calls, [TARGET.volume_guid])
 
     def test_epoch_change_during_observation_clock_fails_closed(self):
         def clock():
