@@ -123,7 +123,8 @@ class ReleaseCoordinatorTests(unittest.TestCase):
         self.assertTrue(outcome.success)
         self.assertEqual(self.gate.state, GateState.RELEASED)
         self.assertEqual(self.port.steps, [
-            "resolve", "revalidate", "available", "lock",
+            "resolve", "revalidate", "available",
+            "revalidate", "available", "lock",
             "dismount", "release", "observe", "unlock",
         ])
         self.assertEqual(mutations, ["SET_TIME-done"])
@@ -198,6 +199,7 @@ class ReleaseCoordinatorTests(unittest.TestCase):
         self.assertEqual(outcome.reason, "TIMEOUT")
         self.assertEqual(self.port.steps, [
             "resolve", "revalidate", "available",
+            "revalidate", "available",
         ])
         self.assertEqual(self.gate.state, GateState.SEALED_FOR_RELEASE)
         for transport in ("msc", "cdc"):
@@ -231,7 +233,8 @@ class ReleaseCoordinatorTests(unittest.TestCase):
             raise TimeoutError("SET_TIME response missing")
         outcome = self.run_release(cdc=fail_mutation)
         self.assertEqual(outcome.status, "SYNC_COMPLETE_RELEASE_FAILED")
-        self.assertNotIn("resolve", self.port.steps)
+        self.assertIn("resolve", self.port.steps)
+        self.assertNotIn("lock", self.port.steps)
 
     def test_gate_remains_sealed_after_volume_timeout(self):
         self.port.disappeared = False
