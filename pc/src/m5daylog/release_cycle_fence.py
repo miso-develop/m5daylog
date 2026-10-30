@@ -156,6 +156,19 @@ class CycleAttemptFence:
             raise PreconditionBlocked("independent release lock required")
         self.anchor = anchor
 
+    @classmethod
+    def for_current_user(cls, *, device_root: Path) -> "CycleAttemptFence":
+        """Fixed Windows per-user store/lock identity for both CLI and watcher.
+
+        No opt-in, enrollment, recovery, or release action is performed here.
+        """
+        if os.name != "nt" or not os.environ.get("LOCALAPPDATA"):
+            raise PreconditionBlocked("Windows release continuity unavailable")
+        state = Path(os.environ["LOCALAPPDATA"]) / "M5Daylog" / "state"
+        return cls(state / "release_cycle_r3.sqlite",
+                   state / "release_cycle_r3.lock",
+                   device_root, WindowsRegistryAnchor())
+
     @contextmanager
     def serialized(self) -> Iterator[None]:
         """Hold for the full future CLI/watcher canonical coordinator call."""
