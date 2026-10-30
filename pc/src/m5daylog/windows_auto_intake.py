@@ -180,6 +180,39 @@ class WindowsArrivalProvider:
         return next(iter(self._epochs.values()))
 
 
+def notify_action_required(notice: dict[str, object], *, user32=None) -> None:
+    """Explicit local Windows notification, no shell, telemetry or tray icon.
+
+    A modal warning is deliberate: this release-blocked intake is not a safe
+    USB-eject success. The operator must acknowledge the blocked condition.
+    """
+    if os.name != "nt":
+        return
+    status = notice.get("sync_release")
+    reason = notice.get("reason")
+    if status == "RELEASE_BLOCKED" and reason == "AUTO_RELEASE_NOT_QUALIFIED":
+        message = ("WAV import completed. Automatic USB release has not been "
+                   "qualified. Keep the USB cable connected; no safe-release "
+                   "or SHUTDOWN_ARMED state has been proven.")
+    elif status == "SYNC_FAILED":
+        message = ("WAV import failed or was incomplete. Device release has "
+                   "not been performed. Keep the USB cable connected.")
+    else:
+        return
+    try:
+        if user32 is None:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+        message_box = user32.MessageBoxW
+        message_box.argtypes = [
+            wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT,
+        ]
+        message_box.restype = ctypes.c_int
+        message_box(None, message, "M5Daylog - action required", 0x30)
+    except Exception:
+        # Status file remains the independent notification fallback.
+        return
+
+
 def run_monitor(*, once: bool = False, output=None) -> int:
     """Entry point is inert without a pre-existing opt-in file."""
     if os.name != "nt":
@@ -213,6 +246,7 @@ def run_monitor(*, once: bool = False, output=None) -> int:
             tmp.replace(dst)
             if output is not None:
                 output(serialized)
+            notify_action_required(notice)
         monitor = PollingMonitor(
             provider, coordinator, provider.current_epoch, report
         )
