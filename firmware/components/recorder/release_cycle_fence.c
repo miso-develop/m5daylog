@@ -22,6 +22,7 @@ enum {
 
 static bool s_boot_checked;
 static bool s_this_boot_qualified;
+static bool s_saw_host_owned;
 
 esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
     nvs_handle_t handle = 0;
@@ -35,6 +36,7 @@ esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
     }
     s_boot_checked = true;
     s_this_boot_qualified = false;
+    s_saw_host_owned = false;
     if (!manual_wake) {
         return ESP_OK;
     }
@@ -98,13 +100,47 @@ bool release_cycle_fence_boot_qualified(void) {
     return s_this_boot_qualified;
 }
 
+esp_err_t release_cycle_fence_note_host_owned(void) {
+    nvs_handle_t handle = 0;
+    uint8_t lifecycle = 0;
+    uint8_t fence = 0;
+    esp_err_t err;
+    if (!s_this_boot_qualified || s_saw_host_owned) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = recorder_nvs_lock();
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_open(k_namespace, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        err = nvs_get_u8(handle, k_lifecycle_key, &lifecycle);
+    }
+    if (err == ESP_OK) {
+        err = nvs_get_u8(handle, k_fence_key, &fence);
+    }
+    if (err == ESP_OK) {
+        if (lifecycle != 2u /* HOST_UNRESOLVED */ ||
+            fence != FENCE_BOOT_ACTIVE) {
+            err = ESP_ERR_INVALID_STATE;
+        } else {
+            s_saw_host_owned = true;
+        }
+    }
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+    recorder_nvs_unlock();
+    return err;
+}
+
 esp_err_t release_cycle_fence_note_release_completed(void) {
     nvs_handle_t handle = 0;
     uint8_t lifecycle = 0;
     uint8_t fence = 0;
     esp_err_t err;
 
-    if (!s_this_boot_qualified) {
+    if (!s_this_boot_qualified || !s_saw_host_owned) {
         return ESP_ERR_INVALID_STATE;
     }
     // After an accepted D-031 request, #87 has already transitioned
@@ -146,6 +182,7 @@ done:
     // Even if NVS reports failure after a partial commit, NEVER retry from
     // this boot. The next boot will assess the durable value independently.
     s_this_boot_qualified = false;
+    s_saw_host_owned = false;
     return err;
 }
 
@@ -157,6 +194,9 @@ esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
 }
 bool release_cycle_fence_boot_qualified(void) {
     return false;
+}
+esp_err_t release_cycle_fence_note_host_owned(void) {
+    return ESP_ERR_NOT_SUPPORTED;
 }
 esp_err_t release_cycle_fence_note_release_completed(void) {
     return ESP_ERR_NOT_SUPPORTED;

@@ -28,6 +28,10 @@ esp_err_t release_cycle_fence_begin_boot(bool manual_wake);
 // durably indexed, current-boot nonzero-PCM manifest proof is also required.
 bool release_cycle_fence_boot_qualified(void);
 
+// Call once after PC-owned USB_SYNC and durable HOST_UNRESOLVED are proven.
+// It cannot be invoked simply because a stale boot marker was found.
+esp_err_t release_cycle_fence_note_host_owned(void);
+
 // Call only AFTER #87 has completed release quiescence, committed
 // SHUTDOWN_ARMED, and proven the preceding host release was accepted.
 // A failed write never grants the following boot a new candidate.

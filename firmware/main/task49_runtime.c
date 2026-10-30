@@ -283,6 +283,13 @@ static void recorder_handle_usb_host_owned(void) {
         return;
     }
 
+    // R3 adds a separate PC-owned witness; it never authorizes release alone.
+    if (release_cycle_fence_boot_qualified() &&
+        release_cycle_fence_note_host_owned() != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "stage: release-cycle, result: ownership-witness-error, action: witness-disabled");
+    }
+
     // D-031 command admission opens only after PC ownership / USB_SYNC.
     usb_cdc_protocol_open_session();
     recorder_flush_usb_scsi_trace();
