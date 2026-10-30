@@ -274,14 +274,18 @@ class FirstUseTransactionTests(unittest.TestCase):
         shutil.copyfile(fence.anchor.path, anchor_backup)
         with fence.serialized():
             fence.reserve_locked(DEVICE, CYCLE_2, SECOND_ATTEMPT)
+        current_db = self.root / "current-sqlite"
+        shutil.copyfile(fence.database, current_db)
         shutil.copyfile(db_backup, fence.database)
         with fence.serialized():
             with self.assertRaises(PreconditionBlocked):
                 fence.check_locked(DEVICE)
-        # Restore current DB so that the anchor-alone rewind is independent.
-        with sqlite3.connect(fence.database) as db:
-            # Current anchor still corresponds to seq 2; this is already a STOP.
-            self.assertEqual(db.execute("SELECT count(*) FROM consumed").fetchone(), (1,))
+        # An anchor-only restore is a distinct case, with current SQLite.
+        shutil.copyfile(current_db, fence.database)
+        shutil.copyfile(anchor_backup, fence.anchor.path)
+        with fence.serialized():
+            with self.assertRaises(PreconditionBlocked):
+                fence.check_locked(DEVICE)
         self.assertEqual(self.store.read()["state"], "CONSUMED")
 
     def test_two_independent_processes_only_one_initializes(self):
