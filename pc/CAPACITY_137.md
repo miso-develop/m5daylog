@@ -25,8 +25,10 @@ cross-process/restart pre-send fence and RTC mutation prerequisites.
 - READY_FOR_NEXT_16H: usable free >= 1,977,417,728 bytes. This is an
   **estimate**, not a promise that a new 16-hour recording will succeed.
 - ACTION_REQUIRED: valid free bytes below threshold.
-- UNKNOWN: no numerical estimate. Capacity-only API failure is a warning,
-  not an additional release gate.
+- UNKNOWN: no numerical estimate. Capacity-only API/timestamp failure is a
+  warning, not an additional release gate when the session remains valid.
+  The notice has `observation_kind=unverified`, even if a historical display
+  was requested; it must never label a failed reading as verified.
 - release_blocked=True means a failed sync prerequisite, invalid/changed
   physical target/session identity or closed gate. It is NOT a capacity-only
   warning; #135 must fail closed through #89 and must not invoke release.
@@ -38,7 +40,8 @@ Render status and free-space information **separately** from sync/release
 outcomes. CapacityResult.public_notice() emits no device/host identifiers and
 never claims release success. It is the caller's responsibility to check
 valid_for(session_epoch=..., session_open=True) before treating the observation
-as current. If showing a previously captured successful-session result after
+as current. A final epoch/gate check occurs after the observation timestamp
+callback; any concurrent session turnover is release-blocking. If showing a previously captured successful-session result after
 release, mark it **last-verified-session**; it is not a fresh post-release
 measurement. Discard at disconnect, re-enumeration, reboot, sleep/resume or the
 next recording session. In every view explain that original unACKed WAVs are
@@ -54,6 +57,28 @@ Run the synthetic tests as part of the PC Python 3.11 suite:
 
     cd pc
     uv run python -m unittest discover -s tests -p 'test_capacity.py' -v
+
+Exact-HEAD synthetic/PC-regression qualification is required on both Python
+3.11 Linux and Windows, using the actual checkout at the PR HEAD. The following
+commands perform **software-only** tests and do not open an actual Device:
+
+Linux (from `pc/`):
+
+    PYTHONPATH=src python3.11 -m unittest discover -s tests -p 'test_capacity.py' -v
+    PYTHONPATH=src python3.11 -m unittest discover -s tests -v
+
+Windows PowerShell (from `pc/`):
+
+    $env:PYTHONPATH = "src"
+    py -3.11 -m unittest discover -s tests -p test_capacity.py -v
+    py -3.11 -m unittest discover -s tests -v
+
+Record the exact `git rev-parse HEAD`, Python version, command exits, and test
+counts for each OS. Committed tests, isolated smoke tests and Security CI
+are **not** substitutes for these runs. A test of `seal()` overlapping an
+in-flight read verifies that #89 drains existing leases, not that #137
+atomically prevents a new query after a concurrent seal. #135 must serialize
+probe against seal at the coordinator level.
 
 The adapter is tested using injected fake kernel32 functions; none of these
 tests prove native Windows GetDiskFreeSpaceExW behavior on the exact real
