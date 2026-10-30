@@ -663,5 +663,163 @@ class WindowsAdapterTests(unittest.TestCase):
                 self.adapter.resolve_target(root, "test-device")
 
 
+
+class PreReleaseSafetySeamTests(unittest.TestCase):
+    """The new hooks are inert for legacy/manual callers unless supplied."""
+
+    def setUp(self):
+        self.port = FakePort()
+        clock = Clock()
+        self.coordinator = SyncReleaseCoordinator(
+            self.port, clock=clock.time, sleep=clock.sleep,
+            timeout_s=1, poll_interval_s=0.25,
+        )
+
+    def invoke(self, **hooks):
+        return self.coordinator.run(
+            mount_root="E:\\", cdc_port="COM5", device_id=lambda: "test-device",
+            sync=lambda: SyncSummary(copied=1), gate=UsbSessionIoGate(),
+            **hooks,
+        )
+
+    def test_observation_identity_block_prevents_seal_and_send(self):
+        observations = []
+        def observe(target, gate):
+            self.assertIs(target, TARGET)
+            self.assertEqual(gate.state, GateState.OPEN)
+            observations.append("capacity")
+            return False
+
+        outcome = self.invoke(before_seal_observation=observe)
+        self.assertEqual(outcome.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(observations, ["capacity"])
+        self.assertNotIn("lock", self.port.steps)
+        self.assertNotIn("release", self.port.steps)
+
+    def test_capacity_only_unknown_can_warn_and_allow_canonical_release(self):
+        steps = self.port.steps
+        def probe(target, gate):
+            steps.append("probe")
+            return True  # #137 capacity API-only UNKNOWN does not veto
+
+        result = self.invoke(before_seal_observation=probe)
+        self.assertTrue(result.success)
+        self.assertEqual(steps.count("release"), 1)
+        self.assertLess(steps.index("probe"), steps.index("lock"))
+
+    def test_pre_send_fence_runs_inside_quiescence_before_single_cdc_send(self):
+        def claim(attempt_id, target):
+            self.assertIs(target, TARGET)
+            self.assertTrue(attempt_id)
+            self.port.steps.append("fence")
+
+        result = self.invoke(before_release_send=claim)
+        self.assertTrue(result.success)
+        self.assertLess(self.port.steps.index("dismount"),
+                        self.port.steps.index("fence"))
+        self.assertLess(self.port.steps.index("fence"),
+                        self.port.steps.index("release"))
+        self.assertEqual(self.port.steps.count("release"), 1)
+
+    def test_failed_pre_send_claim_never_sends_cdc(self):
+        from m5daylog.release import PreconditionBlocked
+
+        def denied(_attempt, _target):
+            raise PreconditionBlocked("previously attempted")
+
+        outcome = self.invoke(before_release_send=denied)
+        self.assertEqual(outcome.reason, "PRECONDITION_BLOCKED")
+        self.assertIn("dismount", self.port.steps)
+        self.assertNotIn("release", self.port.steps)
+
+    def test_mutation_is_after_exact_target_binding(self):
+        def mutation():
+            self.port.steps.append("rtc")
+        def observe(_target, gate):
+            self.assertEqual(gate.state, GateState.OPEN)
+            self.port.steps.append("capacity")
+            return True
+        result = self.invoke(cdc_mutations=mutation,
+                             before_seal_observation=observe)
+        self.assertTrue(result.success)
+        steps = self.port.steps
+        self.assertLess(steps.index("revalidate"), steps.index("rtc"))
+        self.assertLess(steps.index("rtc"), steps.index("capacity"))
+        self.assertLess(steps.index("capacity"), steps.index("lock"))
+
+
+class DurableFenceTests(unittest.TestCase):
+    """Host-side journaling synthetic tests. Device does not expose epoch."""
+
+    def test_restart_replay_and_concurrent_claim_block(self):
+        from dataclasses import replace
+        import tempfile
+        from pathlib import Path
+        import uuid
+        from m5daylog.release_fence import DeviceAttemptFence
+        from m5daylog.release import PreconditionBlocked
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = root / "host" / "attempts.sqlite"
+            media = root / "device"
+            target = replace(
+                TARGET, expected_device_id="00000000-0000-4000-8000-000000000135"
+            )
+            one = DeviceAttemptFence(db, device_root=media)
+            one.reserve(str(uuid.uuid4()), target)
+            # Different process/restart object still sees committed record.
+            restarted = DeviceAttemptFence(db, device_root=media)
+            with self.assertRaises(PreconditionBlocked):
+                restarted.reserve(str(uuid.uuid4()), target)
+
+            # Two contending claimers for a different Device: exactly one
+            # may reserve the same key, regardless of scheduling.
+            other = replace(target,
+                            expected_device_id="00000000-0000-4000-8000-000000000136")
+            barrier = threading.Barrier(3)
+            outcomes = []
+            def claim():
+                barrier.wait(timeout=2)
+                try:
+                    DeviceAttemptFence(db, device_root=media).reserve(
+                        str(uuid.uuid4()), other
+                    )
+                    outcomes.append("RESERVED")
+                except PreconditionBlocked:
+                    outcomes.append("BLOCKED")
+            threads = [threading.Thread(target=claim) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=2)
+            for thread in threads:
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(sorted(outcomes), ["BLOCKED", "RESERVED"])
+
+    def test_device_local_journal_rejected_before_write(self):
+        from dataclasses import replace
+        from pathlib import Path
+        import tempfile
+        import uuid
+        from m5daylog.release_fence import DeviceAttemptFence
+        from m5daylog.release import PreconditionBlocked
+
+        with tempfile.TemporaryDirectory() as directory:
+            media = Path(directory) / "device"
+            media.mkdir()
+            with self.assertRaises(PreconditionBlocked):
+                DeviceAttemptFence(media / "attempts.sqlite", device_root=media)
+            target = replace(
+                TARGET, expected_device_id="00000000-0000-4000-8000-000000000135"
+            )
+            host = DeviceAttemptFence(
+                Path(directory) / "host" / "attempts.sqlite", device_root=media
+            )
+            with self.assertRaises(PreconditionBlocked):
+                host.reserve("not-a-uuid", target)
+
+
+
 if __name__ == "__main__":
     unittest.main()
