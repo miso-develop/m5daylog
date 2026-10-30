@@ -90,9 +90,9 @@ class CandidateTests(unittest.TestCase):
     def test_exact_identity_is_revalidated_before_and_after_status(self):
         port = Port()
         with patch("m5daylog.release_cycle_candidate.inspect_device",
-                   return_value={"deviceId": DEVICE}), \\
+                   return_value={"deviceId": DEVICE}), \
              patch("m5daylog.release_cycle_candidate._load_manifest",
-                   return_value={"deviceId": DEVICE}), \\
+                   return_value={"deviceId": DEVICE}), \
              patch("m5daylog.release_cycle_candidate._preflight",
                    return_value=[(recording(), object())]):
             result = inspect_release_cycle_candidate(
@@ -109,9 +109,9 @@ class CandidateTests(unittest.TestCase):
             observed[0] = "new-observation"
             return evidence()
         with patch("m5daylog.release_cycle_candidate.inspect_device",
-                   return_value={"deviceId": DEVICE}), \\
+                   return_value={"deviceId": DEVICE}), \
              patch("m5daylog.release_cycle_candidate._load_manifest",
-                   return_value={"deviceId": DEVICE}), \\
+                   return_value={"deviceId": DEVICE}), \
              patch("m5daylog.release_cycle_candidate._preflight",
                    return_value=[(recording(), object())]):
             with self.assertRaises(PreconditionBlocked):
