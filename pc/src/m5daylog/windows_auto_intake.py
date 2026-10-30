@@ -130,13 +130,17 @@ class WindowsArrivalProvider:
                 matched = []
                 for com in com_ports:
                     try:
-                        self.port.revalidate_target(target, com)
-                        matched.append(com)
+                        endpoint = self.api.cdc_interface(com)
+                        if endpoint.physical_usb_instance_id == target.usb_physical_instance_id:
+                            matched.append(com)
                     except Exception:
                         continue
-                if len(matched) != 1 or not self.port.volume_available(target):
+                if len(matched) != 1:
                     continue
                 com = matched[0]
+                self.port.revalidate_target(target, com)
+                if not self.port.volume_available(target):
+                    continue
                 result = self.status(com)
                 if (not isinstance(result, dict)
                         or result.get("state") != "USB_SYNC"
