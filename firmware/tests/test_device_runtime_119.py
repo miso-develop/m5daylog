@@ -211,10 +211,23 @@ static void recorder_set_events_ready(bool ready) { (void)ready; }
 static void recorder_log_writer_stack_hw(const char *reason) { (void)reason; }
 static void recorder_log_diagnostics(void) {}
 static bool recorder_manifest_record_wav(const char *path, const char *id,
-                                         const char *started, const char *kind) {
+                                         const char *started, const char *kind,
+                                         uint32_t *verified_pcm) {
     (void)path; (void)id; (void)started;
     if (strcmp(kind, DEVICE_MANIFEST_STATE_FINALIZED)) return false;
-    manifest_writes++; return true;
+    manifest_writes++;
+    if (verified_pcm != NULL) *verified_pcm = s_sink.wav.pcm_bytes;
+    return true;
+}
+// This compiled #119 source-extraction test mocks #144-only external gates.
+// The actual portable production witness is tested independently by #144.
+static bool release_cycle_fence_boot_qualified(void) { return true; }
+static bool rtc_correction_boot_clock_verified(void) { return true; }
+static bool rtc_correction_is_pending(void) { return false; }
+static bool release_cycle_witness_note_committed(
+    const char *id, uint32_t bytes, bool rtc_verified, bool rtc_pending) {
+    (void)id;
+    return bytes != 0 && rtc_verified && !rtc_pending;
 }
 static bool recorder_state_append_usb_capture_accounting(
     const char *path, const char *id, uint32_t elapsed_ms, uint32_t pcm_bytes) {
