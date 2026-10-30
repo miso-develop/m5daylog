@@ -80,6 +80,14 @@ int main(int argc, char **argv) {
     g_fail_set = strcmp(argv[4], "set") == 0;
     g_fail_lock = strcmp(argv[4], "lock") == 0;
     begin = release_cycle_fence_begin_boot(strcmp(argv[1], "normal") != 0);
+    // Simulate a successful #87 RTC/recording transition only after a newly
+    // committed used-permit. Never auto-qualify a stale BOOT_ACTIVE marker.
+    if (begin == ESP_OK && g_write == false && g_has_fence &&
+        g_fence == 82u && g_next == 82u && strcmp(argv[1], "normal") != 0) {
+        g_lifecycle = 0; /* #87 durable NORMAL + RTC and RECORDING success */
+        CHECK(release_cycle_fence_note_recorder_ready() == ESP_OK);
+        g_lifecycle = 1; /* caller's previous ARMED before USB preparation */
+    }
     if (strcmp(argv[1], "complete") == 0) {
         CHECK(begin == ESP_OK && release_cycle_fence_boot_qualified());
         host_before = release_cycle_fence_note_host_owned();

@@ -511,6 +511,14 @@ void app_main(void) {
     cdc_config.command_admission_open =
         recorder_cdc_command_admission_open;
 
+    // Complete the boot-local origin proof only after successful RTC and
+    // recorder recovery; status publication still additionally requires a
+    // finalized current-boot PCM/manifest witness (not yet connected).
+    if (release_cycle_fence_note_recorder_ready() != ESP_OK) {
+        ESP_LOGD(TAG,
+                 "stage: release-cycle, result: recorder-origin-unqualified");
+    }
+
     if (usb_msc_ownership_init() != ESP_OK ||
         usb_msc_ownership_set_physical_session_cutoff(
             recorder_cdc_physical_session_cutoff, NULL) != ESP_OK ||

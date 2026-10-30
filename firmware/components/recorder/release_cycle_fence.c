@@ -21,6 +21,7 @@ enum {
 };
 
 static bool s_boot_checked;
+static bool s_boot_admitted;
 static bool s_this_boot_qualified;
 static bool s_saw_host_owned;
 
@@ -35,6 +36,7 @@ esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
         return ESP_ERR_INVALID_STATE;
     }
     s_boot_checked = true;
+    s_boot_admitted = false;
     s_this_boot_qualified = false;
     s_saw_host_owned = false;
     if (!manual_wake) {
@@ -85,10 +87,44 @@ esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
         err = nvs_commit(handle);
     }
     if (err == ESP_OK) {
-        s_this_boot_qualified = true;
+        s_boot_admitted = true;
     }
 
 done:
+    if (handle != 0) {
+        nvs_close(handle);
+    }
+    recorder_nvs_unlock();
+    return err;
+}
+
+esp_err_t release_cycle_fence_note_recorder_ready(void) {
+    nvs_handle_t handle = 0;
+    uint8_t lifecycle = 0;
+    uint8_t fence = 0;
+    esp_err_t err;
+    if (!s_boot_admitted || s_this_boot_qualified) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = recorder_nvs_lock();
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_open(k_namespace, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        err = nvs_get_u8(handle, k_lifecycle_key, &lifecycle);
+    }
+    if (err == ESP_OK) {
+        err = nvs_get_u8(handle, k_fence_key, &fence);
+    }
+    if (err == ESP_OK) {
+        if (lifecycle != 0u /* NORMAL, fresh #87 recorder-ready */ ||
+            fence != FENCE_BOOT_ACTIVE) {
+            err = ESP_ERR_INVALID_STATE;
+        } else {
+            s_this_boot_qualified = true;
+        }
+    }
     if (handle != 0) {
         nvs_close(handle);
     }
@@ -190,6 +226,9 @@ done:
 
 esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
     (void)manual_wake;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+esp_err_t release_cycle_fence_note_recorder_ready(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
 bool release_cycle_fence_boot_qualified(void) {

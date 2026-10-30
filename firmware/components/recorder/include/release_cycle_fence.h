@@ -24,7 +24,12 @@ extern "C" {
 // but the existing recorder/USB recovery policy remains independent.
 esp_err_t release_cycle_fence_begin_boot(bool manual_wake);
 
-// RAM-only origin witness. NOT sufficient for GET_STATUS: a separate finalized,
+// Called only after #87 manual-WAKE recovery has durably reached NORMAL,
+// recorder reached RECORDING and RTC recovery checks succeeded. This does
+// not authorize publication by itself.
+esp_err_t release_cycle_fence_note_recorder_ready(void);
+
+// RAM-only completed-boot origin witness. NOT sufficient for GET_STATUS: a separate finalized,
 // durably indexed, current-boot nonzero-PCM manifest proof is also required.
 bool release_cycle_fence_boot_qualified(void);
 
