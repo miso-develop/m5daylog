@@ -23,8 +23,11 @@ a Human Gate without separate approval**. A per-user Startup shortcut may
 eventually launch the same module after logon; no installer, service or
 elevation is added. Status is written as one sanitized local JSON snapshot
 (`%LOCALAPPDATA%/M5Daylog/state/auto_intake_status.json`) and optionally
-printed in the foreground. There is no toast/system notification adapter yet,
-and auto-release remains blocked; therefore this is **not** full daily UX.
+printed in the foreground. A native local Windows warning dialog is displayed
+after completed-but-unreleased intake or failed sync, without host/device
+identifiers or external dependencies. This is a **blocking/action-required**
+notification, never a successful safe-eject notice. Auto-release remains
+blocked; therefore this is **not** full daily UX.
 
 The user must create a private, locally stored
 `%LOCALAPPDATA%/M5Daylog/monitor.json` containing the explicit opt-in
@@ -75,9 +78,9 @@ causes no Device read/copy.
 ## Next work required before reviewable end-to-end auto-release
 
 1. Qualify the new Windows-only observer, opt-in/at-login startup, session
-   refresh and operator-visible status on the approved host in a separate
-   exact-HEAD Human Gate. Add a nonmodal notification UX if required; the
-   source-only synthetic tests do not establish physical PC-A01/A05.
+   refresh and operator-visible warning on the approved host in a separate
+   exact-HEAD Human Gate. A nonmodal notification alternative may require a
+   later bounded decision; source-only tests do not establish physical PC-A01/A05.
 2. Integrate the smallest shared #89 coordinator seam after durable #51 sync
    and exact target validation, before sealing, for #137 capacity observation.
    Preserve native lock/dismount and dedicated CDC release control.
