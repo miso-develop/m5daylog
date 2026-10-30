@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
+from contextlib import closing
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -148,7 +149,7 @@ class FirstUseTransactionTests(unittest.TestCase):
             # Prove schema remains compatible with separate ordinary R3
             # reservations; this is not a real subsequent Device boot.
             fence.reserve_locked(DEVICE, CYCLE_2, SECOND_ATTEMPT)
-        with sqlite3.connect(fence.database) as db:
+        with closing(sqlite3.connect(fence.database)) as db:
             rows = db.execute("SELECT seq, cycle, attempt FROM consumed ORDER BY seq").fetchall()
         self.assertEqual(len(rows), 2)
         self.assertEqual([row[0] for row in rows], [1, 2])
