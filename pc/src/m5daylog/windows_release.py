@@ -704,10 +704,24 @@ class NativeWin32DeviceApi:
             if (not isinstance(result.get("state"), str)
                     or not isinstance(result.get("rtcCorrectionPending"), bool)):
                 raise HostQuiesceError("CDC status invalid fields")
-            return {
+            parsed = {
                 "state": result["state"],
                 "rtcCorrectionPending": result["rtcCorrectionPending"],
             }
+            # R3 #143: a Device-authored optional witness is passed through
+            # only if it is a strict lowercase canonical UUID. An absent or
+            # malformed witness does NOT block safe read-only WAV intake, but
+            # never qualifies a release. Caller must independently verify
+            # current-boot origin, finalized manifest and exact CDC/MSC target.
+            cycle = result.get("releaseCycleId")
+            if isinstance(cycle, str):
+                try:
+                    canonical = str(uuid.UUID(cycle))
+                except (ValueError, AttributeError):
+                    canonical = None
+                if canonical is not None and cycle == canonical:
+                    parsed["releaseCycleId"] = canonical
+            return parsed
         finally:
             self.k.CloseHandle(handle)
 
