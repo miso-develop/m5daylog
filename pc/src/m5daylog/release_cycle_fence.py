@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -155,6 +156,7 @@ class CycleAttemptFence:
         if self.database == self.lock_file:
             raise PreconditionBlocked("independent release lock required")
         self.anchor = anchor
+        self._serialized_thread = threading.local()
 
     @classmethod
     def for_current_user(cls, *, device_root: Path) -> "CycleAttemptFence":
@@ -172,9 +174,15 @@ class CycleAttemptFence:
     @contextmanager
     def serialized(self) -> Iterator[None]:
         """Hold for the full future CLI/watcher canonical coordinator call."""
+        if getattr(self._serialized_thread, "held", False):
+            raise PreconditionBlocked("nested release admission is unsupported")
         try:
             with _host_lock(self.lock_file):
-                yield
+                self._serialized_thread.held = True
+                try:
+                    yield
+                finally:
+                    self._serialized_thread.held = False
         except OSError:
             raise PreconditionBlocked("release host lock unavailable") from None
 
@@ -274,6 +282,8 @@ class CycleAttemptFence:
         The returned reservation is irrevocable, even if no bytes were sent.
         A caller must validate Device-origin cycle and exact target separately.
         """
+        if not getattr(self._serialized_thread, "held", False):
+            raise PreconditionBlocked("release OS lock required")
         device = _hash(_uuid(device_id))
         cycle = _hash(_uuid(release_cycle_id))
         attempt = _hash(_uuid(attempt_id))
@@ -303,6 +313,8 @@ class CycleAttemptFence:
 
     def check_locked(self, device_id: str) -> None:
         """Verify enrolled host witnesses under serialized() without mutation."""
+        if not getattr(self._serialized_thread, "held", False):
+            raise PreconditionBlocked("release OS lock required")
         device = _hash(_uuid(device_id))
         try:
             with closing(self._connection()) as db:
