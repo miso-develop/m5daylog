@@ -9,6 +9,23 @@
 #include "cJSON.h"
 #include "recorder_config.h"
 
+static bool cdc_cycle_uuid_valid(const char *id) {
+    size_t i;
+    if (id == NULL || strlen(id) != 36u) {
+        return false;
+    }
+    for (i = 0u; i < 36u; ++i) {
+        const char c = id[i];
+        if (i == 8u || i == 13u || i == 18u || i == 23u) {
+            if (c != '-') return false;
+        } else if (!((c >= '0' && c <= '9') ||
+                     (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool cdc_id_valid(const char *id) {
     size_t i;
     size_t len;
@@ -302,8 +319,7 @@ int usb_cdc_protocol_process_line(
             // No source UUID is forwarded in another recorder state.
             if (status.release_cycle_id != NULL &&
                 strcmp(status.state, "USB_SYNC") == 0 &&
-                device_identity_is_valid_uuid(status.release_cycle_id) &&
-                strpbrk(status.release_cycle_id, "ABCDEF") == NULL) {
+                cdc_cycle_uuid_valid(status.release_cycle_id)) {
                 (void)snprintf(cycle_field, sizeof(cycle_field),
                                ",\"releaseCycleId\":\"%s\"",
                                status.release_cycle_id);
