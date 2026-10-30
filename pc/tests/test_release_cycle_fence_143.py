@@ -120,6 +120,19 @@ class CycleFenceTests(unittest.TestCase):
         self.assertNotIn(CYCLE1, data)
         self.assertNotIn(ATTEMPT1, data)
 
+    def test_exact_consumed_attempt_must_match_before_cdc_send(self):
+        self.enroll()
+        self.reserve(CYCLE1, ATTEMPT1)
+        with self.assertRaises(PreconditionBlocked):
+            self.fence.verify_reserved_locked(DEVICE, CYCLE1, ATTEMPT1)
+        with self.fence.serialized():
+            self.fence.verify_reserved_locked(DEVICE, CYCLE1, ATTEMPT1)
+            for cycle, attempt in ((CYCLE1, ATTEMPT2),
+                                   (CYCLE2, ATTEMPT1)):
+                with self.subTest(cycle=cycle, attempt=attempt):
+                    with self.assertRaises(PreconditionBlocked):
+                        self.fence.verify_reserved_locked(DEVICE, cycle, attempt)
+
     def test_db_only_rollback_never_resends(self):
         self.enroll()
         saved = self.root / "old-ledger-copy"
