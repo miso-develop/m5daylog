@@ -144,6 +144,7 @@ class CycleFenceTests(unittest.TestCase):
         self.reserve(CYCLE1, ATTEMPT1)
         with closing(sqlite3.connect(self.root / "ledger.sqlite")) as db:
             db.execute("UPDATE consumed SET attempt=? WHERE seq=1", ("0" * 64,))
+            db.commit()
         with self.assertRaises(PreconditionBlocked):
             self.reserve(CYCLE2, ATTEMPT2)
 
