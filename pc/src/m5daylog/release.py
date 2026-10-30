@@ -65,6 +65,12 @@ class GateClosed(ReleaseError):
     pass
 
 
+class PreconditionBlocked(ReleaseError):
+    """#135 required pre-release mutation, observation or fence denied."""
+
+
+
+
 class GateState(str, Enum):
     OPEN = "OPEN"
     SEALED_FOR_RELEASE = "SEALED_FOR_RELEASE"
@@ -208,6 +214,8 @@ SyncFn = Callable[[], SyncSummary]
 DeviceIdFn = Callable[[], str]
 AckFn = Callable[[], AckFlushResult]
 MutationFn = Callable[[], None]
+ObservationFn = Callable[[EjectTarget, UsbSessionIoGate], bool]
+PreSendFn = Callable[[str, EjectTarget], None]
 
 
 class SyncReleaseCoordinator:
@@ -232,6 +240,8 @@ class SyncReleaseCoordinator:
         gate: UsbSessionIoGate,
         ack_flush: AckFn | None = None,
         cdc_mutations: MutationFn | None = None,
+        before_seal_observation: ObservationFn | None = None,
+        before_release_send: PreSendFn | None = None,
     ) -> ReleaseOutcome:
         # No release-side I/O before #51 returns with verified finals and DB commits.
         try:
@@ -253,19 +263,34 @@ class SyncReleaseCoordinator:
                     if not isinstance(ack_result, AckFlushResult) or not ack_result.handles_closed:
                         raise HostQuiesceError("ACK handles not confirmed closed")
 
-            # All ordinary CDC mutations, including SET_TIME, complete pre-seal.
-            if cdc_mutations is not None:
-                with gate.ordinary("cdc"):
-                    cdc_mutations()
-
-            # Device metadata, volume extent discovery, and filesystem checks
-            # are ordinary MSC I/O. Keep every such operation inside a lease;
-            # seal() then rejects new admission and drains existing leases.
+            # Resolve the exact MSC + CDC physical parent BEFORE the first
+            # ordinary mutation. A successful sync does not authorize a
+            # mutable COM alias or a newly enumerated volume.
             with gate.ordinary("msc"):
                 target = self.port.resolve_target(mount_root, expected_id)
                 self.port.revalidate_target(target, cdc_port)
                 if not self.port.volume_available(target):
                     raise AlreadyRemoved("exact volume absent before release")
+
+            # Required RTC/other pre-release mutations must complete while
+            # admission is open, on the already frozen exact CDC endpoint.
+            if cdc_mutations is not None:
+                with gate.ordinary("cdc"):
+                    cdc_mutations()
+
+            # #137: optional source-only, session-bound capacity observation.
+            # Its callback owns ordinary MSC admission and must return False
+            # when identity or epoch changes (capacity-only API failure warns).
+            if before_seal_observation is not None:
+                if before_seal_observation(target, gate) is not True:
+                    raise PreconditionBlocked("pre-seal observation unqualified")
+
+            # Recheck after CDC mutation and capacity observation, before
+            # the irreversible I/O seal. No ordinary I/O follows this barrier.
+            with gate.ordinary("msc"):
+                self.port.revalidate_target(target, cdc_port)
+                if not self.port.volume_available(target):
+                    raise AlreadyRemoved("exact volume absent before seal")
 
             gate.seal(timeout_s=self.timeout_s, clock=self.clock)
             attempt_id = str(uuid.uuid4())
@@ -273,6 +298,12 @@ class SyncReleaseCoordinator:
                 # Lock stays held until response and disappearance observation.
                 with self.port.quiesce(target):
                     gate.host_quiesced()
+                    # A caller-provided durable attempt fence MUST be persisted
+                    # before the first possible CDC release byte. This hook
+                    # never authorizes retry; the caller must validate a real
+                    # fresh Device session before supplying it.
+                    if before_release_send is not None:
+                        before_release_send(attempt_id, target)
                     self.port.release_storage(cdc_port, attempt_id, target)
                     gate.accepted()
                     deadline = self.clock() + self.timeout_s
@@ -297,6 +328,7 @@ class SyncReleaseCoordinator:
                 VolumeDismountError: "DISMOUNT_FAILED",
                 ReleaseTimeout: "TIMEOUT",
                 GateClosed: "GATE_CLOSED",
+                PreconditionBlocked: "PRECONDITION_BLOCKED",
             }
             reason = next(
                 (code for typ, code in known.items() if isinstance(exc, typ)),
