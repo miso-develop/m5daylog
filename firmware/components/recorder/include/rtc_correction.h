@@ -42,6 +42,11 @@ esp_err_t rtc_correction_init(void);
 // persistence. A second SET_TIME must return BUSY while this is true.
 bool rtc_correction_is_pending(void);
 
+// Cached origin proof of a successful BM8563 read plus settimeofday in the
+// current manual-WAKE recovery. Only reads RAM in GET_STATUS; fail closed
+// on hardware/clock errors and after an attempted SET_TIME mutation.
+bool rtc_correction_boot_clock_verified(void);
+
 // Validate an offset-bearing ISO-8601 instant, normalize it to UTC seconds,
 // write BM8563 + system time, then commit one pending correction to NVS.
 // `normalized` receives `YYYY-MM-DDTHH:MM:SS+00:00` on success.

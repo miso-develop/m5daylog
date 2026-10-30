@@ -384,7 +384,8 @@ static void recorder_enter_error(recorder_reason_t reason) {
 static bool recorder_manifest_record_wav(const char *wav_path,
                                          const char *rec_id,
                                          const char *started_at,
-                                         const char *state) {
+                                         const char *state,
+                                         uint32_t *out_verified_pcm_bytes) {
     char sha[RECORDER_SHA256_HEX_LEN];
     uint32_t size_bytes = 0;
     uint32_t pcm_bytes = 0;
@@ -434,14 +435,10 @@ static bool recorder_manifest_record_wav(const char *wav_path,
             RECORDER_MANIFEST_PATH, RECORDER_MANIFEST_TMP_PATH, s_device_id,
             s_manifest_now, s_manifest_entry);
         if (r == DEVICE_MANIFEST_OK) {
-            // #144: only a current-boot, SHA-checked nonempty FINALIZED WAV
-            // whose manifest was durably committed can supply one immutable
-            // cycle UUID. Recovered/old entries never execute this writer hook.
-            // The RTC/boot gate is independent from segment rotation.
-            if (strcmp(state, DEVICE_MANIFEST_STATE_FINALIZED) == 0 &&
-                release_cycle_fence_boot_qualified() &&
-                !rtc_correction_is_pending()) {
-                (void)release_cycle_witness_note_committed(rec_id, pcm_bytes);
+            // Keep the successful SHA/manifest PCM length for the TERMINAL
+            // writer only. Periodic rotation must not freeze a cycle UUID.
+            if (out_verified_pcm_bytes != NULL) {
+                *out_verified_pcm_bytes = pcm_bytes;
             }
             ESP_LOGI(TAG, "stage: manifest, result: ok");
             return true;
@@ -1169,7 +1166,7 @@ static void recorder_writer_task(void *arg) {
                          recorder_rotate_reason_str(reason));
                 if (!recorder_manifest_record_wav(
                         s_seg_wav, s_seg_rec_id, s_seg_started,
-                        DEVICE_MANIFEST_STATE_FINALIZED)) {
+                        DEVICE_MANIFEST_STATE_FINALIZED, NULL)) {
                     if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
                         pcm_pipeline_note_sd_error(&s_pipeline);
                         xSemaphoreGive(s_rec_lock);
@@ -1367,21 +1364,33 @@ static void recorder_writer_task(void *arg) {
         recorder_enter_error(RECORDER_REASON_FINALIZE);
     } else {
         ESP_LOGI(TAG, "stage: finalize, result: ok");
+        uint32_t terminal_verified_pcm_bytes = 0;
         if (!recorder_manifest_record_wav(s_seg_wav, s_seg_rec_id,
                                           s_seg_started,
-                                          DEVICE_MANIFEST_STATE_FINALIZED)) {
+                                          DEVICE_MANIFEST_STATE_FINALIZED,
+                                          &terminal_verified_pcm_bytes)) {
             if (xSemaphoreTake(s_rec_lock, portMAX_DELAY) == pdTRUE) {
                 pcm_pipeline_note_sd_error(&s_pipeline);
                 xSemaphoreGive(s_rec_lock);
             }
             recorder_enter_error(RECORDER_REASON_MANIFEST);
-        } else if (recorder_current_state() == RECORDER_STATE_USB_PREPARE &&
-                   !recorder_state_append_usb_capture_accounting(
-                       RECORDER_EVENTS_PATH, s_seg_rec_id,
-                       segment_open_elapsed_ms, seg_bytes)) {
-            // Diagnostic append failure must not rewrite valid finalized WAV.
-            ESP_LOGW(TAG,
-                     "stage: diagnostics, result: append-failed, type: usb_capture_accounting");
+        } else {
+            // This is the final segment of this recorder run. Freeze only
+            // after its actual SHA-checked manifest commit, never at rotation.
+            if (recorder_current_state() == RECORDER_STATE_USB_PREPARE &&
+                release_cycle_fence_boot_qualified()) {
+                (void)release_cycle_witness_note_committed(
+                    s_seg_rec_id, terminal_verified_pcm_bytes,
+                    rtc_correction_boot_clock_verified(),
+                    rtc_correction_is_pending());
+            }
+            if (recorder_current_state() == RECORDER_STATE_USB_PREPARE &&
+                !recorder_state_append_usb_capture_accounting(
+                    RECORDER_EVENTS_PATH, s_seg_rec_id,
+                    segment_open_elapsed_ms, seg_bytes)) {
+                ESP_LOGW(TAG,
+                         "stage: diagnostics, result: append-failed, type: usb_capture_accounting");
+            }
         }
     }
     {

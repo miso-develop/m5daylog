@@ -58,6 +58,9 @@ static i2c_master_bus_handle_t s_rtc_bus = NULL;
 static i2c_master_dev_handle_t s_rtc_dev = NULL;
 static bool s_hw_ready = false;
 static bool s_pending = false;
+// Only a valid BM8563 read and successful process-clock install during this
+// manual-WAKE recovery may grant a current-boot RTC origin witness.
+static bool s_boot_rtc_clock_verified = false;
 static rtc_pending_record_t s_pending_record;
 
 static bool rtc_is_leap(int year) {
@@ -418,17 +421,20 @@ static bool rtc_make_correction_id(char out[RECORDER_UUID_STR_LEN]) {
 static void rtc_sync_system_clock_best_effort_locked(void) {
     time_t rtc_epoch;
 
+    s_boot_rtc_clock_verified = false;
     if (rtc_hw_init() == ESP_OK &&
         rtc_hw_read_epoch(&rtc_epoch) == ESP_OK) {
         struct timeval tv = {.tv_sec = rtc_epoch, .tv_usec = 0};
-        (void)settimeofday(&tv, NULL);
+        if (settimeofday(&tv, NULL) == 0) {
+            s_boot_rtc_clock_verified = true;
+        }
     }
 
-    // Manual-WAKE recovery must not leave a new I2C resource resident on the
-    // later recorder -> TinyUSB publication path. A deinit failure is not
-    // allowed to weaken durable pending-event recovery; SET_TIME will still
-    // fail closed if the surviving transport cannot be used.
-    (void)rtc_hw_deinit();
+    // Tear the I2C transport down before TinyUSB; deinit failure is also
+    // a failed clock proof, not permission to publish releaseCycleId.
+    if (rtc_hw_deinit() != ESP_OK) {
+        s_boot_rtc_clock_verified = false;
+    }
 }
 
 static void rtc_format_epoch(time_t epoch,
@@ -474,6 +480,17 @@ esp_err_t rtc_correction_init(void) {
     }
     xSemaphoreGive(s_rtc_lock);
     return nvs_err;
+}
+
+bool rtc_correction_boot_clock_verified(void) {
+    bool verified = false;
+    if (s_rtc_lock == NULL ||
+        xSemaphoreTake(s_rtc_lock, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    verified = s_boot_rtc_clock_verified;
+    xSemaphoreGive(s_rtc_lock);
+    return verified;
 }
 
 bool rtc_correction_is_pending(void) {
@@ -546,6 +563,9 @@ rtc_correction_result_t rtc_correction_apply(
     memcpy(candidate.after, normalized_local, sizeof(candidate.after));
 
     // Mutation begins only after the request has been fully validated.
+    // An attempted SET_TIME can make existing clock provenance indeterminate.
+    // Keep the frozen UUID unchanged, but withhold it for this ownership cycle.
+    s_boot_rtc_clock_verified = false;
     err = rtc_hw_write_epoch(requested_epoch);
     if (err != ESP_OK) {
         xSemaphoreGive(s_rtc_lock);
@@ -659,6 +679,10 @@ esp_err_t rtc_correction_flush_pending_event(const char *events_path) {
 
 esp_err_t rtc_correction_init(void) {
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+bool rtc_correction_boot_clock_verified(void) {
+    return false;
 }
 
 bool rtc_correction_is_pending(void) {

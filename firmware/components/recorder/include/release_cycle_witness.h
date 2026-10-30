@@ -11,7 +11,9 @@ extern "C" {
 // corresponding FINALIZED manifest upsert completes durably. No recovery,
 // USB callback, host or RTC command is allowed to call this API.
 bool release_cycle_witness_note_committed(const char *recording_id,
-                                          uint32_t pcm_bytes);
+                                          uint32_t pcm_bytes,
+                                          bool rtc_verified,
+                                          bool rtc_pending);
 
 // Read-only after the recorder writer's completed task barrier. Never reads
 // SD, reads NVS, allocates, or changes the token. GET_STATUS must additionally

@@ -29,8 +29,11 @@ static bool canonical_lower_uuid(const char *id) {
 }
 
 bool release_cycle_witness_note_committed(const char *recording_id,
-                                          uint32_t pcm_bytes) {
-    if (s_frozen || pcm_bytes == 0u || (pcm_bytes & 1u) != 0u ||
+                                          uint32_t pcm_bytes,
+                                          bool rtc_verified,
+                                          bool rtc_pending) {
+    if (!rtc_verified || rtc_pending || s_frozen ||
+        pcm_bytes == 0u || (pcm_bytes & 1u) != 0u ||
         !canonical_lower_uuid(recording_id)) {
         return false;
     }

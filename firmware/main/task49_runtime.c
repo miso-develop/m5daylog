@@ -114,6 +114,7 @@ static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
     // proven current-run UUID, never a mutable recording ID or Device SD.
     out->release_cycle_id = NULL;
     if (state == RECORDER_STATE_USB_SYNC &&
+        rtc_correction_boot_clock_verified() &&
         !out->rtc_correction_pending &&
         !sd_mount_is_mounted() &&
         usb_msc_ownership_is_host_owned() &&
