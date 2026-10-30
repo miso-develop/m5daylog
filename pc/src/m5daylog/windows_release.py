@@ -697,3 +697,71 @@ class NativeWin32DeviceApi:
             }
         finally:
             self.k.CloseHandle(handle)
+
+    def set_time(self, port: str, binding: CdcInterface, utc_text: str) -> None:
+        """#21/#50 qualified pre-seal RTC mutation on a frozen CDC endpoint.
+
+        This is a source-only adapter. Caller MUST first prove the current
+        authorized MSC/CDC session and must not retry after indeterminate I/O.
+        No unattended caller is wired until an adequate release session fence
+        and current-running Device qualification both exist.
+        """
+        from datetime import datetime
+
+        if (not isinstance(utc_text, str)
+                or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+                                r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z", utc_text) is None):
+            raise ReleaseRejected("RTC input must be whole-second UTC")
+        try:
+            datetime.strptime(utc_text, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            raise ReleaseRejected("RTC input is invalid") from None
+        if not isinstance(binding, CdcInterface):
+            raise WrongTarget("frozen CDC endpoint required")
+        if self._cdc_interface(port) != binding:
+            raise WrongTarget("RTC endpoint no longer matches frozen binding")
+        request_id = str(uuid.uuid4())
+        request = (json.dumps({
+            "id": request_id, "cmd": "SET_TIME", "args": {"time": utc_text},
+        }, separators=(",", ":")) + "\n").encode("ascii")
+        handle = self._open(binding.device_path, GENERIC_READ | GENERIC_WRITE, 0)
+        try:
+            if self._cdc_interface(port) != binding:
+                raise WrongTarget("RTC endpoint changed during handle acquisition")
+            timeouts = COMMTIMEOUTS(0xFFFFFFFF, 0, 250, 0, 1000)
+            if not self.k.SetCommTimeouts(handle, ctypes.byref(timeouts)):
+                raise ReleaseRejected("RTC CDC timeout configuration failed")
+            written = wintypes.DWORD()
+            out = ctypes.create_string_buffer(request)
+            if not self.k.WriteFile(handle, out, len(request), ctypes.byref(written), None):
+                raise ReleaseIndeterminate("RTC CDC write outcome unproven")
+            if written.value != len(request):
+                raise ReleaseIndeterminate("RTC CDC short write")
+            deadline = time.monotonic() + 5.0
+            reply = bytearray()
+            while time.monotonic() < deadline and len(reply) < MAX_CDC_REPLY:
+                buf = ctypes.create_string_buffer(1)
+                got = wintypes.DWORD()
+                if not self.k.ReadFile(handle, buf, 1, ctypes.byref(got), None):
+                    raise ReleaseIndeterminate("RTC CDC response lost")
+                if got.value:
+                    reply.extend(buf.raw[:got.value])
+                    if reply.endswith(b"\n"):
+                        break
+            else:
+                raise ReleaseIndeterminate("RTC CDC response incomplete")
+            try:
+                response = json.loads(reply.decode("utf-8"))
+            except (ValueError, UnicodeError):
+                raise ReleaseIndeterminate("RTC CDC response malformed") from None
+            if not isinstance(response, dict) or response.get("id") != request_id:
+                raise ReleaseIndeterminate("RTC CDC response identity mismatch")
+            if response.get("ok") is False:
+                raise ReleaseRejected("RTC mutation rejected")
+            result = response.get("result")
+            if (response.get("ok") is not True or not isinstance(result, dict)
+                    or result.get("time") != utc_text
+                    or result.get("eventPending") is not True):
+                raise ReleaseIndeterminate("RTC pending event not proven")
+        finally:
+            self.k.CloseHandle(handle)
