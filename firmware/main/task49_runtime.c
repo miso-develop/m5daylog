@@ -22,6 +22,7 @@ static void recorder_task49_delete(TaskHandle_t task);
 #undef app_main
 
 #include "shutdown_armed.h"
+#include "release_cycle_fence.h"
 #include "rtc_correction.h"
 #include "recorder_nvs.h"
 #include "task87_wake_recovery.h"
@@ -331,6 +332,17 @@ static void recorder_handle_usb_release(void) {
         return;
     }
 
+    // R3 boot admission is deliberately separate from the existing release
+    // authority. A failed next-day re-arm cannot undo an accepted release;
+    // it must remain a visible fail-closed condition, never a retry.
+    if (release_cycle_fence_boot_qualified() &&
+        release_cycle_fence_note_release_completed() != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: release-cycle, result: nvs-rearm-error, action: fail-closed");
+        recorder_enter_error(RECORDER_REASON_INTERNAL);
+        return;
+    }
+
     // Armed intent is already durable before power shutdown. With USB still
     // present deep sleep is a functional shutdown; after cable removal HOLD=0
     // permits the board's power circuit to switch off. A HOLD/wakeup-disable
@@ -422,6 +434,13 @@ void app_main(void) {
     if (action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN) {
         recorder_shutdown_armed_now();
         return;
+    }
+    // The R3 release witness is optional and never changes legacy recorder
+    // recovery or enables CDC release on its own. Consume the durable ready
+    // marker BEFORE #87 can commit WAKE_RECOVERY_PENDING or NORMAL.
+    if (release_cycle_fence_begin_boot(manual_wake) != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "stage: release-cycle, result: boot-fence-error, action: witness-disabled");
     }
     task87_wake_recovery_init(
         &s_wake_recovery,

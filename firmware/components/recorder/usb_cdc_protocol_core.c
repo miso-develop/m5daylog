@@ -286,6 +286,7 @@ int usb_cdc_protocol_process_line(
         }
     } else if (strcmp(cmd, "GET_STATUS") == 0) {
         usb_cdc_protocol_status_t status;
+        char cycle_field[64] = "";
         memset(&status, 0, sizeof(status));
         if (!cdc_args_empty(args_item)) {
             n = cdc_error_response(out, out_size, id,
@@ -296,14 +297,35 @@ int usb_cdc_protocol_process_line(
             n = cdc_error_response(out, out_size, id,
                                    USB_CDC_ERROR_INTERNAL_ERROR);
         } else if (status.battery_valid) {
+            // A caller may not interpolate an unverified/host-supplied string
+            // into JSON. Only lowercase canonical UUIDs in USB_SYNC qualify
+            // for optional publication. The production provider currently
+            // leaves this NULL until manifest binding is independently proven.
+            if (status.release_cycle_id != NULL &&
+                strcmp(status.state, "USB_SYNC") == 0 &&
+                device_identity_is_valid_uuid(status.release_cycle_id) &&
+                strpbrk(status.release_cycle_id, "ABCDEF") == NULL) {
+                (void)snprintf(cycle_field, sizeof(cycle_field),
+                               ",\\"releaseCycleId\\":\\"%s\\"",
+                               status.release_cycle_id);
+            }
             n = snprintf(
                 out, out_size,
                 "{\"id\":\"%s\",\"ok\":true,\"result\":{"
                 "\"state\":\"%s\",\"reason\":\"%s\","
                 "\"batteryMv\":%d,\"rtcCorrectionPending\":%s}}",
                 id, status.state, status.reason, status.battery_mv,
-                status.rtc_correction_pending ? "true" : "false");
+                status.rtc_correction_pending ? "true" : "false",
+                cycle_field);
         } else {
+            if (status.release_cycle_id != NULL &&
+                strcmp(status.state, "USB_SYNC") == 0 &&
+                device_identity_is_valid_uuid(status.release_cycle_id) &&
+                strpbrk(status.release_cycle_id, "ABCDEF") == NULL) {
+                (void)snprintf(cycle_field, sizeof(cycle_field),
+                               ",\\"releaseCycleId\\":\\"%s\\"",
+                               status.release_cycle_id);
+            }
             n = snprintf(
                 out, out_size,
                 "{\"id\":\"%s\",\"ok\":true,\"result\":{"
