@@ -42,9 +42,11 @@ esp_err_t dev_fresh_install_nvs_provision_pristine(
     }
     if (err != ESP_ERR_NVS_NOT_FOUND) goto done;
 
-    // A single NVS commit publishes the identity, deliberately unqualified
-    // release fence, and NORMAL lifecycle together. A partial or uncertain
-    // commit must not trigger in-firmware retries or self-repair.
+    // Request persistence of the identity, unqualified release fence, and
+    // NORMAL lifecycle through one NVS commit. NVS does not guarantee that
+    // these three keys change atomically, including across power failure.
+    // A partial or uncertain write is a spent external installation attempt;
+    // neither this function nor its future caller may retry or self-repair.
     err = nvs_open("m5daylog", NVS_READWRITE, &handle);
     if (err != ESP_OK) goto done;
     err = nvs_set_str(handle, "device_id", expected_device_id);
