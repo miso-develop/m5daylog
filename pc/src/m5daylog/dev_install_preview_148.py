@@ -107,11 +107,16 @@ def _media_bytes(media: Any) -> dict[str, bytes]:
 def _settled_retained(files: dict[str, bytes], expected_id: str) -> dict[str, Any]:
     _require("device.json" in files and "manifest.json" in files,
              "BLOCKED_MEDIA_METADATA")
+    # Case aliases can refer to the same file on FAT/Windows media. A
+    # "complete" offline inventory must not quietly admit two aliases.
+    _require(len({p.casefold() for p in files}) == len(files),
+             "BLOCKED_MEDIA_CONFLICT")
     # Admission cannot invoke manifest recovery or operate on transaction scraps.
-    # Deny all pending/renamed files, including auxiliary metadata transactions.
+    # Deny pending files regardless of filename case, including auxiliary metadata.
     _require(not any(
-        any(part.endswith((".bak", ".tmp", ".part", ".partial", ".new", ".txn"))
-            or part.startswith(".part") for part in p.split("/"))
+        any(part.casefold().endswith(
+                (".bak", ".tmp", ".part", ".partial", ".new", ".txn"))
+            or part.casefold().startswith(".part") for part in p.split("/"))
         for p in files
     ), "BLOCKED_MEDIA_UNSETTLED")
     device = _json_document(files["device.json"])
@@ -169,9 +174,9 @@ def _settled_retained(files: dict[str, bytes], expected_id: str) -> dict[str, An
     # Other fully inventoried historical support files must remain byte-for-byte
     # untouched; a stray WAV or recording-directory artifact is never settled.
     extras = set(files) - seen_paths - {"device.json", "manifest.json"}
-    _require(not any(p.lower().endswith(".wav") or
-                     p.startswith("recordings/") or
-                     p in ("device.json", "manifest.json")
+    _require(not any(p.casefold().endswith(".wav") or
+                     p.casefold().startswith("recordings/") or
+                     p.casefold() in ("device.json", "manifest.json")
                      for p in extras), "BLOCKED_MEDIA_EXTRA_FILE")
     return {"retainedDeviceId": expected_id, "retainedRecordings": len(seen_ids),
             "retainedDigests": {p: hashlib.sha256(files[p]).hexdigest()
