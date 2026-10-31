@@ -313,7 +313,9 @@ static void recorder_first_use_monitor_poll(void) {
     // are counted by an ISR. USB callback session cuts invalidate the clock.
     if (!release_cycle_button_poll(custody, &epoch)) return;
     s_first_use_attempted = true;  // never retry uncertain NVS writes
-    if (!custody || release_cycle_button_session_epoch() != epoch) return;
+    // Recheck the physical low/ISR edge generation, not only USB epoch.
+    // An interrupted hold must never reach the FU_STAGED NVS transaction.
+    if (!custody || !release_cycle_button_witness_still_valid(epoch)) return;
 
     // The API additionally requires a positively provisioned UNQUALIFIED NVS
     // fence and durable HOST_UNRESOLVED; erased/legacy NVS never bootstraps.
@@ -325,7 +327,7 @@ static void recorder_first_use_monitor_poll(void) {
     }
     // A disconnect concurrent with the NVS transaction burns the stage.
     // A durable FU_STAGED marker alone can never grant a boot permit.
-    if (release_cycle_button_session_epoch() != epoch ||
+    if (!release_cycle_button_witness_still_valid(epoch) ||
         recorder_current_state() != RECORDER_STATE_USB_SYNC ||
         !usb_msc_ownership_release_command_admission_open() ||
         !usb_msc_ownership_is_host_owned() || !tud_mounted()) {
