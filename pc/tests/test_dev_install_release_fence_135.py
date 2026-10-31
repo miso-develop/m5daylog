@@ -304,6 +304,38 @@ class DevInstallReleaseFenceTests(unittest.TestCase):
                 self.assertFalse((root / "dev.sqlite").exists())
                 self.assertFalse((root / "dev-anchor.json").exists())
 
+    def test_enrolled_r3_recovery_sidecars_block_all_existing_entrypoints(self):
+        # A previously enrolled host with a dangling SQLite sidecar is NOT a
+        # fresh journal. Check before any writable sqlite3.connect() can
+        # silently normalize its recovery state.
+        for suffix in ("-journal", "-wal", "-shm"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as location:
+                root = Path(location)
+                (root / "device").mkdir()
+                fence = make(root)
+                fence.cycles.enroll(DEV, supervised=True)  # Synthetic only.
+                sidecar = root / ("r3.sqlite" + suffix)
+                sentinel = b"ambiguous enrolled R3 recovery"
+                sidecar.write_bytes(sentinel)
+                anchor_bytes = (root / "r3-anchor.json").read_bytes()
+                with (patch("sqlite3.connect",
+                            side_effect=AssertionError("SQLite recovery attempted")) as db_open,
+                      patch("m5daylog.release.SyncReleaseCoordinator.run",
+                            side_effect=AssertionError("sender invoked")) as sender):
+                    with fence.cycles.serialized():
+                        for operation in (
+                            lambda: fence.cycles.check_locked(DEV),
+                            lambda: fence.cycles.reserve_locked(DEV, CYCLE, CYCLE_ATTEMPT),
+                            lambda: fence.cycles.verify_reserved_locked(
+                                DEV, CYCLE, CYCLE_ATTEMPT),
+                        ):
+                            with self.assertRaises(PreconditionBlocked):
+                                operation()
+                    db_open.assert_not_called()
+                    sender.assert_not_called()
+                self.assertEqual(sidecar.read_bytes(), sentinel)
+                self.assertEqual((root / "r3-anchor.json").read_bytes(), anchor_bytes)
+
     def test_two_process_consumption_is_at_most_once(self):
         ctx = get_context("spawn")
         start, results = ctx.Event(), ctx.Queue()
