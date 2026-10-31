@@ -33,6 +33,10 @@ esp_err_t release_cycle_fence_note_recorder_ready(void);
 // durably indexed, current-boot nonzero-PCM manifest proof is also required.
 bool release_cycle_fence_boot_qualified(void);
 
+// RAM-only, current-boot admission origin. NULL unless the real durable
+// permit was consumed and #87 recorder readiness reached. Not a new grant.
+const char *release_cycle_fence_current_origin(void);
+
 // Call once after PC-owned USB_SYNC and durable HOST_UNRESOLVED are proven.
 // It cannot be invoked simply because a stale boot marker was found.
 esp_err_t release_cycle_fence_note_host_owned(void);
