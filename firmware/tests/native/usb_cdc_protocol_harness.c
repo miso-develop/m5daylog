@@ -10,17 +10,20 @@
 #define CHECK(expr) do { if (!(expr)) {     fprintf(stderr, "CHECK failed %s:%d: %s\n", __FILE__, __LINE__, #expr);     exit(2); } } while (0)
 
 static bool s_pending;
+static const char *s_release_cycle;
+static const char *s_status_state = "USB_SYNC";
 static unsigned s_set_time_calls;
 static unsigned s_release_calls;
 
 static bool status_provider(usb_cdc_protocol_status_t *out, void *ctx) {
     (void)ctx;
     CHECK(out != NULL);
-    out->state = "USB_SYNC";
+    out->state = s_status_state;
     out->reason = "usb";
     out->battery_mv = 3900;
     out->battery_valid = true;
     out->rtc_correction_pending = s_pending;
+    out->release_cycle_id = s_release_cycle;
     return true;
 }
 
@@ -87,6 +90,19 @@ static void expect(const usb_cdc_protocol_config_t *cfg, const char *raw,
     }
 }
 
+static void expect_without(const usb_cdc_protocol_config_t *cfg,
+                           const char *needle) {
+    char response[RESPONSE_BYTES] = {0};
+    usb_cdc_protocol_effect_t effect = {0};
+    static const char request[] =
+        "{\"id\":\"c\",\"cmd\":\"GET_STATUS\",\"args\":{}}";
+    int n = usb_cdc_protocol_process_line(
+        (const uint8_t *)request, strlen(request),
+        response, sizeof(response), cfg, &effect);
+    CHECK(n > 0 && (size_t)n < sizeof(response));
+    CHECK(strstr(response, needle) == NULL);
+}
+
 static void test_commands(const usb_cdc_protocol_config_t *cfg) {
     usb_cdc_protocol_effect_t effect;
     unsigned before_calls;
@@ -103,6 +119,21 @@ static void test_commands(const usb_cdc_protocol_config_t *cfg) {
            "\"deviceId\":\"01234567-89ab-4def-8123-456789abcdef\"", NULL);
     expect(cfg, "{\"id\":\"s\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
            "\"rtcCorrectionPending\":false", NULL);
+
+    /* Optional R3 release cycle is absent by default and for untrusted input. */
+    expect_without(cfg, "\"releaseCycleId\"");
+    s_release_cycle = "01234567-89ab-4def-8123-456789abcdef";
+    expect(cfg, "{\"id\":\"s\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
+           "\"releaseCycleId\":\"01234567-89ab-4def-8123-456789abcdef\"",
+           NULL);
+    s_status_state = "RECORDING";
+    expect_without(cfg, "\"releaseCycleId\"");
+    s_status_state = "USB_SYNC";
+    s_release_cycle = "01234567-89AB-4def-8123-456789abcdef";
+    expect_without(cfg, "\"releaseCycleId\"");
+    s_release_cycle = "bad\\\"json";
+    expect_without(cfg, "\"releaseCycleId\"");
+    s_release_cycle = NULL;
 
     expect(cfg, "{", "\"code\":\"INVALID_JSON\"", NULL);
     expect(cfg, "[]", "\"code\":\"INVALID_REQUEST\"", NULL);

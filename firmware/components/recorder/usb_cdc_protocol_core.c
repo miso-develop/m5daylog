@@ -9,6 +9,23 @@
 #include "cJSON.h"
 #include "recorder_config.h"
 
+static bool cdc_cycle_uuid_valid(const char *id) {
+    size_t i;
+    if (id == NULL || strlen(id) != 36u) {
+        return false;
+    }
+    for (i = 0u; i < 36u; ++i) {
+        const char c = id[i];
+        if (i == 8u || i == 13u || i == 18u || i == 23u) {
+            if (c != '-') return false;
+        } else if (!((c >= '0' && c <= '9') ||
+                     (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool cdc_id_valid(const char *id) {
     size_t i;
     size_t len;
@@ -286,6 +303,7 @@ int usb_cdc_protocol_process_line(
         }
     } else if (strcmp(cmd, "GET_STATUS") == 0) {
         usb_cdc_protocol_status_t status;
+        char cycle_field[64] = "";
         memset(&status, 0, sizeof(status));
         if (!cdc_args_empty(args_item)) {
             n = cdc_error_response(out, out_size, id,
@@ -295,22 +313,36 @@ int usb_cdc_protocol_process_line(
                    status.state == NULL || status.reason == NULL) {
             n = cdc_error_response(out, out_size, id,
                                    USB_CDC_ERROR_INTERNAL_ERROR);
-        } else if (status.battery_valid) {
-            n = snprintf(
-                out, out_size,
-                "{\"id\":\"%s\",\"ok\":true,\"result\":{"
-                "\"state\":\"%s\",\"reason\":\"%s\","
-                "\"batteryMv\":%d,\"rtcCorrectionPending\":%s}}",
-                id, status.state, status.reason, status.battery_mv,
-                status.rtc_correction_pending ? "true" : "false");
         } else {
-            n = snprintf(
-                out, out_size,
-                "{\"id\":\"%s\",\"ok\":true,\"result\":{"
-                "\"state\":\"%s\",\"reason\":\"%s\","
-                "\"batteryMv\":null,\"rtcCorrectionPending\":%s}}",
-                id, status.state, status.reason,
-                status.rtc_correction_pending ? "true" : "false");
+            // An optional cycle must be explicitly qualified by the Device
+            // provider, then independently syntax-gated before JSON output.
+            // No source UUID is forwarded in another recorder state.
+            if (status.release_cycle_id != NULL &&
+                strcmp(status.state, "USB_SYNC") == 0 &&
+                cdc_cycle_uuid_valid(status.release_cycle_id)) {
+                (void)snprintf(cycle_field, sizeof(cycle_field),
+                               ",\"releaseCycleId\":\"%s\"",
+                               status.release_cycle_id);
+            }
+            if (status.battery_valid) {
+                n = snprintf(
+                    out, out_size,
+                    "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                    "\"state\":\"%s\",\"reason\":\"%s\","
+                    "\"batteryMv\":%d,\"rtcCorrectionPending\":%s%s}}",
+                    id, status.state, status.reason, status.battery_mv,
+                    status.rtc_correction_pending ? "true" : "false",
+                    cycle_field);
+            } else {
+                n = snprintf(
+                    out, out_size,
+                    "{\"id\":\"%s\",\"ok\":true,\"result\":{"
+                    "\"state\":\"%s\",\"reason\":\"%s\","
+                    "\"batteryMv\":null,\"rtcCorrectionPending\":%s%s}}",
+                    id, status.state, status.reason,
+                    status.rtc_correction_pending ? "true" : "false",
+                    cycle_field);
+            }
         }
     } else if (strcmp(cmd, "SET_TIME") == 0) {
         cJSON *time_item = cJSON_GetObjectItemCaseSensitive(args_item, "time");

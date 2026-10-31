@@ -24,6 +24,7 @@ idf_component_register(
         "rtc_correction_event.c"
         "rtc_correction.c"
         "shutdown_armed.c"
+        "release_cycle_fence.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

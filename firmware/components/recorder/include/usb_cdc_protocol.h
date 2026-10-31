@@ -60,6 +60,9 @@ typedef struct {
     int battery_mv;
     bool battery_valid;
     bool rtc_correction_pending;
+    // Optional, already frozen and qualified by Device owner; NULL=omit.
+    // This field alone never grants release authority.
+    const char *release_cycle_id;
 } usb_cdc_protocol_status_t;
 
 typedef bool (*usb_cdc_protocol_status_provider_t)(
