@@ -20,7 +20,10 @@ from typing import Callable, Mapping
 from urllib.parse import quote
 
 from .release import PreconditionBlocked
-from .release_cycle_fence import Anchor, CycleAttemptFence, WindowsRegistryAnchor
+from .release_cycle_fence import (
+    Anchor, CycleAttemptFence, WindowsRegistryAnchor,
+    _sqlite_recovery_sidecars_present,
+)
 
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -127,11 +130,10 @@ class DevInstallReleaseFence:
                 "state": "CONSUMED", "receipt": receipt.fingerprint()}
 
     def _read(self) -> dict[str, object]:
+        if _sqlite_recovery_sidecars_present(self.database):
+            raise PreconditionBlocked("DEV release SQLite recovery uncertain")
         if not self.database.is_file():
             raise PreconditionBlocked("DEV release consumption absent")
-        if any(self.database.with_name(self.database.name + ext).exists()
-               for ext in ("-journal", "-wal", "-shm")):
-            raise PreconditionBlocked("DEV release SQLite recovery uncertain")
         try:
             with closing(sqlite3.connect(
                     "file:" + quote(self.database.as_posix(), safe="/:") + "?mode=ro",
@@ -189,7 +191,8 @@ class DevInstallReleaseFence:
         try:
             local_exists = self.database.exists()
             remote = self.anchor.read()
-            if local_exists or remote is not None:
+            if (local_exists or _sqlite_recovery_sidecars_present(self.database)
+                    or remote is not None):
                 raise PreconditionBlocked("DEV release generation already used or uncertain")
             self.database.parent.mkdir(parents=True, exist_ok=True)
             with closing(sqlite3.connect(self.database, isolation_level=None)) as db:
