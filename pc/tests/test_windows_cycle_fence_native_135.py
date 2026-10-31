@@ -89,7 +89,7 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         (self.root / "fake_device").mkdir()
-        self.key = r"Software\\M5DaylogFenceTest_" + uuid.uuid4().hex
+        self.key = r"Software\M5DaylogFenceTest_" + uuid.uuid4().hex
         self.addCleanup(self._remove_registry_key)
         self.fence = _fence(self.root, self.key)
 
@@ -127,8 +127,6 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
         with sqlite3.connect(self.fence.database) as db:
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM consumed").fetchone(), (1,))
-        with _fence(self.root, self.key).serialized() as_unused:
-            pass
         restarted = _fence(self.root, self.key)
         with restarted.serialized():
             restarted.verify_reserved_locked(DEVICE, CYCLE, ATTEMPT)
@@ -264,8 +262,9 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
             fence=self.fence, intent_file=file, **facts,
         ))
         self.assertEqual(file.read()["state"], "CONSUMED")
-        with _fence(self.root, self.key).serialized():
-            _fence(self.root, self.key).verify_reserved_locked(DEVICE, CYCLE, ATTEMPT)
+        restarted = _fence(self.root, self.key)
+        with restarted.serialized():
+            restarted.verify_reserved_locked(DEVICE, CYCLE, ATTEMPT)
         with self.assertRaises(PreconditionBlocked):
             consume_first_use_source_only(fence=_fence(self.root, self.key),
                                           intent_file=file, **facts)
