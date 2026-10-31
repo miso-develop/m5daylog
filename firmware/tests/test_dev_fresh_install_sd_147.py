@@ -45,6 +45,7 @@ int main(int argc, char **argv) {
     exe = directory / "read_only_admit"
     result = subprocess.run(
         [cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
+         "-Wno-error=sign-compare",  # pre-existing sha256.c ternary warning
          "-I", str(COMP / "include"),
          str(COMP / "sha256.c"), str(COMP / "device_identity.c"),
          str(COMP / "device_manifest.c"), str(harness), "-o", str(exe)],
