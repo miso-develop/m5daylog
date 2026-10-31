@@ -22,6 +22,10 @@ static void recorder_task49_delete(TaskHandle_t task);
 #undef app_main
 
 #include "shutdown_armed.h"
+#include "release_cycle_fence.h"
+#include "release_cycle_button.h"
+#include "release_cycle_witness.h"
+#include "tusb.h"
 #include "rtc_correction.h"
 #include "recorder_nvs.h"
 #include "task87_wake_recovery.h"
@@ -49,6 +53,8 @@ extern bool device_manifest_sync_wav_dir(const char *recordings_dir,
 
 static task87_wake_recovery_t s_wake_recovery;
 static TaskHandle_t s_usb_event_task = NULL;
+static bool s_first_use_attempted;
+static bool s_first_use_button_ready;
 
 static usb_cdc_release_result_t recorder_cdc_release_accept(
     const char *release_attempt_id,
@@ -59,6 +65,8 @@ static usb_cdc_release_result_t recorder_cdc_release_accept(
     result = usb_msc_ownership_accept_release_storage(release_attempt_id);
     switch (result) {
         case USB_MSC_RELEASE_STORAGE_ACCEPTED:
+            // Exactly the existing CDC D-031 acceptance, not SCSI/DETACH.
+            release_cycle_fence_note_canonical_release_accepted();
             return USB_CDC_RELEASE_ACCEPTED;
         case USB_MSC_RELEASE_STORAGE_INVALID_ARGS:
             return USB_CDC_RELEASE_INVALID_ARGS;
@@ -84,6 +92,8 @@ static bool recorder_cdc_command_admission_open(void *ctx) {
 
 static void recorder_cdc_physical_session_cutoff(void *ctx) {
     (void)ctx;
+    release_cycle_button_note_session_cutoff();
+    release_cycle_fence_note_physical_session_cutoff();
     usb_cdc_protocol_close_session();
 }
 
@@ -107,6 +117,24 @@ static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
     out->battery_mv = battery_mv;
     out->battery_valid = battery_mv > 0;
     out->rtc_correction_pending = rtc_correction_is_pending();
+    // Writer and USB tasks are serialized by the finalization/ownership
+    // barrier: status reads only the immutable terminal current-run UUID.
+    out->release_cycle_id = NULL;
+    out->release_cycle_origin = NULL;
+    if (state == RECORDER_STATE_USB_SYNC &&
+        rtc_correction_cycle_status_qualified() &&
+        !sd_mount_is_mounted() &&
+        usb_msc_ownership_is_host_owned() &&
+        usb_msc_ownership_release_command_admission_open() &&
+        release_cycle_fence_boot_qualified() &&
+        release_cycle_fence_host_owned_qualified()) {
+        const char *const frozen = release_cycle_witness_frozen_id();
+        const char *const origin = release_cycle_fence_current_origin();
+        if (frozen != NULL && origin != NULL) {
+            out->release_cycle_id = frozen;
+            out->release_cycle_origin = origin;
+        }
+    }
     return out->state != NULL && out->reason != NULL;
 }
 
@@ -269,6 +297,49 @@ static void recorder_flush_usb_scsi_trace(void) {
     }
 }
 
+static void recorder_first_use_monitor_poll(void) {
+    uint32_t epoch = 0u;
+    bool custody;
+    esp_err_t err;
+
+    if (s_first_use_attempted || !s_first_use_button_ready) return;
+    custody = recorder_current_state() == RECORDER_STATE_USB_SYNC &&
+        !sd_mount_is_mounted() &&
+        usb_msc_ownership_is_host_owned() &&
+        usb_msc_ownership_release_command_admission_open() &&
+        tud_mounted();
+
+    // Proof is a *continuous* GPIO42-low observation; physical release edges
+    // are counted by an ISR. USB callback session cuts invalidate the clock.
+    if (!release_cycle_button_poll(custody, &epoch)) return;
+    s_first_use_attempted = true;  // never retry uncertain NVS writes
+    // Recheck the physical low/ISR edge generation, not only USB epoch.
+    // An interrupted hold must never reach the FU_STAGED NVS transaction.
+    if (!custody || !release_cycle_button_witness_still_valid(epoch)) return;
+
+    // The API additionally requires a positively provisioned UNQUALIFIED NVS
+    // fence and durable HOST_UNRESOLVED; erased/legacy NVS never bootstraps.
+    err = release_cycle_fence_stage_first_use();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+            "stage: first-use, result: staging-unqualified, action: release-blocked");
+        return;
+    }
+    // A disconnect concurrent with the NVS transaction burns the stage.
+    // A durable FU_STAGED marker alone can never grant a boot permit.
+    if (!release_cycle_button_witness_still_valid(epoch) ||
+        recorder_current_state() != RECORDER_STATE_USB_SYNC ||
+        !usb_msc_ownership_release_command_admission_open() ||
+        !usb_msc_ownership_is_host_owned() || !tud_mounted()) {
+        release_cycle_fence_cancel_first_use_staging();
+        ESP_LOGW(TAG,
+            "stage: first-use, result: witness-lost, action: release-blocked");
+        return;
+    }
+    ESP_LOGI(TAG,
+        "stage: first-use, result: intent-durable, release-authority: none");
+}
+
 static void recorder_handle_usb_host_owned(void) {
     if (recorder_current_state() != RECORDER_STATE_USB_PREPARE ||
         sd_mount_is_mounted() ||
@@ -282,6 +353,22 @@ static void recorder_handle_usb_host_owned(void) {
         return;
     }
 
+    // R3 adds a separate PC-owned witness; it never authorizes release alone.
+    if (release_cycle_fence_boot_qualified() &&
+        release_cycle_fence_note_host_owned() != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "stage: release-cycle, result: ownership-witness-error, action: witness-disabled");
+    }
+
+    // A failed physical GPIO interrupt setup cannot synthesize a 10s press.
+    if (!s_first_use_attempted && !s_first_use_button_ready) {
+        s_first_use_button_ready = release_cycle_button_init() == ESP_OK;
+        if (!s_first_use_button_ready) {
+            s_first_use_attempted = true;
+            ESP_LOGW(TAG,
+                "stage: first-use, result: gpio-unavailable, action: disabled");
+        }
+    }
     // D-031 command admission opens only after PC ownership / USB_SYNC.
     usb_cdc_protocol_open_session();
     recorder_flush_usb_scsi_trace();
@@ -328,6 +415,21 @@ static void recorder_handle_usb_release(void) {
     // fail-closed and never reaches HOLD release.
     if (usb_msc_ownership_complete_release_quiesce() != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_USB);
+        return;
+    }
+
+    // R3 boot admission is deliberately separate from the existing release
+    // authority. A failed next-day re-arm cannot undo an accepted release;
+    // it must remain a visible fail-closed condition, never a retry.
+    // Loss of the optional host-owned NVS witness withholds the R5 status
+    // pair and next-day re-arm; it must not prevent the already accepted
+    // D-031 quiesce/SHUTDOWN_ARMED from reaching functional shutdown.
+    if (release_cycle_fence_rearm_required(
+            release_cycle_witness_frozen_id() != NULL) &&
+        release_cycle_fence_note_release_completed() != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: release-cycle, result: nvs-rearm-error, action: fail-closed");
+        recorder_enter_error(RECORDER_REASON_INTERNAL);
         return;
     }
 
@@ -381,6 +483,7 @@ static void recorder_usb_event_task(void *arg) {
                 break;
         }
         recorder_flush_usb_scsi_trace();
+        recorder_first_use_monitor_poll();
     }
 }
 
@@ -422,6 +525,13 @@ void app_main(void) {
     if (action == SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN) {
         recorder_shutdown_armed_now();
         return;
+    }
+    // The R3 release witness is optional and never changes legacy recorder
+    // recovery or enables CDC release on its own. Consume the durable ready
+    // marker BEFORE #87 can commit WAKE_RECOVERY_PENDING or NORMAL.
+    if (release_cycle_fence_begin_boot(manual_wake) != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "stage: release-cycle, result: boot-fence-error, action: witness-disabled");
     }
     task87_wake_recovery_init(
         &s_wake_recovery,
@@ -484,6 +594,14 @@ void app_main(void) {
         recorder_cdc_release_response_complete;
     cdc_config.command_admission_open =
         recorder_cdc_command_admission_open;
+
+    // Complete the boot-local origin proof only after successful RTC and
+    // recorder recovery; status publication still additionally requires a
+    // finalized current-boot PCM/manifest witness (not yet connected).
+    if (release_cycle_fence_note_recorder_ready() != ESP_OK) {
+        ESP_LOGD(TAG,
+                 "stage: release-cycle, result: recorder-origin-unqualified");
+    }
 
     if (usb_msc_ownership_init() != ESP_OK ||
         usb_msc_ownership_set_physical_session_cutoff(

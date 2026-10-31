@@ -39,7 +39,7 @@ extern "C" {
 //   evidence: it must not be counted as dropped audio.
 typedef struct {
     uint32_t samples_captured;   // whole 16bit samples accepted
-    uint32_t chunks_written;     // full slots drained to SD
+    uint32_t chunks_written;     // slots drained to SD (including terminal partial)
     uint32_t buffer_overflow;    // software both-full produce events
     uint32_t buffer_drop_bytes;  // software-dropped payload bytes
     uint32_t buffer_drop_samples;  // whole samples among software drops
@@ -75,10 +75,17 @@ void pcm_pipeline_init(pcm_pipeline_t *pipeline, uint8_t *backing0,
 size_t pcm_pipeline_produce(pcm_pipeline_t *pipeline, const uint8_t *data,
                             size_t len);
 
-// True when at least one full slot is ready for the SD writer.
+// After the capture task has stopped, publish every remaining sample-aligned
+// partial slot for terminal drain. Must run only after producer quiescence,
+// under the pipeline lock. Returns the newly sealed byte count (zero is OK).
+size_t pcm_pipeline_seal_partial(pcm_pipeline_t *pipeline);
+
+// True when at least one sealed slot is ready for the SD writer.
 bool pcm_pipeline_has_full(const pcm_pipeline_t *pipeline);
 
-// Oldest full slot payload (always RECORDER_BUFFER_BYTES). NULL when none.
+// Oldest sealed slot payload (1..RECORDER_BUFFER_BYTES, sample aligned).
+// During capture, sealed slots are always full 32KB; a terminal tail can be
+// shorter only after pcm_pipeline_seal_partial(). NULL when none.
 const uint8_t *pcm_pipeline_peek_full(const pcm_pipeline_t *pipeline,
                                       size_t *out_len);
 

@@ -1902,3 +1902,268 @@ bool device_manifest_sync_wav_dir(const char *recordings_dir,
     }
     return true;
 }
+
+
+// #147 FI2-R: strictly non-mutating, explicit development-install R verifier.
+// The approved installer must establish exclusive offline media custody first;
+// passing this function is NOT a first-use permit, a physical writer proof,
+// a Device identity attestation or permission for the normal boot recovery.
+static bool dev_fi_absent(const char *path) {
+    struct stat st;
+    errno = 0;
+    return stat(path, &st) != 0 && errno == ENOENT;
+}
+
+static bool dev_fi_canonical_device_json(const char *path,
+                                         const char *device_id) {
+    char *doc = NULL;
+    size_t len = 0, n = 0;
+    unsigned version = 0;
+    char id[RECORDER_UUID_STR_LEN], model[65], firmware[65], canonical[512];
+    const char *value = NULL;
+    bool ok = false;
+    if (!read_file_bounded(path, &doc, &len, 2048u)) return false;
+    if (!device_identity_parse_schema_version(doc, len, &version) ||
+        version != RECORDER_METADATA_SCHEMA_VERSION ||
+        !device_identity_parse_device_id(doc, len, id) ||
+        strcmp(id, device_id) != 0 ||
+        !json_string_field(doc, len, "\"model\"", NULL, &value, &n) ||
+        n == 0u || n >= sizeof(model)) goto done;
+    memcpy(model, value, n);
+    model[n] = '\0';
+    if (!json_string_field(doc, len, "\"firmwareVersion\"", NULL, &value, &n) ||
+        n == 0u || n >= sizeof(firmware)) goto done;
+    memcpy(firmware, value, n);
+    firmware[n] = '\0';
+    ok = device_identity_build_device_json(
+        device_id, model, firmware, canonical, sizeof(canonical)) &&
+        strlen(canonical) == len && memcmp(doc, canonical, len) == 0;
+done:
+    free(doc);
+    return ok;
+}
+
+static bool dev_fi_canonical_entry_name(const char *filename,
+                                        const char *recording_id) {
+    // One dated directory + six-digit UTC filename + canonical UUID.
+    const char *date;
+    const char *time6;
+    unsigned i;
+    if (strlen(filename) != 11u + 10u + 1u + 6u + 1u + 36u + 4u ||
+        strncmp(filename, "recordings/", 11u) != 0 ||
+        filename[21] != '/' || filename[28] != '_' ||
+        strncmp(filename + 29u, recording_id, 36u) != 0 ||
+        strcmp(filename + 65u, ".wav") != 0) return false;
+    date = filename + 11u;
+    time6 = filename + 22u;
+    if (date[4] != '-' || date[7] != '-') return false;
+    for (i = 0; i < 10u; i++) {
+        if (i != 4u && i != 7u && !is_digit(date[i])) return false;
+    }
+    if (!valid_calendar_date(
+            (unsigned)(date[0]-'0')*1000u+(unsigned)(date[1]-'0')*100u+
+            (unsigned)(date[2]-'0')*10u+(unsigned)(date[3]-'0'),
+            (unsigned)(date[5]-'0')*10u+(unsigned)(date[6]-'0'),
+            (unsigned)(date[8]-'0')*10u+(unsigned)(date[9]-'0'))) return false;
+    for (i = 0; i < 6u; i++) if (!is_digit(time6[i])) return false;
+    return (time6[0]-'0')*10+(time6[1]-'0') < 24 &&
+           (time6[2]-'0')*10+(time6[3]-'0') < 60 &&
+           (time6[4]-'0')*10+(time6[5]-'0') < 60;
+}
+
+static bool dev_fi_count_recordings_readonly(const char *recordings_dir,
+                                              uint32_t *out_count) {
+    DIR *dir = opendir(recordings_dir);
+    struct dirent *entry;
+    uint32_t total = 0;
+    bool ok = dir != NULL;
+    if (!ok) return false;
+    for (;;) {
+        char date_path[RECORDER_MAX_PATH_LEN];
+        DIR *dated = NULL;
+        struct stat st;
+        struct dirent *wav;
+        int n;
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) { if (errno != 0) ok = false; break; }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) continue;
+        if (!valid_date_dir(entry->d_name)) { ok = false; break; }
+        n = snprintf(date_path, sizeof(date_path), "%s/%s", recordings_dir,
+                     entry->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(date_path) ||
+            stat(date_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            ok = false; break;
+        }
+        dated = opendir(date_path);
+        if (!dated) { ok = false; break; }
+        for (;;) {
+            char full[RECORDER_MAX_PATH_LEN];
+            char relative[192];
+            char recorded[65];
+            int len, rel_len;
+            errno = 0;
+            wav = readdir(dated);
+            if (!wav) { if (errno != 0) ok = false; break; }
+            if (strcmp(wav->d_name, ".") == 0 ||
+                strcmp(wav->d_name, "..") == 0) continue;
+            len = snprintf(full, sizeof(full), "%s/%s",
+                           date_path, wav->d_name);
+            rel_len = snprintf(relative, sizeof(relative),
+                               "recordings/%s/%s", entry->d_name, wav->d_name);
+            if (len <= 0 || (size_t)len >= sizeof(full) ||
+                rel_len <= 0 || (size_t)rel_len >= sizeof(relative) ||
+                stat(full, &st) != 0 || !S_ISREG(st.st_mode) ||
+                !device_manifest_extract_recording_id(
+                    wav->d_name, recorded, sizeof(recorded)) ||
+                !device_identity_is_valid_uuid(recorded) ||
+                !dev_fi_canonical_entry_name(relative, recorded) ||
+                total == UINT32_MAX) {
+                ok = false; break;
+            }
+            total++;
+        }
+        if (closedir(dated) != 0) ok = false;
+        if (!ok) break;
+    }
+    if (closedir(dir) != 0) ok = false;
+    if (ok) *out_count = total;
+    return ok;
+}
+
+
+// No rename/cleanup is permitted during R admission. In particular, reject
+// pending artifacts outside recordings/ (including a nonempty quarantine).
+// Benign inventoried files such as events.jsonl remain untouched; the offline
+// host custody inventory is still an independent prerequisite.
+static bool dev_fi_root_settled(const char *manifest_path) {
+    char root[RECORDER_MAX_PATH_LEN];
+    const char *slash = strrchr(manifest_path, '/');
+    DIR *dir;
+    struct dirent *entry;
+    bool ok = true;
+    if (slash == NULL || slash == manifest_path ||
+        (size_t)(slash - manifest_path) >= sizeof(root)) return false;
+    memcpy(root, manifest_path, (size_t)(slash - manifest_path));
+    root[slash - manifest_path] = '\0';
+    dir = opendir(root);
+    if (!dir) return false;
+    for (;;) {
+        size_t n;
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) { if (errno != 0) ok = false; break; }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) continue;
+        n = strlen(entry->d_name);
+        if ((n >= 4u && (strcmp(entry->d_name + n - 4u, ".tmp") == 0 ||
+                          strcmp(entry->d_name + n - 4u, ".bak") == 0)) ||
+            (n >= 5u && strcmp(entry->d_name + n - 5u, ".part") == 0)) {
+            ok = false; break;
+        }
+        if (strcmp(entry->d_name, "quarantine") == 0) {
+            char path[RECORDER_MAX_PATH_LEN];
+            struct stat st;
+            DIR *quarantine;
+            struct dirent *file;
+            int wrote = snprintf(path, sizeof(path), "%s/quarantine", root);
+            if (wrote <= 0 || (size_t)wrote >= sizeof(path) ||
+                stat(path, &st) != 0 || !S_ISDIR(st.st_mode) ||
+                (quarantine = opendir(path)) == NULL) {
+                ok = false; break;
+            }
+            for (;;) {
+                errno = 0;
+                file = readdir(quarantine);
+                if (!file) { if (errno != 0) ok = false; break; }
+                if (strcmp(file->d_name, ".") != 0 &&
+                    strcmp(file->d_name, "..") != 0) {
+                    ok = false; break;
+                }
+            }
+            if (closedir(quarantine) != 0) ok = false;
+            if (!ok) break;
+        }
+    }
+    if (closedir(dir) != 0) ok = false;
+    return ok;
+}
+
+bool device_manifest_verify_settled_readonly(
+    const char *recordings_dir, const char *manifest_path,
+    const char *tmp_path, const char *device_json_path,
+    const char *device_id, uint32_t *out_count) {
+    char backup[RECORDER_MAX_PATH_LEN];
+    char *doc = NULL;
+    size_t len = 0;
+    const char *p, *end;
+    uint32_t entries = 0, disk_entries = 0;
+    bool ok = false;
+    if (out_count != NULL) *out_count = 0;
+    if (out_count == NULL || recordings_dir == NULL ||
+        manifest_path == NULL || tmp_path == NULL ||
+        device_json_path == NULL ||
+        !device_identity_is_valid_uuid(device_id) ||
+        !manifest_backup_path(manifest_path, backup) ||
+        !dev_fi_root_settled(manifest_path) ||
+        !dev_fi_absent(tmp_path) || !dev_fi_absent(backup) ||
+        !dev_fi_canonical_device_json(device_json_path, device_id) ||
+        !read_file_bounded(manifest_path, &doc, &len,
+                           DEVICE_MANIFEST_ADMISSION_CEILING_BYTES)) return false;
+    if (!manifest_snapshot_valid(doc, len, device_id)) goto done;
+    p = memfind(doc, len, "\"recordings\":[");
+    if (!p) goto done;
+    p += strlen("\"recordings\":[");
+    end = doc + len;
+    while (p < end && *p == '{') {
+        const char *id, *filename, *hash, *v;
+        size_t id_len, filename_len, hash_len, n;
+        char recording_id[RECORDER_UUID_STR_LEN], relative[192];
+        char hash_expected[RECORDER_SHA256_HEX_LEN];
+        char actual_hash[RECORDER_SHA256_HEX_LEN];
+        char full[RECORDER_MAX_PATH_LEN];
+        uint32_t duration, size, actual_size = 0;
+        int printed;
+        if (!manifest_expect(&p, end, "{\"recordingId\":") ||
+            !manifest_string(&p, end, &id, &id_len) ||
+            !manifest_expect(&p, end, ",\"filename\":") ||
+            !manifest_string(&p, end, &filename, &filename_len) ||
+            !manifest_expect(&p, end, ",\"startedAt\":") ||
+            !manifest_string(&p, end, &v, &n) ||
+            !manifest_expect(&p, end, ",\"durationMs\":") ||
+            !manifest_uint32(&p, end, &duration) ||
+            !manifest_expect(&p, end, ",\"sizeBytes\":") ||
+            !manifest_uint32(&p, end, &size) ||
+            !manifest_expect(&p, end, ",\"sha256\":") ||
+            !manifest_string(&p, end, &hash, &hash_len) ||
+            id_len != 36u || filename_len >= sizeof(relative) ||
+            hash_len != 64u || entries == UINT32_MAX) goto done;
+        memcpy(recording_id, id, id_len); recording_id[id_len] = '\0';
+        memcpy(relative, filename, filename_len); relative[filename_len] = '\0';
+        memcpy(hash_expected, hash, hash_len); hash_expected[hash_len] = '\0';
+        if (!dev_fi_canonical_entry_name(relative, recording_id)) goto done;
+        printed = snprintf(full, sizeof(full), "%s/%s",
+                           recordings_dir, relative + 11u);
+        if (printed <= 0 || (size_t)printed >= sizeof(full) ||
+            !device_manifest_hash_wav_file(full, actual_hash, &actual_size) ||
+            size != actual_size || strcmp(hash_expected, actual_hash) != 0)
+            goto done;
+        // The canonical v1 snapshot parser already validated all remaining
+        // fields, ordering, numbers and duplicate recording IDs. Stay within
+        // this entry; never treat a later record as its own closing brace.
+        p = memchr(p, '}', (size_t)(end - p));
+        if (!p) goto done;
+        p++;
+        entries++;
+        if (p < end && *p == ',') p++;
+    }
+    if (p >= end || *p != ']' ||
+        !dev_fi_count_recordings_readonly(recordings_dir, &disk_entries) ||
+        entries == 0u || disk_entries != entries) goto done;
+    *out_count = entries;
+    ok = true;
+done:
+    free(doc);
+    return ok;
+}
