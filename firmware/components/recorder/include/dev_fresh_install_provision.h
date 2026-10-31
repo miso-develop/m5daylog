@@ -10,9 +10,11 @@
 extern "C" {
 #endif
 
-// Atomically stage the exact three fresh-session keys only when BOTH recorder
-// namespaces are completely absent. A present namespace, including one left
-// by a partial/uncertain earlier attempt, is a hard failure; never repair it.
+// Request persistence of three fresh-session keys using a single NVS commit
+// only when BOTH recorder namespaces are absent. ESP-IDF does not guarantee
+// multi-key transaction atomicity: any set/commit/readback failure is an
+// indeterminate, externally SPENT attempt. Never retry or repair automatically.
+// A present namespace, including one from a partial attempt, blocks re-entry.
 // Does not inspect unrelated NVS namespaces: independent partition inventory
 // and custody evidence is required before this operation is authorized.
 // On success, separately reopens and checks the committed keys and RTC marker.
