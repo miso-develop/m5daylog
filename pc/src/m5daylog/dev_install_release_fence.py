@@ -17,6 +17,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
+from urllib.parse import quote
 
 from .release import PreconditionBlocked
 from .release_cycle_fence import Anchor, CycleAttemptFence, WindowsRegistryAnchor
@@ -42,7 +43,7 @@ def _digest(value: str) -> str:
     return value
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class DevInstallReceipt:
     """Private receipt *descriptor*, NOT authority or a self-issued permit.
 
@@ -133,7 +134,8 @@ class DevInstallReleaseFence:
             raise PreconditionBlocked("DEV release SQLite recovery uncertain")
         try:
             with closing(sqlite3.connect(
-                    f"file:{self.database.as_posix()}?mode=ro", uri=True,
+                    "file:" + quote(self.database.as_posix(), safe="/:") + "?mode=ro",
+                    uri=True,
                     timeout=0.25)) as db:
                 if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
                     raise PreconditionBlocked("DEV release ledger corrupt")
