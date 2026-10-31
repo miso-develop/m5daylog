@@ -53,6 +53,12 @@ void release_cycle_fence_note_canonical_release_accepted(void);
 // canonical acceptance; no persistent state mutation/re-enrollment.
 void release_cycle_fence_note_physical_session_cutoff(void);
 
+// Burn the in-flight staging attempt if the *physical hold witness* fails
+// a post-commit check. Unlike a normal post-accept USB disconnect, this
+// invalidates even an already observed release acceptance. FU_STAGED stays
+// durably non-eligible; no new first-use boot permit can result.
+void release_cycle_fence_cancel_first_use_staging(void);
+
 // Call once after PC-owned USB_SYNC and durable HOST_UNRESOLVED are proven.
 // It cannot be invoked simply because a stale boot marker was found.
 esp_err_t release_cycle_fence_note_host_owned(void);
