@@ -99,6 +99,19 @@ int main(int argc, char **argv) {
             release_cycle_fence_note_canonical_release_accepted();
             g_lifecycle = 1;
             release = release_cycle_fence_note_release_completed();
+        } else if (strcmp(argv[1], "fu_bad_hold_after_accept") == 0 &&
+                   stage == ESP_OK) {
+            // CDC accept may race with the post-commit GPIO recheck.
+            release_cycle_fence_note_canonical_release_accepted();
+            release_cycle_fence_cancel_first_use_staging();
+            g_lifecycle = 1;
+            release = release_cycle_fence_note_release_completed();
+        } else if (strcmp(argv[1], "fu_bad_hold_before_accept") == 0 &&
+                   stage == ESP_OK) {
+            release_cycle_fence_cancel_first_use_staging();
+            release_cycle_fence_note_canonical_release_accepted();
+            g_lifecycle = 1;
+            release = release_cycle_fence_note_release_completed();
         }
     }
     // Simulate a successful #87 RTC/recording transition only after a newly
