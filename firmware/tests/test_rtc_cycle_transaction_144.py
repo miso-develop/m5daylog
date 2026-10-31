@@ -263,12 +263,12 @@ static void request(const usb_cdc_protocol_config_t *cfg, const char *raw,
     int n = usb_cdc_protocol_process_line(
         (const uint8_t *)raw, strlen(raw), out, sizeof(out), cfg, &effect);
     CHECK(n > 0 && (size_t)n < sizeof(out));
-    if (strstr(raw, "\\"cmd\\":\\"GET_STATUS\\"") != NULL) {
-        const bool has_id = strstr(out, "\\"releaseCycleId\\"") != NULL;
-        const bool has_origin = strstr(out, "\\"releaseCycleOrigin\\"") != NULL;
+    if (strstr(raw, "\"cmd\":\"GET_STATUS\"") != NULL) {
+        const bool has_id = strstr(out, "\"releaseCycleId\"") != NULL;
+        const bool has_origin = strstr(out, "\"releaseCycleOrigin\"") != NULL;
         CHECK(has_id == has_origin);
         if (has_origin) {
-            CHECK(strstr(out, "\\"releaseCycleOrigin\\":\\"NORMAL_WAKE\\"") != NULL);
+            CHECK(strstr(out, "\"releaseCycleOrigin\":\"NORMAL_WAKE\"") != NULL);
         }
     }
     if (expected != NULL && strstr(out, expected) == NULL) {
