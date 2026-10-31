@@ -397,5 +397,6 @@ def preview_install(snapshot: Mapping[str, Any]) -> PreviewResult:
                              _candidate(snapshot))
     except _Denied as exc:
         return PreviewResult("BLOCKED", exc.code)
-    except (TypeError, ValueError, KeyError, UnicodeError, OverflowError):
+    except (TypeError, ValueError, KeyError, UnicodeError, OverflowError,
+            RecursionError):
         return PreviewResult("BLOCKED", "BLOCKED_INVALID_EVIDENCE")
