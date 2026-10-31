@@ -84,18 +84,27 @@ class WindowsRegistryAnchor:
             raise PreconditionBlocked("Windows continuity anchor unavailable")
         import winreg
 
+        # A missing key can represent H0. A present key missing its value is
+        # instead ambiguous partial state and must never authorize enrollment.
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.KEY, 0,
-                                winreg.KEY_READ) as key:
-                value, kind = winreg.QueryValueEx(key, self.VALUE)
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.KEY, 0,
+                                 winreg.KEY_READ)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise PreconditionBlocked("continuity anchor unreadable") from None
+        try:
+            with key:
+                try:
+                    value, kind = winreg.QueryValueEx(key, self.VALUE)
+                except FileNotFoundError:
+                    raise PreconditionBlocked("continuity anchor incomplete") from None
             if kind != winreg.REG_SZ or not isinstance(value, str):
                 raise PreconditionBlocked("continuity anchor invalid")
             decoded = json.loads(value)
             if not isinstance(decoded, dict):
                 raise PreconditionBlocked("continuity anchor invalid")
             return decoded
-        except FileNotFoundError:
-            return None
         except (OSError, ValueError, TypeError):
             raise PreconditionBlocked("continuity anchor unreadable") from None
 
@@ -200,6 +209,11 @@ class CycleAttemptFence:
             raise PreconditionBlocked("release host lock unavailable") from None
 
     def _connection(self) -> sqlite3.Connection:
+        # Opening a pre-existing ledger writable may replay or delete SQLite
+        # recovery sidecars before the independent HKCU witness is compared.
+        # Preserve uncertain state for a separately authorized investigation.
+        if _sqlite_recovery_sidecars_present(self.database):
+            raise PreconditionBlocked("release SQLite recovery uncertain")
         if not self.database.is_file():
             raise PreconditionBlocked("enrolled release ledger missing")
         db = sqlite3.connect(self.database, timeout=0.25, isolation_level=None)
