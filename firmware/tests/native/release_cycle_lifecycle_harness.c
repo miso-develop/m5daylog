@@ -18,20 +18,33 @@
 static uint8_t lifecycle, fence, pending_value;
 static bool staged, staged_lifecycle, locked;
 static int write_number, fail_write, fail_phase; // 1=set, 2=pre-commit, 3=post-commit
+// Only inject faults during the optional host-owned NVS witness, after the
+// actual boot and durable HOST_UNRESOLVED transitions have succeeded.
+static int host_fault; // 1=lock, 2=open, 3=lifecycle read, 4=fence read
+static bool host_read_phase;
 
 esp_err_t recorder_nvs_init(void) { return ESP_OK; }
-esp_err_t recorder_nvs_lock(void) { CHECK(!locked); locked=true; return ESP_OK; }
+esp_err_t recorder_nvs_lock(void) {
+    CHECK(!locked);
+    if (host_read_phase && host_fault==1) return ESP_FAIL;
+    locked=true; return ESP_OK;
+}
 void recorder_nvs_unlock(void) { CHECK(locked); locked=false; }
 esp_err_t nvs_open(const char *ns, int mode, nvs_handle_t *out) {
     CHECK(locked && strcmp(ns,"m5daylog")==0);
     CHECK(mode == NVS_READONLY || mode == NVS_READWRITE);
+    if (host_read_phase && host_fault==2) return ESP_FAIL;
     *out=7; return ESP_OK;
 }
 void nvs_close(nvs_handle_t h) { CHECK(h==7 && locked); }
 esp_err_t nvs_get_u8(nvs_handle_t h, const char *key, uint8_t *out) {
     CHECK(h==7 && locked);
-    if (strcmp(key,"shutdown_armed")==0) { *out=lifecycle; return ESP_OK; }
+    if (strcmp(key,"shutdown_armed")==0) {
+        if (host_read_phase && host_fault==3) return ESP_FAIL;
+        *out=lifecycle; return ESP_OK;
+    }
     CHECK(strcmp(key,"release_boot")==0);
+    if (host_read_phase && host_fault==4) return ESP_FAIL;
     *out=fence; return ESP_OK;
 }
 esp_err_t nvs_set_u8(nvs_handle_t h, const char *key, uint8_t value) {
@@ -57,11 +70,17 @@ esp_err_t nvs_commit(nvs_handle_t h) {
 }
 int main(int argc, char **argv) {
     esp_err_t result=ESP_OK;
-    bool qualified_once=false, host_once=false;
+    bool qualified_once=false, host_once=false, shutdown_reached=false;
     shutdown_armed_boot_action_t action=SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN;
     CHECK(argc==6);
     CHECK(strcmp(argv[1],"cycle")==0 || strcmp(argv[1],"reboot")==0 ||
-          strcmp(argv[1],"fu_cycle")==0);
+          strcmp(argv[1],"fu_cycle")==0 ||
+          strncmp(argv[1],"host_",5)==0);
+    if (strcmp(argv[1],"host_lock")==0) host_fault=1;
+    else if (strcmp(argv[1],"host_open")==0) host_fault=2;
+    else if (strcmp(argv[1],"host_lifecycle_read")==0) host_fault=3;
+    else if (strcmp(argv[1],"host_fence_read")==0) host_fault=4;
+    else CHECK(strncmp(argv[1],"host_",5)!=0);
     lifecycle=(uint8_t)atoi(argv[2]); fence=(uint8_t)atoi(argv[3]);
     fail_write=atoi(argv[4]);
     if (strcmp(argv[5],"set")==0) fail_phase=1;
@@ -109,18 +128,36 @@ int main(int argc, char **argv) {
         if (strcmp(argv[1],"reboot")==0) break;
         result=shutdown_armed_mark_host_unresolved(); // write 4 HOST_UNRESOLVED
         if (result!=ESP_OK) break;
+        host_read_phase = host_fault != 0;
         result=release_cycle_fence_note_host_owned();
+        host_read_phase = false;
+        if (host_fault != 0) {
+            // The optional NVS witness failed. D-031 still accepts the
+            // canonical release independently, then commits real ARMED.
+            CHECK(result!=ESP_OK && !release_cycle_fence_host_owned_qualified());
+            result=shutdown_armed_commit(); // write 5 ARMED after quiesce
+            if (result!=ESP_OK) break;
+            CHECK(!release_cycle_fence_rearm_required(true));
+            // Models the runtime decision to continue to power shutdown,
+            // NOT a physical HOLD test or a real USB teardown.
+            shutdown_reached=true;
+            result=ESP_OK;
+            break;
+        }
         if (result!=ESP_OK) break;
         host_once=release_cycle_fence_host_owned_qualified();
         CHECK(host_once);
         // Model an independently accepted D-031 release only AFTER host-owned.
         result=shutdown_armed_commit(); // write 5 ARMED
         if (result!=ESP_OK) break;
+        CHECK(release_cycle_fence_rearm_required(true));
         result=release_cycle_fence_note_release_completed(); // write 6 READY
     } while (0);
-    printf("result=%d lifecycle=%u fence=%u writes=%d qualified=%d host=%d live=%d\n",
+    printf("result=%d lifecycle=%u fence=%u writes=%d qualified=%d host=%d live=%d",
            result, lifecycle, fence, write_number, qualified_once ? 1 : 0,
            host_once ? 1 : 0, release_cycle_fence_boot_qualified() ? 1 : 0);
+    if (host_fault != 0) printf(" shutdown=%d", shutdown_reached ? 1 : 0);
+    printf("\n");
     CHECK(!locked);
     return 0;
 }
