@@ -11,6 +11,7 @@
 
 static bool s_pending;
 static const char *s_release_cycle;
+static const char *s_release_origin = "NORMAL_WAKE";
 static const char *s_status_state = "USB_SYNC";
 static unsigned s_set_time_calls;
 static unsigned s_release_calls;
@@ -24,6 +25,7 @@ static bool status_provider(usb_cdc_protocol_status_t *out, void *ctx) {
     out->battery_valid = true;
     out->rtc_correction_pending = s_pending;
     out->release_cycle_id = s_release_cycle;
+    out->release_cycle_origin = s_release_origin;
     return true;
 }
 
@@ -120,12 +122,25 @@ static void test_commands(const usb_cdc_protocol_config_t *cfg) {
     expect(cfg, "{\"id\":\"s\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
            "\"rtcCorrectionPending\":false", NULL);
 
-    /* Optional R3 release cycle is absent by default and for untrusted input. */
+    /* R5 pair is optional as a whole, never as separate fields. */
     expect_without(cfg, "\"releaseCycleId\"");
+    expect_without(cfg, "\"releaseCycleOrigin\"");
     s_release_cycle = "01234567-89ab-4def-8123-456789abcdef";
     expect(cfg, "{\"id\":\"s\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
            "\"releaseCycleId\":\"01234567-89ab-4def-8123-456789abcdef\"",
            NULL);
+    expect(cfg, "{\"id\":\"s\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
+           "\"releaseCycleOrigin\":\"NORMAL_WAKE\"", NULL);
+    s_release_origin = NULL;
+    expect_without(cfg, "\"releaseCycleId\"");
+    expect_without(cfg, "\"releaseCycleOrigin\"");
+    s_release_origin = "invalid-origin";
+    expect_without(cfg, "\"releaseCycleId\"");
+    expect_without(cfg, "\"releaseCycleOrigin\"");
+    s_release_origin = "SUPERVISED_FIRST_USE";
+    expect(cfg, "{\"id\":\"s\",\"cmd\":\"GET_STATUS\",\"args\":{}}",
+           "\"releaseCycleOrigin\":\"SUPERVISED_FIRST_USE\"", NULL);
+    s_release_origin = "NORMAL_WAKE";
     s_status_state = "RECORDING";
     expect_without(cfg, "\"releaseCycleId\"");
     s_status_state = "USB_SYNC";
@@ -134,6 +149,7 @@ static void test_commands(const usb_cdc_protocol_config_t *cfg) {
     s_release_cycle = "bad\\\"json";
     expect_without(cfg, "\"releaseCycleId\"");
     s_release_cycle = NULL;
+    expect_without(cfg, "\"releaseCycleOrigin\"");
 
     // #144: a frozen terminal cycle is visible before a valid SET_TIME.
     // The production RTC gate (tested separately) must preserve that UUID
