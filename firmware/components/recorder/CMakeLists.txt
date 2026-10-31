@@ -27,6 +27,7 @@ idf_component_register(
         "release_cycle_fence.c"
         "release_cycle_button.c"
         "release_cycle_witness.c"
+        "dev_fresh_install_nvs.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
