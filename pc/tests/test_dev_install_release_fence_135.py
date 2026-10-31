@@ -285,6 +285,10 @@ class DevInstallReleaseFenceTests(unittest.TestCase):
                             side_effect=AssertionError("SQLite recovery attempted")) as db_open,
                       patch("m5daylog.release.SyncReleaseCoordinator.run",
                             side_effect=AssertionError("sender invoked")) as sender):
+                    # enroll() owns serialized() itself; test it outside the
+                    # already-held lock to exercise its real admission path.
+                    with self.assertRaises(PreconditionBlocked):
+                        fence.cycles.enroll(DEV, supervised=True)
                     with fence.cycles.serialized():
                         with self.assertRaises(PreconditionBlocked):
                             fence.cycles.check_unenrolled_locked()
