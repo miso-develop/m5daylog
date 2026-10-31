@@ -249,6 +249,9 @@ bool usb_msc_ownership_is_host_owned(void) { return g_host_owned; }
 bool usb_msc_ownership_release_command_admission_open(void) { return g_admission_open; }
 bool release_cycle_fence_boot_qualified(void) { return g_boot_fence; }
 bool release_cycle_fence_host_owned_qualified(void) { return g_host_fence; }
+const char *release_cycle_fence_current_origin(void) {
+    return g_boot_fence ? "NORMAL_WAKE" : NULL;
+}
 
 /* INSERT_EXACT_PRODUCTION_STATUS_PROVIDER */
 
@@ -260,6 +263,14 @@ static void request(const usb_cdc_protocol_config_t *cfg, const char *raw,
     int n = usb_cdc_protocol_process_line(
         (const uint8_t *)raw, strlen(raw), out, sizeof(out), cfg, &effect);
     CHECK(n > 0 && (size_t)n < sizeof(out));
+    if (strstr(raw, "\\"cmd\\":\\"GET_STATUS\\"") != NULL) {
+        const bool has_id = strstr(out, "\\"releaseCycleId\\"") != NULL;
+        const bool has_origin = strstr(out, "\\"releaseCycleOrigin\\"") != NULL;
+        CHECK(has_id == has_origin);
+        if (has_origin) {
+            CHECK(strstr(out, "\\"releaseCycleOrigin\\":\\"NORMAL_WAKE\\"") != NULL);
+        }
+    }
     if (expected != NULL && strstr(out, expected) == NULL) {
         fprintf(stderr, "missing '%s': %s\n", expected, out); exit(8);
     }
