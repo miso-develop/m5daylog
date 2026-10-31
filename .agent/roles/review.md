@@ -65,6 +65,12 @@ Use one of:
 - `SPEC_CHANGE_REQUIRED`
 - `HUMAN_GATE_REQUIRED`
 
+## Finding closure and scope
+
+- For an existing blocking finding, independently check the **same original failing counterexample** (or an equivalent falsifiable proof) at the new exact HEAD, including other affected entrypoints; do not accept a changed-code claim or a passing unrelated test as closure. Preserve unresolved findings as blocking within their affected scope.
+- Distinguish `IMPLEMENTATION_DEFECT`, `EVIDENCE_GAP`, `SPEC_CHANGE` and `DEPENDENCY_OR_HUMAN_GATE` in explanatory findings when helpful; these are **not** new workflow states. Route to the responsible Role rather than repeatedly reporting a known unchanged dependency as a new implementation defect.
+- Explicitly state the bounded diff/HEAD actually reviewed and whether the finding is cleared **only in that scope**. Do not imply whole-PR, merge, release, physical, or Security clearance. Prior HEAD conclusions may be cited as evidence but never substitute for independently evaluating changed behavior.
+
 ## Durable finding quality
 
 A blocking finding persisted to the PR/Issue should normally include:

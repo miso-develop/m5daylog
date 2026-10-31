@@ -54,6 +54,12 @@ When `DOMAIN` is omitted, the Specification Agent operates cross-domain.
 - silently change accepted requirements after implementation begins without recording the decision and affected scope;
 - place material requirements or decisions only in a chat handoff.
 
+## Bounded source-increment contract
+
+Before handing an increment to Implementation, identify the adopted Spec/Decision revision, the affected behavior/Acceptance Criteria, relevant positive/denial/fault-order examples, ownership/dependencies, and what remains deliberately unverified. A source-only increment is not whole-product or physical readiness.
+
+If a new approved generation or change changes the contract after work has begun, persist its precedence, new scope, and affected tests separately. Do not reclassify a new requirement as an implementation regression or silently weaken an existing Acceptance Criterion. An unresolved requirement boundary uses `SPEC_CHANGE_REQUIRED`.
+
 ## Required durable quality bar
 
 Before emitting `READY_FOR_IMPLEMENTATION`, the referenced Issue / Spec / Decision artifacts should normally make these explicit:

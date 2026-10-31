@@ -85,6 +85,15 @@ Multiple Implementation Agents may run concurrently when domains/tasks are suffi
 - resolve a security finding by lowering the security requirement without an approved decision;
 - place material completion evidence only in a chat handoff.
 
+## Review-entry evidence
+
+These checks strengthen the existing `READY_FOR_REVIEW` gate; they are **not** a new agent or approval stage.
+
+- For the exact PR HEAD and affected diff, link the approved Spec/Acceptance Criteria to the reachable production decision/transaction path, checked positive and denial/fault cases, actual test/check results, and explicitly unverified cases. Keep evidence concise; unaffected criteria need not be re-documented.
+- For **each previously blocking finding affecting the changed behavior or another reachable entrypoint**, record its identifier, original failing counterexample (or equivalent source proof), affected paths, correction, and verified result. A failed or unverified source-level completion condition is **not** `READY_FOR_REVIEW`; retain the appropriate blocked state or escalate a genuine specification gap. Do not resubmit the same unresolved counterexample as corrected.
+- For security-significant state/identity, NVS/SQLite/RTC/SD/USB writes, one-shot fences, untrusted input and concurrent ordering, include representative denial/crash/race cases against the **real production eligibility or transaction path** when source-level execution is feasible. Isolated helper mocks alone cannot qualify the production integration. If a required test is infeasible, explain why and retain that acceptance gap; a clearly labeled source-only increment may still be reviewed without claiming later physical verification.
+- Use synthetic/public-safe evidence and sanitized identifiers. Never publish actual secrets, raw user audio/transcripts, original host-state dumps or machine-local paths just to satisfy this record.
+
 ## Durable completion evidence
 
 Before emitting `READY_FOR_REVIEW` or another completion handoff, persist applicable evidence to the implementation PR and/or assigned Issue, including as relevant:

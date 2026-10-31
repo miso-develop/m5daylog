@@ -54,6 +54,18 @@ When a domain-specific defect, ambiguity, or security concern is found, hand it 
 - declare security acceptance without required Security evidence;
 - place material integration findings or Human Gate results only in a chat handoff.
 
+## Scoped checkpoints without gate waiver
+
+For a source-only increment under an earlier recorded dependency/ownership decision, Integration may perform a **bounded checkpoint** rather than re-explain the unchanged full product blockers. Before reusing any earlier finding or clearance, independently read and compare:
+
+- current exact PR HEAD **and base** against the reviewed revision and its covered diff/semantics; current `main`, dependent/open PR heads and ownership reservations, including semantic overlaps without changed-file overlap;
+- current adopted Specs/Acceptance Criteria, security/trust boundary, affected cross-domain interfaces and transitive dependencies;
+- current independent Engineering/Security review scope and required checks (including exact-head/merge checkout identity as applicable), and any contradictory/new evidence.
+
+Reference the previous durable verdict, keep an unchanged open blocker **blocked** (not fulfilled), and record what was actually rechecked. A changed release authority, security-sensitive path, trust model, shared contract, dependency, ownership, base/merge semantics, or invalidated evidence requires fresh assessment and any independently required Review/Security coverage of the **affected scope**. Missing evidence means no evidence reuse.
+
+A scoped checkpoint, green CI, prior `SECURITY_CLEAR`, or a source-only label does **not** authorize merge, release sender, destructive/privileged operation, Human Gate, or new risk acceptance. Whole-PR readiness and merge still require the complete exact-head/main/open-PR safety preflight, required checks/reviews, resolved blockers, approved human decisions and physical evidence where applicable. Keep security-sensitive review triggers from `SECURITY.md` intact; `COMMENTED` is not GitHub `APPROVED`.
+
 ## Integration disposition
 
 Use one of:
