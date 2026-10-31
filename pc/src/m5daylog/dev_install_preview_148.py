@@ -107,12 +107,24 @@ def _media_bytes(media: Any) -> dict[str, bytes]:
 def _settled_retained(files: dict[str, bytes], expected_id: str) -> dict[str, Any]:
     _require("device.json" in files and "manifest.json" in files,
              "BLOCKED_MEDIA_METADATA")
+    # Admission cannot invoke manifest recovery or operate on transaction scraps.
+    # Deny all pending/renamed files, including auxiliary metadata transactions.
     _require(not any(
-        p.endswith((".bak", ".tmp", ".part", ".partial")) or
-        "/.part" in p for p in files
+        any(part.endswith((".bak", ".tmp", ".part", ".partial", ".new", ".txn"))
+            or part.startswith(".part") for part in p.split("/"))
+        for p in files
     ), "BLOCKED_MEDIA_UNSETTLED")
     device = _json_document(files["device.json"])
     manifest = _json_document(files["manifest.json"])
+    # Import the unmodified, Integration-owned canonical schema validator.
+    # These are source-contract reads, never Device/host media inspection.
+    from .sync import ContractValidationError, default_contracts_dir, validate_contract_document
+    contracts = default_contracts_dir()
+    try:
+        validate_contract_document(device, contracts / "device.schema.json")
+        validate_contract_document(manifest, contracts / "manifest.schema.json")
+    except ContractValidationError:
+        raise _Denied("BLOCKED_MEDIA_METADATA") from None
     _require(device.get("schemaVersion") == 1 and
              manifest.get("schemaVersion") == 1 and
              type(device.get("audioCapabilities")) is dict and
@@ -152,8 +164,13 @@ def _settled_retained(files: dict[str, bytes], expected_id: str) -> dict[str, An
                  "BLOCKED_MEDIA_HASH")
         seen_ids.add(rid)
         seen_paths.add(filename)
-    _require(set(files) == seen_paths | {"device.json", "manifest.json"},
-             "BLOCKED_MEDIA_EXTRA_FILE")
+    # Other fully inventoried historical support files must remain byte-for-byte
+    # untouched; a stray WAV or recording-directory artifact is never settled.
+    extras = set(files) - seen_paths - {"device.json", "manifest.json"}
+    _require(not any(p.lower().endswith(".wav") or
+                     p.startswith("recordings/") or
+                     p in ("device.json", "manifest.json")
+                     for p in extras), "BLOCKED_MEDIA_EXTRA_FILE")
     return {"retainedDeviceId": expected_id, "retainedRecordings": len(seen_ids),
             "retainedDigests": {p: hashlib.sha256(files[p]).hexdigest()
                                 for p in sorted(files)}}
@@ -165,10 +182,17 @@ def _image(image: Any) -> dict[str, Any]:
                   "bootloaderSha256", "partitionTableSha256"):
         _require(_digest(image.get(field)), "BLOCKED_IMAGE")
     offset, size = image.get("nvsOffset"), image.get("nvsSize")
-    _require(type(offset) is int and type(size) is int and
-             0x9000 <= offset < 0x1000000 and
-             size >= 0x1000 and size % 0x1000 == 0 and
-             offset % 0x1000 == 0 and offset + size <= 0x1000000,
+    flash, app_offset, app_size = (image.get("flashSizeBytes"),
+                                   image.get("appOffset"), image.get("appSize"))
+    _require(all(type(v) is int for v in
+                 (offset, size, flash, app_offset, app_size)) and
+             0x100000 <= flash <= 0x1000000 and
+             0x9000 <= offset and size >= 0x1000 and
+             size % 0x1000 == 0 and offset % 0x1000 == 0 and
+             app_offset >= 0x10000 and app_offset % 0x10000 == 0 and
+             app_size >= 0x1000 and app_size % 0x1000 == 0 and
+             offset + size <= flash and app_offset + app_size <= flash and
+             (offset + size <= app_offset or app_offset + app_size <= offset),
              "BLOCKED_PARTITION")
     regions = image.get("writeRegions")
     _require(type(regions) is list and
@@ -177,6 +201,7 @@ def _image(image: Any) -> dict[str, Any]:
     return {k: image[k] for k in
             ("sourceSha256", "elfSha256", "appSha256",
              "bootloaderSha256", "partitionTableSha256",
+             "flashSizeBytes", "appOffset", "appSize",
              "nvsOffset", "nvsSize", "writeRegions")}
 
 
@@ -199,7 +224,10 @@ def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
              _ref(host.get("independentLineageEvidence")) and
              host.get("releaseSQLite") == "ABSENT" and
              host.get("releaseHKCU") == "ABSENT" and
-             host.get("hostBinding") == target["hostBinding"],
+             host.get("hostBinding") == target["hostBinding"] and
+             host.get("sharedHostCoordinatorBaseline") == "INDEPENDENTLY_OBSERVED" and
+             host.get("historyComplete") is True and
+             host.get("earlierReleaseAttempt") is False,
              "BLOCKED_HOST_H0")
     _require(type(approval) is dict and
              approval.get("purpose") == "DEV_FRESH_INSTALL_PREVIEW" and
@@ -208,7 +236,9 @@ def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
              approval.get("hostBinding") == target["hostBinding"] and
              approval.get("generation") == target["generation"] and
              approval.get("attemptId") == target["attemptId"] and
-             _ref(approval.get("externalEvidenceRef")),
+             _ref(approval.get("externalEvidenceRef")) and
+             approval.get("intentStatus") == "UNISSUED_FOR_REVIEW" and
+             approval.get("priorConsumedOrReplayed") is False,
              "BLOCKED_PERMISSION")
     custody = input_data.get("custody")
     _require(type(custody) is dict and
@@ -223,6 +253,9 @@ def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
         device_id = input_data.get("retainedDeviceId")
         _require(_uuid(device_id), "BLOCKED_MEDIA_IDENTITY")
         media_state = _settled_retained(files, device_id)
+        _require(input_data.get("observedNvsDeviceId") in (None, device_id) and
+                 input_data.get("observedHostDeviceId") in (None, device_id),
+                 "BLOCKED_MEDIA_IDENTITY")
         _require(input_data.get("newDeviceId") in (None, device_id),
                  "BLOCKED_MEDIA_IDENTITY")
     else:
@@ -242,10 +275,19 @@ def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
             archived = _media_bytes(archive.get("snapshot"))
             _require(bool(files) and files.keys() == archived.keys(),
                      "BLOCKED_ARCHIVE_INCOMPLETE")
-            _require(all(hashlib.sha256(value).digest() ==
-                         hashlib.sha256(archived[path]).digest()
-                         for path, value in files.items()),
-                     "BLOCKED_ARCHIVE_HASH")
+            verified = archive.get("verifiedInventory")
+            _require(type(verified) is dict and set(verified) == set(files) and
+                     _ref(archive.get("destinationEvidenceRef")),
+                     "BLOCKED_ARCHIVE_INCOMPLETE")
+            _require(all(
+                type(verified[p]) is dict and
+                verified[p].get("sizeBytes") == len(files[p]) and
+                verified[p].get("sha256") == hashlib.sha256(files[p]).hexdigest()
+                and len(archived[p]) == len(files[p])
+                and hashlib.sha256(archived[p]).digest() ==
+                    hashlib.sha256(files[p]).digest()
+                for p in files
+            ), "BLOCKED_ARCHIVE_HASH")
             _require(archive.get("newMediaFiles") == {},
                      "BLOCKED_MEDIA_NOT_BLANK")
             media_state = {
@@ -267,6 +309,12 @@ def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
             "rtc": "UNQUALIFIED",
         },
         "media": media_state,
+        "originalDataDisposition": {
+            "C": "INDEPENDENTLY_BLANK_NEW_MEDIA",
+            "R": "RETAIN_ALL_PRIOR_BYTES_NO_REPAIR",
+            "A": "SEPARATELY_ARCHIVED_RETIREMENT_REQUIRES_HUMAN_GATE",
+        }[branch],
+        "firstSupervisedReleaseAttemptId": target["attemptId"],
         "approvalEvidenceRef": approval["externalEvidenceRef"],
         "hostLineageEvidenceRef": host["independentLineageEvidence"],
         "custodyEvidenceRef": custody["externalCustodyEvidence"],
