@@ -1,8 +1,10 @@
 # #148 DEV_FRESH_INSTALL — offline preview only
 
 This is a **pure in-memory, source-only preflight**, NOT an installer.
-It has no enabled production CLI entrypoint and never reads a filesystem,
-Windows HKCU, release ledger, USB/CDC, Device NVS, or live SD. It does not
+It has no enabled production CLI entrypoint and does not read input files,
+Windows HKCU, release ledger, USB/CDC, Device NVS, or live SD. For R it
+reads only the repository-bundled canonical JSON schemas via the existing
+contract validator; it does not access a mounted Device or user data. It does not
 flash, format, erase, release storage, copy audio, or mutate the supplied
 snapshot. Physical authorization and exact-device proof are separate gates.
 
@@ -16,28 +18,34 @@ Provide a dict holding these independent pieces of **offline** evidence:
 - target: targetBinding, hostBinding, distinct canonical UUID generation
   and attemptId. These bind an offline candidate, not a live Device.
 - host: matching hostBinding; lineage NEVER_ENROLLED; a nonempty
-  independentLineageEvidence; releaseSQLite and releaseHKCU both ABSENT.
+  independentLineageEvidence; releaseSQLite and releaseHKCU both ABSENT;
+  sharedHostCoordinatorBaseline INDEPENDENTLY_OBSERVED,
+  historyComplete true, earlierReleaseAttempt false.
   The module does not actually read host stores. In production, host H0
   must be independently proven under the shared #135 coordinator lock.
 - approval: purpose DEV_FRESH_INSTALL_PREVIEW, matching branch, target,
-  host, generation and attempt; nonempty externalEvidenceRef. This is
+  host, generation and attempt; nonempty externalEvidenceRef;
+  intentStatus UNISSUED_FOR_REVIEW and priorConsumedOrReplayed false. This is
   traceability for a proposed plan and NEVER a verified release permit.
 - custody: writerExcluded true, inventoryComplete true, and
   externalCustodyEvidence. These are untrusted offline assertions;
   a real single-writer boundary needs independent Human Gate evidence.
 - image: lowercase 64-hex hashes sourceSha256, elfSha256, appSha256,
   bootloaderSha256, partitionTableSha256; 4-KiB-aligned nvsOffset/nvsSize;
+  flashSizeBytes, appOffset and appSize must also be supplied;
   writeRegions must specify exactly the matching NVS partition.
-  This checks intended geometry, NOT actual installed image or boot.
+  This checks intended geometry and NVS/APP nonoverlap, NOT actual
+  installed image or boot.
 - media: a mapping of files from M5DAYLOG-relative filename to full
   immutable bytes, and listedPaths comprising their complete names.
-  All listed files must have bytes; any extra/omitted inventory blocks.
+  All listed files must have bytes. Missing/unlisted files block; R allows
+  fully inventoried ancillary files outside recordings/ and hashes them.
 
 For R: add retainedDeviceId equal to the identity in device.json and
 manifest.json. The preview checks actual supplied WAV bytes, size, full
 SHA-256, path, recordingId uniqueness, and the settled manifest. Pending
-.bak/.tmp/.part files, orphan WAV, unknown artifacts and inconsistent
-schema block. No historical WAV or manifest is rewritten; future
+.bak/.tmp/.part transaction files, orphan WAV, unindexed recording
+artifacts and inconsistent schema block. No historical WAV or manifest is rewritten; future
 append-only behavior belongs to Device #144.
 
 For C: media files/list must be empty, newDeviceId must be a canonical
@@ -77,10 +85,10 @@ Run with Python 3.12 in the PC project:
 The tests use synthetic bytes only. Private audio, host identifiers and
 Device identity should not be published in public CI logs or Issues.
 
-R currently rejects unfamiliar ancillary files including processed ACK
-documents rather than silently repairing or ignoring them. This is a
-deliberately narrow positive admission; independently review any future
-expansion. Python-level snapshot identity or preflight H0 does not prove
+R may retain non-recording ancillary files (including historical ACK or
+event files) only as fully inventoried opaque bytes with captured hashes;
+it does not interpret those as processed authority or edit them. Future
+schema-specific authorization for ancillary content needs separate review. Python-level snapshot identity or preflight H0 does not prove
 live Device/host physical custody, actual image readback, or committed
 Windows storage. Human Gates and >=16h overnight tests remain NOT_RUN.
 
