@@ -135,6 +135,7 @@ def test_complete_settled_r_is_read_only(read_only_binary, tmp_path):
     "wav_truncated", "wav_corrupt_same_size", "wav_orphan",
     "part_pending", "nested_temp", "unknown_date", "unknown_root_file",
     "empty_r", "manifest_hash_mismatch", "manifest_size_mismatch",
+    "quarantine_pending", "unrecognized_root_tmp", "empty_quarantine_control",
     "manifest_duplicate", "id_mismatch", "timestamp_invalid",
 ])
 def test_r_rejects_unsettled_or_conflicting_media_without_writing(
@@ -179,6 +180,15 @@ def test_r_rejects_unsettled_or_conflicting_media_without_writing(
         (base / "recordings" / "2026-11-31").mkdir()
     elif case == "unknown_root_file":
         (base / "recordings" / "mystery.bin").write_bytes(b"test")
+    elif case == "quarantine_pending":
+        quarantine = base / "quarantine"
+        quarantine.mkdir()
+        (quarantine / "orphan.wav.part").write_bytes(b"unindexed")
+    elif case == "unrecognized_root_tmp":
+        (base / "device.json.tmp").write_text("uncertain")
+    elif case == "empty_quarantine_control":
+        (base / "quarantine").mkdir()
+        (base / "quarantine" / "index.tmp").write_bytes(b"unknown")
     elif case == "empty_r":
         doc["recordings"] = []
         wav.unlink()
