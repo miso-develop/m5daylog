@@ -408,3 +408,62 @@ Release status remains `RELEASE_BLOCKED`; `NO_CDC_SEND`,
 future canonical shared CLI/watch coordinator, R5 first-use authenticity,
 independent exact-head review/Security and all physical Device gates remain
 mandatory before any product release or PR merge.
+
+
+## #147 DEV_FRESH_INSTALL v2 — two separate host consumptions (source-only)
+
+The adopted #147 v2 design permits a narrowly scoped developer fresh-image/NVS
+partition rebaseline, **not** unconditional recovery of the original live USB
+session, automatic enrollment, release, or any Device/media/Registry operation.
+The actual C/R/A SD and H0 external preflight candidates belong exclusively
+to #148; Device NVS/SD boot behavior belongs to #144/PR #146.
+
+This increment adds `dev_install_release_fence.py`, intentionally **unwired**:
+
+- `DevInstallReceipt` is a *descriptor* of one externally validated private
+  receipt, bound to exact Device UUID, physical target, host lineage, chosen
+  install generation, exact image bundle, partition/NVS write set, C/R/A
+  branch, admission evidence and **one** supervised first-release attempt.
+  SHA-256 fields identify inputs; they are **not** signatures, proof of
+  H0/custody, or authority. The module does not issue an authorization.
+- `DevInstallReleaseFence` serializes under the **existing R3 OS-wide
+  `CycleAttemptFence.serialized()` lock** shared by future CLI and watcher.
+  It checks both absent normal R3 enrollment witnesses at H0 entry, then
+  commits one `CONSUMED` first-release receipt to separate SQLite FULL-sync
+  state and a distinct HKCU/RegFlushKey anchor. Only an independently
+  supplied external receipt verifier can be considered; no verifier or real
+  first-release sender is implemented. A source-only test verifier that
+  returns true is not a production authorization.
+- Both witnesses must match exactly on restart. Duplicate attempt, different
+  generation/target/host/image/partition/branch, one-sided missing state,
+  corruption, pending SQLite journal, or interruption between SQLite commit
+  and HKCU flush fail closed; no self-heal, reset or second send. This is a
+  distinct FI2-I2 **installation intent**, **not** an R3 release-cycle token.
+- `initialize_first_dev_cycle_locked` models FI2-I3 only *after* #1 has been
+  independently consumed; under the same lock it additionally requires the
+  frozen atomic `SUPERVISED_FIRST_USE` origin/cycle pair and independent
+  first-release/manual-WAKE/current PCM/RTC/manifest/raw-sync proof before
+  the later R3 first-enrollment+cycle-consumption transaction. It refuses
+  reuse of the #1 attempt ID. Positive callback tests are synthetic only.
+- New `test_dev_install_release_fence_135.py` covers state/restart/replay,
+  shared-lock enforcement, H0 prior-enrollment denial, independent-store loss
+  and split commit, receipt mismatch and tampering, distinct first-cycle
+  admission and two-process contention. These are **offline synthetic
+  source-path tests**; no physical USB, CDC, RTC, flash, NVS, SD or real HKCU
+  mutation is part of the test.
+
+**Still blocking a positive sender:** external private receipt authentication
+and independently established never-enrolled H0/old writer exclusion, actual
+pinned Device image/first hold/boot/PCM/RTC/USB identity, #148 C/R/A private
+evidence, #144 current firmware pair, exact #51 sync and canonical #89/#105
+mutations, RTC and release outcome verification, old installed origin-unaware
+CLI/watch exclusion, native Windows flush/power-loss qualification and a
+separately authorized Human Gate. The existing `sync-release` remains
+`R5_ADMISSION_NOT_QUALIFIED`; watcher remains `RELEASE_BLOCKED`. Neither
+new method is wired into a sender. An ambiguity or partial commit burns an
+attempt rather than granting a retry. Approved #143 Option A exclusions
+(matched whole-host rollback, malicious same-user actor, hostile USB) remain
+explicit limitations, not claimed mitigations.
+
+**This is a bounded implementation checkpoint, not full #135 acceptance,
+merge clearance or approval of a physical operation.**
