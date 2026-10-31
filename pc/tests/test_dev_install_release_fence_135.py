@@ -236,6 +236,20 @@ class DevInstallReleaseFenceTests(unittest.TestCase):
                     receipt(), status=status, cycle_attempt_id=CYCLE_ATTEMPT,
                     verify_first_wake=lambda *args: True)
 
+    def test_receipt_repr_does_not_expose_identifiers(self):
+        rendered = repr(receipt())
+        for value in (DEV, GEN, ATTEMPT, "1" * 64, "7" * 64):
+            self.assertNotIn(value, rendered)
+
+    def test_sqlite_read_only_uri_handles_reserved_host_path(self):
+        with tempfile.TemporaryDirectory(prefix="host # and space ") as location:
+            root = Path(location)
+            (root / "device").mkdir()
+            fence = make(root)
+            with fence.cycles.serialized():
+                fence.consume_locked(receipt(), verify_external=lambda _: True)
+                fence.verify_consumed_locked(receipt())
+
     def test_two_process_consumption_is_at_most_once(self):
         ctx = get_context("spawn")
         start, results = ctx.Event(), ctx.Queue()
