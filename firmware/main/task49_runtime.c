@@ -112,6 +112,7 @@ static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
     // Writer and USB tasks are serialized by the finalization/ownership
     // barrier: status reads only the immutable terminal current-run UUID.
     out->release_cycle_id = NULL;
+    out->release_cycle_origin = NULL;
     if (state == RECORDER_STATE_USB_SYNC &&
         rtc_correction_cycle_status_qualified() &&
         !sd_mount_is_mounted() &&
@@ -119,7 +120,12 @@ static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
         usb_msc_ownership_release_command_admission_open() &&
         release_cycle_fence_boot_qualified() &&
         release_cycle_fence_host_owned_qualified()) {
-        out->release_cycle_id = release_cycle_witness_frozen_id();
+        const char *const frozen = release_cycle_witness_frozen_id();
+        const char *const origin = release_cycle_fence_current_origin();
+        if (frozen != NULL && origin != NULL) {
+            out->release_cycle_id = frozen;
+            out->release_cycle_origin = origin;
+        }
     }
     return out->state != NULL && out->reason != NULL;
 }
