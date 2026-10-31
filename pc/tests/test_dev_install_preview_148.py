@@ -499,6 +499,17 @@ class DevInstallPreview148Tests(unittest.TestCase):
         x["target"]["generation"] = None
         self.blocked(x, "BLOCKED_TARGET")
 
+    def test_retained_deep_json_fails_closed_without_mutating_bytes(self):
+        # Malformed deep nesting must return BLOCKED rather than RecursionError.
+        # Synthetic input only: no real SD/host reads or writes.
+        too_deep = (b'{"payload":' + b"[" * 10000 +
+                    b"0" + b"]" * 10000 + b"}")
+        for metadata_path in ("device.json", "manifest.json"):
+            with self.subTest(metadata_path=metadata_path):
+                x = fixture("R")
+                x["media"]["files"][metadata_path] = too_deep
+                self.blocked(x, "BLOCKED_INVALID_EVIDENCE")
+
     def test_invalid_data_fails_closed_without_exception_or_mutation(self):
         x = fixture()
         x["media"]["files"]["device.json"] = b"\xff"
