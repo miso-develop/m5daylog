@@ -266,6 +266,16 @@ bool release_cycle_fence_host_owned_qualified(void) {
     return s_this_boot_qualified && s_saw_host_owned;
 }
 
+bool release_cycle_fence_rearm_required(bool finalized_witness_present) {
+    // The optional R3 witness must not turn an independently accepted D-031
+    // release into a shutdown failure when its PC-owned NVS read failed.
+    // BOOT_ACTIVE remains used and cannot qualify a future boot without a
+    // successful, separately authorized release-cycle re-arm.
+    return atomic_load(&s_first_use_staged) ||
+           (release_cycle_fence_host_owned_qualified() &&
+            finalized_witness_present);
+}
+
 esp_err_t release_cycle_fence_note_release_completed(void) {
     nvs_handle_t handle = 0;
     uint8_t lifecycle = 0;
@@ -352,6 +362,10 @@ esp_err_t release_cycle_fence_note_host_owned(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
 bool release_cycle_fence_host_owned_qualified(void) {
+    return false;
+}
+bool release_cycle_fence_rearm_required(bool finalized_witness_present) {
+    (void)finalized_witness_present;
     return false;
 }
 esp_err_t release_cycle_fence_note_release_completed(void) {
