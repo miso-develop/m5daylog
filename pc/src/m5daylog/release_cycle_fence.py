@@ -44,6 +44,19 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("ascii")).hexdigest()
 
 
+def _sqlite_recovery_sidecars_present(database: Path) -> bool:
+    """Reject orphaned SQLite state before any writable enrollment connection.
+
+    Connecting to a missing DB can recover/delete a leftover hot journal.
+    Treat even dangling sidecar symlinks as ambiguous host state.
+    """
+    for suffix in ("-journal", "-wal", "-shm"):
+        sidecar = database.with_name(database.name + suffix)
+        if sidecar.exists() or sidecar.is_symlink():
+            return True
+    return False
+
+
 def _tip(previous: str, sequence: int, device: str, cycle: str, attempt: str) -> str:
     payload = json.dumps([previous, sequence, device, cycle, attempt],
                          separators=(",", ":")).encode("ascii")
@@ -284,7 +297,9 @@ class CycleAttemptFence:
         if not getattr(self._serialized_thread, "held", False):
             raise PreconditionBlocked("release OS lock required")
         try:
-            if self.database.exists() or self.anchor.read() is not None:
+            if (self.database.exists()
+                    or _sqlite_recovery_sidecars_present(self.database)
+                    or self.anchor.read() is not None):
                 raise PreconditionBlocked("existing or incomplete host enrollment")
         except OSError:
             raise PreconditionBlocked("host enrollment state uncertain") from None
