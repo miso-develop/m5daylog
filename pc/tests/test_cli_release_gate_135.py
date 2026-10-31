@@ -55,10 +55,11 @@ class LegacyCliR5ExclusionTests(unittest.TestCase):
                 patch.object(cli, "inspect_device") as inspect,
                 patch.object(cli, "sync_device") as sync,
                 patch("m5daylog.windows_release.NativeWin32DeviceApi") as native,
-                patch("m5daylog.windows_release.WindowsHostReleasePort.read_status",
-                      return_value=purported_status) as get_status,
+                patch("m5daylog.windows_release.WindowsHostReleasePort.set_time") as set_time,
+                patch("m5daylog.windows_release.WindowsHostReleasePort.release_storage") as cdc_release,
                 patch("m5daylog.release.SyncReleaseCoordinator.run") as sender,
             ):
+                native.return_value.read_status.return_value = purported_status
                 stderr, stdout = io.StringIO(), io.StringIO()
                 with redirect_stderr(stderr), redirect_stdout(stdout):
                     code = cli.main([
@@ -74,7 +75,7 @@ class LegacyCliR5ExclusionTests(unittest.TestCase):
                     "reason=R5_ADMISSION_NOT_QUALIFIED",
                 )
                 for mock in (resolve_db, resolve_library, inspect, sync,
-                             native, get_status, sender):
+                             native, set_time, cdc_release, sender):
                     mock.assert_not_called()
 
     def test_manual_release_does_not_allow_force_override(self):
