@@ -234,3 +234,56 @@ def test_no_auto_release_authority_beyond_device_fence():
     assert release.index("usb_msc_ownership_complete_release_quiesce()") < release.index(
         "release_cycle_fence_note_release_completed()")
     assert "release_cycle_witness_frozen_id() != NULL" in release
+
+
+# R5-FU source-only: an explicit pre-existing UNQUALIFIED marker plus
+# distinct USB-owned physical proof is a staging prerequisite. NVS absence,
+# stale/used states and a staged-but-unaccepted release are not boot permits.
+@pytest.mark.parametrize("fence", ["missing", 82, 83, 84, 85, 99])
+def test_first_use_refuses_missing_or_previously_used_marker(fence_binary, fence):
+    r = observation(fence_binary, "fu_complete", 2, fence)
+    assert r["stage"] != "0"
+    assert r["first_use"] == "0"
+    assert r["fence"] == ("-1" if fence == "missing" else str(fence))
+
+
+def test_first_use_stages_then_requires_canonical_accepted_release(fence_binary):
+    staged = observation(fence_binary, "fu_stage", 2, 81)
+    assert staged["stage"] == "0" and staged["fence"] == "84"
+    assert staged["first_use"] == "1"
+    assert observation(fence_binary, "claim", 1, 84)["qualified"] == "0"
+
+    no_accept = observation(fence_binary, "fu_unaccepted", 2, 81)
+    assert no_accept["stage"] == "0" and no_accept["release"] != "0"
+    assert no_accept["fence"] == "84"
+    detached = observation(fence_binary, "fu_cutoff", 2, 81)
+    assert detached["stage"] == "0" and detached["release"] != "0"
+    assert detached["fence"] == "84"
+
+    released = observation(fence_binary, "fu_complete", 2, 81)
+    assert released["stage"] == "0"
+    assert released["release"] == "0" and released["fence"] == "85"
+    assert released["first_use"] == "0"
+    # The next real manual-WAKE consumes FU_READY in the same durable
+    # BOOT_ACTIVE transition and retains an exact RAM-only origin.
+    boot = observation(fence_binary, "claim", 1, 85)
+    assert boot["qualified"] == "1" and boot["fence"] == "82"
+    assert boot["origin"] == "SUPERVISED_FIRST_USE"
+    assert observation(fence_binary, "claim", 1, 82)["qualified"] == "0"
+
+    # A subsequent independently accepted normal release restores R3 READY.
+    day2 = observation(fence_binary, "complete", 1, 85)
+    assert day2["fence"] == "83"
+    assert day2["origin"] == "NONE"
+    normal = observation(fence_binary, "claim", 1, 83)
+    assert normal["qualified"] == "1" and normal["origin"] == "NORMAL_WAKE"
+
+
+@pytest.mark.parametrize("failure", ["set", "commit_before", "commit_after", "lock"])
+def test_failed_supervised_staging_never_grants_release(fence_binary, failure):
+    r = observation(fence_binary, "fu_complete", 2, 81, failure)
+    assert r["stage"] != "0"
+    assert r["first_use"] == "0"
+    assert r["fence"] in ("81", "84")
+    # Even after an uncertain commit, FU_STAGED is not a manual-WAKE permit.
+    assert observation(fence_binary, "claim", 1, r["fence"])["qualified"] == "0"
