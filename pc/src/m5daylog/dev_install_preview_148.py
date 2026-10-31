@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 from typing import Any, Mapping
 from uuid import UUID, uuid5
@@ -118,8 +118,10 @@ def _settled_retained(files: dict[str, bytes], expected_id: str) -> dict[str, An
     manifest = _json_document(files["manifest.json"])
     # Import the unmodified, Integration-owned canonical schema validator.
     # These are source-contract reads, never Device/host media inspection.
-    from .sync import ContractValidationError, default_contracts_dir, validate_contract_document
-    contracts = default_contracts_dir()
+    from .sync import ContractValidationError, validate_contract_document
+    # Pin the repository-owned schema. Never follow a host environment override
+    # that could point at a mounted SD/MSC target or arbitrary private file.
+    contracts = Path(__file__).resolve().parents[3] / "contracts"
     try:
         validate_contract_document(device, contracts / "device.schema.json")
         validate_contract_document(manifest, contracts / "manifest.schema.json")
@@ -178,6 +180,12 @@ def _settled_retained(files: dict[str, bytes], expected_id: str) -> dict[str, An
 
 def _image(image: Any) -> dict[str, Any]:
     _require(type(image) is dict, "BLOCKED_IMAGE")
+    exact_fields = {
+        "sourceSha256", "elfSha256", "appSha256", "bootloaderSha256",
+        "partitionTableSha256", "flashSizeBytes", "appOffset", "appSize",
+        "nvsOffset", "nvsSize", "writeRegions",
+    }
+    _require(set(image) == exact_fields, "BLOCKED_IMAGE")
     for field in ("sourceSha256", "elfSha256", "appSha256",
                   "bootloaderSha256", "partitionTableSha256"):
         _require(_digest(image.get(field)), "BLOCKED_IMAGE")
