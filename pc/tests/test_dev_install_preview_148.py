@@ -4,7 +4,9 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import os
 import unittest
+from unittest.mock import patch
 from uuid import UUID, uuid5
 
 from m5daylog.dev_install_preview_148 import preview_install
@@ -354,6 +356,22 @@ class DevInstallPreview148Tests(unittest.TestCase):
         x = fixture("A")
         x["archive"]["verifiedInventory"][PATH]["sha256"] = "0" * 64
         self.blocked(x, "BLOCKED_ARCHIVE_HASH")
+
+    def test_schema_never_follows_environment_host_override(self):
+        x = fixture("R")
+        before = deepcopy(x)
+        # The ordinary PC sync validator allows an optional contracts override;
+        # this offline-only module must not follow it into an arbitrary volume.
+        with patch.dict(os.environ, {
+            "M5DAYLOG_CONTRACTS_DIR": "UNTRUSTED_FAKE_SD_OR_HOST_PATH",
+        }):
+            self.ok(x)
+        self.assertEqual(before, x)
+
+    def test_image_plan_extra_operational_field_is_rejected(self):
+        x = fixture("C")
+        x["image"]["eraseWholeChip"] = True
+        self.blocked(x, "BLOCKED_IMAGE")
 
     def test_image_plan_substitution_denied_even_with_valid_sha(self):
         for field in ("sourceSha256", "appSha256", "partitionTableSha256"):
