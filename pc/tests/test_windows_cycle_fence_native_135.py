@@ -195,6 +195,31 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
             winreg.FlushKey(key)
         self._assert_blocked()
 
+    def test_existing_empty_hkcu_key_is_not_fresh_h0(self):
+        # A past interrupted enrollment can leave the HKCU subkey itself
+        # with no named value; only an absent KEY qualifies as empty state.
+        with self.winreg.CreateKeyEx(self.winreg.HKEY_CURRENT_USER,
+                                     self.key) as key:
+            self.winreg.FlushKey(key)
+        with (patch("sqlite3.connect",
+                    side_effect=AssertionError("unexpected DB creation")) as db_open,
+              patch("m5daylog.release.SyncReleaseCoordinator.run",
+                    side_effect=AssertionError("sender invoked")) as sender):
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.anchor.read()
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.enroll(DEVICE, supervised=True)
+            with self.fence.serialized():
+                with self.assertRaises(PreconditionBlocked):
+                    self.fence.check_unenrolled_locked()
+                with self.assertRaises(PreconditionBlocked):
+                    self.fence.initialize_first_cycle_locked(DEVICE, CYCLE, ATTEMPT)
+            db_open.assert_not_called()
+            sender.assert_not_called()
+        self.assertFalse(self.fence.database.exists())
+        with self.winreg.OpenKey(self.winreg.HKEY_CURRENT_USER, self.key):
+            pass
+
     def test_single_store_db_rollback_blocks_without_repair(self):
         self._enroll_fixture()
         backup = self.root / "saved-ledger"
