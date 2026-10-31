@@ -263,8 +263,9 @@ class CycleAttemptFence:
         if not supervised:
             raise PreconditionBlocked("supervised enrollment required")
         with self.serialized():
-            if self.database.exists() or self.anchor.read() is not None:
-                raise PreconditionBlocked("enrollment or recovery already exists")
+            # Apply the same fail-closed H0 check as first-cycle initialization.
+            # Orphan SQLite journals must never be normalized by connect().
+            self.check_unenrolled_locked()
             self.database.parent.mkdir(parents=True, exist_ok=True)
             initial = {"v": 1, "device": device, "seq": 0,
                        "tip": _hash("m5daylog:r3:enrolled:" + device)}
