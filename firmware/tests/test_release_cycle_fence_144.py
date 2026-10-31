@@ -287,3 +287,36 @@ def test_failed_supervised_staging_never_grants_release(fence_binary, failure):
     assert r["fence"] in ("81", "84")
     # Even after an uncertain commit, FU_STAGED is not a manual-WAKE permit.
     assert observation(fence_binary, "claim", 1, r["fence"])["qualified"] == "0"
+
+
+def test_first_use_real_lifecycle_commit_order(lifecycle_binary):
+    staged = lifecycle_run(lifecycle_binary, lifecycle=0, fence=81, mode="fu_cycle")
+    assert staged == {"result": 0, "lifecycle": 1, "fence": 85,
+                      "writes": 4, "qualified": 0, "host": 0, "live": 0}
+    supervised_boot = lifecycle_run(
+        lifecycle_binary, lifecycle=staged["lifecycle"],
+        fence=staged["fence"], mode="cycle")
+    assert supervised_boot == {"result": 0, "lifecycle": 1, "fence": 83,
+                               "writes": 6, "qualified": 1, "host": 1, "live": 0}
+    day2 = lifecycle_run(lifecycle_binary, lifecycle=1, fence=83, mode="cycle")
+    assert day2 == supervised_boot
+    day3 = lifecycle_run(lifecycle_binary, lifecycle=1, fence=83, mode="cycle")
+    assert day3 == supervised_boot
+
+
+@pytest.mark.parametrize("write", [1, 2, 3, 4])
+@pytest.mark.parametrize("phase", ["set", "before", "after"])
+def test_first_use_every_commit_boundary_fails_closed(lifecycle_binary, write, phase):
+    stopped = lifecycle_run(lifecycle_binary, lifecycle=0, fence=81,
+                            fault_write=write, phase=phase, mode="fu_cycle")
+    assert stopped["result"] != 0
+    assert stopped["writes"] == write
+    # A second process loses all volatile proof. A fresh physical WAKE
+    # qualifies only if the exact accepted release and FU_READY commit
+    # were already durable; staged/unresolved/erased state cannot grant it.
+    reboot = lifecycle_run(lifecycle_binary, lifecycle=stopped["lifecycle"],
+                           fence=stopped["fence"], mode="reboot")
+    ready = stopped["lifecycle"] == 1 and stopped["fence"] == 85
+    assert (reboot["qualified"] == 1) == ready
+    if not ready:
+        assert reboot["result"] != 0
