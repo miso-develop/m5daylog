@@ -23,7 +23,9 @@ static void recorder_task49_delete(TaskHandle_t task);
 
 #include "shutdown_armed.h"
 #include "release_cycle_fence.h"
+#include "release_cycle_button.h"
 #include "release_cycle_witness.h"
+#include "tusb.h"
 #include "rtc_correction.h"
 #include "recorder_nvs.h"
 #include "task87_wake_recovery.h"
@@ -51,6 +53,8 @@ extern bool device_manifest_sync_wav_dir(const char *recordings_dir,
 
 static task87_wake_recovery_t s_wake_recovery;
 static TaskHandle_t s_usb_event_task = NULL;
+static bool s_first_use_attempted;
+static bool s_first_use_button_ready;
 
 static usb_cdc_release_result_t recorder_cdc_release_accept(
     const char *release_attempt_id,
@@ -61,6 +65,8 @@ static usb_cdc_release_result_t recorder_cdc_release_accept(
     result = usb_msc_ownership_accept_release_storage(release_attempt_id);
     switch (result) {
         case USB_MSC_RELEASE_STORAGE_ACCEPTED:
+            // Exactly the existing CDC D-031 acceptance, not SCSI/DETACH.
+            release_cycle_fence_note_canonical_release_accepted();
             return USB_CDC_RELEASE_ACCEPTED;
         case USB_MSC_RELEASE_STORAGE_INVALID_ARGS:
             return USB_CDC_RELEASE_INVALID_ARGS;
@@ -86,6 +92,8 @@ static bool recorder_cdc_command_admission_open(void *ctx) {
 
 static void recorder_cdc_physical_session_cutoff(void *ctx) {
     (void)ctx;
+    release_cycle_button_note_session_cutoff();
+    release_cycle_fence_note_physical_session_cutoff();
     usb_cdc_protocol_close_session();
 }
 
@@ -289,6 +297,47 @@ static void recorder_flush_usb_scsi_trace(void) {
     }
 }
 
+static void recorder_first_use_monitor_poll(void) {
+    uint32_t epoch = 0u;
+    bool custody;
+    esp_err_t err;
+
+    if (s_first_use_attempted || !s_first_use_button_ready) return;
+    custody = recorder_current_state() == RECORDER_STATE_USB_SYNC &&
+        !sd_mount_is_mounted() &&
+        usb_msc_ownership_is_host_owned() &&
+        usb_msc_ownership_release_command_admission_open() &&
+        tud_mounted();
+
+    // Proof is a *continuous* GPIO42-low observation; physical release edges
+    // are counted by an ISR. USB callback session cuts invalidate the clock.
+    if (!release_cycle_button_poll(custody, &epoch)) return;
+    s_first_use_attempted = true;  // never retry uncertain NVS writes
+    if (!custody || release_cycle_button_session_epoch() != epoch) return;
+
+    // The API additionally requires a positively provisioned UNQUALIFIED NVS
+    // fence and durable HOST_UNRESOLVED; erased/legacy NVS never bootstraps.
+    err = release_cycle_fence_stage_first_use();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+            "stage: first-use, result: staging-unqualified, action: release-blocked");
+        return;
+    }
+    // A disconnect concurrent with the NVS transaction burns the stage.
+    // A durable FU_STAGED marker alone can never grant a boot permit.
+    if (release_cycle_button_session_epoch() != epoch ||
+        recorder_current_state() != RECORDER_STATE_USB_SYNC ||
+        !usb_msc_ownership_release_command_admission_open() ||
+        !usb_msc_ownership_is_host_owned() || !tud_mounted()) {
+        release_cycle_fence_note_physical_session_cutoff();
+        ESP_LOGW(TAG,
+            "stage: first-use, result: custody-lost, action: release-blocked");
+        return;
+    }
+    ESP_LOGI(TAG,
+        "stage: first-use, result: intent-durable, release-authority: none");
+}
+
 static void recorder_handle_usb_host_owned(void) {
     if (recorder_current_state() != RECORDER_STATE_USB_PREPARE ||
         sd_mount_is_mounted() ||
@@ -309,6 +358,15 @@ static void recorder_handle_usb_host_owned(void) {
                  "stage: release-cycle, result: ownership-witness-error, action: witness-disabled");
     }
 
+    // A failed physical GPIO interrupt setup cannot synthesize a 10s press.
+    if (!s_first_use_attempted && !s_first_use_button_ready) {
+        s_first_use_button_ready = release_cycle_button_init() == ESP_OK;
+        if (!s_first_use_button_ready) {
+            s_first_use_attempted = true;
+            ESP_LOGW(TAG,
+                "stage: first-use, result: gpio-unavailable, action: disabled");
+        }
+    }
     // D-031 command admission opens only after PC ownership / USB_SYNC.
     usb_cdc_protocol_open_session();
     recorder_flush_usb_scsi_trace();
@@ -361,8 +419,9 @@ static void recorder_handle_usb_release(void) {
     // R3 boot admission is deliberately separate from the existing release
     // authority. A failed next-day re-arm cannot undo an accepted release;
     // it must remain a visible fail-closed condition, never a retry.
-    if (release_cycle_fence_boot_qualified() &&
-        release_cycle_witness_frozen_id() != NULL &&
+    if ((release_cycle_fence_first_use_staged() ||
+         (release_cycle_fence_boot_qualified() &&
+          release_cycle_witness_frozen_id() != NULL)) &&
         release_cycle_fence_note_release_completed() != ESP_OK) {
         ESP_LOGE(TAG,
                  "stage: release-cycle, result: nvs-rearm-error, action: fail-closed");
@@ -420,6 +479,7 @@ static void recorder_usb_event_task(void *arg) {
                 break;
         }
         recorder_flush_usb_scsi_trace();
+        recorder_first_use_monitor_poll();
     }
 }
 
