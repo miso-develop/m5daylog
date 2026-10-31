@@ -35,6 +35,13 @@ def read_only_binary(tmp_path_factory):
 #include "device_manifest.h"
 int main(int argc, char **argv) {
     uint32_t count = 0;
+    if (argc == 7) {
+        device_manifest_result_t result = device_manifest_upsert_file(
+            argv[2], argv[3], argv[5],
+            "2026-10-31T12:01:00+00:00", argv[6]);
+        printf("append=%d\n", (int)result);
+        return 0;
+    }
     if (argc != 6) return 9;
     int ok = device_manifest_verify_settled_readonly(
         argv[1], argv[2], argv[3], argv[4], argv[5], &count);
@@ -214,3 +221,43 @@ def test_no_implicit_normal_boot_or_recovery_calls():
     assert "device_manifest_verify_settled_readonly(" not in (
         Path(__file__).resolve().parents[1] / "main" / "main.c"
     ).read_text()
+
+
+
+def test_later_authorized_append_preserves_historical_wav_and_entry(
+    read_only_binary, tmp_path
+):
+    # The admission scan is read-only. This separate production upsert
+    # simulates only a later independently authorized new recording, not
+    # installer admission, release, or actual flash/SD ownership proof.
+    base, previous_wav = fixture_tree(tmp_path)
+    previous_manifest = json.loads((base / "manifest.json").read_text())
+    before_original_audio = previous_wav.read_bytes()
+    before_device = (base / "device.json").read_bytes()
+    new_id = "33333333-3333-4333-8333-333333333333"
+    new_name = f"recordings/2026-10-31/120100_{new_id}.wav"
+    new_wav = base / new_name
+    new_audio = wav_bytes(b"\x03\x02" * 16000)
+    new_wav.write_bytes(new_audio)
+    new_entry = canonical_json({
+        "recordingId": new_id, "filename": new_name,
+        "startedAt": "2026-10-31T12:01:00+00:00",
+        "durationMs": 1000, "sizeBytes": len(new_audio),
+        "sha256": hashlib.sha256(new_audio).hexdigest(),
+        "sampleRate": 16000, "bitDepth": 16, "channels": 1,
+        "state": "finalized", "firmwareVersion": "0.1.0",
+    })
+    command = [
+        str(read_only_binary), str(base / "recordings"),
+        str(base / "manifest.json"), str(base / "manifest.tmp"),
+        str(base / "device.json"), DID, new_entry,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "append=0" in result.stdout
+    after = json.loads((base / "manifest.json").read_text())
+    assert after["recordings"][:1] == previous_manifest["recordings"]
+    assert len(after["recordings"]) == 2
+    assert previous_wav.read_bytes() == before_original_audio
+    assert (base / "device.json").read_bytes() == before_device
+    assert admit(read_only_binary, base) == {"admitted": "1", "count": "2"}
