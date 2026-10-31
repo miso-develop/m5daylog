@@ -89,6 +89,26 @@ uint32_t release_cycle_button_session_epoch(void) {
     return atomic_load_explicit(&s_session_epoch, memory_order_acquire);
 }
 
+bool release_cycle_button_witness_still_valid(uint32_t witness_epoch) {
+    uint32_t edges;
+    int level;
+    // The detector is coordinator-owned; only the ISR/cutoff callbacks change
+    // these atomic generations. A previously fired detector is not a permit.
+    if (!s_initialized || !s_detector.fired ||
+        s_detector.session_epoch != witness_epoch ||
+        release_cycle_button_session_epoch() != witness_epoch) {
+        return false;
+    }
+    edges = atomic_load_explicit(&s_release_edges, memory_order_acquire);
+    if (edges != s_detector.release_edges) return false;
+    level = gpio_get_level((gpio_num_t)RECORDER_WAKE_BUTTON_PIN);
+    // Bracket the physical low sample with edge/cutoff checks: a release
+    // followed by a fast re-press still invalidates the entire hold.
+    return level == 0 &&
+        atomic_load_explicit(&s_release_edges, memory_order_acquire) == edges &&
+        release_cycle_button_session_epoch() == witness_epoch;
+}
+
 bool release_cycle_button_poll(bool custody, uint32_t *witness_epoch) {
     uint32_t epoch;
     uint32_t edges;
@@ -104,8 +124,12 @@ bool release_cycle_button_poll(bool custody, uint32_t *witness_epoch) {
     ready = release_cycle_button_detector_step(&s_detector,
         level == 0, custody && level >= 0 && now >= 0,
         now >= 0 ? (uint64_t)now : 0u, edges, epoch);
-    // A disconnect during sampling cannot count as uninterrupted custody.
-    if (release_cycle_button_session_epoch() != epoch) {
+    // ISR release/re-press can occur after edge snapshot but before the
+    // sampled GPIO level. Do not publish the stale detector result or retain
+    // its elapsed time when either generation advanced during this poll.
+    if (atomic_load_explicit(&s_release_edges, memory_order_acquire) != edges ||
+        release_cycle_button_session_epoch() != epoch ||
+        (ready && !release_cycle_button_witness_still_valid(epoch))) {
         memset(&s_detector, 0, sizeof(s_detector));
         return false;
     }
