@@ -5,6 +5,7 @@ from copy import deepcopy
 import hashlib
 import json
 import unittest
+from uuid import UUID, uuid5
 
 from m5daylog.dev_install_preview_148 import preview_install
 
@@ -47,6 +48,17 @@ def retained_files() -> dict[str, bytes]:
     }
 
 
+def fresh_uuid(branch: str, *, generation: str = GENERATION) -> str:
+    return str(uuid5(
+        UUID(generation),
+        f"m5daylog:dev-fresh-install:v1:{branch}:fixture-capsule:fixture-host",
+    ))
+
+
+def image_pin(image: dict) -> str:
+    return sha(json.dumps(image, sort_keys=True, separators=(",", ":")).encode())
+
+
 def fixture(branch: str = "R") -> dict:
     data = {
         "branch": branch,
@@ -87,9 +99,10 @@ def fixture(branch: str = "R") -> dict:
                   "listedPaths": sorted(retained_files())},
         "retainedDeviceId": DEVICE,
     }
+    data["approval"]["imagePlanSha256"] = image_pin(data["image"])
     if branch == "C":
         data["media"] = {"files": {}, "listedPaths": []}
-        data["newDeviceId"] = NEW_DEVICE
+        data["newDeviceId"] = fresh_uuid(branch)
         data["independentBlankEvidence"] = "fixture-clean-card"
     if branch == "A":
         original = deepcopy(data["media"])
@@ -104,7 +117,17 @@ def fixture(branch: str = "R") -> dict:
                                   for p, v in original["files"].items()},
             "newMediaFiles": {},
         }
-        data["newDeviceId"] = NEW_DEVICE
+        data["newDeviceId"] = fresh_uuid(branch)
+    if branch in ("C", "A"):
+        data.pop("retainedDeviceId")
+        data["freshIdentity"] = {
+            "independentGenerationEvidence": "fixture-independent-generation",
+            "priorIdentityInventoryComplete": True,
+            "knownPriorDeviceIds": [DEVICE],
+        }
+    data["approval"]["deviceId"] = (
+        DEVICE if branch == "R" else fresh_uuid(branch)
+    )
     return data
 
 
@@ -127,9 +150,12 @@ class DevInstallPreview148Tests(unittest.TestCase):
         return result.candidate
 
     def blocked(self, x: dict, why: str):
+        before = deepcopy(x)
         result = preview_install(x)
         self.assertEqual(("BLOCKED", why), (result.status, result.reason))
         self.assertIsNone(result.candidate)
+        # Every negative case, including nested file-byte inventories, is immutable.
+        self.assertEqual(before, x)
 
     def test_retained_settled_card_preview_deterministic_and_pure(self):
         x = fixture()
@@ -147,11 +173,12 @@ class DevInstallPreview148Tests(unittest.TestCase):
         self.assertEqual(before, x)
 
     def test_clean_new_card_and_archive_branches(self):
-        self.assertEqual(NEW_DEVICE,
+        self.assertEqual(fresh_uuid("C"),
                          self.ok(fixture("C"))["nvsDesiredStateModelOnly"]["device_id"])
         a = self.ok(fixture("A"))
         self.assertEqual(3, a["media"]["archivedFiles"])
-        self.assertEqual(NEW_DEVICE, a["nvsDesiredStateModelOnly"]["device_id"])
+        self.assertEqual(fresh_uuid("A"), a["nvsDesiredStateModelOnly"]["device_id"])
+        self.assertNotEqual(fresh_uuid("C"), fresh_uuid("A"))
 
     def test_denies_invalid_branch_or_input(self):
         x = fixture()
@@ -190,6 +217,8 @@ class DevInstallPreview148Tests(unittest.TestCase):
             ("targetBinding", "wrong-device"),
             ("generation", "77777777-7777-4777-8777-777777777777"),
             ("intentStatus", "CONSUMED"), ("priorConsumedOrReplayed", True),
+            ("imagePlanSha256", "",),
+            ("deviceId", NEW_DEVICE),
         ):
             x = fixture()
             x["approval"][field] = val
@@ -328,10 +357,93 @@ class DevInstallPreview148Tests(unittest.TestCase):
         x["archive"]["verifiedInventory"][PATH]["sha256"] = "0" * 64
         self.blocked(x, "BLOCKED_ARCHIVE_HASH")
 
+    def test_image_plan_substitution_denied_even_with_valid_sha(self):
+        for field in ("sourceSha256", "appSha256", "partitionTableSha256"):
+            x = fixture()
+            x["image"][field] = "f" * 64
+            self.blocked(x, "BLOCKED_PERMISSION_IMAGE")
+        for field, replacement in (
+            ("appOffset", 0x30000),
+            ("nvsSize", 0x5000),
+            ("appSize", 0x100000),
+        ):
+            x = fixture()
+            x["image"][field] = replacement
+            x["image"]["writeRegions"] = [{
+                "name": "nvs", "offset": x["image"]["nvsOffset"],
+                "size": x["image"]["nvsSize"],
+            }]
+            self.blocked(x, "BLOCKED_PERMISSION_IMAGE")
+        x = fixture()
+        x["approval"].pop("imagePlanSha256")
+        self.blocked(x, "BLOCKED_PERMISSION_IMAGE")
+        x = fixture()
+        x["approval"]["imagePlanSha256"] = "f" * 64
+        self.blocked(x, "BLOCKED_PERMISSION_IMAGE")
+        x = fixture()
+        x["approval"]["deviceId"] = NEW_DEVICE
+        self.blocked(x, "BLOCKED_PERMISSION_IDENTITY")
+
+    def test_fresh_identity_generation_is_deterministic_and_branch_bound(self):
+        for branch in ("C", "A"):
+            x = fixture(branch)
+            a = self.ok(x)
+            b = self.ok(deepcopy(x))
+            self.assertEqual(a, b)
+            self.assertEqual(fresh_uuid(branch), a["nvsDesiredStateModelOnly"]["device_id"])
+            self.assertEqual("UUID5_FROM_EXTERNALLY_ATTESTED_V4_GENERATION_CANDIDATE",
+                             a["identityProvenanceModelOnly"])
+            self.assertNotEqual(DEVICE, a["nvsDesiredStateModelOnly"]["device_id"])
+            self.assertEqual("fixture-independent-generation",
+                             a["freshGenerationEvidenceRef"])
+            y = fixture(branch)
+            y["newDeviceId"] = DEVICE
+            self.blocked(y, "BLOCKED_MEDIA_IDENTITY")
+            y = fixture(branch)
+            y["newDeviceId"] = NEW_DEVICE
+            self.blocked(y, "BLOCKED_MEDIA_IDENTITY")
+            y = fixture(branch)
+            y["freshIdentity"]["knownPriorDeviceIds"].append(fresh_uuid(branch))
+            self.blocked(y, "BLOCKED_MEDIA_IDENTITY")
+            y = fixture(branch)
+            y["freshIdentity"]["independentGenerationEvidence"] = ""
+            self.blocked(y, "BLOCKED_FRESH_IDENTITY")
+            y = fixture(branch)
+            y["freshIdentity"]["priorIdentityInventoryComplete"] = False
+            self.blocked(y, "BLOCKED_FRESH_IDENTITY")
+            y = fixture(branch)
+            y["freshIdentity"]["knownPriorDeviceIds"] = None
+            self.blocked(y, "BLOCKED_FRESH_IDENTITY")
+            y = fixture(branch)
+            y["target"]["generation"] = "11111111-1111-5111-8111-111111111111"
+            y["approval"]["generation"] = y["target"]["generation"]
+            self.blocked(y, "BLOCKED_FRESH_IDENTITY")
+        x = fixture("R")
+        x["newDeviceId"] = fresh_uuid("C")
+        self.blocked(x, "BLOCKED_MEDIA_IDENTITY")
+        self.assertEqual("RETAIN_VERIFIED_SD_UUID",
+                         self.ok(fixture("R"))["identityProvenanceModelOnly"])
+
+    def test_partial_permission_or_partition_evidence_is_nonmutating(self):
+        for field in ("deviceId", "intentStatus", "imagePlanSha256"):
+            x = fixture("C")
+            x["approval"].pop(field)
+            expected = (
+                "BLOCKED_PERMISSION_IMAGE" if field == "imagePlanSha256" else
+                "BLOCKED_PERMISSION" if field == "intentStatus" else
+                "BLOCKED_PERMISSION_IDENTITY"
+            )
+            self.blocked(x, expected)
+        x = fixture("R")
+        x["image"]["writeRegions"] = [{"name": "nvs", "offset": 0x9000,
+                                         "size": 0x5000}]
+        self.blocked(x, "BLOCKED_WRITE_SET")
+
     def test_pinned_geometry_and_disposition(self):
         for branch in ("C", "R", "A"):
             cand = self.ok(fixture(branch))
             self.assertEqual(ATTEMPT, cand["firstSupervisedReleaseAttemptId"])
+            self.assertEqual(image_pin(fixture(branch)["image"]), cand["imagePlanSha256"])
             self.assertEqual(0x10000, cand["image"]["appOffset"])
             self.assertIn("originalDataDisposition", cand)
             self.assertEqual("NONE_NOT_A_PERMIT", cand["authority"])
