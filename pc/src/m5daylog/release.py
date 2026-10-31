@@ -244,6 +244,7 @@ class SyncReleaseCoordinator:
         before_cdc_mutations: PreMutationFn | None = None,
         before_seal_observation: ObservationFn | None = None,
         before_release_send: PreSendFn | None = None,
+        release_attempt_id: str | None = None,
     ) -> ReleaseOutcome:
         # No release-side I/O before #51 returns with verified finals and DB commits.
         try:
@@ -258,6 +259,18 @@ class SyncReleaseCoordinator:
         attempt_id: str | None = None
         target: EjectTarget | None = None
         try:
+            # A source-only externally pinned DEV first-release attempt can be
+            # correlated to its consumed generation-bound receipt. This is NOT
+            # external permission and does not alter default manual callers.
+            if release_attempt_id is not None:
+                try:
+                    if (type(release_attempt_id) is not str
+                            or str(uuid.UUID(release_attempt_id)) != release_attempt_id
+                            or before_cdc_mutations is None):
+                        raise PreconditionBlocked("pinned release attempt invalid")
+                except (ValueError, TypeError, AttributeError):
+                    raise PreconditionBlocked("pinned release attempt invalid") from None
+
             # #52: a bounded, already-eligible ACK snapshot; never wait for AI.
             if ack_flush is not None:
                 with gate.ordinary("msc"):
@@ -282,7 +295,7 @@ class SyncReleaseCoordinator:
             if before_cdc_mutations is not None:
                 # Correlate the durable pre-RTC tombstone with the *same*
                 # releaseAttemptId later used by canonical CDC release.
-                attempt_id = str(uuid.uuid4())
+                attempt_id = release_attempt_id or str(uuid.uuid4())
                 before_cdc_mutations(attempt_id, target)
 
             # Required RTC/other pre-release mutations must complete while
