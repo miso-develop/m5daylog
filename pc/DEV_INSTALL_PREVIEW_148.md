@@ -16,7 +16,11 @@ Provide a dict holding these independent pieces of **offline** evidence:
 - branch: C (independently blank/new media), R (settled retained media), or
   A (fully archived and separately approved for retirement).
 - target: targetBinding, hostBinding, distinct canonical UUID generation
-  and attemptId. These bind an offline candidate, not a live Device.
+  and attemptId. C/A require an independently recorded **random v4**
+  install generation; their new candidate Device UUID is derived from that
+  generation, branch and target/host (UUIDv5). Reusing a generation therefore
+  reproduces the **same** candidate and is not authorization to install.
+  This remains an offline plan, not a live Device identifier witness.
 - host: matching hostBinding; lineage NEVER_ENROLLED; a nonempty
   independentLineageEvidence; releaseSQLite and releaseHKCU both ABSENT;
   sharedHostCoordinatorBaseline INDEPENDENTLY_OBSERVED,
@@ -25,8 +29,15 @@ Provide a dict holding these independent pieces of **offline** evidence:
   must be independently proven under the shared #135 coordinator lock.
 - approval: purpose DEV_FRESH_INSTALL_PREVIEW, matching branch, target,
   host, generation and attempt; nonempty externalEvidenceRef;
-  intentStatus UNISSUED_FOR_REVIEW and priorConsumedOrReplayed false. This is
-  traceability for a proposed plan and NEVER a verified release permit.
+  intentStatus UNISSUED_FOR_REVIEW and priorConsumedOrReplayed false.
+  approval.imagePlanSha256 must match the SHA-256 of canonical JSON encoding
+  (UTF-8, sorted keys, compact separators) of the validated exact image plan,
+  including source/ELF/APP/bootloader/partition hashes, flash/app/NVS layout
+  and intended writeRegions. approval.deviceId must match the branch-selected
+  retained or derived Device UUID. Changing an otherwise valid image digest
+  or geometry without changing this comparison pin yields BLOCKED.
+  The approval object is caller-supplied and unauthenticated: traceability
+  for proposed external review, NEVER a verified release permit.
 - custody: writerExcluded true, inventoryComplete true, and
   externalCustodyEvidence. These are untrusted offline assertions;
   a real single-writer boundary needs independent Human Gate evidence.
@@ -48,15 +59,27 @@ SHA-256, path, recordingId uniqueness, and the settled manifest. Pending
 artifacts and inconsistent schema block. No historical WAV or manifest is rewritten; future
 append-only behavior belongs to Device #144.
 
-For C: media files/list must be empty, newDeviceId must be a canonical
-UUID, and independentBlankEvidence must be supplied. Missing manifest
-alone cannot prove an empty SD.
+For C: media files/list must be empty, independentBlankEvidence must be
+supplied, and freshIdentity must include independentGenerationEvidence,
+priorIdentityInventoryComplete true and knownPriorDeviceIds (a complete
+offline witness list, possibly empty). The code derives one UUIDv5 candidate
+from the externally issued random v4 install generation. Optional
+newDeviceId, if supplied, must equal this derived ID; it cannot silently
+substitute a preexisting UUID. A derived ID present in knownPriorDeviceIds
+or contradictory supplied NVS/host evidence blocks. This is only a
+**self-consistency check against claimed independent history**; it cannot
+prove the physical host/device never used that UUID. Missing manifest alone
+cannot prove an empty SD.
 
-For A: newDeviceId plus archive containing snapshot (all original
-files and listed paths), noClobberWitness true, retirementApproved true,
-retirementEvidence, newBlankMediaEvidence and newMediaFiles empty.
-The preview checks complete byte hashes across source and archive,
-without moving/deleting any files or validating actual human signatures.
+For A: independently fresh-generation identity evidence as for C, plus
+archive containing snapshot (all original files and listed paths),
+noClobberWitness true, retirementApproved true, retirementEvidence,
+newBlankMediaEvidence, destinationEvidenceRef, a full verifiedInventory
+of per-file SHA-256 and size, and newMediaFiles empty. Its new candidate
+Device UUID is derived from the independently asserted generation and is
+**different from the R retained ID**. The preview checks complete byte
+hashes across source and archive, without moving/deleting any files or
+validating actual human signatures.
 
 ## Output is never a permit
 
@@ -68,8 +91,11 @@ release_boot FENCE_UNQUALIFIED, shutdown_armed NORMAL, RTC UNQUALIFIED;
 actual NVS key encodings and partition layout must be independently
 reconciled against Device #144 before any physical plan.
 
-The candidateDigestSha256 is an unkeyed comparison fingerprint, not
-proof of originality, a signature or a consumed authorization. The
+The candidateDigestSha256 and imagePlanSha256 are unkeyed comparison
+fingerprints, not proof of originality, a signature, or a consumed
+authorization. An attacker can change the caller-supplied image and its
+untrusted approval pin together: only separate independent permission
+validation can establish an authoritative image/target binding. The
 first real supervised-release attempt consumption and later distinct
 first enrolled cycle consumption remain owned by #135. A prior
 single-store receipt rollback cannot reauthorize a used attempt.
@@ -82,8 +108,12 @@ Run with Python 3.12 in the PC project:
 
     python -m unittest discover -s tests -p "test_dev_install_preview_148.py" -v
 
-The tests use synthetic bytes only. Private audio, host identifiers and
-Device identity should not be published in public CI logs or Issues.
+The tests use synthetic bytes only and check every denial path for nested
+fixture/byte immutability; cases cover valid-hex image substitutions,
+partial permits and partition plans, changed-generation UUID candidates,
+known-prior-ID replay and conflicting R restoration. Private audio, host
+identifiers and Device identity should not be published in public CI logs
+or Issues.
 
 R may retain non-recording ancillary files (including historical ACK or
 event files) only as fully inventoried opaque bytes with captured hashes;
