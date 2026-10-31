@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sqlite3
+from contextlib import closing
 import sys
 import tempfile
 import unittest
@@ -124,7 +125,7 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
             raw, kind = winreg.QueryValueEx(key, self.fence.anchor.VALUE)
         self.assertEqual(kind, winreg.REG_SZ)
         self.assertEqual(json.loads(raw), self.fence.anchor.read())
-        with sqlite3.connect(self.fence.database) as db:
+        with closing(sqlite3.connect(self.fence.database)) as db:
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
             self.assertEqual(db.execute("SELECT COUNT(*) FROM consumed").fetchone(), (1,))
         restarted = _fence(self.root, self.key)
@@ -214,7 +215,7 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
         with patch.object(self.fence.anchor, "write", side_effect=OSError("injected")):
             with self.assertRaises(PreconditionBlocked):
                 self._reserve()
-        with sqlite3.connect(self.fence.database) as db:
+        with closing(sqlite3.connect(self.fence.database)) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM consumed").fetchone(), (1,))
         self._assert_blocked()
         self._assert_blocked(CYCLE, ATTEMPT)
