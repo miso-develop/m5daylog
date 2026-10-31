@@ -2032,6 +2032,64 @@ static bool dev_fi_count_recordings_readonly(const char *recordings_dir,
     return ok;
 }
 
+
+// No rename/cleanup is permitted during R admission. In particular, reject
+// pending artifacts outside recordings/ (including a nonempty quarantine).
+// Benign inventoried files such as events.jsonl remain untouched; the offline
+// host custody inventory is still an independent prerequisite.
+static bool dev_fi_root_settled(const char *manifest_path) {
+    char root[RECORDER_MAX_PATH_LEN];
+    const char *slash = strrchr(manifest_path, '/');
+    DIR *dir;
+    struct dirent *entry;
+    bool ok = true;
+    if (slash == NULL || slash == manifest_path ||
+        (size_t)(slash - manifest_path) >= sizeof(root)) return false;
+    memcpy(root, manifest_path, (size_t)(slash - manifest_path));
+    root[slash - manifest_path] = '\0';
+    dir = opendir(root);
+    if (!dir) return false;
+    for (;;) {
+        size_t n;
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) { if (errno != 0) ok = false; break; }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) continue;
+        n = strlen(entry->d_name);
+        if ((n >= 4u && (strcmp(entry->d_name + n - 4u, ".tmp") == 0 ||
+                          strcmp(entry->d_name + n - 4u, ".bak") == 0)) ||
+            (n >= 5u && strcmp(entry->d_name + n - 5u, ".part") == 0)) {
+            ok = false; break;
+        }
+        if (strcmp(entry->d_name, "quarantine") == 0) {
+            char path[RECORDER_MAX_PATH_LEN];
+            struct stat st;
+            DIR *quarantine;
+            struct dirent *file;
+            int wrote = snprintf(path, sizeof(path), "%s/quarantine", root);
+            if (wrote <= 0 || (size_t)wrote >= sizeof(path) ||
+                stat(path, &st) != 0 || !S_ISDIR(st.st_mode) ||
+                (quarantine = opendir(path)) == NULL) {
+                ok = false; break;
+            }
+            for (;;) {
+                errno = 0;
+                file = readdir(quarantine);
+                if (!file) { if (errno != 0) ok = false; break; }
+                if (strcmp(file->d_name, ".") != 0 &&
+                    strcmp(file->d_name, "..") != 0) {
+                    ok = false; break;
+                }
+            }
+            if (closedir(quarantine) != 0) ok = false;
+            if (!ok) break;
+        }
+    }
+    if (closedir(dir) != 0) ok = false;
+    return ok;
+}
+
 bool device_manifest_verify_settled_readonly(
     const char *recordings_dir, const char *manifest_path,
     const char *tmp_path, const char *device_json_path,
@@ -2048,6 +2106,7 @@ bool device_manifest_verify_settled_readonly(
         device_json_path == NULL ||
         !device_identity_is_valid_uuid(device_id) ||
         !manifest_backup_path(manifest_path, backup) ||
+        !dev_fi_root_settled(manifest_path) ||
         !dev_fi_absent(tmp_path) || !dev_fi_absent(backup) ||
         !dev_fi_canonical_device_json(device_json_path, device_id) ||
         !read_file_bounded(manifest_path, &doc, &len,
