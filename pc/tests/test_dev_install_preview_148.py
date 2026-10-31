@@ -58,12 +58,16 @@ def fixture(branch: str = "R") -> dict:
             "hostBinding": "fixture-host", "lineage": "NEVER_ENROLLED",
             "independentLineageEvidence": "fixture-independent-h0",
             "releaseSQLite": "ABSENT", "releaseHKCU": "ABSENT",
+            "sharedHostCoordinatorBaseline": "INDEPENDENTLY_OBSERVED",
+            "historyComplete": True, "earlierReleaseAttempt": False,
         },
         "approval": {
             "purpose": "DEV_FRESH_INSTALL_PREVIEW", "branch": branch,
             "targetBinding": "fixture-capsule", "hostBinding": "fixture-host",
             "generation": GENERATION, "attemptId": ATTEMPT,
             "externalEvidenceRef": "fixture-external-review",
+            "intentStatus": "UNISSUED_FOR_REVIEW",
+            "priorConsumedOrReplayed": False,
         },
         "custody": {
             "writerExcluded": True, "inventoryComplete": True,
@@ -74,6 +78,8 @@ def fixture(branch: str = "R") -> dict:
             "appSha256": "c" * 64, "bootloaderSha256": "d" * 64,
             "partitionTableSha256": "e" * 64,
             "nvsOffset": 0x9000, "nvsSize": 0x6000,
+            "flashSizeBytes": 0x400000,
+            "appOffset": 0x10000, "appSize": 0x200000,
             "writeRegions": [{"name": "nvs", "offset": 0x9000,
                               "size": 0x6000}],
         },
@@ -93,6 +99,9 @@ def fixture(branch: str = "R") -> dict:
             "noClobberWitness": True,
             "newBlankMediaEvidence": "fixture-new-card",
             "snapshot": original,
+            "destinationEvidenceRef": "fixture-independent-archive-location",
+            "verifiedInventory": {p: {"sizeBytes": len(v), "sha256": sha(v)}
+                                  for p, v in original["files"].items()},
             "newMediaFiles": {},
         }
         data["newDeviceId"] = NEW_DEVICE
@@ -158,6 +167,8 @@ class DevInstallPreview148Tests(unittest.TestCase):
             ("releaseSQLite", "MISSING_AFTER_ENROLLED"),
             ("releaseHKCU", "CORRUPTED"),
             ("hostBinding", "other-host"),
+            ("sharedHostCoordinatorBaseline", "SELF_REPORTED"),
+            ("historyComplete", False), ("earlierReleaseAttempt", True),
         ):
             with self.subTest(field=path, value=value):
                 x = fixture()
@@ -178,6 +189,7 @@ class DevInstallPreview148Tests(unittest.TestCase):
             ("externalEvidenceRef", ""),
             ("targetBinding", "wrong-device"),
             ("generation", "77777777-7777-4777-8777-777777777777"),
+            ("intentStatus", "CONSUMED"), ("priorConsumedOrReplayed", True),
         ):
             x = fixture()
             x["approval"][field] = val
@@ -190,6 +202,9 @@ class DevInstallPreview148Tests(unittest.TestCase):
             ("nvsOffset", 0x8100, "BLOCKED_PARTITION"),
             ("nvsSize", 0, "BLOCKED_PARTITION"),
             ("nvsSize", -4096, "BLOCKED_PARTITION"),
+            ("appOffset", 0x9000, "BLOCKED_PARTITION"),
+            ("appSize", 0x400000, "BLOCKED_PARTITION"),
+            ("flashSizeBytes", 0, "BLOCKED_PARTITION"),
             ("writeRegions", [{"name": "flash", "offset": 0,
                                 "size": 0x100000}], "BLOCKED_WRITE_SET"),
             ("writeRegions", [{"name": "nvs", "offset": 0x9000,
@@ -210,6 +225,21 @@ class DevInstallPreview148Tests(unittest.TestCase):
         x = fixture()
         set_manifest(x, lambda m: m.update(deviceId=NEW_DEVICE))
         self.blocked(x, "BLOCKED_MEDIA_IDENTITY")
+
+    def test_retain_accepts_complete_auxiliary_inventory_without_mutation(self):
+        x = fixture()
+        x["media"]["files"]["events/first-session.jsonl"] = b"synthetic-event"
+        x["media"]["listedPaths"].append("events/first-session.jsonl")
+        before = deepcopy(x)
+        digests = self.ok(x)["media"]["retainedDigests"]
+        self.assertEqual(sha(b"synthetic-event"), digests["events/first-session.jsonl"])
+        self.assertEqual(before, x)
+
+    def test_retain_rejects_contradictory_host_or_nvs_id(self):
+        for field in ("observedNvsDeviceId", "observedHostDeviceId"):
+            x = fixture()
+            x[field] = NEW_DEVICE
+            self.blocked(x, "BLOCKED_MEDIA_IDENTITY")
 
     def test_retain_rejects_bytes_size_and_hash(self):
         x = fixture()
@@ -281,6 +311,8 @@ class DevInstallPreview148Tests(unittest.TestCase):
             ("noClobberWitness", False, "BLOCKED_ARCHIVE_APPROVAL"),
             ("newBlankMediaEvidence", "", "BLOCKED_ARCHIVE_APPROVAL"),
             ("newMediaFiles", {"old": b"data"}, "BLOCKED_MEDIA_NOT_BLANK"),
+            ("destinationEvidenceRef", "", "BLOCKED_ARCHIVE_INCOMPLETE"),
+            ("verifiedInventory", {}, "BLOCKED_ARCHIVE_INCOMPLETE"),
         ):
             x = fixture("A")
             x["archive"][field] = value
@@ -292,6 +324,17 @@ class DevInstallPreview148Tests(unittest.TestCase):
         x = fixture("A")
         x["archive"]["snapshot"]["files"][PATH] = BYTES + b"mutation"
         self.blocked(x, "BLOCKED_ARCHIVE_HASH")
+        x = fixture("A")
+        x["archive"]["verifiedInventory"][PATH]["sha256"] = "0" * 64
+        self.blocked(x, "BLOCKED_ARCHIVE_HASH")
+
+    def test_pinned_geometry_and_disposition(self):
+        for branch in ("C", "R", "A"):
+            cand = self.ok(fixture(branch))
+            self.assertEqual(ATTEMPT, cand["firstSupervisedReleaseAttemptId"])
+            self.assertEqual(0x10000, cand["image"]["appOffset"])
+            self.assertIn("originalDataDisposition", cand)
+            self.assertEqual("NONE_NOT_A_PERMIT", cand["authority"])
 
     def test_receipt_candidate_binding_replay_and_indeterminate_fields(self):
         x = fixture()
