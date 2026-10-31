@@ -3,6 +3,7 @@
 #ifdef ESP_PLATFORM
 
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "nvs.h"
 #include "recorder_nvs.h"
@@ -17,13 +18,19 @@ enum {
     FENCE_UNQUALIFIED = 0x51u,
     FENCE_BOOT_ACTIVE = 0x52u,
     FENCE_READY_AFTER_RELEASE = 0x53u,
+    FENCE_FU_STAGED = 0x54u,
+    FENCE_FU_READY_AFTER_RELEASE = 0x55u,
     LIFECYCLE_SHUTDOWN_ARMED = 1u,
+    LIFECYCLE_HOST_UNRESOLVED = 2u,
 };
 
 static bool s_boot_checked;
 static bool s_boot_admitted;
 static bool s_this_boot_qualified;
 static bool s_saw_host_owned;
+static const char *s_boot_origin;
+static _Atomic bool s_first_use_staged;
+static _Atomic bool s_first_use_release_accepted;
 
 esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
     nvs_handle_t handle = 0;
@@ -39,6 +46,9 @@ esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
     s_boot_admitted = false;
     s_this_boot_qualified = false;
     s_saw_host_owned = false;
+    s_boot_origin = NULL;
+    atomic_store(&s_first_use_staged, false);
+    atomic_store(&s_first_use_release_accepted, false);
     if (!manual_wake) {
         return ESP_OK;
     }
@@ -70,13 +80,16 @@ esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
         goto done;
     }
     if (lifecycle != LIFECYCLE_SHUTDOWN_ARMED ||
-        fence != FENCE_READY_AFTER_RELEASE) {
+        (fence != FENCE_READY_AFTER_RELEASE &&
+         fence != FENCE_FU_READY_AFTER_RELEASE)) {
         // NORMAL, HOST_UNRESOLVED, interrupted WAKE, stale BOOT_ACTIVE,
         // corrupt/unknown fence: recorder recovery may proceed, but this
         // process boot cannot be authorized for unattended release.
         err = fence == FENCE_UNQUALIFIED ||
                       fence == FENCE_BOOT_ACTIVE ||
-                      fence == FENCE_READY_AFTER_RELEASE
+                      fence == FENCE_READY_AFTER_RELEASE ||
+                      fence == FENCE_FU_STAGED ||
+                      fence == FENCE_FU_READY_AFTER_RELEASE
                   ? ESP_OK : ESP_ERR_INVALID_STATE;
         goto done;
     }
@@ -88,6 +101,8 @@ esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
     }
     if (err == ESP_OK) {
         s_boot_admitted = true;
+        s_boot_origin = fence == FENCE_FU_READY_AFTER_RELEASE
+            ? "SUPERVISED_FIRST_USE" : "NORMAL_WAKE";
     }
 
 done:
@@ -137,9 +152,61 @@ bool release_cycle_fence_boot_qualified(void) {
 }
 
 const char *release_cycle_fence_current_origin(void) {
-    // R3 has only a consumed, previously armed manual-WAKE origin.
-    // Future supervised first-use requires a separate durably proven path.
-    return s_this_boot_qualified ? "NORMAL_WAKE" : NULL;
+    // A volatile origin exists only after a durable used-permit transition
+    // and #87's recorder recovery. Never infer origin from UUID or RTC.
+    return s_this_boot_qualified ? s_boot_origin : NULL;
+}
+
+esp_err_t release_cycle_fence_stage_first_use(void) {
+    nvs_handle_t handle = 0;
+    uint8_t lifecycle = 0;
+    uint8_t fence = 0;
+    uint8_t readback = 0;
+    esp_err_t err;
+
+    // Only a normal, unqualified process boot may stage; it cannot reuse
+    // a completed/used boot or a prior interrupted staging attempt.
+    if (!s_boot_checked || s_boot_admitted || s_this_boot_qualified ||
+        atomic_load(&s_first_use_staged)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = recorder_nvs_lock();
+    if (err != ESP_OK) return err;
+    err = nvs_open(k_namespace, NVS_READWRITE, &handle);
+    if (err != ESP_OK) goto stage_done;
+    err = nvs_get_u8(handle, k_lifecycle_key, &lifecycle);
+    if (err != ESP_OK) goto stage_done;
+    err = nvs_get_u8(handle, k_fence_key, &fence);
+    // Missing NVS is NOT a positive virginity proof. The exceptional #119
+    // route needs an explicitly present, previously qualified marker.
+    if (err != ESP_OK) goto stage_done;
+    if (lifecycle != LIFECYCLE_HOST_UNRESOLVED ||
+        fence != FENCE_UNQUALIFIED) {
+        err = ESP_ERR_INVALID_STATE;
+        goto stage_done;
+    }
+    err = nvs_set_u8(handle, k_fence_key, FENCE_FU_STAGED);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    if (err == ESP_OK) err = nvs_get_u8(handle, k_fence_key, &readback);
+    if (err == ESP_OK && readback != FENCE_FU_STAGED) {
+        err = ESP_ERR_INVALID_STATE;
+    }
+    if (err == ESP_OK) atomic_store(&s_first_use_staged, true);
+
+stage_done:
+    if (handle != 0) nvs_close(handle);
+    recorder_nvs_unlock();
+    return err;
+}
+
+bool release_cycle_fence_first_use_staged(void) {
+    return atomic_load(&s_first_use_staged);
+}
+
+void release_cycle_fence_note_canonical_release_accepted(void) {
+    if (atomic_load(&s_first_use_staged)) {
+        atomic_store(&s_first_use_release_accepted, true);
+    }
 }
 
 esp_err_t release_cycle_fence_note_host_owned(void) {
@@ -186,7 +253,9 @@ esp_err_t release_cycle_fence_note_release_completed(void) {
     uint8_t fence = 0;
     esp_err_t err;
 
-    if (!s_this_boot_qualified || !s_saw_host_owned) {
+    const bool first_use = atomic_load(&s_first_use_staged) &&
+        atomic_load(&s_first_use_release_accepted);
+    if (!first_use && (!s_this_boot_qualified || !s_saw_host_owned)) {
         return ESP_ERR_INVALID_STATE;
     }
     // After an accepted D-031 request, #87 has already transitioned
@@ -211,11 +280,13 @@ esp_err_t release_cycle_fence_note_release_completed(void) {
         goto done;
     }
     if (lifecycle != LIFECYCLE_SHUTDOWN_ARMED ||
-        fence != FENCE_BOOT_ACTIVE) {
+        fence != (first_use ? FENCE_FU_STAGED : FENCE_BOOT_ACTIVE)) {
         err = ESP_ERR_INVALID_STATE;
         goto done;
     }
-    err = nvs_set_u8(handle, k_fence_key, FENCE_READY_AFTER_RELEASE);
+    err = nvs_set_u8(handle, k_fence_key, first_use
+                     ? FENCE_FU_READY_AFTER_RELEASE
+                     : FENCE_READY_AFTER_RELEASE);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
@@ -229,6 +300,8 @@ done:
     // this boot. The next boot will assess the durable value independently.
     s_this_boot_qualified = false;
     s_saw_host_owned = false;
+    atomic_store(&s_first_use_staged, false);
+    atomic_store(&s_first_use_release_accepted, false);
     return err;
 }
 
@@ -247,6 +320,13 @@ bool release_cycle_fence_boot_qualified(void) {
 const char *release_cycle_fence_current_origin(void) {
     return NULL;
 }
+esp_err_t release_cycle_fence_stage_first_use(void) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+bool release_cycle_fence_first_use_staged(void) {
+    return false;
+}
+void release_cycle_fence_note_canonical_release_accepted(void) {}
 esp_err_t release_cycle_fence_note_host_owned(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
