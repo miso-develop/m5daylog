@@ -283,6 +283,11 @@ class DevInstallPreview148Tests(unittest.TestCase):
             ("recordings/orphan.wav", "BLOCKED_MEDIA_EXTRA_FILE"),
             ("manifest.json.tmp", "BLOCKED_MEDIA_UNSETTLED"),
             ("manifest.json.bak", "BLOCKED_MEDIA_UNSETTLED"),
+            ("manifest.json.BAK", "BLOCKED_MEDIA_UNSETTLED"),
+            ("manifest.json.TMP", "BLOCKED_MEDIA_UNSETTLED"),
+            ("device.json.BaK", "BLOCKED_MEDIA_UNSETTLED"),
+            ("events/pending.TXN", "BLOCKED_MEDIA_UNSETTLED"),
+            ("events/.PART123", "BLOCKED_MEDIA_UNSETTLED"),
             ("recordings/orphan.wav.part", "BLOCKED_MEDIA_UNSETTLED"),
             ("recordings/temp.partial", "BLOCKED_MEDIA_UNSETTLED"),
         ):
@@ -291,6 +296,23 @@ class DevInstallPreview148Tests(unittest.TestCase):
                 x["media"]["files"][extra] = b"old"
                 x["media"]["listedPaths"].append(extra)
                 self.blocked(x, code)
+
+    def test_retain_rejects_case_aliases_and_recordings_directory_alias(self):
+        # A FAT/Windows inventory may alias names that differ only by case.
+        # None of these alternate paths can be treated as opaque support files.
+        for alias, existing, reason in (
+            ("MANIFEST.JSON", "manifest.json", "BLOCKED_MEDIA_CONFLICT"),
+            ("Device.json", "device.json", "BLOCKED_MEDIA_CONFLICT"),
+            ("Recordings/" + PATH.split("/", 1)[1], PATH, "BLOCKED_MEDIA_CONFLICT"),
+            ("Recordings/unindexed.bin", None, "BLOCKED_MEDIA_EXTRA_FILE"),
+        ):
+            with self.subTest(alias=alias):
+                x = fixture("R")
+                x["media"]["files"][alias] = (
+                    x["media"]["files"][existing] if existing else b"unindexed"
+                )
+                x["media"]["listedPaths"].append(alias)
+                self.blocked(x, reason)
 
     def test_retain_rejects_duplicate_ids_and_missing_wav(self):
         x = fixture()
