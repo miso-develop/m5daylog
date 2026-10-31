@@ -421,9 +421,11 @@ static void recorder_handle_usb_release(void) {
     // R3 boot admission is deliberately separate from the existing release
     // authority. A failed next-day re-arm cannot undo an accepted release;
     // it must remain a visible fail-closed condition, never a retry.
-    if ((release_cycle_fence_first_use_staged() ||
-         (release_cycle_fence_boot_qualified() &&
-          release_cycle_witness_frozen_id() != NULL)) &&
+    // Loss of the optional host-owned NVS witness withholds the R5 status
+    // pair and next-day re-arm; it must not prevent the already accepted
+    // D-031 quiesce/SHUTDOWN_ARMED from reaching functional shutdown.
+    if (release_cycle_fence_rearm_required(
+            release_cycle_witness_frozen_id() != NULL) &&
         release_cycle_fence_note_release_completed() != ESP_OK) {
         ESP_LOGE(TAG,
                  "stage: release-cycle, result: nvs-rearm-error, action: fail-closed");
