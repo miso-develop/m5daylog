@@ -51,6 +51,16 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 MAX_CDC_REPLY = 4096
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject ambiguous duplicate JSON keys in the CDC status response."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate CDC JSON key")
+        result[key] = value
+    return result
+
+
 @dataclass(frozen=True)
 class DiskInterface:
     disk_number: int
@@ -78,6 +88,7 @@ class Win32DeviceApi(Protocol):
     def lock_and_dismount(self, volume_guid: str) -> ContextManager[None]: ...
     def release_cdc(self, port: str, attempt_id: str, binding: CdcInterface) -> None: ...
     def cdc_interface(self, port: str) -> CdcInterface: ...
+    def set_time(self, port: str, binding: CdcInterface, utc_text: str) -> None: ...
 
 
 class WindowsHostReleasePort:
@@ -148,6 +159,18 @@ class WindowsHostReleasePort:
                 or self.api.cdc_interface(cdc_port) != binding[2]):
             raise WrongTarget("CDC endpoint changed identity before release")
         self.api.release_cdc(cdc_port, attempt_id, binding[2])
+
+    def set_time(self, cdc_port: str, utc_text: str) -> None:
+        """Current-session #50 pre-release SET_TIME on the frozen CDC path.
+
+        Must only be called between ordinary target validation and I/O seal.
+        The native adapter rejects missing/changed endpoint identity.
+        """
+        binding = self._cdc_binding
+        if (binding is None or binding[1] != cdc_port.upper()
+                or self.api.cdc_interface(cdc_port) != binding[2]):
+            raise WrongTarget("RTC CDC endpoint not frozen")
+        self.api.set_time(cdc_port, binding[2], utc_text)
 
     def volume_disappeared(self, target: EjectTarget) -> bool:
         # No post-acceptance CreateFile, storage IOCTL, or filesystem query.
@@ -637,5 +660,148 @@ class NativeWin32DeviceApi:
                 # A negative response can be distinguished, but an invalid/mismatched
                 # response cannot prove that the Device did not accept the command.
                 raise ReleaseIndeterminate("CDC release acceptance unproven")
+        finally:
+            self.k.CloseHandle(handle)
+
+    def read_status(self, port: str) -> dict[str, object]:
+        """#135 read-only GET_STATUS; no release authority or filesystem write.
+
+        Exact present CDC interface is frozen before open and verified again
+        after CreateFile. The caller separately validates its MSC physical
+        parent and treats every uncertain response as unqualified.
+        """
+        endpoint = self._cdc_interface(port)
+        request_id = str(uuid.uuid4())
+        request = (json.dumps({
+            "id": request_id, "cmd": "GET_STATUS", "args": {},
+        }, separators=(",", ":")) + "\n").encode("ascii")
+        handle = self._open(endpoint.device_path, GENERIC_READ | GENERIC_WRITE, 0)
+        try:
+            if self._cdc_interface(port) != endpoint:
+                raise WrongTarget("CDC endpoint changed before status query")
+            timeouts = COMMTIMEOUTS(0xFFFFFFFF, 0, 250, 0, 1000)
+            if not self.k.SetCommTimeouts(handle, ctypes.byref(timeouts)):
+                raise HostQuiesceError("CDC status timeout configuration failed")
+            out = ctypes.create_string_buffer(request)
+            written = wintypes.DWORD()
+            if not self.k.WriteFile(handle, out, len(request), ctypes.byref(written), None):
+                raise HostQuiesceError("CDC status write failed")
+            if written.value != len(request):
+                raise HostQuiesceError("CDC status short write")
+            deadline = time.monotonic() + 5.0
+            reply = bytearray()
+            while time.monotonic() < deadline and len(reply) < MAX_CDC_REPLY:
+                buf = ctypes.create_string_buffer(1)
+                got = wintypes.DWORD()
+                if not self.k.ReadFile(handle, buf, 1, ctypes.byref(got), None):
+                    raise HostQuiesceError("CDC status response lost")
+                if got.value:
+                    reply.extend(buf.raw[:got.value])
+                    if reply.endswith(b"\n"):
+                        break
+            else:
+                raise HostQuiesceError("CDC status response incomplete")
+            try:
+                response = json.loads(reply.decode("utf-8"),
+                                      object_pairs_hook=_unique_json_object)
+            except (UnicodeError, ValueError):
+                raise HostQuiesceError("CDC status invalid envelope") from None
+            if (not isinstance(response, dict)
+                    or response.get("id") != request_id
+                    or response.get("ok") is not True
+                    or not isinstance(response.get("result"), dict)):
+                raise HostQuiesceError("CDC status not qualified")
+            result = response["result"]
+            if (not isinstance(result.get("state"), str)
+                    or not isinstance(result.get("rtcCorrectionPending"), bool)):
+                raise HostQuiesceError("CDC status invalid fields")
+            parsed = {
+                "state": result["state"],
+                "rtcCorrectionPending": result["rtcCorrectionPending"],
+            }
+            # Frozen #143 R5: only a valid pair from this same status response
+            # may produce a release-cycle candidate. Invalid/missing/legacy
+            # fields do not block independent read-only WAV intake.
+            if "releaseCycleId" in result and "releaseCycleOrigin" in result:
+                cycle = result["releaseCycleId"]
+                origin = result["releaseCycleOrigin"]
+                if (type(cycle) is str and type(origin) is str
+                        and origin in ("NORMAL_WAKE", "SUPERVISED_FIRST_USE")):
+                    try:
+                        canonical = str(uuid.UUID(cycle))
+                    except (ValueError, AttributeError, TypeError):
+                        canonical = None
+                    if canonical is not None and cycle == canonical:
+                        parsed["releaseCycleId"] = canonical
+                        parsed["releaseCycleOrigin"] = origin
+            return parsed
+        finally:
+            self.k.CloseHandle(handle)
+
+    def set_time(self, port: str, binding: CdcInterface, utc_text: str) -> None:
+        """#21/#50 qualified pre-seal RTC mutation on a frozen CDC endpoint.
+
+        This is a source-only adapter. Caller MUST first prove the current
+        authorized MSC/CDC session and must not retry after indeterminate I/O.
+        No unattended caller is wired until an adequate release session fence
+        and current-running Device qualification both exist.
+        """
+        from datetime import datetime
+
+        if (not isinstance(utc_text, str)
+                or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+                                r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z", utc_text) is None):
+            raise ReleaseRejected("RTC input must be whole-second UTC")
+        try:
+            datetime.strptime(utc_text, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            raise ReleaseRejected("RTC input is invalid") from None
+        if not isinstance(binding, CdcInterface):
+            raise WrongTarget("frozen CDC endpoint required")
+        if self._cdc_interface(port) != binding:
+            raise WrongTarget("RTC endpoint no longer matches frozen binding")
+        request_id = str(uuid.uuid4())
+        request = (json.dumps({
+            "id": request_id, "cmd": "SET_TIME", "args": {"time": utc_text},
+        }, separators=(",", ":")) + "\n").encode("ascii")
+        handle = self._open(binding.device_path, GENERIC_READ | GENERIC_WRITE, 0)
+        try:
+            if self._cdc_interface(port) != binding:
+                raise WrongTarget("RTC endpoint changed during handle acquisition")
+            timeouts = COMMTIMEOUTS(0xFFFFFFFF, 0, 250, 0, 1000)
+            if not self.k.SetCommTimeouts(handle, ctypes.byref(timeouts)):
+                raise ReleaseRejected("RTC CDC timeout configuration failed")
+            written = wintypes.DWORD()
+            out = ctypes.create_string_buffer(request)
+            if not self.k.WriteFile(handle, out, len(request), ctypes.byref(written), None):
+                raise ReleaseIndeterminate("RTC CDC write outcome unproven")
+            if written.value != len(request):
+                raise ReleaseIndeterminate("RTC CDC short write")
+            deadline = time.monotonic() + 5.0
+            reply = bytearray()
+            while time.monotonic() < deadline and len(reply) < MAX_CDC_REPLY:
+                buf = ctypes.create_string_buffer(1)
+                got = wintypes.DWORD()
+                if not self.k.ReadFile(handle, buf, 1, ctypes.byref(got), None):
+                    raise ReleaseIndeterminate("RTC CDC response lost")
+                if got.value:
+                    reply.extend(buf.raw[:got.value])
+                    if reply.endswith(b"\n"):
+                        break
+            else:
+                raise ReleaseIndeterminate("RTC CDC response incomplete")
+            try:
+                response = json.loads(reply.decode("utf-8"))
+            except (ValueError, UnicodeError):
+                raise ReleaseIndeterminate("RTC CDC response malformed") from None
+            if not isinstance(response, dict) or response.get("id") != request_id:
+                raise ReleaseIndeterminate("RTC CDC response identity mismatch")
+            if response.get("ok") is False:
+                raise ReleaseRejected("RTC mutation rejected")
+            result = response.get("result")
+            if (response.get("ok") is not True or not isinstance(result, dict)
+                    or result.get("time") != utc_text
+                    or result.get("eventPending") is not True):
+                raise ReleaseIndeterminate("RTC pending event not proven")
         finally:
             self.k.CloseHandle(handle)
