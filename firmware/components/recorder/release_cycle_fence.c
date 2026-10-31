@@ -3,6 +3,7 @@
 #ifdef ESP_PLATFORM
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdatomic.h>
 
 #include "nvs.h"
