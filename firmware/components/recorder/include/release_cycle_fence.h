@@ -49,6 +49,10 @@ bool release_cycle_fence_first_use_staged(void);
 // succeeds; never from SCSI eject, unplug or the button handler.
 void release_cycle_fence_note_canonical_release_accepted(void);
 
+// Callback-safe invalidation for a physical USB-session cutoff before the
+// canonical acceptance; no persistent state mutation/re-enrollment.
+void release_cycle_fence_note_physical_session_cutoff(void);
+
 // Call once after PC-owned USB_SYNC and durable HOST_UNRESOLVED are proven.
 // It cannot be invoked simply because a stale boot marker was found.
 esp_err_t release_cycle_fence_note_host_owned(void);
