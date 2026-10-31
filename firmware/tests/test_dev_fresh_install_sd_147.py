@@ -32,9 +32,19 @@ def read_only_binary(tmp_path_factory):
     harness.write_text(r"""
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include "device_manifest.h"
 int main(int argc, char **argv) {
     uint32_t count = 0;
+    if (argc == 7 && strcmp(argv[1], "--scan") == 0) {
+        uint32_t added = 0, skipped = 0;
+        int ok = device_manifest_sync_wav_dir(
+            argv[2], argv[3], argv[4], argv[5], argv[6], "recovered",
+            &added, &skipped);
+        printf("scanned=%d added=%u skipped=%u\n",
+               ok, (unsigned)added, (unsigned)skipped);
+        return 0;
+    }
     if (argc == 7) {
         device_manifest_result_t result = device_manifest_upsert_file(
             argv[2], argv[3], argv[5],
@@ -119,6 +129,30 @@ def admit(exe, base, did=DID):
     )
     assert result.returncode == 0, result.stderr + result.stdout
     return dict(part.split("=", 1) for part in result.stdout.strip().split())
+
+
+def test_authorized_postgrant_normal_index_scan_is_noop_for_settled_r(
+    read_only_binary, tmp_path
+):
+    # Production C indexer is also reachable in main.c's normal recorder boot
+    # after a writable SD mount. This is a *postgrant* observation only:
+    # external grant consumption, selected APP and physical custody remain
+    # unverified. A settled original R card must not be silently reindexed.
+    base, original_wav = fixture_tree(tmp_path)
+    original = original_wav.read_bytes()
+    historical = json.loads((base / "manifest.json").read_text())["recordings"]
+    assert admit(read_only_binary, base) == {"admitted": "1", "count": "1"}
+    before = inventory(tmp_path)
+    run = subprocess.run(
+        [str(read_only_binary), "--scan", str(base / "recordings"),
+         str(base / "manifest.json"), str(base / "manifest.tmp"),
+         DID, STAMP], capture_output=True, text=True,
+    )
+    assert run.returncode == 0, run.stderr + run.stdout
+    assert run.stdout.strip() == "scanned=1 added=0 skipped=0"
+    assert inventory(tmp_path) == before
+    assert original_wav.read_bytes() == original
+    assert json.loads((base / "manifest.json").read_text())["recordings"] == historical
 
 
 def test_complete_settled_r_is_read_only(read_only_binary, tmp_path):
