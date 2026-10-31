@@ -37,6 +37,18 @@ bool release_cycle_fence_boot_qualified(void);
 // permit was consumed and #87 recorder readiness reached. Not a new grant.
 const char *release_cycle_fence_current_origin(void);
 
+// R5-FU: source-only, explicitly prepared first-use staging path.
+// Caller must establish 10 seconds of uninterrupted real GPIO42 hold in
+// USB_SYNC/PC_OWNED, same-session custody and a separately authorized #119
+// one-shot intent. This function does not accept missing NVS as enrollment.
+// It durably stages intent, NOT release qualification or first boot authority.
+esp_err_t release_cycle_fence_stage_first_use(void);
+bool release_cycle_fence_first_use_staged(void);
+
+// Called only after the existing canonical CDC RELEASE_STORAGE accept
+// succeeds; never from SCSI eject, unplug or the button handler.
+void release_cycle_fence_note_canonical_release_accepted(void);
+
 // Call once after PC-owned USB_SYNC and durable HOST_UNRESOLVED are proven.
 // It cannot be invoked simply because a stale boot marker was found.
 esp_err_t release_cycle_fence_note_host_owned(void);
@@ -48,9 +60,9 @@ bool release_cycle_fence_host_owned_qualified(void);
 // A failed write never grants the following boot a new candidate.
 esp_err_t release_cycle_fence_note_release_completed(void);
 
-// There is intentionally NO unattended enrollment/reset API. A missing or
-// invalid persistent key is unqualified pending a separately authorized
-// supervised first-use/recovery protocol.
+// No erase, auto-enroll or NVS reset API exists. A missing/invalid key stays
+// unqualified: supervised staging needs an already explicitly provisioned
+// UNQUALIFIED marker, live GPIO custody, and host/human attempt evidence.
 #ifdef __cplusplus
 }
 #endif
