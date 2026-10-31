@@ -239,7 +239,7 @@ distinguish already-enrolled *on transaction entry* from the state created by
 the supervised first-enrollment transaction; fail permanently closed on
 split/unknown commits, restart, one-sided rollback and uncertain CDC response.
 Implement and independently review the shared manual CLI+watcher guard,
-provisional CDC origin compatibility, real Windows fault/durability tests and
+frozen source-only CDC origin compatibility, real Windows fault/durability tests and
 Device-side qualified first-use source. Do not use this prototype as evidence
 for PC-A03, physical #119 operations, RELEASE_STORAGE, merge or unattended
 release. #119/#130 firmware provenance and separately permitted physical Human
@@ -300,8 +300,9 @@ qualification, actual Windows at-login UX, current Device firmware or a
 Human Gate**. Additional fault tests at actual Windows persistence/USB/CDC
 boundaries remain mandatory for production release acceptance.
 
-**STOP lines unchanged:** R5 `releaseCycleOrigin` is provisional pending
-the separate #143 CDC compatibility review. No caller may treat the source
+**STOP lines unchanged:** #143's R5 CDC v1 origin-pair contract is
+frozen for source-only compatibility, NOT for release deployment. No caller
+may treat the source
 model or its caller-provided `*_verified` booleans as independent proof.
 Real Device #144, #119/#130 preservation/provenance, exact manifest
 terminal-segment/RTC validation, CLI+watch single full-call coordinator,
@@ -341,3 +342,42 @@ manual sync-release sender or qualify R5 firmware deployment. Full shared
 CLI/watch admission, externally issued one-time intent, current-running
 Device R5 producer, Windows durability and exact physical Human Gates remain
 blocked. PR stays Draft; watcher RELEASE_BLOCKED; no merged release authority.
+
+## R5 manual `sync-release` fail-closed exclusion (source-only milestone)
+
+Under the #135 Integration-owned `cli.py` release-entrypoint carve-out, the
+existing manual command and argument syntax remain parseable, but its release
+branch is explicitly **disabled**: on Windows it emits the sanitized
+`release: status=RELEASE_BLOCKED reason=R5_ADMISSION_NOT_QUALIFIED`
+diagnostic and exits with code `3`, before opening any Device/Windows volume,
+reading a CDC status, calling raw sync, writing a journal or invoking the
+original #89 `SyncReleaseCoordinator.run`. Outside Windows, its original
+Windows-only error (exit `1`) is unchanged. `--force` is unsupported; no
+caller-provided opt-in, environment variable, UUID or claimed pair overrides
+this negative gate. No positive release sender or new coordinator was added.
+
+This temporary gate addresses the *legacy executable bypass* of #143's frozen
+R5 `releaseCycleId` + `releaseCycleOrigin` no-downgrade rule. A paired CDC
+status is **not sufficient**: positive release still needs independently
+qualified Device current-boot/RTC/PCM evidence, precise MSC/CDC identity and
+custody, #51 durable raw sync, the correct ordinary or separately receipted
+#119 supervised origin route, and one committed Device/cycle/attempt fence
+shared by CLI and watcher **before any possible CDC mutation**. Those real
+proof producers and real Windows power-loss durability tests are not wired;
+therefore *even a syntactically valid pair* is blocked rather than treated as
+authority. The explicit `m5daylog sync` raw-only command is unaffected; the
+opt-in Windows watcher still performs intake only and reports
+`RELEASE_BLOCKED` after verified sync. For an independently required raw
+transfer, use `sync`, not `sync-release`.
+
+`test_cli_release_gate_135.py` supplies synthetic variants (legacy-only,
+one-sided, malformed, unknown, NORMAL and SUPERVISED candidate) and instruments
+the original coordinator, Windows native adapter, RTC/CDC release methods and
+raw-copy entrypoint to prove **zero release, time mutation, Windows target or
+copy calls from the blocked command**. These tests deliberately prove only
+the negative CLI boundary, *not* actual Device response parsing, normal or
+supervised enrollment, positive CLI/watch race safety, or physical Windows
+lock/dismount; those are separate mandatory #135/#143 acceptance gates.
+#119/#130 provenance, #131/#132 no-safe-route, independent exact-head Review,
+Security and Human Gate requirements remain unchanged. PR #142 remains Draft;
+no release, merge or human/device operation is authorized.
