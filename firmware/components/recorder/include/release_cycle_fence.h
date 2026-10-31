@@ -65,6 +65,12 @@ esp_err_t release_cycle_fence_note_host_owned(void);
 // RAM-only proof of the current-boot durable HOST_UNRESOLVED observation.
 bool release_cycle_fence_host_owned_qualified(void);
 
+// Post-quiesce re-arm is required only with a positive host-owned witness
+// and finalized current-boot recording, or a staged first-use attempt.
+// On an optional host-witness NVS read failure, skip re-arm without blocking
+// the independently authorized D-031 shutdown. No durable state is changed.
+bool release_cycle_fence_rearm_required(bool finalized_witness_present);
+
 // Call only AFTER #87 has completed release quiescence, committed
 // SHUTDOWN_ARMED, and proven the preceding host release was accepted.
 // A failed write never grants the following boot a new candidate.
