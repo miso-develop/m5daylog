@@ -113,7 +113,7 @@ class DevInstallReleaseFenceTests(unittest.TestCase):
     def test_invalid_receipt_fails_before_writing(self):
         invalid = [
             replace(receipt(), device_id="bad"),
-            replace(receipt(), generation_id=GEN.upper()),
+            replace(receipt(), generation_id="AAAAAAAA-0000-4000-8000-000000000002"),
             replace(receipt(), image_set_digest="g" * 64),
             replace(receipt(), media_branch="R-RECOVERY"),
             replace(receipt(), first_release_attempt_id=ATTEMPT + " "),
