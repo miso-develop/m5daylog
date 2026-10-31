@@ -136,6 +136,12 @@ bool release_cycle_fence_boot_qualified(void) {
     return s_this_boot_qualified;
 }
 
+const char *release_cycle_fence_current_origin(void) {
+    // R3 has only a consumed, previously armed manual-WAKE origin.
+    // Future supervised first-use requires a separate durably proven path.
+    return s_this_boot_qualified ? "NORMAL_WAKE" : NULL;
+}
+
 esp_err_t release_cycle_fence_note_host_owned(void) {
     nvs_handle_t handle = 0;
     uint8_t lifecycle = 0;
@@ -237,6 +243,9 @@ esp_err_t release_cycle_fence_note_recorder_ready(void) {
 }
 bool release_cycle_fence_boot_qualified(void) {
     return false;
+}
+const char *release_cycle_fence_current_origin(void) {
+    return NULL;
 }
 esp_err_t release_cycle_fence_note_host_owned(void) {
     return ESP_ERR_NOT_SUPPORTED;
