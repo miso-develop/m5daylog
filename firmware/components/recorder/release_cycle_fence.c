@@ -220,6 +220,14 @@ void release_cycle_fence_note_physical_session_cutoff(void) {
     }
 }
 
+void release_cycle_fence_cancel_first_use_staging(void) {
+    // A GPIO release/bounce or loss of custody while staging is NOT an
+    // accepted physical 10-second hold. Even a racing accepted CDC request
+    // cannot rehabilitate it. FU_STAGED persists as an inert, spent marker.
+    atomic_store(&s_first_use_staged, false);
+    atomic_store(&s_first_use_release_accepted, false);
+}
+
 esp_err_t release_cycle_fence_note_host_owned(void) {
     nvs_handle_t handle = 0;
     uint8_t lifecycle = 0;
@@ -339,6 +347,7 @@ bool release_cycle_fence_first_use_staged(void) {
 }
 void release_cycle_fence_note_canonical_release_accepted(void) {}
 void release_cycle_fence_note_physical_session_cutoff(void) {}
+void release_cycle_fence_cancel_first_use_staging(void) {}
 esp_err_t release_cycle_fence_note_host_owned(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
