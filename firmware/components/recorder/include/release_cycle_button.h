@@ -34,4 +34,8 @@ void release_cycle_button_note_session_cutoff(void);
 uint32_t release_cycle_button_session_epoch(void);
 // Called by USB coordinator only; capture epoch alongside the proof.
 bool release_cycle_button_poll(bool custody, uint32_t *witness_epoch);
+// Revalidate a just-returned threshold witness immediately before and after
+// durable staging: the ISR edge generation, physical button and USB cutoff
+// epoch must still match. Not release authority or a substitute for custody.
+bool release_cycle_button_witness_still_valid(uint32_t witness_epoch);
 #endif
