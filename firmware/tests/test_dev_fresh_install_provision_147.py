@@ -92,6 +92,7 @@ esp_err_t nvs_commit(nvs_handle_t h) {
     assert(staged_id && staged_fence && staged_lifecycle);
     if (!is("commit_eio")) {
         has_device = true;
+        if (is("postcommit_pending")) has_rtc = true;
         strcpy(persisted_id, is("postcommit_mismatch") ? OTHER : ID);
         fence = 0x51;
         lifecycle = 0;
@@ -124,7 +125,6 @@ int main(int argc, char **argv) {
     mode = argv[1];
     if (is("preexisting") || is("preexisting_partial")) has_device = true;
     if (is("rtc_present")) has_rtc = true;
-    if (is("postcommit_pending")) has_rtc = true;
     const bool preexisting = has_device || has_rtc;
     esp_err_t result = dev_fresh_install_nvs_provision_pristine(
         is("badid") ? "not-a-uuid" : ID);
