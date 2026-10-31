@@ -13,7 +13,7 @@ import json
 from pathlib import PurePosixPath
 import re
 from typing import Any, Mapping
-from uuid import UUID
+from uuid import UUID, uuid5
 
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -205,6 +205,25 @@ def _image(image: Any) -> dict[str, Any]:
              "nvsOffset", "nvsSize", "writeRegions")}
 
 
+def _image_plan_digest(image: dict[str, Any]) -> str:
+    """Offline comparison pin. No signature, authentication or live evidence."""
+    canonical = json.dumps(image, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _fresh_device_id(branch: str, target: Mapping[str, Any]) -> str:
+    """Deterministic *candidate* from a separately issued random v4 generation.
+
+    This cannot establish real-world freshness, uniqueness or enrollment state.
+    An independently attested generation and full prior-ID inventory are required.
+    """
+    return str(uuid5(
+        UUID(target["generation"]),
+        f"m5daylog:dev-fresh-install:v1:{branch}:"
+        f"{target['targetBinding']}:{target['hostBinding']}",
+    ))
+
+
 def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
     _require(type(input_data) is dict, "BLOCKED_INPUT")
     branch = input_data.get("branch")
@@ -247,6 +266,9 @@ def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
              _ref(custody.get("externalCustodyEvidence")),
              "BLOCKED_CUSTODY")
     image = _image(input_data.get("image"))
+    _require(_digest(approval.get("imagePlanSha256")) and
+             approval["imagePlanSha256"] == _image_plan_digest(image),
+             "BLOCKED_PERMISSION_IMAGE")
     files = _media_bytes(input_data.get("media"))
     media_state: dict[str, Any]
     if branch == "R":
@@ -259,8 +281,25 @@ def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
         _require(input_data.get("newDeviceId") in (None, device_id),
                  "BLOCKED_MEDIA_IDENTITY")
     else:
-        device_id = input_data.get("newDeviceId")
-        _require(_uuid(device_id), "BLOCKED_MEDIA_IDENTITY")
+        # C and A select an independently fresh generation for new media.
+        # R never enters this path and never generates a new identity.
+        fresh = input_data.get("freshIdentity")
+        _require(type(fresh) is dict and
+                 _ref(fresh.get("independentGenerationEvidence")) and
+                 fresh.get("priorIdentityInventoryComplete") is True and
+                 type(fresh.get("knownPriorDeviceIds")) is list and
+                 all(_uuid(value) for value in fresh["knownPriorDeviceIds"]) and
+                 len(fresh["knownPriorDeviceIds"]) ==
+                 len(set(fresh["knownPriorDeviceIds"])) and
+                 UUID(target["generation"]).version == 4,
+                 "BLOCKED_FRESH_IDENTITY")
+        device_id = _fresh_device_id(branch, target)
+        _require(device_id not in fresh["knownPriorDeviceIds"] and
+                 input_data.get("newDeviceId") in (None, device_id) and
+                 input_data.get("retainedDeviceId") != device_id and
+                 input_data.get("observedNvsDeviceId") != device_id and
+                 input_data.get("observedHostDeviceId") != device_id,
+                 "BLOCKED_MEDIA_IDENTITY")
         if branch == "C":
             _require(not files and _ref(input_data.get("independentBlankEvidence")),
                      "BLOCKED_MEDIA_NOT_BLANK")
@@ -295,6 +334,7 @@ def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
                 "archivedDigests": {p: hashlib.sha256(files[p]).hexdigest()
                                     for p in sorted(files)},
             }
+    _require(approval.get("deviceId") == device_id, "BLOCKED_PERMISSION_IDENTITY")
     candidate = {
         "kind": "DEV_FRESH_INSTALL_OFFLINE_CANDIDATE",
         "authority": "NONE_NOT_A_PERMIT",
@@ -302,6 +342,14 @@ def _candidate(input_data: Mapping[str, Any]) -> dict[str, Any]:
         "target": {k: target[k] for k in
                    ("targetBinding", "hostBinding", "generation", "attemptId")},
         "image": image,
+        "imagePlanSha256": _image_plan_digest(image),
+        "identityProvenanceModelOnly": (
+            "RETAIN_VERIFIED_SD_UUID" if branch == "R"
+            else "UUID5_FROM_EXTERNALLY_ATTESTED_V4_GENERATION_CANDIDATE"
+        ),
+        "freshGenerationEvidenceRef": (
+            None if branch == "R" else fresh["independentGenerationEvidence"]
+        ),
         "nvsDesiredStateModelOnly": {
             "device_id": device_id,
             "release_boot": "FENCE_UNQUALIFIED",
