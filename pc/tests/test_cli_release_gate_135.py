@@ -48,7 +48,8 @@ class LegacyCliR5ExclusionTests(unittest.TestCase):
             }),
         )
         for label, purported_status in candidate_statuses:
-            with self.subTest(case=label), (
+            with (
+                self.subTest(case=label),
                 patch.object(cli.sys, "platform", "win32"),
                 patch.object(cli, "resolve_db_path") as resolve_db,
                 patch.object(cli, "resolve_library_root") as resolve_library,
