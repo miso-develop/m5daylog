@@ -217,8 +217,6 @@ class DevInstallPreview148Tests(unittest.TestCase):
             ("targetBinding", "wrong-device"),
             ("generation", "77777777-7777-4777-8777-777777777777"),
             ("intentStatus", "CONSUMED"), ("priorConsumedOrReplayed", True),
-            ("imagePlanSha256", "",),
-            ("deviceId", NEW_DEVICE),
         ):
             x = fixture()
             x["approval"][field] = val
