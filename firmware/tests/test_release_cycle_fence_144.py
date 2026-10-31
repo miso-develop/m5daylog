@@ -320,3 +320,17 @@ def test_first_use_every_commit_boundary_fails_closed(lifecycle_binary, write, p
     assert (reboot["qualified"] == 1) == ready
     if not ready:
         assert reboot["result"] != 0
+
+
+@pytest.mark.parametrize("mode", [
+    "fu_bad_hold_before_accept", "fu_bad_hold_after_accept",
+])
+def test_lost_physical_hold_burns_staged_intent_even_after_accept(fence_binary, mode):
+    # The post-stage GPIO/ISR proof may fail while a CDC request is racing.
+    # Neither order can turn FU_STAGED into an eligible next-boot permit.
+    r = observation(fence_binary, mode, 2, 81)
+    assert r["stage"] == "0"
+    assert r["first_use"] == "0"
+    assert r["release"] != "0"
+    assert r["fence"] == "84"
+    assert observation(fence_binary, "claim", 1, r["fence"])["qualified"] == "0"
