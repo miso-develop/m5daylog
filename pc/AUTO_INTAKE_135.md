@@ -309,3 +309,35 @@ unattended release sender, Windows crash durability, exact-head independent
 Engineering/Security and separately authorized physical Human Gates are
 outstanding. PR #142 remains Draft; watcher `RELEASE_BLOCKED` is unchanged;
 no merge, CDC release, RTC/SD/NVS action or claimed PC-A03 PASS is permitted.
+
+## R5 CDC v1 origin-pair compatibility (read-only source milestone)
+
+The frozen source-only CDC contract in #143 requires releaseCycleId and
+releaseCycleOrigin to be present together in one matched GET_STATUS result.
+The normalized Windows decoder preserves the pair only when the cycle is
+strictly lowercase canonical UUID and the origin is exactly NORMAL_WAKE or
+SUPERVISED_FIRST_USE. Missing, malformed, unknown, legacy cycle-only and
+one-sided values produce no release witness; independent read-only WAV
+intake remains possible. Duplicate JSON keys fail the entire status parse
+instead of silently taking the last value. A stale envelope ID or CDC endpoint
+still blocks the status observation.
+
+The read-only manifest candidate now carries the source-owned CycleOrigin
+enum, so a future caller MUST route NORMAL_WAKE through a previously-enrolled
+ordinary flow and SUPERVISED_FIRST_USE through the supervised never-enrolled
+flow; it must reject missing/unknown origins without fallback. Source-only
+candidate generation is never a permit to send or enroll. A successful
+in-session SET_TIME may leave rtcCorrectionPending=true with the frozen pair;
+the bit in either state does NOT prove RTC validity, Device boot lineage,
+terminal current-run PCM, manifest hash/sync, or physically qualified custody.
+
+Fake-port tests cover paired and legacy/one-sided/null/noncanonical values,
+invalid origin casing and whitespace, duplicate envelope/result keys, stale
+response IDs, changed endpoints, stale epochs, ordinary versus supervised
+candidate tagging and positive pending-audit observation. No actual CDC
+SET_TIME/RELEASE_STORAGE command was added. An old origin-unaware executable
+can still ignore the new field: this change does NOT disable the legacy
+manual sync-release sender or qualify R5 firmware deployment. Full shared
+CLI/watch admission, externally issued one-time intent, current-running
+Device R5 producer, Windows durability and exact physical Human Gates remain
+blocked. PR stays Draft; watcher RELEASE_BLOCKED; no merged release authority.

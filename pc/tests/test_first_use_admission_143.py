@@ -170,7 +170,6 @@ class FirstUseContractTests(unittest.TestCase):
         for bad in (
             {"state": "NORMAL"},
             {"state": "WAKE_RECOVERY_PENDING"},
-            {"rtcCorrectionPending": True},
             {"rtcCorrectionPending": "false"},
             {"rtcCorrectionPending": None},
             {"releaseCycleId": None},
@@ -182,6 +181,14 @@ class FirstUseContractTests(unittest.TestCase):
                     self.assess(status={**self.status, **bad})
         with self.assertRaises(PreconditionBlocked):
             self.assess(boot=replace(self.boot, rtc_validity_verified=False))
+
+    def test_pending_audit_requires_independent_rtc_proof(self):
+        status = {**self.status, "rtcCorrectionPending": True}
+        self.assertEqual(self.assess(status=status).release_cycle_id, CYCLE)
+        with self.assertRaises(PreconditionBlocked):
+            self.assess(
+                status=status, boot=replace(self.boot, rtc_validity_verified=False),
+            )
 
     def test_no_source_mutations_or_inferred_new_enrollment(self):
         previous_status = dict(self.status)

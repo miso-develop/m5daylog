@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
 from .capacity import VerifiedSession
+from .first_use_admission import CycleOrigin, parse_cycle_origin
 from .release import EjectTarget, PreconditionBlocked
 from .sync import _contracts_dir, _load_manifest, _preflight, inspect_device
 
@@ -25,10 +26,11 @@ class ExactTargetReader(Protocol):
 
 @dataclass(frozen=True)
 class QualifiedCycleCandidate:
-    """Only a pre-seal candidate, never a Device provenance/release receipt."""
+    """Origin-tagged read-only candidate, never release or enrollment permission."""
 
     device_id: str = field(repr=False)
     release_cycle_id: str = field(repr=False)
+    release_cycle_origin: CycleOrigin = field(repr=False)
     binding: VerifiedSession = field(repr=False)
 
 
@@ -45,8 +47,8 @@ def _canonical(value: object) -> str:
 def _cycle_from_documents(
     status: object, device: object, manifest: object,
     prepared: object,
-) -> tuple[str, str]:
-    """Pure conservative validation, without treating metadata as attestation."""
+) -> tuple[str, str, CycleOrigin]:
+    """Read-only R5 paired status and manifest candidate, not authorization."""
     if not isinstance(device, dict) or not isinstance(manifest, dict):
         raise PreconditionBlocked("Device metadata missing")
     device_id = _canonical(device.get("deviceId"))
@@ -56,6 +58,8 @@ def _cycle_from_documents(
         raise PreconditionBlocked("qualified USB_SYNC state missing")
     if not isinstance(status.get("rtcCorrectionPending"), bool):
         raise PreconditionBlocked("RTC state missing")
+    # An origin-unaware/legacy cycleId-only response cannot qualify.
+    origin = parse_cycle_origin(status)
     cycle = _canonical(status.get("releaseCycleId"))
     if not isinstance(prepared, list) or not prepared:
         raise PreconditionBlocked("manifest not qualified")
@@ -82,7 +86,7 @@ def _cycle_from_documents(
             or not isinstance(rec.get("sha256"), str)
             or len(rec["sha256"]) != 64):
         raise PreconditionBlocked("manifest cycle lacks finalized PCM")
-    return device_id, cycle
+    return device_id, cycle, origin
 
 
 def inspect_release_cycle_candidate(
@@ -113,14 +117,14 @@ def inspect_release_cycle_candidate(
         manifest = _load_manifest(root, _contracts_dir(contracts_dir))
         prepared = _preflight(root, device, manifest)
         status = status_reader(session.cdc_port)
-        dev_id, cycle_id = _cycle_from_documents(status, device, manifest, prepared)
+        dev_id, cycle_id, origin = _cycle_from_documents(status, device, manifest, prepared)
         if dev_id != t.expected_device_id:
             raise PreconditionBlocked("release target identity mismatch")
         port.revalidate_target(t, session.cdc_port)
         if (not port.volume_available(t)
                 or current_session_epoch() != session.session_epoch):
             raise PreconditionBlocked("release session changed after status")
-        return QualifiedCycleCandidate(dev_id, cycle_id, session)
+        return QualifiedCycleCandidate(dev_id, cycle_id, origin, session)
     except PreconditionBlocked:
         raise
     except Exception:

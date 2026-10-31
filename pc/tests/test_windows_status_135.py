@@ -26,12 +26,40 @@ class FakeKernel:
             "id": self.request["id"], "ok": True,
             "result": {"state": "USB_SYNC", "rtcCorrectionPending": False},
         }
-        if self.mode == "qualified-cycle":
+        if self.mode in (
+            "qualified-cycle", "supervised-cycle", "pending-cycle",
+            "legacy-cycle", "noncanonical-cycle", "invalid-cycle", "null-cycle",
+            "empty-cycle", "unknown-origin", "lower-origin", "space-origin",
+            "null-origin", "empty-origin", "orphan-cycle", "duplicate-cycle",
+            "duplicate-origin", "duplicate-envelope", "duplicate-state",
+        ):
             response["result"]["releaseCycleId"] = "aaaaaaaa-0000-4000-8000-000000000002"
+            if self.mode not in ("legacy-cycle", "orphan-cycle"):
+                response["result"]["releaseCycleOrigin"] = "NORMAL_WAKE"
+        if self.mode == "supervised-cycle":
+            response["result"]["releaseCycleOrigin"] = "SUPERVISED_FIRST_USE"
+        elif self.mode == "pending-cycle":
+            response["result"]["rtcCorrectionPending"] = True
         elif self.mode == "noncanonical-cycle":
             response["result"]["releaseCycleId"] = "AAAAAAAA-0000-4000-8000-000000000002"
         elif self.mode == "invalid-cycle":
             response["result"]["releaseCycleId"] = "not-a-release-cycle"
+        elif self.mode == "null-cycle":
+            response["result"]["releaseCycleId"] = None
+        elif self.mode == "empty-cycle":
+            response["result"]["releaseCycleId"] = ""
+        elif self.mode == "unknown-origin":
+            response["result"]["releaseCycleOrigin"] = "UNKNOWN"
+        elif self.mode == "lower-origin":
+            response["result"]["releaseCycleOrigin"] = "normal_wake"
+        elif self.mode == "space-origin":
+            response["result"]["releaseCycleOrigin"] = "NORMAL_WAKE "
+        elif self.mode == "null-origin":
+            response["result"]["releaseCycleOrigin"] = None
+        elif self.mode == "empty-origin":
+            response["result"]["releaseCycleOrigin"] = ""
+        elif self.mode == "orphan-cycle":
+            response["result"].pop("releaseCycleId")
         if self.request["cmd"] == "SET_TIME":
             response["result"] = {
                 "time": self.request["args"]["time"], "eventPending": True,
@@ -48,7 +76,21 @@ class FakeKernel:
             response["ok"] = False
         elif self.mode == "missing-state":
             response["result"].pop("state")
-        self.reply = (json.dumps(response) + "\n").encode("ascii")
+        encoded = json.dumps(response)
+        if self.mode == "duplicate-cycle":
+            encoded = encoded.replace(
+                '"releaseCycleId": ', '"releaseCycleId": "duplicate", "releaseCycleId": ', 1
+            )
+        elif self.mode == "duplicate-origin":
+            encoded = encoded.replace(
+                '"releaseCycleOrigin": ',
+                '"releaseCycleOrigin": "UNKNOWN", "releaseCycleOrigin": ', 1
+            )
+        elif self.mode == "duplicate-envelope":
+            encoded = encoded.replace('"ok": true', '"ok": false, "ok": true', 1)
+        elif self.mode == "duplicate-state":
+            encoded = encoded.replace('"state": ', '"state": "NORMAL", "state": ', 1)
+        self.reply = (encoded + "\n").encode("ascii")
         ctypes.cast(written, ctypes.POINTER(wintypes.DWORD)).contents.value = count
         return 1
 
@@ -90,17 +132,49 @@ class ReadOnlyStatusTests(unittest.TestCase):
         api, kernel = self.make_api("qualified-cycle")
         self.assertEqual(api.read_status("COM7"), {
             "state": "USB_SYNC", "rtcCorrectionPending": False,
-            "releaseCycleId": expected,
+            "releaseCycleId": expected, "releaseCycleOrigin": "NORMAL_WAKE",
         })
         self.assertEqual(kernel.request["cmd"], "GET_STATUS")
         # Invalid/missing witness must NEVER be forwarded as a release key.
         # Status can still qualify independent read-only raw intake.
-        for mode in ("valid", "noncanonical-cycle", "invalid-cycle"):
+        for mode in (
+            "valid", "legacy-cycle", "orphan-cycle", "noncanonical-cycle",
+            "invalid-cycle", "null-cycle", "empty-cycle", "unknown-origin",
+            "lower-origin", "space-origin", "null-origin", "empty-origin",
+        ):
             with self.subTest(mode=mode):
                 api, _ = self.make_api(mode)
                 self.assertEqual(api.read_status("COM7"), {
                     "state": "USB_SYNC", "rtcCorrectionPending": False,
                 })
+
+    def test_frozen_r5_pair_and_pending_audit_remain_read_only(self):
+        cycle = "aaaaaaaa-0000-4000-8000-000000000002"
+        for mode, origin, pending in (
+            ("qualified-cycle", "NORMAL_WAKE", False),
+            ("supervised-cycle", "SUPERVISED_FIRST_USE", False),
+            ("pending-cycle", "NORMAL_WAKE", True),
+        ):
+            with self.subTest(mode=mode):
+                api, kernel = self.make_api(mode)
+                self.assertEqual(api.read_status("COM7"), {
+                    "state": "USB_SYNC", "rtcCorrectionPending": pending,
+                    "releaseCycleId": cycle, "releaseCycleOrigin": origin,
+                })
+                self.assertEqual(kernel.request["cmd"], "GET_STATUS")
+                self.assertEqual(kernel.closed, 1)
+
+    def test_duplicate_json_fields_fail_closed(self):
+        for mode in (
+            "duplicate-cycle", "duplicate-origin", "duplicate-envelope",
+            "duplicate-state",
+        ):
+            with self.subTest(mode=mode):
+                api, kernel = self.make_api(mode)
+                with self.assertRaises(HostQuiesceError):
+                    api.read_status("COM7")
+                self.assertEqual(kernel.request["cmd"], "GET_STATUS")
+                self.assertEqual(kernel.closed, 1)
 
     def test_invalid_status_is_not_usb_sync_proof(self):
         for mode in ("wrong-id", "invalid-pending", "not-ok", "missing-state"):

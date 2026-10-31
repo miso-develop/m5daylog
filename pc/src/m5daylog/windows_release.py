@@ -51,6 +51,16 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 MAX_CDC_REPLY = 4096
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject ambiguous duplicate JSON keys in the CDC status response."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate CDC JSON key")
+        result[key] = value
+    return result
+
+
 @dataclass(frozen=True)
 class DiskInterface:
     disk_number: int
@@ -692,7 +702,8 @@ class NativeWin32DeviceApi:
             else:
                 raise HostQuiesceError("CDC status response incomplete")
             try:
-                response = json.loads(reply.decode("utf-8"))
+                response = json.loads(reply.decode("utf-8"),
+                                      object_pairs_hook=_unique_json_object)
             except (UnicodeError, ValueError):
                 raise HostQuiesceError("CDC status invalid envelope") from None
             if (not isinstance(response, dict)
@@ -708,19 +719,21 @@ class NativeWin32DeviceApi:
                 "state": result["state"],
                 "rtcCorrectionPending": result["rtcCorrectionPending"],
             }
-            # R3 #143: a Device-authored optional witness is passed through
-            # only if it is a strict lowercase canonical UUID. An absent or
-            # malformed witness does NOT block safe read-only WAV intake, but
-            # never qualifies a release. Caller must independently verify
-            # current-boot origin, finalized manifest and exact CDC/MSC target.
-            cycle = result.get("releaseCycleId")
-            if isinstance(cycle, str):
-                try:
-                    canonical = str(uuid.UUID(cycle))
-                except (ValueError, AttributeError):
-                    canonical = None
-                if canonical is not None and cycle == canonical:
-                    parsed["releaseCycleId"] = canonical
+            # Frozen #143 R5: only a valid pair from this same status response
+            # may produce a release-cycle candidate. Invalid/missing/legacy
+            # fields do not block independent read-only WAV intake.
+            if "releaseCycleId" in result and "releaseCycleOrigin" in result:
+                cycle = result["releaseCycleId"]
+                origin = result["releaseCycleOrigin"]
+                if (type(cycle) is str and type(origin) is str
+                        and origin in ("NORMAL_WAKE", "SUPERVISED_FIRST_USE")):
+                    try:
+                        canonical = str(uuid.UUID(cycle))
+                    except (ValueError, AttributeError, TypeError):
+                        canonical = None
+                    if canonical is not None and cycle == canonical:
+                        parsed["releaseCycleId"] = canonical
+                        parsed["releaseCycleOrigin"] = origin
             return parsed
         finally:
             self.k.CloseHandle(handle)

@@ -55,7 +55,7 @@ def _opaque(value: object) -> str:
 
 
 def parse_cycle_origin(status: object) -> CycleOrigin:
-    """Strict R5 source-only proposed schema. Not a frozen CDC wire contract."""
+    """Frozen R5 origin enum; never itself a Device boot attestation."""
     if not isinstance(status, Mapping):
         raise PreconditionBlocked("release origin missing")
     raw = status.get("releaseCycleOrigin")
@@ -150,8 +150,10 @@ def inspect_first_use_admission(
         raise PreconditionBlocked("first-use evidence missing")
     if parse_cycle_origin(status) is not CycleOrigin.SUPERVISED_FIRST_USE:
         raise PreconditionBlocked("first-use origin mismatch")
+    # In-session successful SET_TIME may have a pending audit; independent
+    # boot/RTC evidence must qualify it rather than a pending-bit heuristic.
     if (status.get("state") != "USB_SYNC"
-            or status.get("rtcCorrectionPending") is not False):
+            or type(status.get("rtcCorrectionPending")) is not bool):
         raise PreconditionBlocked("first-use Device status not qualified")
 
     device = _uuid(boot.device_id)

@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from m5daylog.capacity import VerifiedSession
+from m5daylog.first_use_admission import CycleOrigin
 from m5daylog.release import EjectTarget, PreconditionBlocked
 from m5daylog.release_cycle_candidate import (
     _cycle_from_documents, inspect_release_cycle_candidate,
@@ -33,7 +34,7 @@ def recording(**fields):
 def evidence(**status_fields):
     status = {
         "state": "USB_SYNC", "rtcCorrectionPending": False,
-        "releaseCycleId": CYCLE,
+        "releaseCycleId": CYCLE, "releaseCycleOrigin": "NORMAL_WAKE",
     }
     status.update(status_fields)
     return status
@@ -65,12 +66,21 @@ class CandidateTests(unittest.TestCase):
         )
 
     def test_valid_candidate_is_not_a_release_receipt(self):
-        self.assertEqual(self.check(), (DEVICE, CYCLE))
+        self.assertEqual(self.check(), (DEVICE, CYCLE, CycleOrigin.NORMAL_WAKE))
 
     def test_fail_closed_on_missing_unqualified_duplicate_or_recovered(self):
         invalid = [
             (evidence(releaseCycleId=None), None),
             (evidence(releaseCycleId=CYCLE.upper()), None),
+            (evidence(releaseCycleOrigin=None), None),
+            (evidence(releaseCycleOrigin="UNKNOWN"), None),
+            (evidence(releaseCycleOrigin="normal_wake"), None),
+            (evidence(releaseCycleOrigin="NORMAL_WAKE "), None),
+            (evidence(releaseCycleOrigin=""), None),
+            ({"state": "USB_SYNC", "rtcCorrectionPending": False,
+              "releaseCycleId": CYCLE}, None),
+            ({"state": "USB_SYNC", "rtcCorrectionPending": False,
+              "releaseCycleOrigin": "NORMAL_WAKE"}, None),
             (evidence(state="NORMAL"), None),
             (evidence(rtcCorrectionPending="false"), None),
             (None, [recording(recordingId=DEVICE)]),
@@ -87,6 +97,28 @@ class CandidateTests(unittest.TestCase):
                 with self.assertRaises(PreconditionBlocked):
                     self.check(status=status, recs=records)
 
+    def test_both_origins_are_tagged_without_authorizing_send(self):
+        self.assertEqual(
+            self.check(status=evidence(releaseCycleOrigin="SUPERVISED_FIRST_USE")),
+            (DEVICE, CYCLE, CycleOrigin.SUPERVISED_FIRST_USE),
+        )
+        port = Port()
+        with patch("m5daylog.release_cycle_candidate.inspect_device",
+                   return_value={"deviceId": DEVICE}), \
+             patch("m5daylog.release_cycle_candidate._load_manifest",
+                   return_value={"deviceId": DEVICE}), \
+             patch("m5daylog.release_cycle_candidate._preflight",
+                   return_value=[(recording(), object())]):
+            result = inspect_release_cycle_candidate(
+                session=SESSION, port=port,
+                status_reader=lambda _: evidence(releaseCycleOrigin="SUPERVISED_FIRST_USE"),
+                current_session_epoch=lambda: SESSION.session_epoch,
+            )
+        self.assertEqual(result.release_cycle_origin, CycleOrigin.SUPERVISED_FIRST_USE)
+        self.assertFalse(hasattr(result, "release_storage"))
+        self.assertFalse(hasattr(result, "authorize"))
+        self.assertEqual(port.events, ["binding", "volume", "binding", "volume"])
+
     def test_exact_identity_is_revalidated_before_and_after_status(self):
         port = Port()
         with patch("m5daylog.release_cycle_candidate.inspect_device",
@@ -100,6 +132,7 @@ class CandidateTests(unittest.TestCase):
                 current_session_epoch=lambda: SESSION.session_epoch,
             )
         self.assertEqual(result.release_cycle_id, CYCLE)
+        self.assertEqual(result.release_cycle_origin, CycleOrigin.NORMAL_WAKE)
         self.assertEqual(port.events, ["binding", "volume", "binding", "volume"])
 
     def test_epoch_change_during_get_status_is_rejected(self):
