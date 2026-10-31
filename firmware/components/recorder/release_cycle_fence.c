@@ -209,6 +209,16 @@ void release_cycle_fence_note_canonical_release_accepted(void) {
     }
 }
 
+void release_cycle_fence_note_physical_session_cutoff(void) {
+    // If release was already accepted, TinyUSB teardown is expected and
+    // must not revoke its committed one-shot. Before acceptance, an actual
+    // cable/session cutoff burns the current staged intent in RAM; NVS
+    // FU_STAGED remains non-eligible and cannot auto-restage.
+    if (!atomic_load(&s_first_use_release_accepted)) {
+        atomic_store(&s_first_use_staged, false);
+    }
+}
+
 esp_err_t release_cycle_fence_note_host_owned(void) {
     nvs_handle_t handle = 0;
     uint8_t lifecycle = 0;
@@ -327,6 +337,7 @@ bool release_cycle_fence_first_use_staged(void) {
     return false;
 }
 void release_cycle_fence_note_canonical_release_accepted(void) {}
+void release_cycle_fence_note_physical_session_cutoff(void) {}
 esp_err_t release_cycle_fence_note_host_owned(void) {
     return ESP_ERR_NOT_SUPPORTED;
 }
