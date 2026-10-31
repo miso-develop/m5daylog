@@ -336,12 +336,14 @@ Fake-port tests cover paired and legacy/one-sided/null/noncanonical values,
 invalid origin casing and whitespace, duplicate envelope/result keys, stale
 response IDs, changed endpoints, stale epochs, ordinary versus supervised
 candidate tagging and positive pending-audit observation. No actual CDC
-SET_TIME/RELEASE_STORAGE command was added. An old origin-unaware executable
-can still ignore the new field: this change does NOT disable the legacy
-manual sync-release sender or qualify R5 firmware deployment. Full shared
-CLI/watch admission, externally issued one-time intent, current-running
-Device R5 producer, Windows durability and exact physical Human Gates remain
-blocked. PR stays Draft; watcher RELEASE_BLOCKED; no merged release authority.
+SET_TIME/RELEASE_STORAGE command was added. At this *earlier decoder-only
+milestone*, the change did not yet disable the legacy manual sender. The later
+CLI exclusion below now blocks the sender in the **current source HEAD**.
+Previously installed origin-unaware executables can still ignore the new field
+and require separate deployment exclusion. Full shared CLI/watch admission,
+externally issued one-time intent, current-running Device R5 producer,
+Windows durability and exact physical Human Gates remain blocked. PR stays
+Draft; watcher RELEASE_BLOCKED; no merged release authority.
 
 ## R5 manual `sync-release` fail-closed exclusion (source-only milestone)
 
@@ -381,3 +383,28 @@ lock/dismount; those are separate mandatory #135/#143 acceptance gates.
 #119/#130 provenance, #131/#132 no-safe-route, independent exact-head Review,
 Security and Human Gate requirements remain unchanged. PR #142 remains Draft;
 no release, merge or human/device operation is authorized.
+
+## Native Windows offline continuity evidence (test-only milestone)
+
+`test_windows_cycle_fence_native_135.py` exercises the **actual Windows
+HKCU Registry APIs**, `RegFlushKey`, SQLite commits/reopens and `msvcrt`
+cross-process locking; it skips on Linux. Each test uses a uniquely named
+temporary HKCU key and off-Device temporary SQLite/lock files, with cleanup,
+and never modifies the canonical M5Daylog user anchor or live Device.
+Synthetic test enrollment/receipt inputs are not valid #119 permission.
+
+The regression covers competing real Windows processes, lock exclusion while
+held, durable consumed-cycle re-read, same-cycle replay rejection, missing/
+invalid HKCU anchor, independent SQLite and Registry rollback, and a
+deterministically injected failure after SQLite commit but before independent
+Registry flush. It also exercises source-only first-use intent consumption,
+partial-intent interruption and ambiguous initial enrollment. All outcomes
+must fail closed without repair, extra release sender or CDC bytes. This is
+**offline Windows API fault-injection evidence**, not a physical host power-loss
+test, actual supervised receipt issuance or real Device/USB/RTC qualification.
+
+Release status remains `RELEASE_BLOCKED`; `NO_CDC_SEND`,
+`NO_RELEASE_ENABLED`, `HUMAN_GATE_NOT_RUN`. A real Windows power-loss test,
+future canonical shared CLI/watch coordinator, R5 first-use authenticity,
+independent exact-head review/Security and all physical Device gates remain
+mandatory before any product release or PR merge.
