@@ -211,11 +211,15 @@ def _image(image: Any) -> dict[str, Any]:
     _require(type(regions) is list and
              regions == [{"name": "nvs", "offset": offset, "size": size}],
              "BLOCKED_WRITE_SET")
-    return {k: image[k] for k in
+    # Rebuild the one authorized write region from validated scalar values.
+    # Do not leak the caller's nested list/dict into the pinned candidate.
+    plan = {k: image[k] for k in
             ("sourceSha256", "elfSha256", "appSha256",
              "bootloaderSha256", "partitionTableSha256",
              "flashSizeBytes", "appOffset", "appSize",
-             "nvsOffset", "nvsSize", "writeRegions")}
+             "nvsOffset", "nvsSize")}
+    plan["writeRegions"] = [{"name": "nvs", "offset": offset, "size": size}]
+    return plan
 
 
 def _image_plan_digest(image: dict[str, Any]) -> str:
