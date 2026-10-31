@@ -27,6 +27,7 @@ HARNESS = r"""
 #define OTHER "22222222-2222-4222-8222-222222222222"
 static const char *mode;
 static bool has_device, has_rtc, staged_id, staged_fence, staged_lifecycle;
+static bool persisted_fence, persisted_lifecycle;
 static int locks, writes, commits, read_probe;
 static char persisted_id[37];
 static uint8_t fence, lifecycle;
@@ -70,6 +71,12 @@ esp_err_t nvs_set_str(nvs_handle_t h, const char *key, const char *value) {
     writes++;
     if (is("set_id_eio")) return ESP_FAIL;
     assert(strcmp(value, ID) == 0);
+    // NVS may persist a key before nvs_commit; model that explicitly.
+    if (is("partial_set_id")) {
+        has_device = true;
+        strcpy(persisted_id, ID);
+        return ESP_FAIL;
+    }
     staged_id = true; return ESP_OK;
 }
 esp_err_t nvs_set_u8(nvs_handle_t h, const char *key, uint8_t value) {
@@ -78,10 +85,26 @@ esp_err_t nvs_set_u8(nvs_handle_t h, const char *key, uint8_t value) {
     if (strcmp(key, "release_boot") == 0) {
         assert(value == 0x51);
         if (is("set_fence_eio")) return ESP_FAIL;
+        if (is("partial_set_fence")) {
+            has_device = true;
+            strcpy(persisted_id, ID);
+            persisted_fence = true;
+            fence = 0x51;
+            return ESP_FAIL;
+        }
         staged_fence = true;
     } else {
         assert(strcmp(key, "shutdown_armed") == 0 && value == 0);
         if (is("set_lifecycle_eio")) return ESP_FAIL;
+        if (is("partial_set_lifecycle")) {
+            has_device = true;
+            strcpy(persisted_id, ID);
+            fence = 0x51;
+            persisted_fence = true;
+            lifecycle = 0;
+            persisted_lifecycle = true;
+            return ESP_FAIL;
+        }
         staged_lifecycle = true;
     }
     return ESP_OK;
@@ -90,12 +113,23 @@ esp_err_t nvs_commit(nvs_handle_t h) {
     assert(locks == 1 && h == 1);
     commits++;
     assert(staged_id && staged_fence && staged_lifecycle);
+    if (is("partial_commit") || is("partial_commit_ok")) {
+        has_device = true;
+        strcpy(persisted_id, ID);
+        fence = 0x51;
+        persisted_fence = true;
+        // A torn write might report error, or a seemingly successful commit
+        // while the follow-up key readback discovers missing lifecycle.
+        return is("partial_commit") ? ESP_FAIL : ESP_OK;
+    }
     if (!is("commit_eio")) {
         has_device = true;
         if (is("postcommit_pending")) has_rtc = true;
         strcpy(persisted_id, is("postcommit_mismatch") ? OTHER : ID);
         fence = 0x51;
         lifecycle = 0;
+        persisted_fence = true;
+        persisted_lifecycle = true;
     }
     if (is("commit_eio") || is("commit_ambiguous")) return ESP_FAIL;
     return ESP_OK;
@@ -110,8 +144,14 @@ esp_err_t nvs_get_str(nvs_handle_t h, const char *key,
 }
 esp_err_t nvs_get_u8(nvs_handle_t h, const char *key, uint8_t *out) {
     assert(h == 1 && has_device);
-    if (strcmp(key, "release_boot") == 0) *out = fence;
-    else { assert(strcmp(key, "shutdown_armed") == 0); *out = lifecycle; }
+    if (strcmp(key, "release_boot") == 0) {
+        if (!persisted_fence) return ESP_ERR_NVS_NOT_FOUND;
+        *out = fence;
+    } else {
+        assert(strcmp(key, "shutdown_armed") == 0);
+        if (!persisted_lifecycle) return ESP_ERR_NVS_NOT_FOUND;
+        *out = lifecycle;
+    }
     return ESP_OK;
 }
 esp_err_t nvs_get_blob(nvs_handle_t h, const char *key,
@@ -141,11 +181,18 @@ int main(int argc, char **argv) {
                ESP_ERR_INVALID_STATE);
         assert(writes == 3 && commits == 1 && locks == 0);
     }
-    if (is("commit_ambiguous")) {
+    if (is("commit_ambiguous") || is("partial_set_id") ||
+        is("partial_set_fence") || is("partial_set_lifecycle") ||
+        is("partial_commit") || is("partial_commit_ok")) {
         assert(result != ESP_OK && has_device);
+        const int commits_before_retry = commits;
+        const int writes_before_retry = writes;
+        // After a reboot with any surviving namespace, no second install
+        // attempt is allowed to re-enter the production NVS writer.
         assert(dev_fresh_install_nvs_provision_pristine(ID) ==
                ESP_ERR_INVALID_STATE);
-        assert(commits == 1 && locks == 0);
+        assert(commits == commits_before_retry &&
+               writes == writes_before_retry && locks == 0);
     }
     puts("FI2_NVS_PROVISION=PASS");
     return 0;
@@ -206,6 +253,8 @@ def provision_binary(tmp_path_factory):
     "rtc_present", "dev_probe_eio", "rtc_probe_eio", "write_open_eio",
     "set_id_eio", "set_fence_eio", "set_lifecycle_eio", "commit_eio",
     "commit_ambiguous", "postcommit_mismatch", "postcommit_pending",
+    "partial_set_id", "partial_set_fence", "partial_set_lifecycle",
+    "partial_commit", "partial_commit_ok",
 ])
 def test_pristine_nvs_fail_closed(provision_binary, mode):
     run = subprocess.run([str(provision_binary), mode],
