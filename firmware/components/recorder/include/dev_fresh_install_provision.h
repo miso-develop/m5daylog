@@ -2,8 +2,16 @@
 // #147 FI2-I1: supervised development-install NVS baseline preparation ONLY.
 // The caller must independently verify an explicit one-generation install
 // receipt, target/image/partition write-set, H0 and selected C/R/A media.
-// This does NOT erase NVS, prove the partition was erased, access SD/RTC
-// hardware or authorize first release. Never call from ordinary app boot.
+// FI3.1 first-write ordering (external physical-containment alternative):
+// the selected SD is electrically excluded from ALL potential APP/host writers
+// throughout preparation, including unexpected old/wrong APP boots or absent
+// lifecycle NVS (whose legacy default is NORMAL). An independently recorded
+// NEW_GENERATION_RECORDING_AUTHORIZED grant MUST already be durably consumed
+// before this helper can write the final NORMAL NVS baseline. This helper
+// cannot validate or consume that external grant; NVS readback is not a permit.
+// This does NOT erase NVS, prove a partition is pristine, access SD/RTC
+// hardware, attest the selected running APP, or authorize first release.
+// Never call from ordinary app boot.
 #include "device_identity.h"
 
 #ifdef __cplusplus
