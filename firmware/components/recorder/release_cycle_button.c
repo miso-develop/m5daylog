@@ -32,6 +32,7 @@ bool release_cycle_button_detector_step(release_cycle_button_detector_t *s,
 
 #include <stdatomic.h>
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_intr_alloc.h"
 #include "esp_timer.h"
 
