@@ -331,9 +331,9 @@ static void recorder_first_use_monitor_poll(void) {
         recorder_current_state() != RECORDER_STATE_USB_SYNC ||
         !usb_msc_ownership_release_command_admission_open() ||
         !usb_msc_ownership_is_host_owned() || !tud_mounted()) {
-        release_cycle_fence_note_physical_session_cutoff();
+        release_cycle_fence_cancel_first_use_staging();
         ESP_LOGW(TAG,
-            "stage: first-use, result: custody-lost, action: release-blocked");
+            "stage: first-use, result: witness-lost, action: release-blocked");
         return;
     }
     ESP_LOGI(TAG,
