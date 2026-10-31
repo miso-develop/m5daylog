@@ -231,9 +231,49 @@ def test_no_auto_release_authority_beyond_device_fence():
     runtime = (ROOT / "firmware/main/task49_runtime.c").read_text(encoding="utf-8")
     release = runtime[runtime.index("static void recorder_handle_usb_release("):
                       runtime.index("static void recorder_shutdown_armed_now(")]
-    assert release.index("usb_msc_ownership_complete_release_quiesce()") < release.index(
-        "release_cycle_fence_note_release_completed()")
+    # The production runtime invokes the compiled predicate, not a weaker
+    # boot-qualified check, after the true D-031 quiescence boundary.
+    assert (release.index("usb_msc_ownership_complete_release_quiesce()") <
+            release.index("release_cycle_fence_rearm_required(") <
+            release.index("release_cycle_fence_note_release_completed()") <
+            release.index("recorder_power_shutdown()"))
     assert "release_cycle_witness_frozen_id() != NULL" in release
+    assert "release_cycle_fence_boot_qualified()" not in release
+
+
+@pytest.mark.parametrize("mode", [
+    "host_lock", "host_open", "host_lifecycle_read", "host_fence_read",
+])
+def test_optional_host_witness_nvs_error_preserves_accepted_d031_shutdown(
+        lifecycle_binary, mode):
+    # Compiles and executes the actual fence and #87 NVS lifecycle commits.
+    # D-031 quiescence and physical HOLD are modeled, not hardware-tested.
+    observation_after_quiesce = lifecycle_run(lifecycle_binary, mode=mode)
+    assert observation_after_quiesce == {
+        "result": 0, "lifecycle": 1, "fence": 82,
+        "writes": 5, "qualified": 1, "host": 0, "live": 1,
+        "shutdown": 1,
+    }
+    # The permit remains durably used: neither a new boot nor a second
+    # asserted WAKE can manufacture an R5 release-cycle token.
+    stale = lifecycle_run(lifecycle_binary, lifecycle=1, fence=82, mode="reboot")
+    assert stale["qualified"] == 0 and stale["result"] != 0
+
+
+def test_rearm_decision_preserves_qualified_failure_stop_and_supervised_route(
+        fence_binary):
+    # Fully witnessed rearm failures remain blocked; they are NOT the
+    # optional-host-read-loss case. Existing tests assert every write boundary.
+    for fault in ("rearm_commit_before", "rearm_commit_after",
+                  "rearm_set", "rearm_lock"):
+        r = observation(fence_binary, "complete", 1, 83, fault)
+        assert r["host"] == "0"
+        assert r["release"] != "0"
+        assert r["qualified"] == "0"
+    # A separately staged, already accepted supervised release still needs
+    # its own durable first-use marker; no generic skip is introduced.
+    first_use = observation(fence_binary, "fu_complete", 2, 81)
+    assert first_use["release"] == "0" and first_use["fence"] == "85"
 
 
 # R5-FU source-only: an explicit pre-existing UNQUALIFIED marker plus
