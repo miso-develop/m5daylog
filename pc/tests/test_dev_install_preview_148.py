@@ -477,6 +477,50 @@ class DevInstallPreview148Tests(unittest.TestCase):
                                          "size": 0x5000}]
         self.blocked(x, "BLOCKED_WRITE_SET")
 
+    def test_returned_candidate_does_not_alias_caller_owned_mutables(self):
+        # Security F-148-SEC-01: the validated NVS-only write plan is a
+        # self-contained preview even if caller-held snapshots change later.
+        for branch in ("C", "R", "A"):
+            with self.subTest(branch=branch):
+                x = fixture(branch)
+                before_input = deepcopy(x)
+                candidate = self.ok(x)
+                self.assertEqual(before_input, x)
+                before_candidate = deepcopy(candidate)
+                self.assertIsNot(candidate["image"]["writeRegions"],
+                                 x["image"]["writeRegions"])
+                self.assertIsNot(candidate["image"]["writeRegions"][0],
+                                 x["image"]["writeRegions"][0])
+
+                # Simulate later caller reuse; the already-pinned result must
+                # not silently change without a new negative-first admission.
+                x["image"]["writeRegions"][0]["name"] = "whole-flash"
+                x["image"]["writeRegions"][0]["offset"] = 0
+                x["image"]["writeRegions"].append(
+                    {"name": "bootloader", "offset": 0, "size": 0x8000})
+                x["target"]["attemptId"] = NEW_DEVICE
+                x["approval"]["imagePlanSha256"] = "f" * 64
+                if branch == "R":
+                    x["media"]["files"][PATH] = b"post-preview-corruption"
+                elif branch == "A":
+                    x["archive"]["verifiedInventory"].clear()
+                else:
+                    x["freshIdentity"]["knownPriorDeviceIds"].append(
+                        fresh_uuid(branch))
+
+                self.assertEqual(before_candidate, candidate)
+                self.assertEqual(
+                    [{"name": "nvs", "offset": 0x9000, "size": 0x6000}],
+                    candidate["image"]["writeRegions"])
+                self.assertEqual(
+                    image_pin(candidate["image"]), candidate["imagePlanSha256"])
+                canonical = {k: v for k, v in candidate.items()
+                             if k != "candidateDigestSha256"}
+                self.assertEqual(
+                    sha(json.dumps(canonical, sort_keys=True,
+                                   separators=(",", ":")).encode()),
+                    candidate["candidateDigestSha256"])
+
     def test_pinned_geometry_and_disposition(self):
         for branch in ("C", "R", "A"):
             cand = self.ok(fixture(branch))
