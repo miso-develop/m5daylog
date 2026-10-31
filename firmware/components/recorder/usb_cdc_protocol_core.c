@@ -303,7 +303,7 @@ int usb_cdc_protocol_process_line(
         }
     } else if (strcmp(cmd, "GET_STATUS") == 0) {
         usb_cdc_protocol_status_t status;
-        char cycle_field[64] = "";
+        char cycle_field[128] = "";
         memset(&status, 0, sizeof(status));
         if (!cdc_args_empty(args_item)) {
             n = cdc_error_response(out, out_size, id,
@@ -317,12 +317,20 @@ int usb_cdc_protocol_process_line(
             // An optional cycle must be explicitly qualified by the Device
             // provider, then independently syntax-gated before JSON output.
             // No source UUID is forwarded in another recorder state.
+            // R5 status is pair-atomic: legacy, one-sided, unknown or
+            // malformed values are omitted together. Do not make a default
+            // origin from a canonical-looking ID or rtcCorrectionPending.
             if (status.release_cycle_id != NULL &&
+                status.release_cycle_origin != NULL &&
                 strcmp(status.state, "USB_SYNC") == 0 &&
-                cdc_cycle_uuid_valid(status.release_cycle_id)) {
+                cdc_cycle_uuid_valid(status.release_cycle_id) &&
+                (strcmp(status.release_cycle_origin, "NORMAL_WAKE") == 0 ||
+                 strcmp(status.release_cycle_origin, "SUPERVISED_FIRST_USE") == 0)) {
                 (void)snprintf(cycle_field, sizeof(cycle_field),
-                               ",\"releaseCycleId\":\"%s\"",
-                               status.release_cycle_id);
+                               ",\"releaseCycleId\":\"%s\","
+                               "\"releaseCycleOrigin\":\"%s\"",
+                               status.release_cycle_id,
+                               status.release_cycle_origin);
             }
             if (status.battery_valid) {
                 n = snprintf(
