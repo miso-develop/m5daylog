@@ -191,6 +191,19 @@ const char *device_manifest_scan_error_name(device_manifest_scan_error_t error);
 // inserts, out_skipped is excluded names, and the successful indexed
 // count includes already-indexed files. Either pointer may be NULL.
 // No WAV is deleted.
+// #147 FI2-R: explicit, read-only retained-SD admission evidence only.
+// Requires external exclusive custody and exactly settled v1 metadata.
+// Verifies canonical device.json, committed manifest with no .bak/.tmp,
+// every indexed WAV size/full SHA256 and no orphan/partial/unindexed files.
+// Requires at least one historical WAV (empty/new media is branch C).
+// Does not modify SD or authorize NVS/flash/boot/release/host enrollment.
+// A later independent approved recording boot may append new entries; the
+// historical WAV bytes, recording IDs and entry values remain invariant.
+bool device_manifest_verify_settled_readonly(
+    const char *recordings_dir, const char *manifest_path,
+    const char *tmp_path, const char *device_json_path,
+    const char *device_id, uint32_t *out_count);
+
 bool device_manifest_sync_wav_dir(const char *recordings_dir,
                                   const char *manifest_path,
                                   const char *tmp_path, const char *device_id,
