@@ -25,6 +25,7 @@ idf_component_register(
         "rtc_correction.c"
         "shutdown_armed.c"
         "release_cycle_fence.c"
+        "release_cycle_button.c"
         "release_cycle_witness.c"
     INCLUDE_DIRS
         "include"
