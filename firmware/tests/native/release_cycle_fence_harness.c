@@ -69,7 +69,9 @@ esp_err_t nvs_commit(nvs_handle_t h) {
 }
 int main(int argc, char **argv) {
     esp_err_t begin;
+    esp_err_t stage = ESP_ERR_NOT_SUPPORTED;
     esp_err_t host_before = 0, host = 0, release = 0, duplicate = 0;
+    const bool is_fu_stage = strncmp(argv[1], "fu_", 3u) == 0;
     CHECK(argc == 5);
     g_has_lifecycle = strcmp(argv[2], "missing") != 0;
     if (g_has_lifecycle) g_lifecycle = (uint8_t)atoi(argv[2]);
@@ -79,7 +81,26 @@ int main(int argc, char **argv) {
     g_commit_after = strcmp(argv[4], "commit_after") == 0;
     g_fail_set = strcmp(argv[4], "set") == 0;
     g_fail_lock = strcmp(argv[4], "lock") == 0;
-    begin = release_cycle_fence_begin_boot(strcmp(argv[1], "normal") != 0);
+    begin = release_cycle_fence_begin_boot(is_fu_stage
+        ? false : strcmp(argv[1], "normal") != 0);
+    if (is_fu_stage && begin == ESP_OK) {
+        stage = release_cycle_fence_stage_first_use();
+        if (strcmp(argv[1], "fu_complete") == 0 && stage == ESP_OK) {
+            release_cycle_fence_note_canonical_release_accepted();
+            g_lifecycle = 1; /* durable accepted release + SHUTDOWN_ARMED */
+            release = release_cycle_fence_note_release_completed();
+        } else if (strcmp(argv[1], "fu_unaccepted") == 0 &&
+                   stage == ESP_OK) {
+            g_lifecycle = 1;
+            release = release_cycle_fence_note_release_completed();
+        } else if (strcmp(argv[1], "fu_cutoff") == 0 &&
+                   stage == ESP_OK) {
+            release_cycle_fence_note_physical_session_cutoff();
+            release_cycle_fence_note_canonical_release_accepted();
+            g_lifecycle = 1;
+            release = release_cycle_fence_note_release_completed();
+        }
+    }
     // Simulate a successful #87 RTC/recording transition only after a newly
     // committed used-permit. Never auto-qualify a stale BOOT_ACTIVE marker.
     if (begin == ESP_OK && g_write == false && g_has_fence &&
@@ -107,10 +128,13 @@ int main(int argc, char **argv) {
         release = release_cycle_fence_note_release_completed();
     }
     printf("begin=%d qualified=%d host_before=%d host=%d release=%d "
-           "duplicate=%d fence=%d\n",
+           "duplicate=%d fence=%d stage=%d first_use=%d origin=%s\n",
            begin, release_cycle_fence_boot_qualified() ? 1 : 0,
            host_before, host, release, duplicate,
-           g_has_fence ? g_fence : -1);
+           g_has_fence ? g_fence : -1,
+           stage, release_cycle_fence_first_use_staged() ? 1 : 0,
+           release_cycle_fence_current_origin() == NULL
+             ? "NONE" : release_cycle_fence_current_origin());
     CHECK(!g_locked);
     return 0;
 }
