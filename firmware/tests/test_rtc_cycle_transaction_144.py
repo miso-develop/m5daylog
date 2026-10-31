@@ -127,6 +127,7 @@ HARNESS = r"""
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "CHECK %d: %s\n", __LINE__, #x); exit(9); } } while (0)
 
 static bool g_invalid_boot_rtc;
+static bool g_supervised;
 static bool g_fail_rtc_write;
 static bool g_fail_system_clock;
 static bool g_fail_nvs_set;
@@ -250,7 +251,8 @@ bool usb_msc_ownership_release_command_admission_open(void) { return g_admission
 bool release_cycle_fence_boot_qualified(void) { return g_boot_fence; }
 bool release_cycle_fence_host_owned_qualified(void) { return g_host_fence; }
 const char *release_cycle_fence_current_origin(void) {
-    return g_boot_fence ? "NORMAL_WAKE" : NULL;
+    if (!g_boot_fence) return NULL;
+    return g_supervised ? "SUPERVISED_FIRST_USE" : "NORMAL_WAKE";
 }
 
 /* INSERT_EXACT_PRODUCTION_STATUS_PROVIDER */
@@ -268,7 +270,9 @@ static void request(const usb_cdc_protocol_config_t *cfg, const char *raw,
         const bool has_origin = strstr(out, "\"releaseCycleOrigin\"") != NULL;
         CHECK(has_id == has_origin);
         if (has_origin) {
-            CHECK(strstr(out, "\"releaseCycleOrigin\":\"NORMAL_WAKE\"") != NULL);
+            CHECK(strstr(out, g_supervised
+                ? "\"releaseCycleOrigin\":\"SUPERVISED_FIRST_USE\""
+                : "\"releaseCycleOrigin\":\"NORMAL_WAKE\"") != NULL);
         }
     }
     if (expected != NULL && strstr(out, expected) == NULL) {
@@ -288,6 +292,7 @@ int main(int argc, char **argv) {
     CHECK(argc == 2);
     const char *scenario = argv[1];
     g_invalid_boot_rtc = strcmp(scenario, "bad_boot") == 0;
+    g_supervised = strcmp(scenario, "supervised") == 0;
     CHECK(rtc_correction_init() == ESP_OK);
     CHECK(rtc_correction_flush_pending_event("host-only") == ESP_OK);
     CHECK(rtc_correction_boot_clock_verified() == !g_invalid_boot_rtc);
@@ -331,6 +336,7 @@ int main(int argc, char **argv) {
         if (strcmp(scenario, "commit_before") == 0) g_fail_commit = 1;
         if (strcmp(scenario, "commit_after") == 0) g_fail_commit = 2;
         bool should_succeed = strcmp(scenario, "success") == 0 ||
+                              strcmp(scenario, "supervised") == 0 ||
                               strcmp(scenario, "busy") == 0 ||
                               strcmp(scenario, "reconnect") == 0 ||
                               strcmp(scenario, "rotation") == 0 ||
@@ -416,7 +422,7 @@ def transaction_binary(tmp_path_factory):
 
 
 @pytest.mark.parametrize("scenario", [
-    "success", "invalid", "busy", "rtc_write_fail", "system_clock_fail",
+    "success", "supervised", "invalid", "busy", "rtc_write_fail", "system_clock_fail",
     "nvs_set_fail", "commit_before", "commit_after", "bad_boot",
     "owner", "reconnect", "rotation",
 ])
