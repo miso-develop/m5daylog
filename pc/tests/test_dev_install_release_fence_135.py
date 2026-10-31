@@ -10,6 +10,7 @@ from contextlib import closing
 from dataclasses import replace
 from multiprocessing import get_context
 from pathlib import Path
+from unittest.mock import patch
 
 from m5daylog.dev_install_release_fence import DevInstallReceipt, DevInstallReleaseFence
 from m5daylog.release import PreconditionBlocked
@@ -249,6 +250,55 @@ class DevInstallReleaseFenceTests(unittest.TestCase):
             with fence.cycles.serialized():
                 fence.consume_locked(receipt(), verify_external=lambda _: True)
                 fence.verify_consumed_locked(receipt())
+
+    def test_dev_orphan_sidecars_block_without_db_open_or_sender(self):
+        for suffix in ("-journal", "-wal", "-shm"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as location:
+                root = Path(location)
+                (root / "device").mkdir()
+                fence = make(root)
+                sidecar = root / ("dev.sqlite" + suffix)
+                sidecar.write_bytes(b"uncertain previous DEV attempt")
+                with (patch("sqlite3.connect",
+                            side_effect=AssertionError("SQLite recovery attempted")) as db_open,
+                      patch("m5daylog.release.SyncReleaseCoordinator.run",
+                            side_effect=AssertionError("sender invoked")) as sender):
+                    with fence.cycles.serialized():
+                        with self.assertRaises(PreconditionBlocked):
+                            fence.consume_locked(receipt(), verify_external=lambda _: True)
+                    db_open.assert_not_called()
+                    sender.assert_not_called()
+                self.assertEqual(sidecar.read_bytes(), b"uncertain previous DEV attempt")
+                self.assertFalse((root / "dev.sqlite").exists())
+                self.assertFalse((root / "dev-anchor.json").exists())
+                self.assertFalse((root / "r3.sqlite").exists())
+
+    def test_r3_h0_orphan_sidecars_block_before_any_enrollment_write(self):
+        for suffix in ("-journal", "-wal", "-shm"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as location:
+                root = Path(location)
+                (root / "device").mkdir()
+                fence = make(root)
+                sidecar = root / ("r3.sqlite" + suffix)
+                sidecar.write_bytes(b"uncertain previous R3 enrollment")
+                with (patch("sqlite3.connect",
+                            side_effect=AssertionError("SQLite recovery attempted")) as db_open,
+                      patch("m5daylog.release.SyncReleaseCoordinator.run",
+                            side_effect=AssertionError("sender invoked")) as sender):
+                    with fence.cycles.serialized():
+                        with self.assertRaises(PreconditionBlocked):
+                            fence.cycles.check_unenrolled_locked()
+                        with self.assertRaises(PreconditionBlocked):
+                            fence.consume_locked(receipt(), verify_external=lambda _: True)
+                        with self.assertRaises(PreconditionBlocked):
+                            fence.cycles.initialize_first_cycle_locked(DEV, CYCLE, CYCLE_ATTEMPT)
+                    db_open.assert_not_called()
+                    sender.assert_not_called()
+                self.assertEqual(sidecar.read_bytes(), b"uncertain previous R3 enrollment")
+                self.assertFalse((root / "r3.sqlite").exists())
+                self.assertFalse((root / "r3-anchor.json").exists())
+                self.assertFalse((root / "dev.sqlite").exists())
+                self.assertFalse((root / "dev-anchor.json").exists())
 
     def test_two_process_consumption_is_at_most_once(self):
         ctx = get_context("spawn")
