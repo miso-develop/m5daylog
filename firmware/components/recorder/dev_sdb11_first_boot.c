@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "nvs.h"
-#include "esp_system.h"
+#include "esp_random.h"
 #include "device_identity.h"
 #include "recorder_nvs.h"
 #include "dev_fresh_install_nvs.h"
