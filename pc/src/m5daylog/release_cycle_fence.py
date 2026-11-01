@@ -274,13 +274,16 @@ class CycleAttemptFence:
             v, kind, consumed, receipt = rows[0]
             local = {"v": v, "kind": kind, "state": consumed, "receipt": receipt}
             if (type(v) is not int or v != 1
-                    or kind != "DEV_FRESH_INSTALL_FIRST_RELEASE"
+                    or kind not in ("DEV_FRESH_INSTALL_FIRST_RELEASE",
+                                    "SAME_HOST_DEV_GENERATION_FIRST_RELEASE")
                     or consumed != "CONSUMED"
                     or type(receipt) is not str or not _HEX.fullmatch(receipt)
                     or local != remote):
                 raise PreconditionBlocked("DEV cutover witness mismatch")
-            if state["v"] != 2:
+            if kind == "SAME_HOST_DEV_GENERATION_FIRST_RELEASE" and state["v"] != 2:
                 raise PreconditionBlocked("DEV cutover pending; old generation blocked")
+            if kind == "DEV_FRESH_INSTALL_FIRST_RELEASE" and state["v"] != 1:
+                raise PreconditionBlocked("legacy first-use witness cannot enroll V2")
         except (sqlite3.Error, OSError, ValueError, TypeError):
             raise PreconditionBlocked("DEV cutover continuity uncertain") from None
 
