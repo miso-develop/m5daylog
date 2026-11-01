@@ -145,9 +145,17 @@ int main(int argc, char **argv) {
         assert(sets == 0 && commits == 0);
     }
     int commits_before = commits, sets_before = sets;
-    // This process must NEVER repair/retry, including after ambiguous writes.
-    assert(dev_sdb11_consume_boot_intent(GEN, DEVICE, SHA, true) != ESP_OK);
-    assert(commits == commits_before && sets == sets_before);
+    if (is("short_hold")) {
+        // A rejected short hold has not entered an NVS transaction. A later
+        // distinct, genuinely measured full hold is still the first attempt.
+        assert(dev_sdb11_consume_boot_intent(GEN, DEVICE, SHA, true) == ESP_OK);
+        assert(commits == 2 && sets == 4);
+    } else {
+        // Once any valid hold attempted the NVS path, NEVER repair/retry
+        // within the same boot, including after an ambiguous commit.
+        assert(dev_sdb11_consume_boot_intent(GEN, DEVICE, SHA, true) != ESP_OK);
+        assert(commits == commits_before && sets == sets_before);
+    }
     puts("SDB11_NVS_INTENT=PASS");
     return 0;
 }
