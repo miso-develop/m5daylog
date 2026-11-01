@@ -16,6 +16,16 @@ typedef int esp_err_t;
 #ifdef __cplusplus
 extern "C" {
 #endif
+// Called only by the separate supervised DEV installer after verified
+// freshly formatted original SD, canonical empty metadata and NVS/RTC
+// baseline readback. Absent/partial key state is never a retry permission.
+// The first commit burns a provision attempt; the second publishes READY.
+// This does not flash, format, erase NVS or grant release.
+esp_err_t dev_sdb11_mark_baseline_ready(const char *generation,
+                                        const char *device_id,
+                                        const char *binding,
+                                        bool sd_baseline_readback_passed);
+
 // Only a completely provisioned READY_UNSPENT generation may request a
 // device-measured physical hold. USED plus a previously accepted release and
 // READY_AFTER_RELEASE is a *normal* next-day WAKE; incomplete/partial/restarted
