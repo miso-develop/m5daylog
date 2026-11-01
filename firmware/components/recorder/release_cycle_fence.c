@@ -8,6 +8,7 @@
 
 #include "nvs.h"
 #include "recorder_nvs.h"
+#include "dev_sdb11_first_boot.h"
 
 // Values are deliberately distinct from a missing key. This additional key
 // never changes the existing shutdown_armed lifecycle semantics.
@@ -112,6 +113,24 @@ done:
     }
     recorder_nvs_unlock();
     return err;
+}
+
+esp_err_t release_cycle_fence_admit_dev_first_boot(void) {
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    // Legacy R5 staged first-use remains a separate route after USB_SYNC.
+    // The SDB-1.1 initial recording requires the *same-process* irreversible
+    // DEV intent consumption BEFORE recorder startup and USB publication.
+    if (!s_boot_checked || s_boot_admitted || s_this_boot_qualified ||
+        atomic_load(&s_first_use_staged) ||
+        !dev_sdb11_boot_intent_consumed_this_boot()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_boot_admitted = true;
+    s_boot_origin = "SUPERVISED_FIRST_USE";
+    return ESP_OK;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }
 
 esp_err_t release_cycle_fence_note_recorder_ready(void) {
@@ -335,6 +354,8 @@ done:
 }
 
 #else
+
+esp_err_t release_cycle_fence_admit_dev_first_boot(void) { return ESP_ERR_NOT_SUPPORTED; }
 
 esp_err_t release_cycle_fence_begin_boot(bool manual_wake) {
     (void)manual_wake;
