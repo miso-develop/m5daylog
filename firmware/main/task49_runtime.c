@@ -24,6 +24,10 @@ static void recorder_task49_delete(TaskHandle_t task);
 #include "shutdown_armed.h"
 #include "release_cycle_fence.h"
 #include "release_cycle_button.h"
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+#include "dev_sdb11_first_boot.h"
+#include "esp_timer.h"
+#endif
 #include "release_cycle_witness.h"
 #include "tusb.h"
 #include "rtc_correction.h"
@@ -487,10 +491,41 @@ static void recorder_usb_event_task(void *arg) {
     }
 }
 
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+// Only the dedicated DEV install image can enter this gate; it executes
+// before recorder_base_task, SD access, TinyUSB install or USB publication.
+// The existing button ISR detects release/repress even between 20ms polls.
+static bool recorder_dev_wait_for_first_hold(uint32_t *out_epoch) {
+    const int64_t k_window_us = INT64_C(30000000);
+    int64_t start, now;
+    uint32_t epoch = 0u;
+    if (out_epoch == NULL ||
+        release_cycle_button_init() != ESP_OK) return false;
+    *out_epoch = 0u;
+    start = esp_timer_get_time();
+    if (start < 0) return false;
+    for (;;) {
+        now = esp_timer_get_time();
+        if (now < start || now - start >= k_window_us) return false;
+        if (release_cycle_button_poll(true, &epoch) &&
+            release_cycle_button_witness_still_valid(epoch)) {
+            *out_epoch = epoch;
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+#endif
+
 void app_main(void) {
     bool manual_wake = false;
     usb_cdc_protocol_config_t cdc_config;
     shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN;
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    dev_sdb11_boot_policy_t dev_boot_policy;
+    bool dev_first_boot = false;
+    uint32_t dev_hold_epoch = 0u;
+#endif
 
     // Maintain power before any persistent-state inspection. On an armed boot,
     // only the physical active-low WAKE button may authorize fresh recovery.
@@ -526,13 +561,62 @@ void app_main(void) {
         recorder_shutdown_armed_now();
         return;
     }
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    // DEV-only pinning intentionally blocks an empty/mismatched install,
+    // partially consumed intent, unexpected restart or replay. The NORMAL
+    // next-day path is allowed only after a real accepted release has
+    // established both SHUTDOWN_ARMED and READY_AFTER_RELEASE.
+    dev_boot_policy = dev_sdb11_probe_boot(
+        CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION,
+        CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID,
+        CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256);
+    if (dev_boot_policy == DEV_SDB11_BOOT_BLOCKED) {
+        ESP_LOGE(TAG,
+                 "stage: dev-first-boot, result: unqualified, action: shutdown");
+        recorder_shutdown_armed_now();
+        return;
+    }
+    if (dev_boot_policy == DEV_SDB11_BOOT_NEEDS_HOLD) {
+        // A short, interrupted or unmeasurable physical hold never consumes
+        // NVS. Do not start recording merely because the DEV SD is blank.
+        if (!recorder_dev_wait_for_first_hold(&dev_hold_epoch) ||
+            !release_cycle_button_witness_still_valid(dev_hold_epoch) ||
+            dev_sdb11_consume_boot_intent(
+                CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION,
+                CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID,
+                CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256,
+                true) != ESP_OK ||
+            !release_cycle_button_witness_still_valid(dev_hold_epoch)) {
+            ESP_LOGE(TAG,
+                     "stage: dev-first-boot, result: hold-or-consume-failed, action: shutdown");
+            recorder_shutdown_armed_now();
+            return;
+        }
+        dev_first_boot = true;
+    }
+#endif
     // The R3 release witness is optional and never changes legacy recorder
     // recovery or enables CDC release on its own. Consume the durable ready
     // marker BEFORE #87 can commit WAKE_RECOVERY_PENDING or NORMAL.
     if (release_cycle_fence_begin_boot(manual_wake) != ESP_OK) {
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+        // DEV installation has no optional-bypass: incomplete NVS proof is
+        // a hard stop before recording/MSC (not an unsigned cycle).
+        recorder_shutdown_armed_now();
+        return;
+#else
         ESP_LOGW(TAG,
                  "stage: release-cycle, result: boot-fence-error, action: witness-disabled");
+#endif
     }
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    if (dev_first_boot && release_cycle_fence_admit_dev_first_boot() != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: dev-first-boot, result: origin-unqualified, action: shutdown");
+        recorder_shutdown_armed_now();
+        return;
+    }
+#endif
     task87_wake_recovery_init(
         &s_wake_recovery,
         action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
