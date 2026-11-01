@@ -285,7 +285,7 @@ def production_binary(tmp_path_factory):
         #define ESP_ERR_NOT_SUPPORTED 5
         #define ESP_ERR_NVS_NOT_FOUND 10
     """))
-    (inc / "esp_system.h").write_text("#pragma once\n#include <stdint.h>\nuint32_t esp_random(void);\n")
+    (inc / "esp_random.h").write_text("#pragma once\n#include <stdint.h>\nuint32_t esp_random(void);\n")
     (inc / "nvs.h").write_text(textwrap.dedent("""\
         #pragma once
         #include <stddef.h>
