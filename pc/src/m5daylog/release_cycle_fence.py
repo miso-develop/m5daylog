@@ -22,6 +22,7 @@ import uuid
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Iterator, Protocol
+from urllib.parse import quote
 
 from .release import PreconditionBlocked
 
@@ -190,6 +191,8 @@ class CycleAttemptFence:
             raise PreconditionBlocked("independent release lock required")
         self.anchor = anchor
         self._serialized_thread = threading.local()
+        self._dev_cutover_database: Path | None = None
+        self._dev_cutover_anchor: Anchor | None = None
 
     @classmethod
     def for_current_user(cls, *, device_root: Path) -> "CycleAttemptFence":
@@ -200,9 +203,16 @@ class CycleAttemptFence:
         if os.name != "nt" or not os.environ.get("LOCALAPPDATA"):
             raise PreconditionBlocked("Windows release continuity unavailable")
         state = Path(os.environ["LOCALAPPDATA"]) / "M5Daylog" / "state"
-        return cls(state / "release_cycle_r3.sqlite",
-                   state / "release_cycle_r3.lock",
-                   device_root, WindowsRegistryAnchor())
+        fence = cls(state / "release_cycle_r3.sqlite",
+                    state / "release_cycle_r3.lock",
+                    device_root, WindowsRegistryAnchor())
+        # Canonical CLI/watch fences must observe DEV consumption even when
+        # their caller does not instantiate DevInstallReleaseFence separately.
+        from .dev_install_release_fence import DevInstallRegistryAnchor
+        fence.bind_dev_cutover_witness(
+            state / "dev_install_release_v1.sqlite", DevInstallRegistryAnchor(),
+        )
+        return fence
 
     @contextmanager
     def serialized(self) -> Iterator[None]:
@@ -218,6 +228,61 @@ class CycleAttemptFence:
                     self._serialized_thread.held = False
         except OSError:
             raise PreconditionBlocked("release host lock unavailable") from None
+
+    def bind_dev_cutover_witness(self, database: Path, anchor: Anchor) -> None:
+        """Bind independent DEV consumption for all cooperating release paths."""
+        target = Path(database).expanduser().resolve()
+        if (target == self.database or target == self.lock_file
+                or not callable(getattr(anchor, "read", None))):
+            raise PreconditionBlocked("DEV cutover witness invalid")
+        if (self._dev_cutover_database is not None
+                and self._dev_cutover_database != target):
+            raise PreconditionBlocked("DEV cutover witness already bound")
+        self._dev_cutover_database = target
+        self._dev_cutover_anchor = anchor
+
+    def _check_dev_cutover_locked(self, state: dict[str, object]) -> None:
+        """Block old V1 after DEV commit, including pre-R3-transaction failures.
+
+        Required by reservation and pre-send proof, not an optional caller
+        authorization callback. Never repairs or deletes a witness.
+        """
+        if self._dev_cutover_database is None:
+            return  # Isolated legacy fixture; canonical factory always binds.
+        database, anchor = self._dev_cutover_database, self._dev_cutover_anchor
+        if anchor is None or _sqlite_recovery_sidecars_present(database):
+            raise PreconditionBlocked("DEV cutover continuity uncertain")
+        try:
+            remote = anchor.read()
+            exists = database.exists()
+            if not exists and remote is None:
+                if state["v"] != 1:
+                    raise PreconditionBlocked("DEV cutover witness missing")
+                return
+            if not database.is_file() or remote is None:
+                raise PreconditionBlocked("DEV cutover witness incomplete")
+            with closing(sqlite3.connect(
+                    "file:" + quote(database.as_posix(), safe="/:") + "?mode=ro",
+                    uri=True, timeout=0.25)) as db:
+                if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    raise PreconditionBlocked("DEV cutover ledger invalid")
+                rows = db.execute(
+                    "SELECT v, kind, state, receipt FROM dev_consumed"
+                ).fetchall()
+            if len(rows) != 1:
+                raise PreconditionBlocked("DEV cutover ledger ambiguous")
+            v, kind, consumed, receipt = rows[0]
+            local = {"v": v, "kind": kind, "state": consumed, "receipt": receipt}
+            if (type(v) is not int or v != 1
+                    or kind != "DEV_FRESH_INSTALL_FIRST_RELEASE"
+                    or consumed != "CONSUMED"
+                    or type(receipt) is not str or not _HEX.fullmatch(receipt)
+                    or local != remote):
+                raise PreconditionBlocked("DEV cutover witness mismatch")
+            if state["v"] != 2:
+                raise PreconditionBlocked("DEV cutover pending; old generation blocked")
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            raise PreconditionBlocked("DEV cutover continuity uncertain") from None
 
     def _connection(self) -> sqlite3.Connection:
         # Opening a pre-existing ledger writable may replay or delete SQLite
@@ -293,7 +358,8 @@ class CycleAttemptFence:
                         or any(type(h) is not str or not _HEX.fullmatch(h)
                                for h in (new_device, generation, grant, marker_tip))
                         or remote["active_device"] != new_device
-                        or remote["generation"] != generation):
+                        or remote["generation"] != generation
+                        or new_device == stored):
                     raise PreconditionBlocked("DEV generation transition invalid")
                 marker = (after_seq, new_device, generation, grant, marker_tip)
 
@@ -349,6 +415,8 @@ class CycleAttemptFence:
         generation = _hash(_uuid(generation_id))
         cycle = _hash(_uuid(release_cycle_id))
         attempt = _hash(_uuid(attempt_id))
+        if old == new:
+            raise PreconditionBlocked("DEV generation must change device identity")
         if (type(grant_digest) is not str or not _HEX.fullmatch(grant_digest)
                 or type(prior_state_digest) is not str
                 or not _HEX.fullmatch(prior_state_digest)):
@@ -546,6 +614,7 @@ class CycleAttemptFence:
                 db.execute("BEGIN IMMEDIATE")
                 try:
                     prior = self._verify(db, device)
+                    self._check_dev_cutover_locked(prior)
                     if db.execute("SELECT 1 FROM consumed WHERE cycle=?", (cycle,)).fetchone():
                         raise PreconditionBlocked("release cycle already consumed")
                     seq = prior["seq"] + 1
@@ -579,7 +648,8 @@ class CycleAttemptFence:
         attempt = _hash(_uuid(attempt_id))
         try:
             with closing(self._connection()) as db:
-                self._verify(db, device)
+                state = self._verify(db, device)
+                self._check_dev_cutover_locked(state)
                 row = db.execute(
                     "SELECT attempt FROM consumed WHERE cycle=?", (cycle,)
                 ).fetchone()
@@ -595,6 +665,7 @@ class CycleAttemptFence:
         device = _hash(_uuid(device_id))
         try:
             with closing(self._connection()) as db:
-                self._verify(db, device)
+                state = self._verify(db, device)
+                self._check_dev_cutover_locked(state)
         except (sqlite3.Error, OSError):
             raise PreconditionBlocked("release host continuity uncertain") from None
