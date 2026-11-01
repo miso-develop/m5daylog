@@ -336,7 +336,7 @@ cleanup:
     cleanup_err = spi_bus_free(host.slot);
     if (err == ESP_OK && cleanup_err != ESP_OK) err = cleanup_err;
     // Success proves only an empty reformatted FAT selected by this helper.
-    // Canonical device.json, manifest, generation/NVS and RTC readback are
+    // Canonical identity/index, generation/NVS and RTC readback are
     // separate required steps before DEV_READY_UNSPENT may be persisted.
     return err;
 }
