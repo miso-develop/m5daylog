@@ -34,10 +34,13 @@ HARNESS = r"""
 static const char *mode;
 static uint8_t state = 0xa2u, fence = 0x51u, lifecycle = 0u;
 static uint64_t nonce;
-static bool nonce_exists;
+static bool nonce_exists, state_exists = true, gen_exists = true, bind_exists = true;
 static int locks, sets, commits, read_state_count, read_fence_count;
 static bool is(const char *s) { return strcmp(mode, s) == 0; }
 
+esp_err_t dev_fresh_install_nvs_readback_matches(const char *id) {
+    assert(strcmp(id, DEVICE) == 0); return ESP_OK;
+}
 bool device_identity_is_valid_uuid(const char *id) {
     return id && strlen(id) == 36 && id[8] == '-' && id[13] == '-' &&
            id[18] == '-' && id[23] == '-';
@@ -62,6 +65,10 @@ esp_err_t nvs_get_str(nvs_handle_t h, const char *key, char *out, size_t *len) {
     else if (strcmp(key, "dev_bind") == 0)
         src = is("bad_binding") ? "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" : SHA;
     else assert(false);
+    if ((strcmp(key, "dev_gen") == 0 && !gen_exists) ||
+        (strcmp(key, "dev_bind") == 0 && !bind_exists)) return ESP_ERR_NVS_NOT_FOUND;
+    if (is("provision_wrong_gen_readback") && commits == 2 &&
+        strcmp(key, "dev_gen") == 0) src = DEVICE;
     size_t needed = strlen(src) + 1u;
     assert(*len >= needed);
     memcpy(out, src, needed);
@@ -72,6 +79,10 @@ esp_err_t nvs_get_u8(nvs_handle_t h, const char *key, uint8_t *out) {
     assert(h == 1);
     if (strcmp(key, "dev_state") == 0) {
         read_state_count++;
+        if (!state_exists) return ESP_ERR_NVS_NOT_FOUND;
+        if (is("provision_incomplete_readback") && commits == 1) {
+            *out = 0xffu; return ESP_OK;
+        }
         if (is("readback_stage_error") && commits == 1) return ESP_FAIL;
         if (is("readback_used_error") && commits == 2) return ESP_FAIL;
         if (is("readback_used_mismatch") && commits == 2) {
@@ -96,14 +107,25 @@ esp_err_t nvs_set_u8(nvs_handle_t h, const char *key, uint8_t value) {
     sets++;
     // Eagerly persisted key writes model partially surviving NVS commits.
     if (strcmp(key, "dev_state") == 0) {
-        state = value;
-        if ((is("stage_set_failure") && value == 0xa3u) ||
+        state = value; state_exists = true;
+        if ((is("provision_incomplete_set_error") && value == 0xa1u) ||
+            (is("provision_ready_set_error") && value == 0xa2u) ||
+            (is("stage_set_failure") && value == 0xa3u) ||
             (is("used_set_failure") && value == 0xa4u)) return ESP_FAIL;
     } else if (strcmp(key, "release_boot") == 0) {
         assert(value == 0x52u);
         fence = value;
         if (is("fence_set_failure")) return ESP_FAIL;
     } else assert(false);
+    return ESP_OK;
+}
+esp_err_t nvs_set_str(nvs_handle_t h, const char *key, const char *value) {
+    assert(h == 1 && value != NULL);
+    sets++;
+    if (strcmp(key, "dev_gen") == 0) { gen_exists = true; assert(strcmp(value, GEN) == 0); }
+    else if (strcmp(key, "dev_bind") == 0) { bind_exists = true; assert(strcmp(value, SHA) == 0); }
+    else assert(false);
+    if (is("provision_bind_set_error") && strcmp(key, "dev_bind") == 0) return ESP_FAIL;
     return ESP_OK;
 }
 esp_err_t nvs_set_u64(nvs_handle_t h, const char *key, uint64_t value) {
@@ -115,13 +137,36 @@ esp_err_t nvs_set_u64(nvs_handle_t h, const char *key, uint64_t value) {
 esp_err_t nvs_commit(nvs_handle_t h) {
     assert(h == 1);
     commits++;
-    if ((commits == 1 && is("stage_commit_ambiguous")) ||
-        (commits == 2 && is("used_commit_ambiguous"))) return ESP_FAIL;
+    if ((commits == 1 && (is("stage_commit_ambiguous") ||
+                          is("provision_incomplete_commit"))) ||
+        (commits == 2 && (is("used_commit_ambiguous") ||
+                          is("provision_ready_commit")))) return ESP_FAIL;
     return ESP_OK;
 }
 
 int main(int argc, char **argv) {
     assert(argc == 2); mode = argv[1];
+    if (strncmp(mode, "provision_", 10) == 0) {
+        state_exists = false; gen_exists = false; bind_exists = false;
+        if (is("provision_existing_state")) state_exists = true;
+        bool success = is("provision_success");
+        esp_err_t prepared = dev_sdb11_mark_baseline_ready(GEN, DEVICE, SHA,
+            !is("provision_no_sd"));
+        assert((prepared == ESP_OK) == success);
+        if (success) {
+            assert(state_exists && gen_exists && bind_exists &&
+                   state == 0xa2u && commits == 2);
+            assert(dev_sdb11_probe_boot(GEN, DEVICE, SHA) ==
+                   DEV_SDB11_BOOT_NEEDS_HOLD);
+        }
+        int commits_before = commits;
+        // Any attempted install is spent even when the commit was ambiguous.
+        assert(dev_sdb11_mark_baseline_ready(GEN, DEVICE, SHA, true) != ESP_OK);
+        assert(commits == commits_before);
+        assert(locks == 0);
+        puts("SDB11_PROVISION=PASS");
+        return 0;
+    }
     if (is("no_ready")) state = 0xa1u;
     if (is("used")) state = 0xa4u;
     if (is("staged")) state = 0xa3u;
@@ -208,6 +253,7 @@ def production_binary(tmp_path_factory):
         esp_err_t nvs_get_u8(nvs_handle_t, const char *, uint8_t *);
         esp_err_t nvs_get_u64(nvs_handle_t, const char *, uint64_t *);
         esp_err_t nvs_set_u8(nvs_handle_t, const char *, uint8_t);
+        esp_err_t nvs_set_str(nvs_handle_t, const char *, const char *);
         esp_err_t nvs_set_u64(nvs_handle_t, const char *, uint64_t);
         esp_err_t nvs_commit(nvs_handle_t);
     """))
@@ -255,3 +301,16 @@ def test_default_build_excludes_writes_and_dev_gate_precedes_recording():
         "xTaskCreate(recorder_base_task,")
     assert "release_cycle_button_witness_still_valid(dev_hold_epoch)" in boot
     assert 'ESP_ERR_INVALID_STATE' in src
+
+@pytest.mark.parametrize("mode", [
+    "provision_success", "provision_no_sd", "provision_existing_state",
+    "provision_incomplete_set_error", "provision_incomplete_commit",
+    "provision_incomplete_readback", "provision_bind_set_error",
+    "provision_ready_set_error", "provision_ready_commit",
+    "provision_wrong_gen_readback",
+])
+def test_sdb11_actual_production_nvs_baseline_ready(production_binary, mode):
+    proc = subprocess.run([str(production_binary), mode],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "SDB11_PROVISION=PASS" in proc.stdout
