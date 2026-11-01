@@ -130,6 +130,15 @@ class SdbGenerationReleaseTests(unittest.TestCase):
         self.assertFalse(self.fence.database.exists())
         self.assertEqual(self.port.sent, [])
 
+    def test_external_proof_failure_cannot_abort_monitor_with_raw_exception(self):
+        def unavailable(*args):
+            raise RuntimeError("synthetic private verification error")
+        self.assertEqual(self.attempt(external=unavailable).reason,
+                         "PRECONDITION_BLOCKED")
+        self.assertFalse(self.fence.database.exists())
+        self.assertEqual(self.port.sent, [])
+        self.assertNotIn("rtc", self.events)
+
     def test_prior_host_anchor_corrupt_does_not_write_or_send(self):
         self.fence.cycles.anchor.write({"v": 1, "device": "f" * 64,
                                        "seq": 1, "tip": "a" * 64})

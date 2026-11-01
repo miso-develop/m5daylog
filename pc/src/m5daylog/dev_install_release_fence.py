@@ -248,7 +248,11 @@ class DevInstallReleaseFence:
         if digest != receipt.host_lineage_digest:
             raise PreconditionBlocked("DEV private grant host lineage mismatch")
         # Verify external authority before any new host-state write.
-        if verify_external(receipt, status) is not True:
+        try:
+            granted = verify_external(receipt, status) is True
+        except Exception:
+            raise PreconditionBlocked("DEV generation external grant unavailable") from None
+        if not granted:
             raise PreconditionBlocked("DEV generation external grant unqualified")
 
         # One OS-wide lock spans both independently persistent writers and
