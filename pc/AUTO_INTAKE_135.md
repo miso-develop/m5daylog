@@ -500,3 +500,42 @@ binding, authenticated owner grant, image/G proof, Device-side origin producer,
 two real daily cycles and exact-device Human Gate remain **NOT_RUN /
 RELEASE_BLOCKED**. This source increment is not PC-A03/A05 acceptance,
 automatic release clearance, or merge approval.
+
+## SDB-1.1 bounded Engineering correction — old identity / two-writer split
+
+This source-only correction addresses ER-135-SDB-01/02 without enabling a
+release sender:
+
+- An enrolled DEV generation transition requires a **different new deviceId**
+  from the previously enrolled deviceId. The DEV entrypoint rejects equality
+  before consuming the separate DEV receipt; the R3 append itself rejects it
+  independently, and R3 V2 chain validation rejects a forged same-ID marker.
+  The prior V1 chain remains unchanged on denial. A generation UUID alone
+  cannot distinguish the old identity or authorize a rebaseline.
+- Distinct host DEV consumption kinds preserve the old regression-only H0
+  first-use path versus the **previously enrolled** SDB-1.1 DEV generation.
+  A consumed `SAME_HOST_DEV_GENERATION_FIRST_RELEASE` witness with an
+  otherwise healthy R3 V1 ledger is a **spent and blocked partial cutover**.
+  The cooperating R3 `reserve_locked`, `verify_reserved_locked`, and
+  `check_locked` paths must inspect the independently persisted DEV
+  SQLite+anchor pair; a missing, rolled-back, corrupted or split witness
+  fails closed. The canonical per-user R3 factory binds this check even when
+  a caller does not instantiate the DEV adapter. A completed V2 transition
+  must still prove its immutable chain and both host witnesses.
+- The new negative regression injects failure **after DEV SQLite/HKCU commit
+  but before the R3 generation transaction begins**, then confirms the
+  new DEV retry, old-device direct R3 reservation/pre-send proof and the
+  existing source-only canonical coordinator's old normal-cycle route all
+  transmit **zero** RTC/release bytes. A separate disposable native Windows
+  HKCU/SQLite test observes denial after reconstructing a new R3 object.
+  An independently interrupted first writer or R3 anchor flush is also
+  fail-closed, not auto-repaired.
+- These guards apply to cooperating source clients. Old installed,
+  origin-unaware standalone executables are **not** retroactively controlled
+  and remain an explicit pre-activation exclusion gate. Neither synthetic
+  receipt assertions nor Windows-runner HKCU tests constitute an owner grant,
+  current-run/PCM/RTC/MSC+CDC proof, physical power-loss qualification or
+  permission to call `RELEASE_STORAGE`.
+
+`RELEASE_BLOCKED` remains mandatory. PC-A03/A05/A07, real USB/Device
+execution, two daily cycles and Human Gate remain NOT_RUN; PR #142 stays Draft.
