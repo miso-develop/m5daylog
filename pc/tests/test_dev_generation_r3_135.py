@@ -10,7 +10,8 @@ from contextlib import closing
 from pathlib import Path
 
 from m5daylog.release import PreconditionBlocked
-from test_dev_install_release_fence_135 import DEV, GEN, CYCLE, make
+from m5daylog.release_cycle_fence import CycleAttemptFence
+from test_dev_install_release_fence_135 import DEV, GEN, CYCLE, FileFakeAnchor
 
 OLD = "00000000-0000-4000-8000-000000000091"
 OLD_CYCLE = "00000000-0000-4000-8000-000000000092"
@@ -33,7 +34,12 @@ class GenerationAppendTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         (self.root / "device").mkdir()
-        self.fence = make(self.root).cycles
+        # Isolated R3 hash-chain primitive; coupled DEV-store admission is
+        # exercised via SourceOnlyReleaseSequence in test_dev_generation_release.
+        self.fence = CycleAttemptFence(
+            self.root / "r3.sqlite", self.root / "shared.lock",
+            self.root / "device", FileFakeAnchor(self.root / "r3-anchor.json"),
+        )
         with self.fence.serialized():
             self.fence.initialize_first_cycle_locked(
                 OLD, OLD_CYCLE, OLD_ATTEMPT
@@ -78,6 +84,24 @@ class GenerationAppendTests(unittest.TestCase):
         with self.fence.serialized():
             with self.assertRaises(PreconditionBlocked):
                 self.fence.reserve_locked(DEV, CYCLE, FIRST_ATTEMPT)
+
+    def test_same_device_identity_rejected_before_r3_generation_write(self):
+        with self.fence.serialized():
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.append_dev_generation_first_cycle_locked(
+                    previous_device_id=OLD, new_device_id=OLD,
+                    generation_id=GEN, grant_digest=GRANT,
+                    prior_state_digest=digest(self.prior),
+                    release_cycle_id=CYCLE, attempt_id=FIRST_ATTEMPT,
+                )
+            self.assertEqual(self.fence.read_enrolled_state_locked(OLD), self.prior)
+        with closing(sqlite3.connect(self.fence.database)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM consumed"
+            ).fetchone(), (1,))
+            self.assertFalse(db.execute(
+                "SELECT name FROM sqlite_master WHERE name='generation_transition'"
+            ).fetchall())
 
     def test_wrong_prior_receipt_or_grant_cannot_advance_generation(self):
         with self.assertRaises(PreconditionBlocked):
