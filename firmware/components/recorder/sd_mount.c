@@ -15,6 +15,10 @@
 #include <errno.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+#include <dirent.h>
+#include "esp_vfs_fat.h"
+#endif
 
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
@@ -228,6 +232,123 @@ esp_err_t sd_mount_recordings(void) {
              RECORDER_SD_MOUNT_POINT);
     return ESP_OK;
 }
+
+// SDB-1.1 intentionally destructive installer primitive. The source-only
+// entrypoint is NOT reachable from ordinary app_main or any CDC/MSC command.
+// Only the exact already-mounted, Device-owned SPI card is targeted; a GPIO,
+// ROM/APP/image witness and the external one-use grant belong to a separate
+// operator-approved installer (not this helper).
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+static bool dev_sd_empty_root(void) {
+    DIR *root = opendir(RECORDER_SD_MOUNT_POINT);
+    struct dirent *ent;
+    if (root == NULL) return false;
+    errno = 0;
+    while ((ent = readdir(root)) != NULL) {
+        if (strcmp(ent->d_name, ".") != 0 &&
+            strcmp(ent->d_name, "..") != 0) {
+            (void)closedir(root);
+            return false;
+        }
+        errno = 0;
+    }
+    const bool empty = errno == 0 && closedir(root) == 0;
+    return empty;
+}
+
+static bool dev_sd_same_selected_card(const sdmmc_card_t *card,
+                                      uint32_t serial, uint64_t sectors) {
+    // CID+capacity is a collision/target-denial guard, not authenticated
+    // physical origin. The exact physical media/ROM must be proven separately.
+    return card != NULL && card->cid.serial == serial &&
+           (uint64_t)card->csd.capacity == sectors;
+}
+
+esp_err_t sd_mount_dev_rebaseline_selected(bool owner_grant_consumed,
+                                           uint32_t expected_cid_serial,
+                                           uint64_t expected_sector_count) {
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    sdspi_device_config_t dev = SDSPI_DEVICE_CONFIG_DEFAULT();
+    spi_bus_config_t bus = {
+        .mosi_io_num = RECORDER_SD_MOSI_PIN,
+        .miso_io_num = RECORDER_SD_MISO_PIN,
+        .sclk_io_num = RECORDER_SD_CLK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    esp_vfs_fat_mount_config_t fs = {
+        .format_if_mount_failed = false, // absolutely no implicit erase
+        .max_files = 4,
+        .allocation_unit_size = 16 * 1024,
+    };
+    sdmmc_card_t *card = NULL;
+    bool mounted = false;
+    esp_err_t err, cleanup_err;
+
+    if (!owner_grant_consumed || expected_sector_count == 0u ||
+        sd_mount_is_mounted() || s_storage != NULL || s_bus_init ||
+        s_sdspi_init || s_device_init || s_msc_driver_init) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // Do NOT create a TinyUSB MSC driver/storage or publish a USB LUN here.
+    err = spi_bus_initialize(host.slot, &bus, SDSPI_DEFAULT_DMA);
+    if (err != ESP_OK) return err;
+    dev.host_id = host.slot;
+    dev.gpio_cs = RECORDER_SD_CS_PIN;
+    err = esp_vfs_fat_sdspi_mount(RECORDER_SD_MOUNT_POINT,
+                                 &host, &dev, &fs, &card);
+    if (err != ESP_OK) goto cleanup;
+    mounted = true;
+
+    if (!dev_sd_same_selected_card(card, expected_cid_serial,
+                                   expected_sector_count)) {
+        err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+    // Explicit erase, never a fallback for ordinary mount/recovery failure.
+    err = esp_vfs_fat_sdcard_format(RECORDER_SD_MOUNT_POINT, card);
+    if (err != ESP_OK) goto cleanup;
+    if (!dev_sd_empty_root()) {
+        err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+    // Tear down the FAT/VFS view; a second independent registration/readback
+    // checks that the empty filesystem actually survives close/remount.
+    err = esp_vfs_fat_sdcard_unmount(RECORDER_SD_MOUNT_POINT, card);
+    if (err != ESP_OK) goto cleanup;
+    mounted = false;
+    card = NULL;
+    err = esp_vfs_fat_sdspi_mount(RECORDER_SD_MOUNT_POINT,
+                                 &host, &dev, &fs, &card);
+    if (err != ESP_OK) goto cleanup;
+    mounted = true;
+    if (!dev_sd_same_selected_card(card, expected_cid_serial,
+                                   expected_sector_count) ||
+        !dev_sd_empty_root()) err = ESP_ERR_INVALID_STATE;
+
+cleanup:
+    if (mounted) {
+        cleanup_err = esp_vfs_fat_sdcard_unmount(RECORDER_SD_MOUNT_POINT, card);
+        if (err == ESP_OK && cleanup_err != ESP_OK) err = cleanup_err;
+    }
+    cleanup_err = spi_bus_free(host.slot);
+    if (err == ESP_OK && cleanup_err != ESP_OK) err = cleanup_err;
+    // Success proves only an empty reformatted FAT selected by this helper.
+    // Canonical device.json, manifest, generation/NVS and RTC readback are
+    // separate required steps before DEV_READY_UNSPENT may be persisted.
+    return err;
+}
+#else
+esp_err_t sd_mount_dev_rebaseline_selected(bool owner_grant_consumed,
+                                           uint32_t expected_cid_serial,
+                                           uint64_t expected_sector_count) {
+    (void)owner_grant_consumed;
+    (void)expected_cid_serial;
+    (void)expected_sector_count;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+#endif
 
 esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd) {
     char dir[RECORDER_MAX_PATH_LEN];
