@@ -169,9 +169,9 @@ class SdbGenerationReleaseTests(unittest.TestCase):
         self.fence = make(root)
         with self.fence.cycles.serialized():
             self.fence.cycles.initialize_first_cycle_locked(
-                OLD, OLD_CYCLE, OLD_ATTEMPT
+                old_device, OLD_CYCLE, OLD_ATTEMPT
             )
-            old = self.fence.cycles.read_enrolled_state_locked(OLD)
+            old = self.fence.cycles.read_enrolled_state_locked(old_device)
         digest = hashlib.sha256(json.dumps(
             old, sort_keys=True, separators=(",", ":")
         ).encode("ascii")).hexdigest()
