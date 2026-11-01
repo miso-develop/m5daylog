@@ -92,3 +92,36 @@ def test_sdb11_origin_is_from_consumed_boot_not_nvs_presence():
     assert "s_this_boot_qualified = true" in fence
     assert "FENCE_BOOT_ACTIVE" in fence
     assert "READY_AFTER_RELEASE" in fence
+
+
+def test_dev_installer_is_separate_one_shot_and_reads_back_metadata():
+    installer = (COMP / "dev_sdb11_installer.c").read_text()
+    runtime = RUNTIME.read_text()
+    kconfig = (COMP / "Kconfig").read_text()
+    cmake = (COMP / "CMakeLists.txt").read_text()
+    assert '"dev_sdb11_installer.c"' in cmake
+    assert "config M5DAYLOG_SDB11_INSTALLER_MODE" in kconfig
+    assert "depends on M5DAYLOG_SDB11_DEV_INSTALL" in kconfig
+    assert installer.index("dev_fresh_install_nvs_provision_pristine(") < installer.index(
+        "sd_mount_dev_rebaseline_selected(") < installer.index(
+        "dev_write_new_exact(",
+        installer.index("dev_sdb11_install_baseline(")) < installer.index(
+        "dev_sdb11_mark_baseline_ready(")
+    assert installer.count("sd_mount_recordings()") == 2
+    assert installer.count("dev_media_readback(device_json, manifest, marker)") == 2
+    assert "sd_mount_dev_card_matches(" in installer
+    assert "dev_dir_has_exact(RECORDER_RECORDINGS_DIR, NULL, 0u)" in installer
+    assert "dev_dir_has_exact(RECORDER_QUARANTINE_DIR, NULL, 0u)" in installer
+    assert "O_CREAT | O_EXCL" in installer
+    assert "fsync(fd)" in installer
+    assert "DEV_EMPTY_TIME" in installer
+    assert "dev_sdb11_install_baseline(" not in (
+        ROOT / "main" / "main.c").read_text()
+    assert "#if defined(CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE)" in runtime
+    begin = runtime.index("void app_main(void) {")
+    boot = runtime[begin:]
+    assert boot.index("recorder_dev_wait_for_first_hold(&installer_epoch)") < (
+        boot.index("dev_sdb11_install_baseline(") < boot.index(
+        "xTaskCreate(recorder_base_task,"))
+    assert "return;  // NEVER record or publish USB in the installer image" in boot
+    assert "ESP_ERR_NOT_SUPPORTED" in installer
