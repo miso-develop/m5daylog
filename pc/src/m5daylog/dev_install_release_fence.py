@@ -128,8 +128,10 @@ class DevInstallReleaseFence:
             raise PreconditionBlocked("shared release OS lock required")
 
     @staticmethod
-    def _state(receipt: DevInstallReceipt) -> dict[str, object]:
-        return {"v": 1, "kind": "DEV_FRESH_INSTALL_FIRST_RELEASE",
+    def _state(receipt: DevInstallReceipt, *, generation: bool = False) -> dict[str, object]:
+        kind = ("SAME_HOST_DEV_GENERATION_FIRST_RELEASE" if generation
+                else "DEV_FRESH_INSTALL_FIRST_RELEASE")
+        return {"v": 1, "kind": kind,
                 "state": "CONSUMED", "receipt": receipt.fingerprint()}
 
     def _read(self) -> dict[str, object]:
@@ -149,7 +151,8 @@ class DevInstallReleaseFence:
                 raise PreconditionBlocked("DEV release ledger ambiguous")
             v, kind, state, receipt = rows[0]
             if (type(v) is not int or v != 1
-                    or kind != "DEV_FRESH_INSTALL_FIRST_RELEASE"
+                    or kind not in ("DEV_FRESH_INSTALL_FIRST_RELEASE",
+                                    "SAME_HOST_DEV_GENERATION_FIRST_RELEASE")
                     or state != "CONSUMED"
                     or type(receipt) is not str or not _HEX.fullmatch(receipt)):
                 raise PreconditionBlocked("DEV release ledger invalid")
@@ -157,14 +160,15 @@ class DevInstallReleaseFence:
         except (sqlite3.Error, OSError, ValueError):
             raise PreconditionBlocked("DEV release ledger unreadable") from None
 
-    def verify_consumed_locked(self, receipt: DevInstallReceipt) -> None:
+    def verify_consumed_locked(self, receipt: DevInstallReceipt, *,
+                               generation: bool = False) -> None:
         """Observe the exact separately consumed #1 attempt, never re-arm it.
 
         This check can later correlate the first enrolled R3 cycle, but is
         not a standalone proof of Device first-use origin or a send permit.
         """
         self._require_lock()
-        expected = self._state(receipt)
+        expected = self._state(receipt, generation=generation)
         local = self._read()
         try:
             remote = self.anchor.read()
@@ -193,10 +197,11 @@ class DevInstallReleaseFence:
         self.cycles.check_unenrolled_locked()
         self._commit_dev_store_locked(receipt)
 
-    def _commit_dev_store_locked(self, receipt: DevInstallReceipt) -> None:
+    def _commit_dev_store_locked(self, receipt: DevInstallReceipt, *,
+                                 generation: bool = False) -> None:
         """One irreversible DEV attempt, after caller's external authorization."""
         self._require_lock()
-        expected = self._state(receipt)
+        expected = self._state(receipt, generation=generation)
         try:
             local_exists = self.database.exists()
             remote = self.anchor.read()
@@ -215,7 +220,7 @@ class DevInstallReleaseFence:
                 db.execute("COMMIT")
             # A crash after SQLite and before HKCU flush blocks permanently.
             self.anchor.write(expected)
-            self.verify_consumed_locked(receipt)
+            self.verify_consumed_locked(receipt, generation=generation)
         except (sqlite3.Error, OSError, ValueError):
             raise PreconditionBlocked("DEV first release persistence uncertain") from None
 
@@ -265,7 +270,7 @@ class DevInstallReleaseFence:
         # One OS-wide lock spans both independently persistent writers and
         # the full #89 coordinator. Split/unknown commit is permanently spent.
         # Reversing these writes is forbidden: the first attempt is burned.
-        self._commit_dev_store_locked(receipt)
+        self._commit_dev_store_locked(receipt, generation=True)
         self.cycles.append_dev_generation_first_cycle_locked(
             previous_device_id=previous_device_id,
             new_device_id=receipt.device_id,
@@ -275,7 +280,7 @@ class DevInstallReleaseFence:
             release_cycle_id=cycle,
             attempt_id=receipt.first_release_attempt_id,
         )
-        self.verify_consumed_locked(receipt)
+        self.verify_consumed_locked(receipt, generation=True)
         self.cycles.verify_dev_generation_locked(
             receipt.device_id, receipt.generation_id,
             receipt.external_permit_digest, cycle,
