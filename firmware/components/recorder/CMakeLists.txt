@@ -29,6 +29,7 @@ idf_component_register(
         "release_cycle_witness.c"
         "dev_fresh_install_nvs.c"
         "dev_fresh_install_provision.c"
+        "dev_sdb11_first_boot.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
