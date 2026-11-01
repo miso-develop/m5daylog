@@ -24,6 +24,12 @@ extern "C" {
 // but the existing recorder/USB recovery policy remains independent.
 esp_err_t release_cycle_fence_begin_boot(bool manual_wake);
 
+// SDB-1.1 DEV-only: consume the already committed/read-back first-boot
+// intent into the existing process-local R3 permit, never on ordinary boots.
+// Requires prior release_cycle_fence_begin_boot AND a positive Device-local
+// staged->used NVS witness in this same process. No USB/SD access.
+esp_err_t release_cycle_fence_admit_dev_first_boot(void);
+
 // Called only after #87 manual-WAKE recovery has durably reached NORMAL,
 // recorder reached RECORDING and RTC recovery checks succeeded. This does
 // not authorize publication by itself.
