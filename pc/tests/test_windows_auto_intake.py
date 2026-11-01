@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from m5daylog.auto_intake import IntakeResult, PollingMonitor
 from m5daylog.windows_auto_intake import WindowsArrivalProvider, read_opt_in
 from m5daylog.windows_release import CdcInterface
 from m5daylog.release import EjectTarget
@@ -103,6 +104,75 @@ class ProviderTests(unittest.TestCase):
         self.status["state"] = "USB_SYNC"
         later = self.provider.scan()[0].binding.session_epoch
         self.assertNotEqual(earlier, later)
+
+    def test_enumeration_failure_revokes_epoch_before_polling_recovery(self):
+        # Real Provider.scan + PollingMonitor.poll_once path, with synthetic
+        # Windows endpoints only. No physical USB/CDC or release sender.
+        class Coordinator:
+            def __init__(self):
+                self.sessions = []
+
+            def _authorized(self, arrival):
+                return arrival.usb_sync_confirmed
+
+            def intake(self, arrival, *, current_session_epoch):
+                self.sessions.append((
+                    arrival.binding.session_epoch, current_session_epoch(),
+                ))
+                return IntakeResult("RELEASE_BLOCKED", "AUTO_RELEASE_NOT_QUALIFIED")
+
+        coordinator = Coordinator()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        monitor.poll_once()
+        self.assertEqual(coordinator.sessions, [])
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+        initial_epoch = coordinator.sessions[-1][0]
+
+        # COM enumeration failure must not preserve an old observer epoch,
+        # even when every PnP/mount key appears identical on the next scan.
+        def fail_ports():
+            raise OSError("synthetic serial enumeration failure")
+
+        self.provider.ports = fail_ports
+        monitor.poll_once()
+        self.assertEqual(self.provider.current_epoch(), "")
+        self.assertEqual(len(coordinator.sessions), 1)
+        self.provider.ports = lambda: list(self.coms)
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 2)
+        after_ports = coordinator.sessions[-1][0]
+        self.assertNotEqual(initial_epoch, after_ports)
+
+        # A drive iterator may fail after yielding a plausible first root.
+        # Its partial enumeration must not retain or reissue an old epoch.
+        def fail_roots():
+            yield "E:\\"
+            raise OSError("synthetic removable-root enumeration failure")
+
+        self.provider.roots = fail_roots
+        monitor.poll_once()
+        self.assertEqual(self.provider.current_epoch(), "")
+        self.assertEqual(len(coordinator.sessions), 2)
+        self.provider.roots = lambda: ["E:\\"]
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 2)
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 3)
+        self.assertNotEqual(after_ports, coordinator.sessions[-1][0])
+        self.assertTrue(all(stored == current for stored, current in coordinator.sessions))
+        self.assertTrue(all(n["safe_to_leave_usb_connected"] is False
+                            for n in notices))
+        self.assertIn(
+            "ARRIVAL_OBSERVATION_ERROR",
+            [n["reason"] for n in notices],
+        )
 
     def test_invalid_status_response_does_not_admit(self):
         for value in (None, {}, {"state": "USB_SYNC"}, {"state": "USB_SYNC",
