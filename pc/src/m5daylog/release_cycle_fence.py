@@ -270,6 +270,8 @@ class CycleAttemptFence:
             # anchor. Never downgrade V2 by accepting the legacy V1 shape.
             remote = self._validated(self.anchor.read())
             current = {"v": v, "device": stored, "seq": sequence, "tip": tip}
+            if v != remote["v"]:
+                raise PreconditionBlocked("host continuity version mismatch")
             if v == 2:
                 current.update(active_device=remote["active_device"],
                                generation=remote["generation"])
