@@ -63,7 +63,7 @@ def test_dev_gpio_gate_and_cdc_release_are_guarded():
     ):
         assert marker in boot
     assert boot.index("dev_sdb11_probe_boot(") < boot.index(
-        "recorder_dev_wait_for_first_hold(") < boot.index(
+        "recorder_dev_wait_for_first_hold(&dev_hold_epoch)") < boot.index(
         "dev_sdb11_consume_boot_intent(") < boot.index(
         "release_cycle_fence_admit_dev_first_boot(")
     assert source.index("release_cycle_button_init()",  # physical ISR
@@ -120,8 +120,8 @@ def test_dev_installer_is_separate_one_shot_and_reads_back_metadata():
     assert "#if defined(CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE)" in runtime
     begin = runtime.index("void app_main(void) {")
     boot = runtime[begin:]
-    assert boot.index("recorder_dev_wait_for_first_hold(&installer_epoch)") < (
-        boot.index("dev_sdb11_install_baseline(") < boot.index(
-        "xTaskCreate(recorder_base_task,"))
+    assert (boot.index("recorder_dev_wait_for_first_hold(&installer_epoch)") <
+            boot.index("dev_sdb11_install_baseline(") <
+            boot.index("xTaskCreate(recorder_base_task,"))
     assert "return;  // NEVER record or publish USB in the installer image" in boot
     assert "ESP_ERR_NOT_SUPPORTED" in installer
