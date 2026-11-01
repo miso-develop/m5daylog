@@ -88,7 +88,7 @@ class SdbGenerationReleaseTests(unittest.TestCase):
         self.assertLess(self.events.index("rtc"), self.events.index("lock"))
         self.assertLess(self.events.index("lock"), self.events.index("release"))
         with self.fence.cycles.serialized():
-            self.fence.verify_consumed_locked(self.receipt)
+            self.fence.verify_consumed_locked(self.receipt, generation=True)
             self.fence.cycles.verify_dev_generation_locked(
                 DEV, GEN, self.receipt.external_permit_digest, CYCLE, ATTEMPT
             )
