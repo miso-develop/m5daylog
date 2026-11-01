@@ -1,0 +1,9 @@
+menu "M5Daylog development-only admission"
+    config M5DAYLOG_SDB11_DEV_INSTALL
+        bool "Compile DEV SDB-1.1 first-boot candidate NVS transaction"
+        default n
+        help
+            Source-only development path. This does not wire startup,
+            authorize installation, format SD, or permit release. Normal
+            builds cannot call the mutating implementation.
+endmenu
