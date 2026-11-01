@@ -6,4 +6,22 @@ menu "M5Daylog development-only admission"
             Source-only development path. This does not wire startup,
             authorize installation, format SD, or permit release. Normal
             builds cannot call the mutating implementation.
+    config M5DAYLOG_SDB11_EXPECTED_GENERATION
+        string "Pinned DEV installation generation UUID"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
+        default ""
+        help
+            Exact supervised install generation. Empty blocks DEV startup.
+    config M5DAYLOG_SDB11_EXPECTED_DEVICE_ID
+        string "Pinned DEV device UUID"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
+        default ""
+        help
+            Exact installed NVS and SD device ID; UUID is not a grant.
+    config M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256
+        string "Pinned DEV image/partition/card baseline SHA-256"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
+        default ""
+        help
+            Lowercase 64-hex baseline binding read back from NVS. Empty blocks.
 endmenu
