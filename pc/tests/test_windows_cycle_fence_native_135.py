@@ -13,6 +13,7 @@ import os
 import shutil
 import sqlite3
 from contextlib import closing
+from dataclasses import replace
 import sys
 import tempfile
 import unittest
@@ -29,6 +30,8 @@ from m5daylog.first_use_transaction import (
     FileFirstUseIntent, consume_first_use_source_only,
 )
 from m5daylog.release import PreconditionBlocked
+from m5daylog.dev_install_release_fence import DevInstallReleaseFence, DevInstallRegistryAnchor
+from test_dev_install_release_fence_135 import receipt
 from m5daylog.release_cycle_fence import (
     CycleAttemptFence, WindowsRegistryAnchor,
 )
@@ -259,6 +262,51 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
                     prior_state_digest=self._lineage_digest(prior),
                     release_cycle_id=NEW_CYCLE, attempt_id=NEW_ATTEMPT,
                 )
+
+    def test_native_dev_commit_pre_r3_begin_denies_old_v1_even_after_restart(self):
+        # Real disposable HKCU/SQLite stores; simulate failure before the R3
+        # V2 transaction is opened. No actual USB, CDC or release sender.
+        self._enroll_fixture()
+        self._reserve()
+        dev_key = self.key + "_DEV"
+        dev_anchor = DevInstallRegistryAnchor()
+        dev_anchor.KEY = dev_key
+        def cleanup_dev_key():
+            try:
+                self.winreg.DeleteKey(self.winreg.HKEY_CURRENT_USER, dev_key)
+            except FileNotFoundError:
+                pass
+        self.addCleanup(cleanup_dev_key)
+        dev_db = self.root / "dev_install.sqlite"
+        dev = DevInstallReleaseFence(
+            cycles=self.fence, database=dev_db,
+            device_root=self.root / "fake_device", anchor=dev_anchor,
+        )
+        new_receipt = replace(
+            receipt(), device_id=NEW_DEVICE, generation_id=NEW_GENERATION,
+            first_release_attempt_id=NEW_ATTEMPT,
+        )
+        with self.fence.serialized():
+            dev._commit_dev_store_locked(new_receipt, generation=True)
+            self.assertEqual(self.fence.read_enrolled_state_locked(DEVICE)["v"], 1)
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.reserve_locked(DEVICE, NEXT_CYCLE, NEXT_ATTEMPT)
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.verify_reserved_locked(DEVICE, CYCLE, ATTEMPT)
+        restarted = _fence(self.root, self.key)
+        DevInstallReleaseFence(
+            cycles=restarted, database=dev_db,
+            device_root=self.root / "fake_device", anchor=dev_anchor,
+        )
+        with restarted.serialized():
+            with self.assertRaises(PreconditionBlocked):
+                restarted.reserve_locked(DEVICE, NEXT_CYCLE, NEXT_ATTEMPT)
+        self.assertEqual(dev_anchor.read()["kind"],
+                         "SAME_HOST_DEV_GENERATION_FIRST_RELEASE")
+        with closing(sqlite3.connect(restarted.database)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM consumed"
+            ).fetchone(), (1,))
 
     def test_native_two_processes_only_one_new_generation_cycle_reservation(self):
         self._native_generation()
