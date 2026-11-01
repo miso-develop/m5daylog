@@ -30,6 +30,7 @@ idf_component_register(
         "dev_fresh_install_nvs.c"
         "dev_fresh_install_provision.c"
         "dev_sdb11_first_boot.c"
+        "dev_sdb11_installer.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
