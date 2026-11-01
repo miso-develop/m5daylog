@@ -265,6 +265,14 @@ static bool dev_sd_same_selected_card(const sdmmc_card_t *card,
            (uint64_t)card->csd.capacity == sectors;
 }
 
+bool sd_mount_dev_card_matches(uint32_t expected_cid_serial,
+                               uint64_t expected_sector_count) {
+    return sd_mount_is_mounted() && !s_usb_release_requested &&
+           expected_sector_count > 0u &&
+           dev_sd_same_selected_card(&s_card, expected_cid_serial,
+                                     expected_sector_count);
+}
+
 esp_err_t sd_mount_dev_rebaseline_selected(bool owner_grant_consumed,
                                            uint32_t expected_cid_serial,
                                            uint64_t expected_sector_count) {
@@ -341,6 +349,11 @@ cleanup:
     return err;
 }
 #else
+bool sd_mount_dev_card_matches(uint32_t expected_cid_serial,
+                               uint64_t expected_sector_count) {
+    (void)expected_cid_serial; (void)expected_sector_count;
+    return false;
+}
 esp_err_t sd_mount_dev_rebaseline_selected(bool owner_grant_consumed,
                                            uint32_t expected_cid_serial,
                                            uint64_t expected_sector_count) {
