@@ -1,12 +1,16 @@
 """#135 Windows observer and opt-in tests with synthetic Win32 ports only."""
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from m5daylog.auto_intake import IntakeResult, PollingMonitor
-from m5daylog.windows_auto_intake import WindowsArrivalProvider, read_opt_in
+from m5daylog.windows_auto_intake import (
+    WindowsArrivalProvider, enumerate_com_ports, read_opt_in,
+)
 from m5daylog.windows_release import CdcInterface
 from m5daylog.release import EjectTarget
 
@@ -53,6 +57,51 @@ class StubReleasePort:
     def volume_available(self, target):
         self.calls.append("available")
         return self.present
+
+
+class SyntheticSerialRegistry:
+    """Fake Win32 EnumValue with explicit EOF, partial I/O errors and a cap."""
+
+    HKEY_LOCAL_MACHINE = object()
+
+    def __init__(self, values):
+        self.values = list(values)
+        self.fail_at = None
+        self.fail_winerror = 5
+
+    def OpenKey(self, hive, path):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def EnumValue(self, key, index):
+        if index == self.fail_at:
+            error = OSError("synthetic non-EOF registry error")
+            error.winerror = self.fail_winerror
+            raise error
+        if index >= len(self.values):
+            error = OSError("synthetic end of registry enumeration")
+            error.winerror = 259  # ERROR_NO_MORE_ITEMS
+            raise error
+        return (f"serial{index}", self.values[index], 1)
+
+
+class RecordingIntake:
+    def __init__(self):
+        self.sessions = []
+
+    def _authorized(self, arrival):
+        return arrival.usb_sync_confirmed
+
+    def intake(self, arrival, *, current_session_epoch):
+        self.sessions.append((
+            arrival.binding.session_epoch, current_session_epoch(),
+        ))
+        return IntakeResult("RELEASE_BLOCKED", "AUTO_RELEASE_NOT_QUALIFIED")
 
 
 class ProviderTests(unittest.TestCase):
@@ -173,6 +222,87 @@ class ProviderTests(unittest.TestCase):
             "ARRIVAL_OBSERVATION_ERROR",
             [n["reason"] for n in notices],
         )
+
+    def test_actual_registry_partial_failure_denies_ambiguous_binding_and_rearms(self):
+        # Exercise the production EnumValue -> Provider.scan -> Monitor path.
+        # A partial COM list must never make two same-parent CDCs look unique.
+        registry = SyntheticSerialRegistry(["COM7", "COM8"])
+        self.provider.ports = enumerate_com_ports
+        coordinator = RecordingIntake()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        with mock.patch.dict(sys.modules, {"winreg": registry}):
+            monitor.poll_once()
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            old_epoch = coordinator.sessions[-1][0]
+
+            self.api.mapping["COM8"] = CdcInterface(
+                "synthetic-second", "cdc8", "parent",
+            )
+            registry.fail_at = 1  # COM7 returned; COM8 hidden by WinError 5
+            monitor.poll_once()
+            self.assertEqual(self.provider.current_epoch(), "")
+            self.assertEqual(len(coordinator.sessions), 1)
+            self.assertEqual(notices[-1]["reason"], "ARRIVAL_OBSERVATION_ERROR")
+
+            registry.fail_at = None  # complete, genuinely ambiguous enumeration
+            monitor.poll_once()
+            self.assertEqual(self.provider.current_epoch(), "")
+            self.assertEqual(len(coordinator.sessions), 1)
+
+            self.api.mapping["COM8"] = CdcInterface(
+                "other-path", "cdc8", "other-parent",
+            )
+            monitor.poll_once()  # only the first stable recovered observation
+            self.assertEqual(len(coordinator.sessions), 1)
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 2)
+            self.assertNotEqual(old_epoch, coordinator.sessions[-1][0])
+        self.assertTrue(all(
+            stored == current for stored, current in coordinator.sessions
+        ))
+        self.assertTrue(all(
+            notice["safe_to_leave_usb_connected"] is False
+            for notice in notices
+        ))
+
+    def test_actual_registry_cap_requires_eof_not_a_truncated_subset(self):
+        registry = SyntheticSerialRegistry(["COM7", "COM8"])
+        self.provider.ports = enumerate_com_ports
+        coordinator = RecordingIntake()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        with mock.patch.dict(sys.modules, {"winreg": registry}):
+            self.assertEqual(enumerate_com_ports(), ["COM7", "COM8"])
+            monitor.poll_once()
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            old_epoch = coordinator.sessions[-1][0]
+
+            registry.values = ["COM7"] + ["COM8"] * 128
+            monitor.poll_once()  # 129th registry entry proves the cap truncates
+            self.assertEqual(self.provider.current_epoch(), "")
+            self.assertEqual(len(coordinator.sessions), 1)
+            self.assertEqual(notices[-1]["reason"], "ARRIVAL_OBSERVATION_ERROR")
+
+            registry.values = ["COM7"] + ["COM8"] * 127
+            self.assertEqual(enumerate_com_ports(), ["COM7", "COM8"])
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 2)
+            self.assertNotEqual(old_epoch, coordinator.sessions[-1][0])
+        self.assertTrue(all(
+            notice["safe_to_leave_usb_connected"] is False
+            for notice in notices
+        ))
 
     def test_invalid_status_response_does_not_admit(self):
         for value in (None, {}, {"state": "USB_SYNC"}, {"state": "USB_SYNC",
