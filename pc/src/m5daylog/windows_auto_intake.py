@@ -120,8 +120,17 @@ class WindowsArrivalProvider:
 
     def scan(self) -> list[Arrival]:
         candidates: list[Arrival] = []
-        com_ports = self.ports()
-        for root in self.roots():
+        # An observer enumeration failure leaves the USB epoch unknown. Drop
+        # the prior epoch before propagating the error to PollingMonitor, which
+        # also clears its stable-scan/handled state. Materialize the roots first
+        # so a failing enumerator cannot leave a partly refreshed epoch map.
+        try:
+            com_ports = tuple(self.ports())
+            roots = tuple(self.roots())
+        except Exception:
+            self._epochs.clear()
+            raise
+        for root in roots:
             try:
                 device_id = self.preflight(root)
                 if device_id not in self.trusted:
