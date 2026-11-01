@@ -37,6 +37,11 @@ esp_err_t sd_mount_dev_rebaseline_selected(bool owner_grant_consumed,
                                            uint32_t expected_cid_serial,
                                            uint64_t expected_sector_count);
 
+// Read-only check against the APP-owned mounted card. DEV-only logic
+// additionally proves that the same pinned card was remounted after format.
+bool sd_mount_dev_card_matches(uint32_t expected_cid_serial,
+                               uint64_t expected_sector_count);
+
 esp_err_t sd_mount_recordings(void);
 esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd);
 esp_err_t sd_mount_ensure_quarantine_dir(void);
