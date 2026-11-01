@@ -63,6 +63,17 @@ def _tip(previous: str, sequence: int, device: str, cycle: str, attempt: str) ->
     return hashlib.sha256(payload).hexdigest()
 
 
+
+def _generation_tip(previous: str, after_seq: int, new_device: str,
+                    generation: str, grant: str) -> str:
+    """Domain-separated append-only transition; never a reset to H0."""
+    payload = json.dumps(
+        ["m5daylog:r3:dev-generation:v2", previous, after_seq,
+         new_device, generation, grant], separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
 class Anchor(Protocol):
     def read(self) -> dict[str, object] | None: ...
     def write(self, state: dict[str, object]) -> None: ...
@@ -226,15 +237,27 @@ class CycleAttemptFence:
 
     @staticmethod
     def _validated(state: object) -> dict[str, object]:
-        if not isinstance(state, dict) or set(state) != {"v", "device", "seq", "tip"}:
+        if not isinstance(state, dict):
             raise PreconditionBlocked("invalid release continuity state")
-        if (type(state["v"]) is not int or state["v"] != 1
-                or not isinstance(state["device"], str)
+        version = state.get("v")
+        expected = ({"v", "device", "seq", "tip"} if version == 1 else
+                    {"v", "device", "seq", "tip", "active_device", "generation"}
+                    if version == 2 else set())
+        if set(state) != expected or type(version) is not int:
+            raise PreconditionBlocked("invalid release continuity state")
+        if (not isinstance(state["device"], str)
                 or not _HEX.fullmatch(state["device"])
                 or type(state["seq"]) is not int or state["seq"] < 0
                 or not isinstance(state["tip"], str)
                 or not _HEX.fullmatch(state["tip"])):
             raise PreconditionBlocked("invalid release continuity state")
+        if version == 2 and (
+                not isinstance(state["active_device"], str)
+                or not _HEX.fullmatch(state["active_device"])
+                or not isinstance(state["generation"], str)
+                or not _HEX.fullmatch(state["generation"])
+                or state["seq"] < 2):
+            raise PreconditionBlocked("invalid DEV generation continuity state")
         return state
 
     def _verify(self, db: sqlite3.Connection, device: str) -> dict[str, object]:
@@ -243,29 +266,167 @@ class CycleAttemptFence:
             if len(rows) != 1:
                 raise PreconditionBlocked("release enrollment missing")
             v, stored, sequence, tip = rows[0]
-            local = self._validated({"v": v, "device": stored, "seq": sequence, "tip": tip})
+            # A V2 witness is independently flushed in the same existing HKCU
+            # anchor. Never downgrade V2 by accepting the legacy V1 shape.
             remote = self._validated(self.anchor.read())
-            if local != remote or local["device"] != device:
+            current = {"v": v, "device": stored, "seq": sequence, "tip": tip}
+            if v == 2:
+                current.update(active_device=remote["active_device"],
+                               generation=remote["generation"])
+            local = self._validated(current)
+            if local != remote:
                 raise PreconditionBlocked("host continuity mismatch")
-            previous = _hash("m5daylog:r3:enrolled:" + device)
+
+            marker = None
+            if v == 2:
+                markers = db.execute(
+                    "SELECT after_seq, new_device, generation, grant, tip "
+                    "FROM generation_transition"
+                ).fetchall()
+                if len(markers) != 1:
+                    raise PreconditionBlocked("DEV generation transition missing")
+                after_seq, new_device, generation, grant, marker_tip = markers[0]
+                if (type(after_seq) is not int or after_seq < 1
+                        or after_seq >= sequence
+                        or any(type(h) is not str or not _HEX.fullmatch(h)
+                               for h in (new_device, generation, grant, marker_tip))
+                        or remote["active_device"] != new_device
+                        or remote["generation"] != generation):
+                    raise PreconditionBlocked("DEV generation transition invalid")
+                marker = (after_seq, new_device, generation, grant, marker_tip)
+
+            active = stored
+            previous = _hash("m5daylog:r3:enrolled:" + stored)
             observed = 0
             for seq, cycle, attempt, row_tip in db.execute(
                 "SELECT seq, cycle, attempt, tip FROM consumed ORDER BY seq"
             ):
                 observed += 1
                 if (type(seq) is not int or seq != observed
-                        or not isinstance(cycle, str) or not _HEX.fullmatch(cycle)
-                        or not isinstance(attempt, str) or not _HEX.fullmatch(attempt)
-                        or not isinstance(row_tip, str) or not _HEX.fullmatch(row_tip)):
+                        or any(type(h) is not str or not _HEX.fullmatch(h)
+                               for h in (cycle, attempt, row_tip))):
                     raise PreconditionBlocked("release chain invalid")
-                previous = _tip(previous, seq, device, cycle, attempt)
+                if marker is not None and seq == marker[0] + 1:
+                    previous = _generation_tip(previous, *marker[:4])
+                    if previous != marker[4]:
+                        raise PreconditionBlocked("DEV generation chain invalid")
+                    active = marker[1]
+                previous = _tip(previous, seq, active, cycle, attempt)
                 if row_tip != previous:
                     raise PreconditionBlocked("release chain invalid")
-            if observed != local["seq"] or previous != local["tip"]:
-                raise PreconditionBlocked("release chain tip invalid")
+            if (observed != local["seq"] or previous != local["tip"]
+                    or active != device):
+                raise PreconditionBlocked("release chain tip or active device invalid")
             return local
         except sqlite3.Error:
             raise PreconditionBlocked("release ledger unreadable") from None
+
+    def read_enrolled_state_locked(self, device_id: str) -> dict[str, object]:
+        """Read healthy dual-store continuity; no enrollment or repair."""
+        if not getattr(self._serialized_thread, "held", False):
+            raise PreconditionBlocked("release OS lock required")
+        with closing(self._connection()) as db:
+            return self._verify(db, _hash(_uuid(device_id)))
+
+    def append_dev_generation_first_cycle_locked(
+        self, *, previous_device_id: str, new_device_id: str,
+        generation_id: str, grant_digest: str, prior_state_digest: str,
+        release_cycle_id: str, attempt_id: str,
+    ) -> None:
+        """Single SDB-1.1 generation append AND first consumed cycle, unwired.
+
+        Requires the independently verified *existing* V1 host lineage under
+        the shared lock. A grant hash is correlation only, not an issued grant.
+        SQLite transition+consumed tuple commit precedes HKCU flush/readback.
+        After an uncertain partial write there is NO automatic recovery.
+        """
+        if not getattr(self._serialized_thread, "held", False):
+            raise PreconditionBlocked("release OS lock required")
+        old = _hash(_uuid(previous_device_id))
+        new = _hash(_uuid(new_device_id))
+        generation = _hash(_uuid(generation_id))
+        cycle = _hash(_uuid(release_cycle_id))
+        attempt = _hash(_uuid(attempt_id))
+        if (type(grant_digest) is not str or not _HEX.fullmatch(grant_digest)
+                or type(prior_state_digest) is not str
+                or not _HEX.fullmatch(prior_state_digest)):
+            raise PreconditionBlocked("DEV generation lineage invalid")
+        try:
+            with closing(self._connection()) as db:
+                # Verifies exact prior hash-chain AND independently flushed
+                # anchor before any BEGIN/CREATE/UPDATE/INSERT.
+                prior = self._verify(db, old)
+                if prior["v"] != 1 or prior["seq"] < 1:
+                    raise PreconditionBlocked("DEV generation requires prior consumed lineage")
+                digest = hashlib.sha256(json.dumps(
+                    prior, sort_keys=True, separators=(",", ":")
+                ).encode("ascii")).hexdigest()
+                if digest != prior_state_digest:
+                    raise PreconditionBlocked("DEV host lineage receipt mismatch")
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._verify(db, old) != prior:
+                        raise PreconditionBlocked("DEV lineage changed during admission")
+                    after_seq = prior["seq"]
+                    marker_tip = _generation_tip(
+                        prior["tip"], after_seq, new, generation, grant_digest,
+                    )
+                    seq = after_seq + 1
+                    tip = _tip(marker_tip, seq, new, cycle, attempt)
+                    db.execute(
+                        "CREATE TABLE generation_transition ("
+                        "after_seq INTEGER PRIMARY KEY, new_device TEXT NOT NULL, "
+                        "generation TEXT UNIQUE NOT NULL, grant TEXT UNIQUE NOT NULL, "
+                        "tip TEXT NOT NULL)"
+                    )
+                    db.execute(
+                        "INSERT INTO generation_transition VALUES (?,?,?,?,?)",
+                        (after_seq, new, generation, grant_digest, marker_tip),
+                    )
+                    db.execute("INSERT INTO consumed VALUES (?,?,?,?)",
+                               (seq, cycle, attempt, tip))
+                    db.execute(
+                        "UPDATE ledger_state SET v=2, seq=?, tip=?", (seq, tip)
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+            updated = {"v": 2, "device": old, "seq": seq, "tip": tip,
+                       "active_device": new, "generation": generation}
+            self.anchor.write(updated)
+            self.verify_dev_generation_locked(
+                new_device_id, generation_id, grant_digest,
+                release_cycle_id, attempt_id,
+            )
+        except (sqlite3.Error, OSError):
+            raise PreconditionBlocked("DEV generation persistence uncertain") from None
+
+    def verify_dev_generation_locked(
+        self, new_device_id: str, generation_id: str, grant_digest: str,
+        release_cycle_id: str, attempt_id: str,
+    ) -> None:
+        """Read back exact transition + first tuple in both stores before send."""
+        if not getattr(self._serialized_thread, "held", False):
+            raise PreconditionBlocked("release OS lock required")
+        new = _hash(_uuid(new_device_id))
+        generation = _hash(_uuid(generation_id))
+        cycle = _hash(_uuid(release_cycle_id))
+        attempt = _hash(_uuid(attempt_id))
+        with closing(self._connection()) as db:
+            state = self._verify(db, new)
+            if state["v"] != 2 or state["generation"] != generation:
+                raise PreconditionBlocked("DEV generation not enrolled")
+            row = db.execute(
+                "SELECT after_seq, grant FROM generation_transition"
+            ).fetchone()
+            if row is None or row[1] != grant_digest:
+                raise PreconditionBlocked("DEV grant not correlated")
+            first = db.execute(
+                "SELECT cycle, attempt FROM consumed WHERE seq=?", (row[0] + 1,)
+            ).fetchone()
+            if first != (cycle, attempt):
+                raise PreconditionBlocked("DEV first cycle not consumed")
 
     def enroll(self, device_id: str, *, supervised: bool = False) -> None:
         """Explicit supervised initialization only; NEVER call from monitor/CLI.
@@ -394,7 +555,7 @@ class CycleAttemptFence:
                 except BaseException:
                     db.execute("ROLLBACK")
                     raise
-            updated = {"v": 1, "device": device, "seq": seq, "tip": tip}
+            updated = dict(prior, seq=seq, tip=tip)
             self.anchor.write(updated)
             with closing(self._connection()) as db:
                 if self._verify(db, device) != updated:
