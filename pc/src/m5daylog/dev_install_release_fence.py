@@ -188,6 +188,12 @@ class DevInstallReleaseFence:
         # Confirm actual R3 H0 two-store absence before the first consume.
         # This check alone is never evidence of never-enrolled history.
         self.cycles.check_unenrolled_locked()
+        self._commit_dev_store_locked(receipt)
+
+    def _commit_dev_store_locked(self, receipt: DevInstallReceipt) -> None:
+        """One irreversible DEV attempt, after caller's external authorization."""
+        self._require_lock()
+        expected = self._state(receipt)
         try:
             local_exists = self.database.exists()
             remote = self.anchor.read()
@@ -209,6 +215,61 @@ class DevInstallReleaseFence:
             self.verify_consumed_locked(receipt)
         except (sqlite3.Error, OSError, ValueError):
             raise PreconditionBlocked("DEV first release persistence uncertain") from None
+
+    def consume_new_generation_locked(
+        self, receipt: DevInstallReceipt, *, previous_device_id: str,
+        status: Mapping[str, object],
+        verify_external: Callable[[DevInstallReceipt, Mapping[str, object]], bool],
+    ) -> None:
+        """SDB-1.1: enrolled-host DEV generation and first tuple pre-send.
+
+        This is UNWIRED source-only logic. An approved private one-use grant,
+        running firmware, physical WAKE, exact installed generation/media,
+        valid current final PCM/SHA/RTC, status origin and host custody MUST
+        be independently verified by the future caller. A Python callback
+        or a bare local hash cannot authenticate those facts.
+        """
+        self._require_lock()
+        if (type(receipt) is not DevInstallReceipt
+                or not isinstance(status, Mapping)
+                or not callable(verify_external)):
+            raise PreconditionBlocked("DEV generation evidence missing")
+        if (status.get("releaseCycleOrigin") != "SUPERVISED_FIRST_USE"
+                or status.get("state") != "USB_SYNC"
+                or type(status.get("rtcCorrectionPending")) is not bool):
+            raise PreconditionBlocked("DEV initial recording origin unqualified")
+        cycle = _uuid(status.get("releaseCycleId"))
+        old = self.cycles.read_enrolled_state_locked(previous_device_id)
+        if old["v"] != 1 or old["seq"] < 1:
+            raise PreconditionBlocked("DEV prior host lineage not established")
+        digest = hashlib.sha256(json.dumps(
+            old, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")).hexdigest()
+        if digest != receipt.host_lineage_digest:
+            raise PreconditionBlocked("DEV private grant host lineage mismatch")
+        # Verify external authority before any new host-state write.
+        if verify_external(receipt, status) is not True:
+            raise PreconditionBlocked("DEV generation external grant unqualified")
+
+        # One OS-wide lock spans both independently persistent writers and
+        # the full #89 coordinator. Split/unknown commit is permanently spent.
+        # Reversing these writes is forbidden: the first attempt is burned.
+        self._commit_dev_store_locked(receipt)
+        self.cycles.append_dev_generation_first_cycle_locked(
+            previous_device_id=previous_device_id,
+            new_device_id=receipt.device_id,
+            generation_id=receipt.generation_id,
+            grant_digest=receipt.external_permit_digest,
+            prior_state_digest=receipt.host_lineage_digest,
+            release_cycle_id=cycle,
+            attempt_id=receipt.first_release_attempt_id,
+        )
+        self.verify_consumed_locked(receipt)
+        self.cycles.verify_dev_generation_locked(
+            receipt.device_id, receipt.generation_id,
+            receipt.external_permit_digest, cycle,
+            receipt.first_release_attempt_id,
+        )
 
     def initialize_first_dev_cycle_locked(
         self, receipt: DevInstallReceipt, *, status: Mapping[str, object],

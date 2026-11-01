@@ -122,6 +122,73 @@ class SourceOnlyReleaseSequence:
             fixed_attempt=receipt.first_release_attempt_id,
         )
 
+    def dev_generation_first_release(
+        self, *, receipt: DevInstallReceipt, previous_device_id: str,
+        candidate: QualifiedCycleCandidate,
+        read_current_status: Callable[[], Mapping[str, object]],
+        verify_external: Callable[
+            [DevInstallReceipt, QualifiedCycleCandidate, Mapping[str, object],
+             VerifiedSession, EjectTarget], bool
+        ],
+    ) -> ReleaseOutcome:
+        """SDB-1.1 initial REAL recording boot, not a post-release WAKE.
+
+        Source-only seam; no CLI/watch caller enables or qualifies this path.
+        A live, atomic-pair GET_STATUS implementation is mandatory and its
+        JSON alone is not proof of release authority.
+        """
+        self._check_inputs()
+        if (type(receipt) is not DevInstallReceipt
+                or type(candidate) is not QualifiedCycleCandidate
+                or candidate.release_cycle_origin is not CycleOrigin.SUPERVISED_FIRST_USE
+                or candidate.binding != self.session
+                or candidate.device_id != receipt.device_id
+                or candidate.device_id != self.session.target.expected_device_id
+                or not isinstance(previous_device_id, str)
+                or not callable(read_current_status)
+                or not callable(verify_external)):
+            raise PreconditionBlocked("DEV generation initial cycle unqualified")
+        live_cycle = candidate.release_cycle_id
+
+        def reserve(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            if attempt != receipt.first_release_attempt_id:
+                raise PreconditionBlocked("DEV generation attempt mismatch")
+            # Called *inside* shared OS lock and after canonical #51 sync.
+            # Do not reuse a cached pre-arrival status/host epoch.
+            try:
+                status = read_current_status()
+            except Exception:
+                raise PreconditionBlocked("DEV current status unavailable") from None
+            if (not isinstance(status, Mapping)
+                    or status.get("releaseCycleId") != live_cycle
+                    or status.get("releaseCycleOrigin") != "SUPERVISED_FIRST_USE"
+                    or status.get("state") != "USB_SYNC"
+                    or type(status.get("rtcCorrectionPending")) is not bool):
+                raise PreconditionBlocked("DEV current atomic pair invalid")
+            self._target(target)
+            self.fence.consume_new_generation_locked(
+                receipt, previous_device_id=previous_device_id, status=status,
+                verify_external=lambda r, s: verify_external(
+                    r, candidate, s, self.session, target
+                ) is True,
+            )
+
+        def verify(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            if attempt != receipt.first_release_attempt_id:
+                raise PreconditionBlocked("DEV generation attempt mismatch")
+            self.fence.verify_consumed_locked(receipt)
+            self.fence.cycles.verify_dev_generation_locked(
+                receipt.device_id, receipt.generation_id,
+                receipt.external_permit_digest, live_cycle, attempt,
+            )
+
+        return self._run(
+            reserve=reserve, verify=verify,
+            fixed_attempt=receipt.first_release_attempt_id,
+        )
+
     def first_supervised_cycle(
         self, *, receipt: DevInstallReceipt,
         candidate: QualifiedCycleCandidate,
