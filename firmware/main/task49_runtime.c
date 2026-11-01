@@ -60,12 +60,29 @@ static TaskHandle_t s_usb_event_task = NULL;
 static bool s_first_use_attempted;
 static bool s_first_use_button_ready;
 
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx);
+#endif
+
 static usb_cdc_release_result_t recorder_cdc_release_accept(
     const char *release_attempt_id,
     void *ctx) {
     usb_msc_release_storage_result_t result;
     (void)ctx;
 
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    // SDB-1.1 DEV installed generations cannot use legacy origin-unaware
+    // canonical release. Validate the SAME actual RAM-only status predicate
+    // as GET_STATUS before any potentially accepted CDC release bytes.
+    // This is a Device-side denial, NOT proof of the host's durable grant.
+    usb_cdc_protocol_status_t observed = {0};
+    if (!recorder_cdc_status(&observed, NULL) ||
+        observed.release_cycle_id == NULL ||
+        observed.release_cycle_origin == NULL ||
+        !release_cycle_fence_host_owned_qualified()) {
+        return USB_CDC_RELEASE_CONFLICT;
+    }
+#endif
     result = usb_msc_ownership_accept_release_storage(release_attempt_id);
     switch (result) {
         case USB_MSC_RELEASE_STORAGE_ACCEPTED:
