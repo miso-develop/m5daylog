@@ -76,22 +76,30 @@ def enumerate_removable_roots(kernel32: object) -> list[str]:
 
 
 def enumerate_com_ports() -> list[str]:
+    """Only a complete registry enumeration can authorize a CDC candidate."""
     import winreg
     try:
-        with winreg.OpenKey(
+        handle = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM"
-        ) as handle:
-            values = []
-            for index in range(128):
-                try:
-                    _, value, _ = winreg.EnumValue(handle, index)
-                except OSError:
-                    break
-                if isinstance(value, str) and _COM.fullmatch(value):
-                    values.append(value.upper())
-    except OSError:
+        )
+    except FileNotFoundError:
+        # No SERIALCOMM mapping means no candidates, never a partial set.
         return []
-    return sorted(set(values))
+    with handle:
+        values = []
+        # Probe one past the 128-value bound to prove actual exhaustion.
+        for index in range(129):
+            try:
+                _, value, _ = winreg.EnumValue(handle, index)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 259:  # ERROR_NO_MORE_ITEMS
+                    return sorted(set(values))
+                raise OSError("Windows COM enumeration failed") from None
+            if index == 128:
+                raise OSError("Windows COM enumeration incomplete")
+            if isinstance(value, str) and _COM.fullmatch(value):
+                values.append(value.upper())
+    raise OSError("Windows COM enumeration incomplete")
 
 
 class WindowsArrivalProvider:
