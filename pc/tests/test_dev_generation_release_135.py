@@ -68,7 +68,7 @@ class SdbGenerationReleaseTests(unittest.TestCase):
         self.events.append("get_status")
         return dict(self.status)
 
-    def run(self, *, external=None, current=None):
+    def attempt(self, *, external=None, current=None):
         candidate = QualifiedCycleCandidate(
             DEV, CYCLE, CycleOrigin.SUPERVISED_FIRST_USE, self.session
         )
@@ -79,7 +79,7 @@ class SdbGenerationReleaseTests(unittest.TestCase):
         )
 
     def test_positive_enrolled_generation_is_consumed_before_any_cdc_send(self):
-        outcome = self.run()
+        outcome = self.attempt()
         self.assertTrue(outcome.success)
         self.assertEqual(self.port.sent, [ATTEMPT])
         self.assertLess(self.events.index("sync"), self.events.index("get_status"))
@@ -95,11 +95,11 @@ class SdbGenerationReleaseTests(unittest.TestCase):
             self.assertEqual(db.execute(
                 "SELECT COUNT(*) FROM consumed"
             ).fetchone(), (2,))
-        self.assertEqual(self.run().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
         self.assertEqual(self.port.sent, [ATTEMPT])
 
     def test_real_normal_origin_then_second_distinct_cycle_succeeds_in_model(self):
-        self.assertTrue(self.run().success)
+        self.assertTrue(self.attempt().success)
         normal = QualifiedCycleCandidate(
             DEV, NEXT_CYCLE, CycleOrigin.NORMAL_WAKE, self.session
         )
@@ -118,14 +118,14 @@ class SdbGenerationReleaseTests(unittest.TestCase):
 
     def test_wrong_live_origin_epoch_or_external_denial_sends_zero_bytes(self):
         self.status["releaseCycleOrigin"] = "NORMAL_WAKE"
-        self.assertEqual(self.run().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
         self.assertEqual(self.port.sent, [])
         self.status["releaseCycleOrigin"] = "SUPERVISED_FIRST_USE"
         self.epoch = "stale-epoch"
         with self.assertRaises(PreconditionBlocked):
-            self.run()
+            self.attempt()
         self.epoch = "live-epoch"
-        self.assertEqual(self.run(external=lambda *args: False).reason,
+        self.assertEqual(self.attempt(external=lambda *args: False).reason,
                          "PRECONDITION_BLOCKED")
         self.assertFalse(self.fence.database.exists())
         self.assertEqual(self.port.sent, [])
@@ -133,24 +133,24 @@ class SdbGenerationReleaseTests(unittest.TestCase):
     def test_prior_host_anchor_corrupt_does_not_write_or_send(self):
         self.fence.cycles.anchor.write({"v": 1, "device": "f" * 64,
                                        "seq": 1, "tip": "a" * 64})
-        self.assertEqual(self.run().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
         self.assertFalse(self.fence.database.exists())
         self.assertEqual(self.port.sent, [])
 
     def test_split_dev_or_r3_commit_denies_retries_and_sends_zero_bytes(self):
         self.fence.anchor.fail_write = True
-        self.assertEqual(self.run().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
         self.fence.anchor.fail_write = False
-        self.assertEqual(self.run().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
         self.assertEqual(self.port.sent, [])
         self.assertNotIn("rtc", self.events)
 
         with tempfile.TemporaryDirectory() as other:
             self.setUp_in_new_root(Path(other))
             self.fence.cycles.anchor.fail_write = True
-            self.assertEqual(self.run().reason, "PRECONDITION_BLOCKED")
+            self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
             self.fence.cycles.anchor.fail_write = False
-            self.assertEqual(self.run().reason, "PRECONDITION_BLOCKED")
+            self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
             self.assertEqual(self.port.sent, [])
 
     def setUp_in_new_root(self, root):
@@ -178,14 +178,14 @@ class SdbGenerationReleaseTests(unittest.TestCase):
 
     def test_lost_release_reply_consumes_once_no_retry(self):
         self.port.indeterminate = True
-        self.assertEqual(self.run().reason, "INDETERMINATE")
+        self.assertEqual(self.attempt().reason, "INDETERMINATE")
         self.assertEqual(self.port.sent, [ATTEMPT])
         self.port.indeterminate = False
-        self.assertEqual(self.run().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
         self.assertEqual(self.port.sent, [ATTEMPT])
 
     def test_current_status_provider_throws_zero_mutation(self):
-        self.assertEqual(self.run(current=lambda: (_ for _ in ()).throw(
+        self.assertEqual(self.attempt(current=lambda: (_ for _ in ()).throw(
             RuntimeError("synthetic read failure")
         )).reason, "PRECONDITION_BLOCKED")
         self.assertFalse(self.fence.database.exists())
