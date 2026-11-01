@@ -308,6 +308,72 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM consumed"
             ).fetchone(), (1,))
 
+    def test_native_canonical_factory_blocks_dev_split_without_adapter(self):
+        # The real future CLI/watch R3 constructor must observe a consumed
+        # DEV cutover after restart, even if no DEV adapter was constructed.
+        # Only disposable LOCALAPPDATA, HKCU keys and synthetic IDs are used.
+        dev_key = self.key + "_DEV_FACTORY"
+
+        def cleanup_dev_key():
+            try:
+                self.winreg.DeleteKey(self.winreg.HKEY_CURRENT_USER, dev_key)
+            except FileNotFoundError:
+                pass
+        self.addCleanup(cleanup_dev_key)
+        device_root = self.root / "fake_device"
+        with (patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}),
+              patch.object(WindowsRegistryAnchor, "KEY", self.key),
+              patch.object(DevInstallRegistryAnchor, "KEY", dev_key)):
+            dev = DevInstallReleaseFence.for_current_user(
+                device_root=device_root
+            )
+            with dev.cycles.serialized():
+                dev.cycles.initialize_first_cycle_locked(
+                    DEVICE, CYCLE, ATTEMPT
+                )
+                prior = dev.cycles.read_enrolled_state_locked(DEVICE)
+                self.assertEqual(prior["v"], 1)
+                # Inject the exact DEV-committed, R3-not-begun fault point.
+                # This is a source-only synthetic consumed receipt, not a
+                # human grant, boot proof or real release permission.
+                dev._commit_dev_store_locked(
+                    replace(
+                        receipt(), device_id=NEW_DEVICE,
+                        generation_id=NEW_GENERATION,
+                        first_release_attempt_id=NEW_ATTEMPT,
+                    ),
+                    generation=True,
+                )
+            self.assertEqual(dev.anchor.read()["kind"],
+                             "SAME_HOST_DEV_GENERATION_FIRST_RELEASE")
+            self.assertTrue(dev.cycles.database.is_file())
+
+            # Reconstruct only the canonical R3 factory. The DEV adapter
+            # must NOT need to be recreated to enforce the same cutover.
+            restarted = CycleAttemptFence.for_current_user(
+                device_root=device_root
+            )
+            self.assertEqual(restarted.lock_file, dev.cycles.lock_file)
+            self.assertEqual(restarted._dev_cutover_database, dev.database)
+            self.assertIsInstance(restarted._dev_cutover_anchor,
+                                  DevInstallRegistryAnchor)
+            with restarted.serialized():
+                self.assertEqual(
+                    restarted.read_enrolled_state_locked(DEVICE), prior
+                )
+                with self.assertRaises(PreconditionBlocked):
+                    restarted.reserve_locked(
+                        DEVICE, NEXT_CYCLE, NEXT_ATTEMPT
+                    )
+                with self.assertRaises(PreconditionBlocked):
+                    restarted.verify_reserved_locked(DEVICE, CYCLE, ATTEMPT)
+                with self.assertRaises(PreconditionBlocked):
+                    restarted.check_locked(DEVICE)
+            with closing(sqlite3.connect(restarted.database)) as db:
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM consumed"
+                ).fetchone(), (1,))
+
     def test_native_two_processes_only_one_new_generation_cycle_reservation(self):
         self._native_generation()
         ctx = get_context("spawn")

@@ -539,3 +539,26 @@ release sender:
 
 `RELEASE_BLOCKED` remains mandatory. PC-A03/A05/A07, real USB/Device
 execution, two daily cycles and Human Gate remain NOT_RUN; PR #142 stays Draft.
+
+## Canonical Windows R3 factory regression — still no installed release
+
+The native Windows regression `test_native_canonical_factory_blocks_dev_split_without_adapter`
+creates a healthy V1 host ledger using disposable per-user state/HKCU keys,
+consumes the independent DEV generation witness, and deliberately stops before
+R3 V2 append. A **new** `CycleAttemptFence.for_current_user` instance (with
+**no** `DevInstallReleaseFence` adapter instantiated for that restart)
+reads the canonical DEV witness and rejects old-generation `reserve_locked`,
+`verify_reserved_locked` and `check_locked`. It preserves the historical
+V1 consumed tuple. Existing `test_cli_release_gate_135.py` independently
+asserts the actual manual `sync-release` entrypoint performs zero host/CDC
+I/O even when supplied an apparently valid R5 status; the watcher is still
+intake-only. The test uses fabricated receipt evidence, not a real grant.
+
+This is a **source-only, default-disabled construction-boundary proof**, not
+positive release admission. An independently authenticated owner grant,
+current Device PCM/manifest/RTC and atomic R5 pair, original host volume/CDC
+identity, installed legacy sender exclusion, actual lock/dismount/one-send
+ordering and physical `SHUTDOWN_ARMED` remain outstanding. Do not allow a
+manually instantiated/unbound R3 fence or an older binary to become an
+installed alternative sender. Exact Windows host qualification, required
+Engineering/Security reviews, Human Gate and merge remain blocked.
