@@ -223,7 +223,7 @@ jobs:
                 else
                   grep -q "^# CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE is not set$" "$config"
                 fi
-                echo "SDB11_DEV_$mode_COMPILE=PASS"
+                printf "SDB11_DEV_%s_COMPILE=PASS\n" "$mode"
               done
             '
           printf 'SDB-1.1 DEV installer + recorder compiled in ESP-IDF v5.5.5 with synthetic config only. No flash or physical action.\n' >> "$GITHUB_STEP_SUMMARY"
