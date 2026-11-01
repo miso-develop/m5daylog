@@ -112,6 +112,9 @@ class DevInstallReleaseFence:
                 or anchor is cycles.anchor):
             raise PreconditionBlocked("DEV ledger/anchor isolation invalid")
         self.anchor = anchor
+        # The global R3 reserve/pre-send paths must see DEV's independent
+        # consumed witness, even if the R3 V2 append never began.
+        self.cycles.bind_dev_cutover_witness(self.database, self.anchor)
 
     @classmethod
     def for_current_user(cls, *, device_root: Path) -> "DevInstallReleaseFence":
@@ -234,6 +237,10 @@ class DevInstallReleaseFence:
                 or not isinstance(status, Mapping)
                 or not callable(verify_external)):
             raise PreconditionBlocked("DEV generation evidence missing")
+        # Same deviceId cannot distinguish the old R3 origin from a new DEV
+        # generation. Reject before spending the independent DEV receipt.
+        if _uuid(previous_device_id) == _uuid(receipt.device_id):
+            raise PreconditionBlocked("DEV generation requires a new device identity")
         if (status.get("releaseCycleOrigin") != "SUPERVISED_FIRST_USE"
                 or status.get("state") != "USB_SYNC"
                 or type(status.get("rtcCorrectionPending")) is not bool):
