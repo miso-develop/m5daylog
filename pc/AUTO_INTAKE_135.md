@@ -467,3 +467,36 @@ explicit limitations, not claimed mitigations.
 
 **This is a bounded implementation checkpoint, not full #135 acceptance,
 merge clearance or approval of a physical operation.**
+
+
+## SDB-1.1 single-host DEV generation source-only increment (#147 / #135)
+
+The current Draft branch contains a **non-installed** SDB-1.1 generation
+continuation candidate. The previous **enrolled** R3 SQLite chain and its
+independent HKCU witness must be read back and agree before any DEV admission.
+A single domain-separated V2 generation marker is appended to the existing
+chain, binding the externally granted generation and the **first already
+consumed** `SUPERVISED_FIRST_USE` tuple in one SQLite transaction. Its V2
+continuity state is flushed to the **same** independent HKCU anchor and both
+stores are reread. V1 consumed rows/receipts are never deleted, rekeyed or
+treated as H0. A second generation, old-device reuse, duplicate cycle,
+one-sided rollback or crash between SQLite/HKCU commits blocks without repair.
+
+The separate DEV first-attempt ledger is consumed **before** the R3 append,
+under the same cooperating OS lock. A split between those irreversible writes
+remains spent and blocks all release, rather than providing a retry path.
+`SourceOnlyReleaseSequence.dev_generation_first_release` uses the canonical
+#89 coordinator, a fresh status read during that lock and pre-RTC consumption;
+its input callbacks and private receipt descriptors **cannot issue or
+authenticate real Human/Device evidence**. The legacy H0/old-first-WAKE source
+fixtures remain for regression only; neither CLI nor watcher imports this
+adapter or is enabled to transmit an unattended release.
+
+The tests use synthetic IDs, disposable SQLite and fake hosts. Windows CI
+additionally checks native disposable HKCU/RegFlushKey, two-process contention,
+single-sided rollback and a partial anchor flush. Actual PC shutdown/power-loss
+durability, installed old-client exclusion, genuine USB/CDC/RTC/PCM/manifest
+binding, authenticated owner grant, image/G proof, Device-side origin producer,
+two real daily cycles and exact-device Human Gate remain **NOT_RUN /
+RELEASE_BLOCKED**. This source increment is not PC-A03/A05 acceptance,
+automatic release clearance, or merge approval.

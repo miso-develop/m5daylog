@@ -8,6 +8,7 @@ These tests do not simulate real host power loss or authorize release.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -39,6 +40,12 @@ NEXT_CYCLE = "00000000-0000-4000-8000-000000000003"
 ATTEMPT = "00000000-0000-4000-8000-000000000004"
 NEXT_ATTEMPT = "00000000-0000-4000-8000-000000000005"
 MAINTENANCE_ATTEMPT = "00000000-0000-4000-8000-000000000006"
+NEW_DEVICE = "00000000-0000-4000-8000-000000000021"
+NEW_GENERATION = "00000000-0000-4000-8000-000000000022"
+NEW_CYCLE = "00000000-0000-4000-8000-000000000023"
+NEW_ATTEMPT = "00000000-0000-4000-8000-000000000024"
+NEXT_NEW_CYCLE = "00000000-0000-4000-8000-000000000025"
+NEXT_NEW_ATTEMPT = "00000000-0000-4000-8000-000000000026"
 
 
 def _fence(root: str | Path, key: str) -> CycleAttemptFence:
@@ -52,14 +59,14 @@ def _fence(root: str | Path, key: str) -> CycleAttemptFence:
 
 
 def _reserve_worker(root: str, key: str, cycle: str, attempt: str,
-                    start, results) -> None:
+                    start, results, device: str = DEVICE) -> None:
     if not start.wait(15):
         results.put("START_TIMEOUT")
         return
     try:
         fence = _fence(root, key)
         with fence.serialized():
-            fence.reserve_locked(DEVICE, cycle, attempt)
+            fence.reserve_locked(device, cycle, attempt)
         results.put("RESERVED")
     except PreconditionBlocked:
         results.put("BLOCKED")
@@ -133,6 +140,146 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
             restarted.verify_reserved_locked(DEVICE, CYCLE, ATTEMPT)
             with self.assertRaises(PreconditionBlocked):
                 restarted.reserve_locked(DEVICE, CYCLE, NEXT_ATTEMPT)
+
+    @staticmethod
+    def _lineage_digest(state) -> str:
+        return hashlib.sha256(json.dumps(
+            state, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")).hexdigest()
+
+    def _native_generation(self) -> dict[str, object]:
+        self._enroll_fixture()
+        self._reserve()
+        with self.fence.serialized():
+            prior = self.fence.read_enrolled_state_locked(DEVICE)
+            self.fence.append_dev_generation_first_cycle_locked(
+                previous_device_id=DEVICE, new_device_id=NEW_DEVICE,
+                generation_id=NEW_GENERATION, grant_digest="d" * 64,
+                prior_state_digest=self._lineage_digest(prior),
+                release_cycle_id=NEW_CYCLE, attempt_id=NEW_ATTEMPT,
+            )
+            self.fence.verify_dev_generation_locked(
+                NEW_DEVICE, NEW_GENERATION, "d" * 64,
+                NEW_CYCLE, NEW_ATTEMPT,
+            )
+        return prior
+
+    def test_native_existing_hkcu_v2_generation_append_and_two_later_cycles(self):
+        import winreg
+
+        with patch.object(winreg, "FlushKey", wraps=winreg.FlushKey) as flush:
+            prior = self._native_generation()
+            self.assertGreaterEqual(flush.call_count, 3)
+        self.assertEqual(prior["v"], 1)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.key) as key:
+            raw, kind = winreg.QueryValueEx(key, self.fence.anchor.VALUE)
+        self.assertEqual(kind, winreg.REG_SZ)
+        self.assertEqual(json.loads(raw)["v"], 2)
+        restarted = _fence(self.root, self.key)
+        with restarted.serialized():
+            restarted.verify_dev_generation_locked(
+                NEW_DEVICE, NEW_GENERATION, "d" * 64,
+                NEW_CYCLE, NEW_ATTEMPT,
+            )
+            with self.assertRaises(PreconditionBlocked):
+                restarted.check_locked(DEVICE)
+            restarted.reserve_locked(
+                NEW_DEVICE, NEXT_NEW_CYCLE, NEXT_NEW_ATTEMPT
+            )
+            restarted.verify_reserved_locked(
+                NEW_DEVICE, NEXT_NEW_CYCLE, NEXT_NEW_ATTEMPT
+            )
+            with self.assertRaises(PreconditionBlocked):
+                restarted.reserve_locked(
+                    NEW_DEVICE, NEXT_NEW_CYCLE, "00000000-0000-4000-8000-000000000027"
+                )
+        with closing(sqlite3.connect(restarted.database)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM consumed"
+            ).fetchone(), (3,))
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+
+    def test_native_single_sided_generation_rollback_blocks_without_repair(self):
+        # Roll back only HKCU while retaining V2 SQLite, then separately
+        # roll back only SQLite while keeping the already-flushed V2 anchor.
+        old_state = None
+        self._enroll_fixture()
+        self._reserve()
+        with self.fence.serialized():
+            old_state = self.fence.read_enrolled_state_locked(DEVICE)
+        backup = self.root / "v1-immutable.sqlite"
+        shutil.copyfile(self.fence.database, backup)
+        with self.fence.serialized():
+            self.fence.append_dev_generation_first_cycle_locked(
+                previous_device_id=DEVICE, new_device_id=NEW_DEVICE,
+                generation_id=NEW_GENERATION, grant_digest="d" * 64,
+                prior_state_digest=self._lineage_digest(old_state),
+                release_cycle_id=NEW_CYCLE, attempt_id=NEW_ATTEMPT,
+            )
+        new_state = self.fence.anchor.read()
+        self.fence.anchor.write(old_state)
+        with self.fence.serialized():
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.check_locked(NEW_DEVICE)
+        self.fence.anchor.write(new_state)
+        shutil.copyfile(backup, self.fence.database)
+        with self.fence.serialized():
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.check_locked(NEW_DEVICE)
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.check_locked(DEVICE)
+
+    def test_native_generation_partial_flush_blocks_repeat(self):
+        self._enroll_fixture()
+        self._reserve()
+        with self.fence.serialized():
+            prior = self.fence.read_enrolled_state_locked(DEVICE)
+        with patch.object(self.fence.anchor, "write", side_effect=OSError("injected")):
+            with self.fence.serialized():
+                with self.assertRaises(PreconditionBlocked):
+                    self.fence.append_dev_generation_first_cycle_locked(
+                        previous_device_id=DEVICE, new_device_id=NEW_DEVICE,
+                        generation_id=NEW_GENERATION, grant_digest="d" * 64,
+                        prior_state_digest=self._lineage_digest(prior),
+                        release_cycle_id=NEW_CYCLE, attempt_id=NEW_ATTEMPT,
+                    )
+        with self.fence.serialized():
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.append_dev_generation_first_cycle_locked(
+                    previous_device_id=DEVICE, new_device_id=NEW_DEVICE,
+                    generation_id=NEW_GENERATION, grant_digest="d" * 64,
+                    prior_state_digest=self._lineage_digest(prior),
+                    release_cycle_id=NEW_CYCLE, attempt_id=NEW_ATTEMPT,
+                )
+
+    def test_native_two_processes_only_one_new_generation_cycle_reservation(self):
+        self._native_generation()
+        ctx = get_context("spawn")
+        start, results = ctx.Event(), ctx.Queue()
+        children = [
+            ctx.Process(target=_reserve_worker,
+                        args=(str(self.root), self.key, NEXT_NEW_CYCLE,
+                              attempt, start, results, NEW_DEVICE))
+            for attempt in (NEXT_NEW_ATTEMPT, ATTEMPT)
+        ]
+        try:
+            for child in children:
+                child.start()
+            start.set()
+            values = [results.get(timeout=25) for _ in children]
+            for child in children:
+                child.join(timeout=15)
+            self.assertEqual(sorted(values), ["BLOCKED", "RESERVED"])
+            self.assertTrue(all(child.exitcode == 0 for child in children))
+        finally:
+            for child in children:
+                if child.is_alive():
+                    child.terminate()
+                    child.join(timeout=5)
+        with self.fence.serialized():
+            self.fence.check_locked(NEW_DEVICE)
+            with self.assertRaises(PreconditionBlocked):
+                self.fence.reserve_locked(NEW_DEVICE, NEXT_NEW_CYCLE, ATTEMPT)
 
     def test_two_real_processes_only_one_consumes_cycle(self):
         self._enroll_fixture()
