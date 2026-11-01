@@ -178,7 +178,7 @@ class SourceOnlyReleaseSequence:
             self._target(target)
             if attempt != receipt.first_release_attempt_id:
                 raise PreconditionBlocked("DEV generation attempt mismatch")
-            self.fence.verify_consumed_locked(receipt)
+            self.fence.verify_consumed_locked(receipt, generation=True)
             self.fence.cycles.verify_dev_generation_locked(
                 receipt.device_id, receipt.generation_id,
                 receipt.external_permit_digest, live_cycle, attempt,
