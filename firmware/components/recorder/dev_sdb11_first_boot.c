@@ -29,6 +29,63 @@ static bool sha256_lower_hex(const char *s) {
     return true;
 }
 
+dev_sdb11_boot_policy_t dev_sdb11_probe_boot(const char *expected_generation,
+                                               const char *expected_device_id,
+                                               const char *expected_binding_sha256) {
+    nvs_handle_t h = 0;
+    char generation[RECORDER_UUID_STR_LEN] = {0};
+    char id[RECORDER_UUID_STR_LEN] = {0};
+    char binding[65] = {0};
+    size_t gen_len = sizeof(generation), id_len = sizeof(id);
+    size_t bind_len = sizeof(binding);
+    uint8_t state = 0, fence = 0, lifecycle = 0xffu;
+    uint64_t nonce = 0;
+    esp_err_t err, nonce_err;
+    dev_sdb11_boot_policy_t result = DEV_SDB11_BOOT_BLOCKED;
+
+    // Empty/invalid pinned parameters fail BEFORE touching media.
+    if (!device_identity_is_valid_uuid(expected_generation) ||
+        !device_identity_is_valid_uuid(expected_device_id) ||
+        !sha256_lower_hex(expected_binding_sha256)) {
+        return DEV_SDB11_BOOT_BLOCKED;
+    }
+    err = recorder_nvs_lock();
+    if (err != ESP_OK) return DEV_SDB11_BOOT_BLOCKED;
+    err = nvs_open("m5daylog", NVS_READONLY, &h);
+    if (err != ESP_OK) goto policy_done;
+    err = nvs_get_str(h, "dev_gen", generation, &gen_len);
+    if (err == ESP_OK) err = nvs_get_str(h, "device_id", id, &id_len);
+    if (err == ESP_OK) err = nvs_get_str(h, "dev_bind", binding, &bind_len);
+    if (err == ESP_OK) err = nvs_get_u8(h, "dev_state", &state);
+    if (err == ESP_OK) err = nvs_get_u8(h, "release_boot", &fence);
+    if (err == ESP_OK) err = nvs_get_u8(h, "shutdown_armed", &lifecycle);
+    if (err != ESP_OK || gen_len != RECORDER_UUID_STR_LEN ||
+        id_len != RECORDER_UUID_STR_LEN || bind_len != 65u ||
+        strcmp(generation, expected_generation) != 0 ||
+        strcmp(id, expected_device_id) != 0 ||
+        strcmp(binding, expected_binding_sha256) != 0) goto policy_done;
+
+    nonce_err = nvs_get_u64(h, "dev_nonce", &nonce);
+    if (state == DEV_READY_UNSPENT && fence == FENCE_UNQUALIFIED &&
+        lifecycle == LIFECYCLE_NORMAL &&
+        nonce_err == ESP_ERR_NVS_NOT_FOUND && !s_attempted) {
+        result = DEV_SDB11_BOOT_NEEDS_HOLD;
+    } else if (state == DEV_FIRST_BOOT_USED &&
+               fence == 0x53u /* READY_AFTER_RELEASE */ &&
+               lifecycle == 1u /* SHUTDOWN_ARMED */ &&
+               nonce_err == ESP_OK && nonce != 0u) {
+        // Only the real release acceptance/quiesce path may create the
+        // READY_AFTER_RELEASE marker. The normal R3 manual WAKE gate
+        // independently consumes it; this is NOT a first-use replay.
+        result = DEV_SDB11_BOOT_NORMAL_CYCLE;
+    }
+
+policy_done:
+    if (h != 0) nvs_close(h);
+    recorder_nvs_unlock();
+    return result;
+}
+
 bool dev_sdb11_boot_intent_consumed_this_boot(void) {
     return s_consumed;
 }
@@ -130,6 +187,12 @@ done:
 }
 
 #else
+dev_sdb11_boot_policy_t dev_sdb11_probe_boot(const char *generation,
+                                              const char *device_id,
+                                              const char *binding) {
+    (void)generation; (void)device_id; (void)binding;
+    return DEV_SDB11_BOOT_BLOCKED;
+}
 bool dev_sdb11_boot_intent_consumed_this_boot(void) { return false; }
 esp_err_t dev_sdb11_consume_boot_intent(const char *generation,
                                        const char *device_id,
