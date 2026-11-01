@@ -160,9 +160,18 @@ int main(int argc, char **argv) {
                    DEV_SDB11_BOOT_NEEDS_HOLD);
         }
         int commits_before = commits;
-        // Any attempted install is spent even when the commit was ambiguous.
-        assert(dev_sdb11_mark_baseline_ready(GEN, DEVICE, SHA, true) != ESP_OK);
-        assert(commits == commits_before);
+        if (is("provision_no_sd")) {
+            // No SD baseline witness means NVS provisioning was never
+            // attempted. A later separately completed readback may be the
+            // first actual NVS transaction in this boot.
+            assert(dev_sdb11_mark_baseline_ready(GEN, DEVICE, SHA, true) == ESP_OK);
+            assert(commits == 2);
+        } else {
+            // Any entered NVS transaction is spent, including ambiguous
+            // commits, partial key writes or a failed readback.
+            assert(dev_sdb11_mark_baseline_ready(GEN, DEVICE, SHA, true) != ESP_OK);
+            assert(commits == commits_before);
+        }
         assert(locks == 0);
         puts("SDB11_PROVISION=PASS");
         return 0;
