@@ -16,6 +16,19 @@ typedef int esp_err_t;
 #ifdef __cplusplus
 extern "C" {
 #endif
+// Only a completely provisioned READY_UNSPENT generation may request a
+// device-measured physical hold. USED plus a previously accepted release and
+// READY_AFTER_RELEASE is a *normal* next-day WAKE; incomplete/partial/restarted
+// first attempts never become first-use or normal-cycle authority.
+typedef enum {
+    DEV_SDB11_BOOT_BLOCKED = 0,
+    DEV_SDB11_BOOT_NEEDS_HOLD = 1,
+    DEV_SDB11_BOOT_NORMAL_CYCLE = 2
+} dev_sdb11_boot_policy_t;
+dev_sdb11_boot_policy_t dev_sdb11_probe_boot(const char *generation,
+                                              const char *device_id,
+                                              const char *binding);
+
 // Explicitly pinned G, deviceId, and lower-case SHA-256 baseline binding
 // must match durable NVS. Caller supplies a genuinely measured continuous
 // 10s current-boot physical GPIO hold (not host-provided evidence).
