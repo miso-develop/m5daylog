@@ -61,7 +61,8 @@ static bool s_first_use_attempted;
 static bool s_first_use_button_ready;
 
 #if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
-static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx);
+static bool
+recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx);
 #endif
 
 static usb_cdc_release_result_t recorder_cdc_release_accept(
