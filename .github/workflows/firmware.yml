@@ -166,3 +166,64 @@ jobs:
           printf 'ESP-IDF: `v5.5.5`\nClean build: `PASS`\n\n### CDC stack budget\n```text\n' >> "$GITHUB_STEP_SUMMARY"
           cat "$stack_report" >> "$GITHUB_STEP_SUMMARY"
           printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+
+  sdb11-dev-build-variants:
+    name: firmware:sdb11-dev-v5.5.5-build-variants
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build DEV installer and first-recording variants without flashing
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          IDF_IMAGE: espressif/idf@sha256:6e2800a69f1c6521a5651da524f811e237d13e34cad369687916d0ad0bc4ef89
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace/firmware \
+            "$IDF_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              case "$(idf.py --version)" in *"v5.5.5"*) ;; *) exit 1 ;; esac
+              for mode in installer recorder; do
+                defaults="sdkconfig.defaults.sdb11-ci-$mode"
+                cat > "$defaults" <<EOF
+          CONFIG_M5DAYLOG_SDB11_DEV_INSTALL=y
+          CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION="11111111-1111-4111-8111-111111111111"
+          CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID="22222222-2222-4222-8222-222222222222"
+          CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          EOF
+                if [ "$mode" = installer ]; then
+                  cat >> "$defaults" <<EOF
+          CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE=y
+          CONFIG_M5DAYLOG_SDB11_EXPECTED_CID_SERIAL=0x12345678
+          CONFIG_M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT=4096
+          EOF
+                else
+                  echo "CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE=n" >> "$defaults"
+                fi
+                # Independent configs and build directories avoid stale defaults.
+                idf.py -B "build-sdb11-$mode" \
+                  -DSDKCONFIG="sdkconfig.sdb11-ci-$mode" \
+                  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;$defaults" \
+                  build
+                config="sdkconfig.sdb11-ci-$mode"
+                grep -q "^CONFIG_M5DAYLOG_SDB11_DEV_INSTALL=y$" "$config"
+                if [ "$mode" = installer ]; then
+                  grep -q "^CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE=y$" "$config"
+                else
+                  grep -q "^# CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE is not set$" "$config"
+                fi
+                echo "SDB11_DEV_$mode_COMPILE=PASS"
+              done
+            '
+          printf 'SDB-1.1 DEV installer + recorder compiled in ESP-IDF v5.5.5 with synthetic config only. No flash or physical action.\n' >> "$GITHUB_STEP_SUMMARY"
