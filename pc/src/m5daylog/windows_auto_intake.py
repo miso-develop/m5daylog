@@ -135,6 +135,14 @@ class WindowsArrivalProvider:
         try:
             com_ports = tuple(self.ports())
             roots = tuple(self.roots())
+            # A port whose parent cannot be resolved might be a second CDC on
+            # the selected MSC's parent. Never treat unknown as unrelated.
+            resolved_ports = tuple(
+                (com, self.api.cdc_interface(com)) for com in com_ports
+            )
+            if any(not getattr(endpoint, "physical_usb_instance_id", None)
+                   for _, endpoint in resolved_ports):
+                raise OSError("Windows CDC parent resolution incomplete")
         except Exception:
             self._epochs.clear()
             raise
@@ -146,14 +154,10 @@ class WindowsArrivalProvider:
                 session_port = self.port_factory()
                 target = session_port.resolve_target(root, device_id)
                 # Require exactly one current CDC on the same USB physical parent.
-                matched = []
-                for com in com_ports:
-                    try:
-                        endpoint = self.api.cdc_interface(com)
-                        if endpoint.physical_usb_instance_id == target.usb_physical_instance_id:
-                            matched.append(com)
-                    except Exception:
-                        continue
+                matched = [
+                    com for com, endpoint in resolved_ports
+                    if endpoint.physical_usb_instance_id == target.usb_physical_instance_id
+                ]
                 if len(matched) != 1:
                     continue
                 com = matched[0]

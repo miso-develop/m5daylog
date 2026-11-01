@@ -304,6 +304,82 @@ class ProviderTests(unittest.TestCase):
             for notice in notices
         ))
 
+    def test_unresolved_com_parent_blocks_even_with_complete_registry_list(self):
+        # The registry enumerator completes, but COM8's parent is unknown.
+        # A successful COM7 mapping alone cannot prove one same-parent CDC.
+        registry = SyntheticSerialRegistry(["COM7", "COM8"])
+        self.provider.ports = enumerate_com_ports
+        self.api.mapping["COM8"] = CdcInterface(
+            "synthetic-second", "cdc8", "parent",
+        )
+        coordinator = RecordingIntake()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        actual_lookup = self.api.cdc_interface
+
+        def fail_com8(com):
+            if com == "COM8":
+                raise OSError("synthetic SetupAPI parent-resolution failure")
+            return actual_lookup(com)
+
+        with mock.patch.dict(sys.modules, {"winreg": registry}):
+            with mock.patch.object(self.api, "cdc_interface", side_effect=fail_com8):
+                monitor.poll_once()
+                monitor.poll_once()
+                self.assertEqual(coordinator.sessions, [])
+                self.assertEqual(self.provider.current_epoch(), "")
+                self.assertTrue(all(
+                    n["reason"] == "ARRIVAL_OBSERVATION_ERROR"
+                    for n in notices
+                ))
+
+            # Full resolution exposes actual same-parent ambiguity, still denied.
+            monitor.poll_once()
+            self.assertEqual(coordinator.sessions, [])
+            self.assertEqual(self.provider.current_epoch(), "")
+
+            # Even a returned endpoint with unknown parent must not qualify.
+            self.api.mapping["COM8"] = CdcInterface(
+                "synthetic-second", "cdc8", "",
+            )
+            monitor.poll_once()
+            self.assertEqual(coordinator.sessions, [])
+            self.assertEqual(self.provider.current_epoch(), "")
+            self.assertEqual(notices[-1]["reason"], "ARRIVAL_OBSERVATION_ERROR")
+
+            # A fully resolved unrelated COM8 makes the ordinary target unique.
+            self.api.mapping["COM8"] = CdcInterface(
+                "unrelated-path", "cdc8", "other-parent",
+            )
+            monitor.poll_once()
+            self.assertEqual(coordinator.sessions, [])
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            first_epoch = coordinator.sessions[-1][0]
+
+            # Failure after a handled arrival revokes the epoch and requires a
+            # fresh two-scan admission, rather than retaining old admission.
+            with mock.patch.object(self.api, "cdc_interface", side_effect=fail_com8):
+                monitor.poll_once()
+                self.assertEqual(len(coordinator.sessions), 1)
+                self.assertEqual(self.provider.current_epoch(), "")
+                self.assertEqual(notices[-1]["reason"], "ARRIVAL_OBSERVATION_ERROR")
+
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 2)
+            self.assertNotEqual(first_epoch, coordinator.sessions[-1][0])
+        self.assertTrue(all(
+            stored == current for stored, current in coordinator.sessions
+        ))
+        self.assertTrue(all(
+            n["safe_to_leave_usb_connected"] is False for n in notices
+        ))
+
     def test_invalid_status_response_does_not_admit(self):
         for value in (None, {}, {"state": "USB_SYNC"}, {"state": "USB_SYNC",
                         "rtcCorrectionPending": "false"}):
