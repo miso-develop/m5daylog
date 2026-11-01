@@ -47,7 +47,7 @@ void recorder_nvs_unlock(void) { assert(locks == 1); locks--; }
 uint32_t esp_random(void) { return 0x654321abU; }
 esp_err_t nvs_open(const char *ns, int mode_flags, nvs_handle_t *h) {
     assert(locks == 1 && strcmp(ns, "m5daylog") == 0);
-    assert(mode_flags == NVS_READWRITE);
+    assert(mode_flags == NVS_READWRITE || mode_flags == NVS_READONLY);
     if (is("open_failure")) return ESP_FAIL;
     *h = 1; return ESP_OK;
 }
@@ -128,6 +128,13 @@ int main(int argc, char **argv) {
     if (is("stale_fence")) fence = 0x52u;
     if (is("host_unresolved")) lifecycle = 2u;
     if (is("nonce_present")) { nonce_exists = true; nonce = 99u; }
+    dev_sdb11_boot_policy_t policy = dev_sdb11_probe_boot(GEN, DEVICE, SHA);
+    bool should_hold = !is("no_ready") && !is("used") && !is("staged") &&
+        !is("stale_fence") && !is("host_unresolved") &&
+        !is("nonce_present") && !is("bad_gen") && !is("bad_id") &&
+        !is("bad_binding") && !is("open_failure");
+    assert(policy == (should_hold ? DEV_SDB11_BOOT_NEEDS_HOLD :
+                                   DEV_SDB11_BOOT_BLOCKED));
     esp_err_t err = dev_sdb11_consume_boot_intent(
         GEN, DEVICE, SHA, !is("short_hold"));
     bool success = is("success");
@@ -137,6 +144,14 @@ int main(int argc, char **argv) {
     if (success) {
         assert(state == 0xa4u && fence == 0x52u && nonce_exists);
         assert(commits == 2 && sets == 4);
+        // Reboot after USED/BOOT_ACTIVE without a real release is a replay.
+        assert(dev_sdb11_probe_boot(GEN, DEVICE, SHA) ==
+               DEV_SDB11_BOOT_BLOCKED);
+        // Only a *later* accepted Device release may establish this state.
+        state = 0xa4u; fence = 0x53u; lifecycle = 1u;
+        assert(dev_sdb11_probe_boot(GEN, DEVICE, SHA) ==
+               DEV_SDB11_BOOT_NORMAL_CYCLE);
+        fence = 0x52u; lifecycle = 0u;
     }
     if (is("short_hold") || is("no_ready") || is("used") ||
         is("staged") || is("stale_fence") || is("host_unresolved") ||
@@ -186,6 +201,7 @@ def production_binary(tmp_path_factory):
         #include "esp_err.h"
         typedef int nvs_handle_t;
         #define NVS_READWRITE 1
+        #define NVS_READONLY 0
         esp_err_t nvs_open(const char *, int, nvs_handle_t *);
         void nvs_close(nvs_handle_t);
         esp_err_t nvs_get_str(nvs_handle_t, const char *, char *, size_t *);
@@ -222,11 +238,20 @@ def test_sdb11_actual_production_nvs_transaction(production_binary, mode):
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "SDB11_NVS_INTENT=PASS" in proc.stdout
 
-def test_default_build_excludes_writes_and_no_startup_wiring():
+def test_default_build_excludes_writes_and_dev_gate_precedes_recording():
     src = (COMP / "dev_sdb11_first_boot.c").read_text()
+    runtime = (Path(__file__).resolve().parents[1] /
+               "main" / "task49_runtime.c").read_text()
+    base_main = (Path(__file__).resolve().parents[1] /
+                 "main" / "main.c").read_text()
     assert "CONFIG_M5DAYLOG_SDB11_DEV_INSTALL" in src
-    for path in [
-        Path(__file__).resolve().parents[1] / "main" / "task49_runtime.c",
-        Path(__file__).resolve().parents[1] / "main" / "main.c",
-    ]:
-        assert "dev_sdb11_consume_boot_intent(" not in path.read_text()
+    assert 'default n' in (COMP / "Kconfig").read_text()
+    assert "dev_sdb11_consume_boot_intent(" not in base_main
+    assert '#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL)' in runtime
+    boot = runtime[runtime.index("void app_main(void) {"):]
+    assert boot.index("dev_sdb11_probe_boot(") < boot.index(
+        "dev_sdb11_consume_boot_intent(") < boot.index(
+        "release_cycle_fence_admit_dev_first_boot(") < boot.index(
+        "xTaskCreate(recorder_base_task,")
+    assert "release_cycle_button_witness_still_valid(dev_hold_epoch)" in boot
+    assert 'ESP_ERR_INVALID_STATE' in src
