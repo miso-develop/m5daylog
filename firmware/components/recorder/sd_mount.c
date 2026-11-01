@@ -252,8 +252,9 @@ static bool dev_sd_empty_root(void) {
         }
         errno = 0;
     }
-    const bool empty = errno == 0 && closedir(root) == 0;
-    return empty;
+    const int scan_errno = errno;
+    const bool closed = closedir(root) == 0;
+    return scan_errno == 0 && closed;
 }
 
 static bool dev_sd_same_selected_card(const sdmmc_card_t *card,
