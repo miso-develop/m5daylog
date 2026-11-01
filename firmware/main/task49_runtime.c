@@ -26,6 +26,7 @@ static void recorder_task49_delete(TaskHandle_t task);
 #include "release_cycle_button.h"
 #if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
 #include "dev_sdb11_first_boot.h"
+#include "dev_sdb11_installer.h"
 #include "esp_timer.h"
 #endif
 #include "release_cycle_witness.h"
@@ -560,6 +561,31 @@ void app_main(void) {
         recorder_shutdown_armed_now();
         return;
     }
+#if defined(CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE) && CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE
+    // A standalone DEV installer image never starts recorder_base_task or
+    // TinyUSB. The operator must independently consume the exact selected
+    // board/card/image one-use grant and cut off all old host writers before
+    // this binary is installed. This actual ISR-backed 10s hold is an
+    // additional local interlock, not a substitute for owner authorization.
+    uint32_t installer_epoch = 0u;
+    if (!recorder_dev_wait_for_first_hold(&installer_epoch) ||
+        !release_cycle_button_witness_still_valid(installer_epoch) ||
+        dev_sdb11_install_baseline(
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256,
+            (uint32_t)CONFIG_M5DAYLOG_SDB11_EXPECTED_CID_SERIAL,
+            (uint64_t)CONFIG_M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT,
+            true) != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: dev-install, result: unqualified-or-failed, action: shutdown");
+    } else {
+        ESP_LOGI(TAG,
+                 "stage: dev-install, result: baseline-ready, release-authority: none");
+    }
+    recorder_shutdown_armed_now();
+    return;  // NEVER record or publish USB in the installer image
+#endif
     if (recorder_power_manual_wake_asserted(&manual_wake) != ESP_OK ||
         shutdown_armed_boot_action(manual_wake, &action) != ESP_OK) {
         ESP_LOGE(TAG,
