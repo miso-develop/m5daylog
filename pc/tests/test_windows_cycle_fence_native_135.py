@@ -46,6 +46,8 @@ NEW_CYCLE = "00000000-0000-4000-8000-000000000023"
 NEW_ATTEMPT = "00000000-0000-4000-8000-000000000024"
 NEXT_NEW_CYCLE = "00000000-0000-4000-8000-000000000025"
 NEXT_NEW_ATTEMPT = "00000000-0000-4000-8000-000000000026"
+NEXT_NEW2_CYCLE = "00000000-0000-4000-8000-000000000028"
+NEXT_NEW2_ATTEMPT = "00000000-0000-4000-8000-000000000029"
 
 
 def _fence(root: str | Path, key: str) -> CycleAttemptFence:
@@ -189,6 +191,12 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
             restarted.verify_reserved_locked(
                 NEW_DEVICE, NEXT_NEW_CYCLE, NEXT_NEW_ATTEMPT
             )
+            restarted.reserve_locked(
+                NEW_DEVICE, NEXT_NEW2_CYCLE, NEXT_NEW2_ATTEMPT
+            )
+            restarted.verify_reserved_locked(
+                NEW_DEVICE, NEXT_NEW2_CYCLE, NEXT_NEW2_ATTEMPT
+            )
             with self.assertRaises(PreconditionBlocked):
                 restarted.reserve_locked(
                     NEW_DEVICE, NEXT_NEW_CYCLE, "00000000-0000-4000-8000-000000000027"
@@ -196,7 +204,7 @@ class NativeWindowsCycleFenceTests(unittest.TestCase):
         with closing(sqlite3.connect(restarted.database)) as db:
             self.assertEqual(db.execute(
                 "SELECT COUNT(*) FROM consumed"
-            ).fetchone(), (3,))
+            ).fetchone(), (4,))
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
 
     def test_native_single_sided_generation_rollback_blocks_without_repair(self):
