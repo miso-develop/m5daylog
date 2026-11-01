@@ -23,6 +23,7 @@ HARNESS = r"""
 #include <stdio.h>
 #include <string.h>
 #include "dev_sdb11_first_boot.h"
+#include "release_cycle_fence.h"
 #include "device_identity.h"
 #include "nvs.h"
 #include "recorder_nvs.h"
@@ -113,7 +114,7 @@ esp_err_t nvs_set_u8(nvs_handle_t h, const char *key, uint8_t value) {
             (is("stage_set_failure") && value == 0xa3u) ||
             (is("used_set_failure") && value == 0xa4u)) return ESP_FAIL;
     } else if (strcmp(key, "release_boot") == 0) {
-        assert(value == 0x52u);
+        assert(value == 0x52u || value == 0x53u);
         fence = value;
         if (is("fence_set_failure")) return ESP_FAIL;
     } else assert(false);
@@ -146,6 +147,43 @@ esp_err_t nvs_commit(nvs_handle_t h) {
 
 int main(int argc, char **argv) {
     assert(argc == 2); mode = argv[1];
+    if (is("cycle_supervised") || is("cycle_normal")) {
+        if (is("cycle_normal")) {
+            state = 0xa4u; fence = 0x53u; lifecycle = 1u;
+            nonce_exists = true; nonce = 0x42u;
+            assert(dev_sdb11_probe_boot(GEN, DEVICE, SHA) ==
+                   DEV_SDB11_BOOT_NORMAL_CYCLE);
+            assert(release_cycle_fence_begin_boot(true) == ESP_OK);
+        } else {
+            assert(dev_sdb11_probe_boot(GEN, DEVICE, SHA) ==
+                   DEV_SDB11_BOOT_NEEDS_HOLD);
+            assert(dev_sdb11_consume_boot_intent(GEN, DEVICE, SHA, true) == ESP_OK);
+            assert(release_cycle_fence_begin_boot(false) == ESP_OK);
+            assert(release_cycle_fence_admit_dev_first_boot() == ESP_OK);
+        }
+        assert(fence == 0x52u);
+        // Only the real #87 recorder transition may make NORMAL ready.
+        lifecycle = 0u;
+        assert(release_cycle_fence_note_recorder_ready() == ESP_OK);
+        assert(release_cycle_fence_boot_qualified());
+        const char *origin = release_cycle_fence_current_origin();
+        assert(origin != NULL && strcmp(origin,
+            is("cycle_supervised") ? "SUPERVISED_FIRST_USE" : "NORMAL_WAKE") == 0);
+        lifecycle = 2u; // after actual USB_SYNC HOST_UNRESOLVED
+        assert(release_cycle_fence_note_host_owned() == ESP_OK);
+        assert(release_cycle_fence_host_owned_qualified());
+        assert(release_cycle_fence_rearm_required(true));
+        // The caller must independently have accepted RELEASE_STORAGE and
+        // durably performed #105 USB quiesce, then SHUTDOWN_ARMED.
+        lifecycle = 1u;
+        assert(release_cycle_fence_note_release_completed() == ESP_OK);
+        assert(fence == 0x53u);  // next physical WAKE => NORMAL, never FU
+        assert(!release_cycle_fence_boot_qualified());
+        assert(release_cycle_fence_current_origin() == NULL);
+        assert(locks == 0);
+        puts("SDB11_REAL_FENCE_CYCLE=PASS");
+        return 0;
+    }
     if (strncmp(mode, "provision_", 10) == 0) {
         state_exists = false; gen_exists = false; bind_exists = false;
         if (is("provision_existing_state")) state_exists = true;
@@ -273,7 +311,8 @@ def production_binary(tmp_path_factory):
         cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
         "-DESP_PLATFORM", "-DCONFIG_M5DAYLOG_SDB11_DEV_INSTALL=1",
         "-I", str(inc), "-I", str(COMP / "include"),
-        str(COMP / "dev_sdb11_first_boot.c"), str(src),
+        str(COMP / "dev_sdb11_first_boot.c"),
+        str(COMP / "release_cycle_fence.c"), str(src),
         "-o", str(exe)
     ], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
@@ -323,3 +362,10 @@ def test_sdb11_actual_production_nvs_baseline_ready(production_binary, mode):
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "SDB11_PROVISION=PASS" in proc.stdout
+
+@pytest.mark.parametrize("mode", ["cycle_supervised", "cycle_normal"])
+def test_sdb11_actual_fence_first_release_and_next_wake(production_binary, mode):
+    proc = subprocess.run([str(production_binary), mode],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "SDB11_REAL_FENCE_CYCLE=PASS" in proc.stdout
