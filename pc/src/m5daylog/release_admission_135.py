@@ -67,11 +67,18 @@ class SourceOnlyReleaseSequence:
         reserve: Callable[[str, EjectTarget], None],
         verify: Callable[[str, EjectTarget], None],
         fixed_attempt: str | None = None,
+        after_mutation_check: Callable[[EjectTarget], None] | None = None,
     ) -> ReleaseOutcome:
         self._check_inputs()
 
         def before_seal(target: EjectTarget, gate: UsbSessionIoGate) -> bool:
             self._target(target)
+            # Read live CDC status after RTC mutation while ordinary I/O is
+            # still open. Never query status once the release gate is sealed.
+            if after_mutation_check is not None:
+                with gate.ordinary("cdc"):
+                    after_mutation_check(target)
+                self._target(target)
             if self.before_seal_observation(target, gate) is not True:
                 return False
             self._target(target)
@@ -150,12 +157,10 @@ class SourceOnlyReleaseSequence:
             raise PreconditionBlocked("DEV generation initial cycle unqualified")
         live_cycle = candidate.release_cycle_id
 
-        def reserve(attempt: str, target: EjectTarget) -> None:
+        def current_pair(target: EjectTarget) -> Mapping[str, object]:
+            # Frozen GET_STATUS pairing is necessary, not an external
+            # qualification of the real Device boot, RTC or PCM evidence.
             self._target(target)
-            if attempt != receipt.first_release_attempt_id:
-                raise PreconditionBlocked("DEV generation attempt mismatch")
-            # Called *inside* shared OS lock and after canonical #51 sync.
-            # Do not reuse a cached pre-arrival status/host epoch.
             try:
                 status = read_current_status()
             except Exception:
@@ -167,6 +172,14 @@ class SourceOnlyReleaseSequence:
                     or type(status.get("rtcCorrectionPending")) is not bool):
                 raise PreconditionBlocked("DEV current atomic pair invalid")
             self._target(target)
+            return status
+
+        def reserve(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            if attempt != receipt.first_release_attempt_id:
+                raise PreconditionBlocked("DEV generation attempt mismatch")
+            # Inside shared lock, after #51 sync and before irreversible RTC.
+            status = current_pair(target)
             self.fence.consume_new_generation_locked(
                 receipt, previous_device_id=previous_device_id, status=status,
                 verify_external=lambda r, s: verify_external(
@@ -187,6 +200,9 @@ class SourceOnlyReleaseSequence:
         return self._run(
             reserve=reserve, verify=verify,
             fixed_attempt=receipt.first_release_attempt_id,
+            # Failed/changed post-RTC status burns the attempt, never sends.
+            # A pending RTC audit bit may stay true if independently qualified.
+            after_mutation_check=lambda target: current_pair(target),
         )
 
     def first_supervised_cycle(

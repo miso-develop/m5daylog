@@ -562,3 +562,21 @@ ordering and physical `SHUTDOWN_ARMED` remain outstanding. Do not allow a
 manually instantiated/unbound R3 fence or an older binary to become an
 installed alternative sender. Exact Windows host qualification, required
 Engineering/Security reviews, Human Gate and merge remain blocked.
+
+## SDB-1.1 frozen status recheck after RTC (source-only)
+
+`SourceOnlyReleaseSequence.dev_generation_first_release` re-reads the
+same live atomic `(releaseCycleId, SUPERVISED_FIRST_USE)` `GET_STATUS`
+after the one-shot host consumption and RTC callback, while ordinary CDC
+I/O remains open and **before** pre-seal observation, volume lock/dismount
+and possible `RELEASE_STORAGE`. Missing/changed pair, non-`USB_SYNC`,
+unknown RTC field or transport uncertainty fails closed. The attempt remains
+consumed; the caller must not retry. `rtcCorrectionPending=true` still
+requires separate independent RTC qualification and is not itself proof.
+
+Source-only fake-port regression covers post-RTC cycle/origin/state changes,
+one-sided fields, uncertain status transport, consumed retry denial and
+pending-audit compatibility. This is not physical acceptance or a positive
+release permit. Existing CLI/watch continue to block Release, and real
+owner-grant/PCM/manifest/RTC/USB, deployed older-sender exclusion, exact
+Windows hardware and Human Gate remain unqualified.

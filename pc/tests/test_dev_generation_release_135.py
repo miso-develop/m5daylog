@@ -86,6 +86,8 @@ class SdbGenerationReleaseTests(unittest.TestCase):
         self.assertLess(self.events.index("sync"), self.events.index("get_status"))
         self.assertLess(self.events.index("get_status"), self.events.index("rtc"))
         self.assertLess(self.events.index("rtc"), self.events.index("lock"))
+        self.assertEqual(self.events.count("get_status"), 2)
+        self.assertLess(self.events.index("rtc"), self.events.index("get_status", self.events.index("rtc")))
         self.assertLess(self.events.index("lock"), self.events.index("release"))
         with self.fence.cycles.serialized():
             self.fence.verify_consumed_locked(self.receipt, generation=True)
@@ -97,6 +99,63 @@ class SdbGenerationReleaseTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM consumed"
             ).fetchone(), (2,))
         self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [ATTEMPT])
+
+    def test_post_rtc_pair_change_blocks_before_volume_lock_and_burns_attempt(self):
+        # Previously only the pre-RTC status was checked, so a transition
+        # during SET_TIME could reach lock/dismount and RELEASE_STORAGE.
+        baseline = dict(self.status)
+        changes = (
+            ("cycle", "releaseCycleId", NEXT_CYCLE),
+            ("origin", "releaseCycleOrigin", "NORMAL_WAKE"),
+            ("one_sided", "releaseCycleOrigin", None),
+            ("state", "state", "RECORDING"),
+            ("rtc_unknown", "rtcCorrectionPending", None),
+        )
+        for label, field, value in changes:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                self.setUp_in_new_root(Path(tmp))
+                self.status = dict(baseline)
+                def rtc(field=field, value=value):
+                    self.events.append("rtc")
+                    self.status[field] = value
+                self.seq.cdc_mutations = rtc
+                result = self.attempt()
+                self.assertEqual(result.reason, "PRECONDITION_BLOCKED")
+                self.assertEqual(self.events.count("get_status"), 2)
+                self.assertEqual(self.port.sent, [])
+                self.assertNotIn("lock", self.events)
+                self.assertNotIn("release", self.events)
+                # The first attempt was already spent before RTC.
+                self.status = dict(baseline)
+                self.seq.cdc_mutations = lambda: self.events.append("rtc")
+                self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
+                self.assertEqual(self.port.sent, [])
+
+    def test_uncertain_post_rtc_get_status_blocks_without_resend(self):
+        seen = 0
+        def status():
+            nonlocal seen
+            seen += 1
+            if seen == 2:
+                raise OSError("synthetic read uncertainty")
+            return self.current()
+        result = self.attempt(current=status)
+        self.assertEqual(result.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(seen, 2)
+        self.assertIn("rtc", self.events)
+        self.assertNotIn("lock", self.events)
+        self.assertEqual(self.port.sent, [])
+        self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [])
+
+    def test_qualified_rtc_pending_audit_preserves_frozen_pair(self):
+        def rtc():
+            self.events.append("rtc")
+            self.status["rtcCorrectionPending"] = True
+        self.seq.cdc_mutations = rtc
+        self.assertTrue(self.attempt().success)
+        self.assertEqual(self.events.count("get_status"), 2)
         self.assertEqual(self.port.sent, [ATTEMPT])
 
     def test_real_normal_origin_then_second_distinct_cycle_succeeds_in_model(self):
