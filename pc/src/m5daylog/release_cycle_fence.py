@@ -192,6 +192,9 @@ class CycleAttemptFence:
         self.anchor = anchor
         self._serialized_thread = threading.local()
         self._dev_cutover_database: Path | None = None
+        # Retain the un-resolved binding path: Hpre must detect a DEV
+        # symlink/junction even when resolve() points to an absent target.
+        self._dev_cutover_source_path: Path | None = None
         self._dev_cutover_anchor: Anchor | None = None
 
     @classmethod
@@ -231,14 +234,20 @@ class CycleAttemptFence:
 
     def bind_dev_cutover_witness(self, database: Path, anchor: Anchor) -> None:
         """Bind independent DEV consumption for all cooperating release paths."""
-        target = Path(database).expanduser().resolve()
+        # absolute() does not follow a symlink; resolve() does. Preserve
+        # both so the read-only Hpre can reject a dangling/redirected
+        # *nominal* DEV path instead of trusting an absent resolved target.
+        source = Path(database).expanduser().absolute()
+        target = source.resolve()
         if (target == self.database or target == self.lock_file
                 or not callable(getattr(anchor, "read", None))):
             raise PreconditionBlocked("DEV cutover witness invalid")
         if (self._dev_cutover_database is not None
-                and self._dev_cutover_database != target):
+                and (self._dev_cutover_database != target
+                     or self._dev_cutover_source_path != source)):
             raise PreconditionBlocked("DEV cutover witness already bound")
         self._dev_cutover_database = target
+        self._dev_cutover_source_path = source
         self._dev_cutover_anchor = anchor
 
     def _check_dev_cutover_locked(self, state: dict[str, object]) -> None:
