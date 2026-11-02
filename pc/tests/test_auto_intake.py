@@ -14,7 +14,7 @@ from m5daylog.auto_intake import (
 from m5daylog.capacity import (
     CapacityStatus, FreeSpace64, VerifiedSession, WARNING_THRESHOLD_BYTES,
 )
-from m5daylog.release import EjectTarget
+from m5daylog.release import EjectTarget, ReleaseOutcome
 from m5daylog.sync import SyncSummary
 
 
@@ -125,6 +125,67 @@ class AutoIntakeTests(unittest.TestCase):
         second = self.intake()
         self.assertEqual((second.copied, second.reused), (0, 1))
         self.assertEqual(second.status, "RELEASE_BLOCKED")
+
+    def test_qualified_release_runs_once_after_sync_and_capacity(self):
+        events = self.events
+        attempts = []
+
+        def approved(session, epoch):
+            attempts.append((session, epoch()))
+            events.append("release")
+            return ReleaseOutcome(
+                "SYNC_COMPLETE_RELEASED", "RELEASED", "test-attempt", TARGET
+            )
+
+        self.coordinator._qualified_release = approved
+        result = self.intake()
+        self.assertEqual(result.status, "SYNCED_RELEASED")
+        self.assertEqual(result.reason, "RELEASED")
+        self.assertEqual(events, ["preflight", "sync", "release"])
+        self.assertEqual(len(self.reader.calls), 1)
+        self.assertEqual(attempts, [(self.binding, self.binding.session_epoch)])
+        self.assertTrue(result.public_notice()["safe_to_leave_usb_connected"])
+        # Host release/disappearance is not an observation of Device NVS.
+        self.assertFalse(result.public_notice()["device_shutdown_armed_proven"])
+        self.assertNotIn(DEVICE, json.dumps(result.public_notice()))
+
+    def test_qualified_release_never_confuses_sync_with_release_failure(self):
+        for result in (
+            ReleaseOutcome("SYNC_COMPLETE_RELEASE_FAILED", "INDETERMINATE",
+                           "test-attempt", TARGET),
+            ReleaseOutcome("SYNC_COMPLETE_RELEASED", "RELEASED",
+                           "test-attempt", replace(TARGET, usb_physical_instance_id="other")),
+            ReleaseOutcome("SYNC_COMPLETE_RELEASED", "RELEASED", None, TARGET),
+            None,
+        ):
+            with self.subTest(result=result):
+                self.setUp()
+                self.coordinator._qualified_release = lambda session, epoch, value=result: value
+                outcome = self.intake()
+                self.assertEqual(outcome.status, "RELEASE_BLOCKED")
+                self.assertEqual(outcome.reason, "RELEASE_NOT_CONFIRMED")
+                self.assertEqual(outcome.copied, 1)
+                self.assertFalse(outcome.public_notice()["safe_to_leave_usb_connected"])
+
+        self.setUp()
+        def uncertain(session, epoch):
+            raise OSError("synthetic lost CDC response")
+        self.coordinator._qualified_release = uncertain
+        outcome = self.intake()
+        self.assertEqual(outcome.status, "RELEASE_BLOCKED")
+        self.assertEqual(outcome.reason, "RELEASE_NOT_CONFIRMED")
+        self.assertEqual(outcome.copied, 1)
+        self.assertFalse(outcome.public_notice()["safe_to_leave_usb_connected"])
+
+    def test_qualified_release_not_invoked_after_invalid_session_or_sync(self):
+        calls = []
+        self.coordinator._qualified_release = lambda *args: calls.append("release")
+        self.epoch = "stale"
+        self.assertEqual(self.intake().reason, "STALE_SESSION")
+        self.epoch = self.binding.session_epoch
+        self.sync_result = SyncSummary(copied=0, conflicts=1)
+        self.assertEqual(self.intake().reason, "SYNC_CONFLICT")
+        self.assertEqual(calls, [])
 
     def test_reject_before_copy_when_not_authorized_or_usb_sync_unproven(self):
         cases = [
