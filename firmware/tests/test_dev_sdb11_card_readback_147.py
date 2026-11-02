@@ -26,8 +26,11 @@ def test_actual_dev_readback_and_card_guard_deny_swaps(tmp_path):
         "static bool dev_sd_same_selected_card(",
         source.index("// SDB-1.1 intentionally destructive"))
     end = source.index("// PRE-INTENT read-only media verification.", start)
-    # Real production functions, no rewritten mirror.
-    guarded_functions = source[start:end]
+    media = (COMP / "dev_sdb11_media_readback.c").read_text()
+    media_start = media.index("// These reads are deliberately side-effect-free:")
+    media_end = media.index("#else", media_start)
+    # Real production card-identity and filesystem-readback C, no mirror.
+    guarded_functions = source[start:end] + media[media_start:media_end]
     root = tmp_path / "card"
     daylog = root / "M5DAYLOG"
     recording = daylog / "recordings"
@@ -113,39 +116,39 @@ def test_actual_dev_readback_and_card_guard_deny_swaps(tmp_path):
         assert(!dev_sd_same_selected_card(&c, 0x12345678u, 4096u));
         assert(!dev_sd_same_selected_card(NULL, 0x12345678u, 4096u));
 
-        assert(dev_sd_metadata_matches(gen, id, sha, true));
-        assert(dev_sd_metadata_matches(gen, id, sha, false));
-        assert(!dev_sd_metadata_matches(
+        assert(dev_sdb11_media_readback_matches(gen, id, sha, true));
+        assert(dev_sdb11_media_readback_matches(gen, id, sha, false));
+        assert(!dev_sdb11_media_readback_matches(
            "33333333-3333-4333-8333-333333333333", id, sha, true));
-        assert(!dev_sd_metadata_matches(
+        assert(!dev_sdb11_media_readback_matches(
            gen, "33333333-3333-4333-8333-333333333333", sha, true));
-        assert(!dev_sd_metadata_matches(
+        assert(!dev_sdb11_media_readback_matches(
            gen, id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true));
 
         write_doc(marker, "corrupted-marker");
-        assert(!dev_sd_metadata_matches(gen, id, sha, true));
-        assert(!dev_sd_metadata_matches(gen, id, sha, false));
+        assert(!dev_sdb11_media_readback_matches(gen, id, sha, true));
+        assert(!dev_sdb11_media_readback_matches(gen, id, sha, false));
         write_doc(marker, correct_marker);
         assert(remove(marker) == 0);
-        assert(!dev_sd_metadata_matches(gen, id, sha, false));
+        assert(!dev_sdb11_media_readback_matches(gen, id, sha, false));
         write_doc(marker, correct_marker);
         write_doc(RECORDER_DEVICE_JSON_PATH, "wrong-device");
-        assert(!dev_sd_metadata_matches(gen, id, sha, false));
+        assert(!dev_sdb11_media_readback_matches(gen, id, sha, false));
         write_doc(RECORDER_DEVICE_JSON_PATH, "ID=__ID__");
 
         write_doc(manifest, "changed-after-recording");
-        assert(!dev_sd_metadata_matches(gen, id, sha, true));
-        assert(dev_sd_metadata_matches(gen, id, sha, false));
+        assert(!dev_sdb11_media_readback_matches(gen, id, sha, true));
+        assert(dev_sdb11_media_readback_matches(gen, id, sha, false));
         write_doc(manifest, "EMPTY=__ID__|1970-01-01T00:00:00+00:00");
 
         write_doc(RECORDER_RECORDINGS_DIR "/old.wav", "old-bytes");
-        assert(!dev_sd_metadata_matches(gen, id, sha, true));
-        assert(dev_sd_metadata_matches(gen, id, sha, false));
+        assert(!dev_sdb11_media_readback_matches(gen, id, sha, true));
+        assert(dev_sdb11_media_readback_matches(gen, id, sha, false));
         assert(remove(RECORDER_RECORDINGS_DIR "/old.wav") == 0);
         write_doc(RECORDER_M5DAYLOG_DIR "/unexpected", "data");
-        assert(!dev_sd_metadata_matches(gen, id, sha, true));
+        assert(!dev_sdb11_media_readback_matches(gen, id, sha, true));
         assert(remove(RECORDER_M5DAYLOG_DIR "/unexpected") == 0);
-        assert(dev_sd_metadata_matches(gen, id, sha, true));
+        assert(dev_sdb11_media_readback_matches(gen, id, sha, true));
         puts("SDB11_SELECTED_MEDIA_DENIALS=PASS");
         return 0;
     }
