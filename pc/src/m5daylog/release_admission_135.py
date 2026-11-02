@@ -26,6 +26,32 @@ ExternalWakeProof = Callable[
 ExternalNormalProof = Callable[[QualifiedCycleCandidate, EjectTarget], bool]
 
 
+@dataclass(frozen=True, repr=False)
+class Sdb14RiskDecision:
+    """One-generation Option B evidence reference, never a release permit.
+
+    The recorded owner decision is independently verified by the caller;
+    neither this descriptor nor the GitHub risk decision approves P0/P1.
+    Binding to the entire DEV receipt prevents a scoped approval from being
+    reused for another device, card, Windows profile, image, or attempt.
+    """
+
+    approval_record_digest: str
+    bound_receipt_fingerprint: str
+    admission: str = "H0_PRESENCE_CLEAR_HISTORY_UNKNOWN"
+
+    def matches(self, receipt: DevInstallReceipt) -> bool:
+        def digest(value: object) -> bool:
+            return (type(value) is str and len(value) == 64
+                    and all(ch in "0123456789abcdef" for ch in value))
+
+        return (type(receipt) is DevInstallReceipt
+                and self.admission == "H0_PRESENCE_CLEAR_HISTORY_UNKNOWN"
+                and digest(self.approval_record_digest)
+                and digest(self.bound_receipt_fingerprint)
+                and self.bound_receipt_fingerprint == receipt.fingerprint())
+
+
 @dataclass
 class SourceOnlyReleaseSequence:
     """Two distinct first-use consumptions plus later R3 cycles, one #89 sender.
@@ -139,9 +165,20 @@ class SourceOnlyReleaseSequence:
             [DevInstallReceipt, QualifiedCycleCandidate, Mapping[str, object],
              VerifiedSession, EjectTarget], bool
         ],
+        risk_decision: Sdb14RiskDecision,
+        verify_risk_decision: Callable[
+            [Sdb14RiskDecision, DevInstallReceipt, VerifiedSession, EjectTarget], bool
+        ],
     ) -> ReleaseOutcome:
-        """SDB-1.3: consume DEV and first R3 seq=1 before any CDC mutation.
+        """SDB-1.4: consume DEV and first R3 seq=1 before any CDC mutation.
 
+        SDB-1.4 changes only the affirmative never-R3-history prerequisite.
+        A separate approved one-generation B risk record is mandatory; its
+        descriptor is not a credential and must be independently verified.
+        The external verifier must establish absent present-day R3/DEV stores,
+        aliases/sidecars and old writers/senders for the exact user/profile,
+        plus separately approved P0/P1 and current Device evidence. It must
+        not misrepresent a historical-unknown host as proven never-enrolled.
         The external verifier must independently establish clean host H0,
         distinct exact-target P0/P1 owner grants, current installed Device,
         GPIO/NVS first boot, real finalized PCM/RTC and #51 SYNCED. A fake
@@ -157,8 +194,11 @@ class SourceOnlyReleaseSequence:
                 or candidate.device_id != receipt.device_id
                 or candidate.device_id != self.session.target.expected_device_id
                 or not callable(read_current_status)
-                or not callable(verify_external)):
-            raise PreconditionBlocked("H0 first recording evidence unavailable")
+                or not callable(verify_external)
+                or type(risk_decision) is not Sdb14RiskDecision
+                or not callable(verify_risk_decision)
+                or not risk_decision.matches(receipt)):
+            raise PreconditionBlocked("SDB-1.4 bounded risk decision unavailable")
         cycle = candidate.release_cycle_id
 
         def current_pair(target: EjectTarget) -> Mapping[str, object]:
@@ -185,11 +225,18 @@ class SourceOnlyReleaseSequence:
             # not via a tautological receipt-equality callback.
             def approved(r: DevInstallReceipt) -> bool:
                 try:
+                    # The owner's B approval and the P0/P1/current-device
+                    # authorization are distinct checks. Both must succeed
+                    # inside the same OS lock BEFORE irreversible DEV consume.
+                    if verify_risk_decision(
+                        risk_decision, r, self.session, target
+                    ) is not True:
+                        return False
                     return verify_external(
                         r, candidate, status, self.session, target
                     ) is True
                 except Exception:
-                    raise PreconditionBlocked("H0 independent grant unavailable") from None
+                    raise PreconditionBlocked("SDB-1.4 independent proof unavailable") from None
             self.fence.consume_locked(
                 receipt, verify_external=approved,
             )
