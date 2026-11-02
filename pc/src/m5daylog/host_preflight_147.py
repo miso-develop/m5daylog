@@ -62,9 +62,22 @@ def _unspent_dev_witness_locked(fence: CycleAttemptFence) -> bool:
     recover journals, enroll, reset, or rewrite either continuity store.
     """
     database = fence._dev_cutover_database
+    source = fence._dev_cutover_source_path
     anchor = fence._dev_cutover_anchor
-    if database is None or anchor is None:
+    if database is None or source is None or anchor is None:
         return False  # No positive path via a direct, unbound fixture fence.
+    try:
+        # resolve() at binding time can erase a dangling DEV symlink. Check
+        # the original nominal path AND every parent before trusting absence.
+        # On Windows, directory junctions are aliases too (Python 3.12+).
+        for component in (source, *source.parents):
+            if (component.is_symlink()
+                    or (os.name == "nt" and component.is_junction())):
+                return False
+        if source.resolve() != database:
+            return False  # Path changed since the fixed DEV witness was bound.
+    except (OSError, RuntimeError):
+        return False
     if (_sqlite_recovery_sidecars_present(database)
             or database.exists() or database.is_symlink()):
         return False
