@@ -10,7 +10,7 @@ from unittest import mock
 from m5daylog.auto_intake import IntakeResult, PollingMonitor
 from m5daylog.windows_auto_intake import (
     WindowsArrivalProvider, enumerate_com_ports, read_opt_in,
-    notify_action_required,
+    notify_action_required, run_monitor, main,
 )
 from m5daylog.windows_release import CdcInterface
 from m5daylog.release import EjectTarget
@@ -481,6 +481,47 @@ class OutcomeNoticeTests(unittest.TestCase):
             }, user32=ui)
             self.assertEqual(ui.MessageBoxW.call_count, 2)
 
+
+class MonitorReleaseWiringTests(unittest.TestCase):
+    """The real public monitor CLI never supplies physical release authority."""
+
+    def test_runner_callback_is_explicit_not_derived_from_opt_in(self):
+        from types import SimpleNamespace
+
+        def independently_qualified_release(session, epoch):
+            raise AssertionError("must not run during monitor setup")
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("m5daylog.windows_auto_intake.os",
+                       SimpleNamespace(name="nt")),
+            mock.patch("m5daylog.windows_auto_intake.local_config_path",
+                       return_value=Path(directory) / "monitor.json"),
+            mock.patch("m5daylog.windows_auto_intake.read_opt_in",
+                       return_value=frozenset({DEVICE})) as opt_in,
+            mock.patch("m5daylog.windows_auto_intake.NativeWin32DeviceApi") as native,
+            mock.patch("m5daylog.windows_auto_intake.WindowsHostReleasePort"),
+            mock.patch("m5daylog.windows_auto_intake.WindowsCapacityReader"),
+            mock.patch("m5daylog.windows_auto_intake.resolve_db_path",
+                       return_value=Path(directory) / "status.sqlite"),
+            mock.patch("m5daylog.windows_auto_intake.IntakeCoordinator") as intake,
+            mock.patch("m5daylog.windows_auto_intake.PollingMonitor") as monitor,
+            mock.patch("m5daylog.windows_auto_intake.time.sleep"),
+        ):
+            self.assertEqual(run_monitor(
+                once=True, qualified_release=independently_qualified_release
+            ), 0)
+            self.assertIs(
+                intake.call_args.kwargs["qualified_release"],
+                independently_qualified_release,
+            )
+            native.assert_called_once()
+            opt_in.assert_called_once()
+            self.assertEqual(monitor.return_value.poll_once.call_count, 2)
+
+            intake.reset_mock()
+            self.assertEqual(main(["--once"]), 0)
+            self.assertIsNone(intake.call_args.kwargs["qualified_release"])
 
 class ConsentTests(unittest.TestCase):
     def test_disabled_missing_or_bad_config_fails_closed(self):
