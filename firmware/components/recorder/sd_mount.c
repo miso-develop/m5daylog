@@ -343,7 +343,6 @@ esp_err_t sd_mount_dev_verify_selected_baseline(uint32_t expected_cid_serial,
         s_bus_init || s_sdspi_init || s_device_init || s_msc_driver_init ||
         !device_identity_is_valid_uuid(generation) ||
         !device_identity_is_valid_uuid(device_id) ||
-        !device_manifest_is_valid_sha256_hex(binding) ||
         strlen(binding) != 64u) return ESP_ERR_INVALID_STATE;
 
     err = spi_bus_initialize(host.slot, &bus, SDSPI_DEFAULT_DMA);
