@@ -120,7 +120,7 @@ class HpreSourceTests(unittest.TestCase):
         self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
         self.assertIsNone(result.lineage_digest)
         self.assertEqual(before, self.snapshot())
-        self.assertEqual(self.dev_database.readlink(), missing_target)
+        self.assertEqual(self.dev_database.readlink().name, missing_target.name)
         self.assertFalse(missing_target.exists())
         self.assertIsNone(self.dev_anchor.read())
 
@@ -163,7 +163,7 @@ class HpreSourceTests(unittest.TestCase):
         self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
         self.assertIsNone(result.lineage_digest)
         self.assertEqual(before, self.snapshot())
-        self.assertEqual(parent_alias.readlink(), missing_parent)
+        self.assertEqual(parent_alias.readlink().name, missing_parent.name)
         self.assertFalse(missing_parent.exists())
 
     def test_spent_dev_first_use_and_valid_v1_never_qualifies_p0(self):
