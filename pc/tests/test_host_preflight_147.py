@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 import uuid
 from pathlib import Path
 from unittest.mock import patch
@@ -121,7 +122,7 @@ class HpreSourceTests(unittest.TestCase):
         self.assertEqual(self.inspect().status, HpreStatus.SPLIT_OR_ROLLED_BACK)
 
         # Chain corruption remains blocked independently of split anchor.
-        with sqlite3.connect(self.fence.database) as db:
+        with closing(sqlite3.connect(self.fence.database)) as db:
             db.execute("UPDATE consumed SET attempt=? WHERE seq=1", ("0" * 64,))
             db.commit()
         self.assertEqual(self.inspect().status, HpreStatus.SPLIT_OR_ROLLED_BACK)
@@ -137,7 +138,7 @@ class HpreSourceTests(unittest.TestCase):
 
     def test_v2_and_unsupported_versions_not_downgraded(self):
         self.prepared()
-        with sqlite3.connect(self.fence.database) as db:
+        with closing(sqlite3.connect(self.fence.database)) as db:
             db.execute("UPDATE ledger_state SET v=2")
             db.commit()
         self.assertEqual(self.inspect().status, HpreStatus.V2_OR_UNSUPPORTED)
