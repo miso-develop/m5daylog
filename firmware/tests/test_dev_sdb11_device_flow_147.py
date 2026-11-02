@@ -33,14 +33,14 @@ def test_dev_sd_rebaseline_is_explicitly_guarded_and_isolated():
     assert "expected_sector_count" in installer
     assert "card->cid.serial == serial" in installer
     assert "(uint64_t)card->csd.capacity == sectors" in installer
-    assert installer.count("esp_vfs_fat_sdspi_mount(") == 2
+    rebaseline = installer[installer.index("esp_err_t sd_mount_dev_rebaseline_selected("):]
+    assert rebaseline.count("esp_vfs_fat_sdspi_mount(") == 2
     assert "esp_vfs_fat_sdcard_format(" in installer
-    assert installer.index("dev_sd_same_selected_card(",
-                           installer.index("sd_mount_dev_rebaseline_selected(")) < installer.index(
-                           "esp_vfs_fat_sdcard_format(")
-    assert installer.index("esp_vfs_fat_sdcard_format(") < installer.index(
-                           "esp_vfs_fat_sdcard_unmount(") < installer.rindex(
-                           "esp_vfs_fat_sdspi_mount(")
+    assert rebaseline.index("dev_sd_same_selected_card(") < rebaseline.index(
+        "esp_vfs_fat_sdcard_format(")
+    assert rebaseline.index("esp_vfs_fat_sdcard_format(") < rebaseline.index(
+        "esp_vfs_fat_sdcard_unmount(") < rebaseline.rindex(
+        "esp_vfs_fat_sdspi_mount(")
     assert "tinyusb_msc_new_storage_sdmmc" not in installer
     assert ".format_if_mount_failed = false" in installer
     assert "ESP_ERR_NOT_SUPPORTED" in installer
@@ -125,3 +125,51 @@ def test_dev_installer_is_separate_one_shot_and_reads_back_metadata():
             boot.index("xTaskCreate(recorder_base_task,"))
     assert "return;  // NEVER record or publish USB in the installer image" in boot
     assert "ESP_ERR_NOT_SUPPORTED" in installer
+
+
+def test_review_er_144_sdb11_01_preintent_and_live_card_denials():
+    """A swapped/original-card mismatch must stop before NVS or FAT writes."""
+    sd = (COMP / "sd_mount.c").read_text()
+    runtime = RUNTIME.read_text()
+    kconfig = (COMP / "Kconfig").read_text()
+    assert "esp_err_t sd_mount_dev_verify_selected_baseline(" in sd
+    assert "esp_err_t sd_mount_dev_verify_selected_baseline(" in (
+        COMP / "include" / "sd_mount.h").read_text()
+    for required in (
+        "CONFIG_M5DAYLOG_SDB11_EXPECTED_CID_SERIAL",
+        "CONFIG_M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT",
+        "CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION",
+        "CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID",
+        "CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256",
+    ):
+        assert required in sd or required in runtime
+    assert "depends on M5DAYLOG_SDB11_DEV_INSTALL" in kconfig[
+        kconfig.index("config M5DAYLOG_SDB11_EXPECTED_CID_SERIAL"):
+        kconfig.index("config M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT")]
+    assert "depends on M5DAYLOG_SDB11_DEV_INSTALL" in kconfig[
+        kconfig.index("config M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT"):]
+    boot = runtime[runtime.index("void app_main(void) {"):]
+    assert boot.index("dev_sdb11_probe_boot(") < boot.index(
+        "sd_mount_dev_verify_selected_baseline(") < boot.index(
+        "dev_sdb11_consume_boot_intent(") < boot.index(
+        "release_cycle_fence_begin_boot(") < boot.index(
+        "xTaskCreate(recorder_base_task,")
+    # On every normal DEV boot, the actual new APP SD must still be compared
+    # before MSC storage mount and any mkdir()/manifest creation.
+    normal_mount = sd[sd.index("esp_err_t sd_mount_recordings(void) {"):
+                      sd.index("// SDB-1.1 intentionally destructive")]
+    assert normal_mount.index("!s_dev_preflight_passed") < normal_mount.index(
+        "sd_mount_install_msc_driver()")
+    assert normal_mount.index("dev_sd_same_selected_card(&s_card,") < (
+        normal_mount.index("sd_mount_create_storage("))
+    assert normal_mount.index("!dev_sd_metadata_matches(") < normal_mount.index(
+        "ensure_recording_dirs();", normal_mount.index(
+            "sd_mount_create_storage("))
+    assert ".format_if_mount_failed = false" in sd
+    readback = sd[sd.index("static bool dev_sd_metadata_matches(",
+                          sd.index("// These reads are deliberately")):
+                  sd.index("// PRE-INTENT read-only media verification.")]
+    for x in ("dev_sd_file_exact(", "dev_sd_dir_exact(",
+              "RECORDER_MANIFEST_PATH", "RECORDER_DEVICE_JSON_PATH",
+              "dev-install.json", "1970-01-01T00:00:00+00:00"):
+        assert x in readback
