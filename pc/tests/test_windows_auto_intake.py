@@ -10,6 +10,7 @@ from unittest import mock
 from m5daylog.auto_intake import IntakeResult, PollingMonitor
 from m5daylog.windows_auto_intake import (
     WindowsArrivalProvider, enumerate_com_ports, read_opt_in,
+    notify_action_required,
 )
 from m5daylog.windows_release import CdcInterface
 from m5daylog.release import EjectTarget
@@ -449,6 +450,36 @@ class ProviderTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.provider.status = lambda name, value=value: value
                 self.assertEqual(self.provider.scan(), [])
+
+
+class OutcomeNoticeTests(unittest.TestCase):
+    def test_release_success_and_uncertainty_are_distinct_local_notices(self):
+        from types import SimpleNamespace
+
+        ui = SimpleNamespace(MessageBoxW=mock.Mock(return_value=1))
+        with mock.patch("m5daylog.windows_auto_intake.os.name", "nt"):
+            notify_action_required({
+                "sync_release": "SYNCED_RELEASED",
+                "safe_to_leave_usb_connected": True,
+            }, user32=ui)
+            self.assertEqual(ui.MessageBoxW.call_count, 1)
+            self.assertIn("USB release succeeded", ui.MessageBoxW.call_args.args[1])
+            self.assertIn("not been independently verified",
+                          ui.MessageBoxW.call_args.args[1])
+
+            notify_action_required({
+                "sync_release": "RELEASE_BLOCKED",
+                "reason": "RELEASE_NOT_CONFIRMED",
+            }, user32=ui)
+            self.assertEqual(ui.MessageBoxW.call_count, 2)
+            self.assertIn("not proven", ui.MessageBoxW.call_args.args[1])
+            self.assertNotIn("safe to unplug", ui.MessageBoxW.call_args.args[1])
+
+            notify_action_required({
+                "sync_release": "SYNCED_RELEASED",
+                "safe_to_leave_usb_connected": False,
+            }, user32=ui)
+            self.assertEqual(ui.MessageBoxW.call_count, 2)
 
 
 class ConsentTests(unittest.TestCase):
