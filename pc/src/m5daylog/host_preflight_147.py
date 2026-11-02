@@ -52,6 +52,25 @@ def _unchanged_signature(path: Path) -> tuple[int, int, int]:
     return s.st_size, s.st_mtime_ns, s.st_ctime_ns
 
 
+def _unspent_dev_witness_locked(fence: CycleAttemptFence) -> bool:
+    """Only an unused, canonical-bound DEV one-shot can precede P0.
+
+    The later SDB-1.1 DEV writer rejects any existing DEV SQLite or HKCU
+    witness, even a healthy DEV_FRESH_INSTALL_FIRST_RELEASE record with an R3
+    V1 ledger. A mere valid R3/DEV pair is therefore NOT a P0 candidate.
+    Read-only presence checks under the shared lock must not open SQLite,
+    recover journals, enroll, reset, or rewrite either continuity store.
+    """
+    database = fence._dev_cutover_database
+    anchor = fence._dev_cutover_anchor
+    if database is None or anchor is None:
+        return False  # No positive path via a direct, unbound fixture fence.
+    if (_sqlite_recovery_sidecars_present(database)
+            or database.exists() or database.is_symlink()):
+        return False
+    return anchor.read() is None
+
+
 def inspect_hpre_locked(
     fence: CycleAttemptFence, *, expected_previous_device_id: str,
 ) -> HpreResult:
@@ -77,7 +96,8 @@ def inspect_hpre_locked(
         if (not fence.lock_file.is_file() or
                 (os.name == "nt" and fence.lock_file.stat().st_size < 1)):
             return unknown
-        if _sqlite_recovery_sidecars_present(database):
+        if (_sqlite_recovery_sidecars_present(database)
+                or not _unspent_dev_witness_locked(fence)):
             return unknown
         db_present = database.exists() or database.is_symlink()
         anchor = fence.anchor.read()
@@ -112,13 +132,15 @@ def inspect_hpre_locked(
             try:
                 # Full V1 chain / tip / previous Device hash / HKCU match.
                 state = fence._verify(db, old)
-                # A consumed DEV witness, missing half-witness or V2 cutover
-                # must not pass as a fresh old-V1 baseline.
+                # Preserve the canonical R3/DEV cutover consistency check,
+                # but it is not sufficient: it can allow an already spent
+                # DEV_FRESH_INSTALL witness alongside a healthy old R3 V1.
                 fence._check_dev_cutover_locked(state)
             except PreconditionBlocked:
                 return HpreResult(HpreStatus.SPLIT_OR_ROLLED_BACK)
 
         if (_sqlite_recovery_sidecars_present(database)
+                or not _unspent_dev_witness_locked(fence)
                 or _unchanged_signature(database) != signature
                 or fence.anchor.read() != state):
             return unknown
