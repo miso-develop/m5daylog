@@ -69,6 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Canonical contracts directory (normally auto-detected).",
     )
+    subparsers.add_parser(
+        "h0-presence",
+        help="Read-only current-user R3/DEV witness presence (never grants release).",
+    )
     release_parser = subparsers.add_parser(
         "sync-release",
         help="R5 release is blocked until durable Device and host admission qualify.",
@@ -140,6 +144,21 @@ def cmd_sync(
 
 
 
+def cmd_h0_presence() -> int:
+    """Read only canonical Windows-user R3/DEV witness presence; no authorization."""
+    if sys.platform != "win32":
+        print("h0: state=UNREADABLE_OR_UNKNOWN authorization=NOT_GRANTED")
+        return 3
+    try:
+        from .host_preflight_147 import inspect_current_user_clean_h0_presence
+        observed = inspect_current_user_clean_h0_presence()
+        print(f"h0: state={observed.status.value} authorization=NOT_GRANTED")
+        return 0 if observed.status.value == "ABSENT_OR_UNPROVEN_H0" else 3
+    except Exception:
+        print("h0: state=UNREADABLE_OR_UNKNOWN authorization=NOT_GRANTED")
+        return 3
+
+
 def cmd_sync_release(
     device_root: str,
     cdc_port: str,
@@ -179,6 +198,8 @@ def main(argv: list[str] | None = None) -> int:
             args.data_dir,
             args.contracts_dir,
         )
+    if args.command == "h0-presence":
+        return cmd_h0_presence()
     if args.command == "sync-release":
         return cmd_sync_release(
             args.device_root,
