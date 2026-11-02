@@ -243,11 +243,14 @@ class CycleAttemptFence:
                 or not callable(getattr(anchor, "read", None))):
             raise PreconditionBlocked("DEV cutover witness invalid")
         if (self._dev_cutover_database is not None
-                and (self._dev_cutover_database != target
-                     or self._dev_cutover_source_path != source)):
+                and self._dev_cutover_database != target):
             raise PreconditionBlocked("DEV cutover witness already bound")
+        # Native Windows may express the same already-bound target with an
+        # extended-length path on the second bind. Preserve the ORIGINAL
+        # lexical path for Hpre even when an equivalent alias is rebound.
+        if self._dev_cutover_source_path is None:
+            self._dev_cutover_source_path = source
         self._dev_cutover_database = target
-        self._dev_cutover_source_path = source
         self._dev_cutover_anchor = anchor
 
     def _check_dev_cutover_locked(self, state: dict[str, object]) -> None:
