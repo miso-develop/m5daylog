@@ -132,6 +132,83 @@ class SdbGenerationReleaseTests(unittest.TestCase):
                 self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
                 self.assertEqual(self.port.sent, [])
 
+    def test_preseal_observation_changes_dev_pair_after_rtc_check_blocks_release(self):
+        # Original ER-135-POSTOBS-01: the last MSC/capacity observation
+        # invalidates the R5 pair after RTC. The old ordering sent release.
+        def preseal(target, gate):
+            with gate.ordinary("msc"):
+                self.events.append("preseal")
+                self.status["releaseCycleId"] = NEXT_CYCLE
+            return True
+        self.seq.before_seal_observation = preseal
+        result = self.attempt()
+        self.assertEqual(result.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.events.count("get_status"), 2)
+        self.assertLess(self.events.index("preseal"),
+                        self.events.index("get_status", self.events.index("rtc")))
+        self.assertNotIn("lock", self.events)
+        self.assertNotIn("dismount", self.events)
+        self.assertNotIn("release", self.events)
+        self.assertEqual(self.port.sent, [])
+        # Already-consumed DEV/R3 witness cannot be retried after restoration.
+        self.status["releaseCycleId"] = CYCLE
+        self.seq.before_seal_observation = lambda target, gate: True
+        self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [])
+
+    def test_preseal_observation_invalidates_normal_origin_before_release(self):
+        self.assertTrue(self.attempt().success)
+        self.events.clear()
+        self.status.update(releaseCycleId=NEXT_CYCLE,
+                           releaseCycleOrigin="NORMAL_WAKE")
+        def preseal(target, gate):
+            with gate.ordinary("msc"):
+                self.events.append("preseal")
+                self.status["releaseCycleOrigin"] = "SUPERVISED_FIRST_USE"
+            return True
+        self.seq.before_seal_observation = preseal
+        normal = QualifiedCycleCandidate(
+            DEV, NEXT_CYCLE, CycleOrigin.NORMAL_WAKE, self.session
+        )
+        result = self.seq.normal_cycle(
+            candidate=normal, verify_current_cycle=lambda c, t: True,
+            read_current_status=self.current,
+        )
+        self.assertEqual(result.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.events.count("get_status"), 2)
+        self.assertLess(self.events.index("preseal"),
+                        self.events.index("get_status", self.events.index("rtc")))
+        self.assertNotIn("lock", self.events)
+        self.assertEqual(self.port.sent, [ATTEMPT])
+        self.status["releaseCycleOrigin"] = "NORMAL_WAKE"
+        self.seq.before_seal_observation = lambda target, gate: True
+        self.assertEqual(self.seq.normal_cycle(
+            candidate=normal, verify_current_cycle=lambda c, t: True,
+            read_current_status=self.current,
+        ).reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [ATTEMPT])
+
+    def test_preseal_status_read_uncertainty_denies_dev_send(self):
+        preseal_done = False
+        def preseal(target, gate):
+            nonlocal preseal_done
+            self.events.append("preseal")
+            preseal_done = True
+            return True
+        def current():
+            if preseal_done:
+                raise OSError("synthetic status transport uncertainty")
+            return self.current()
+        self.seq.before_seal_observation = preseal
+        result = self.attempt(current=current)
+        self.assertEqual(result.reason, "PRECONDITION_BLOCKED")
+        self.assertIn("preseal", self.events)
+        self.assertNotIn("lock", self.events)
+        self.assertEqual(self.port.sent, [])
+        self.seq.before_seal_observation = lambda target, gate: True
+        self.assertEqual(self.attempt().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [])
+
     def test_uncertain_post_rtc_get_status_blocks_without_resend(self):
         seen = 0
         def status():
