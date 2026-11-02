@@ -74,7 +74,8 @@ def inspect_hpre_locked(
         old = _hash(_uuid(expected_previous_device_id))
         database = fence.database
         # Do not manufacture a lock file or directory for this observation.
-        if not fence.lock_file.is_file() or fence.lock_file.stat().st_size < 1:
+        if (not fence.lock_file.is_file() or
+                (os.name == "nt" and fence.lock_file.stat().st_size < 1)):
             return unknown
         if _sqlite_recovery_sidecars_present(database):
             return unknown
