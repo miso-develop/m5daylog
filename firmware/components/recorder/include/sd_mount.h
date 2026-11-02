@@ -37,6 +37,17 @@ esp_err_t sd_mount_dev_rebaseline_selected(bool owner_grant_consumed,
                                            uint32_t expected_cid_serial,
                                            uint64_t expected_sector_count);
 
+// DEV recorder boot preflight: read the selected card identity, exact generation
+// marker and canonical device identity before first-use intent, WAV/APP setup,
+// or USB publication. On first boot, require the pristine installed index.
+// Does NOT format, repair, create directories or expose MSC.
+esp_err_t sd_mount_dev_verify_selected_baseline(uint32_t expected_cid_serial,
+                                                uint64_t expected_sector_count,
+                                                const char *generation,
+                                                const char *device_id,
+                                                const char *binding,
+                                                bool first_boot);
+
 // Read-only check against the APP-owned mounted card. DEV-only logic
 // additionally proves that the same pinned card was remounted after format.
 bool sd_mount_dev_card_matches(uint32_t expected_cid_serial,
