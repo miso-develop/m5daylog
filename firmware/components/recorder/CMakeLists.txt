@@ -31,6 +31,7 @@ idf_component_register(
         "dev_fresh_install_provision.c"
         "dev_sdb11_first_boot.c"
         "dev_sdb11_installer.c"
+        "dev_sdb11_media_readback.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
