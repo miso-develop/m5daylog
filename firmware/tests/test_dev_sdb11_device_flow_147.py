@@ -133,6 +133,7 @@ def test_review_er_144_sdb11_01_preintent_and_live_card_denials():
     runtime = RUNTIME.read_text()
     kconfig = (COMP / "Kconfig").read_text()
     assert "esp_err_t sd_mount_dev_verify_selected_baseline(" in sd
+    assert "dev_sdb11_media_readback_matches(" in sd
     assert "esp_err_t sd_mount_dev_verify_selected_baseline(" in (
         COMP / "include" / "sd_mount.h").read_text()
     for required in (
@@ -162,13 +163,13 @@ def test_review_er_144_sdb11_01_preintent_and_live_card_denials():
         "sd_mount_install_msc_driver()")
     assert normal_mount.index("dev_sd_same_selected_card(&s_card,") < (
         normal_mount.index("sd_mount_create_storage("))
-    assert normal_mount.index("!dev_sd_metadata_matches(") < normal_mount.index(
+    assert normal_mount.index("!dev_sdb11_media_readback_matches(") < normal_mount.index(
         "ensure_recording_dirs();", normal_mount.index(
             "sd_mount_create_storage("))
     assert ".format_if_mount_failed = false" in sd
-    readback = sd[sd.index("static bool dev_sd_metadata_matches(",
-                          sd.index("// These reads are deliberately")):
-                  sd.index("// PRE-INTENT read-only media verification.")]
+    media = (COMP / "dev_sdb11_media_readback.c").read_text()
+    readback = media[media.index("bool dev_sdb11_media_readback_matches("):
+                     media.index("#else")]
     for x in ("dev_sd_file_exact(", "dev_sd_dir_exact(",
               "RECORDER_MANIFEST_PATH", "RECORDER_DEVICE_JSON_PATH",
               "dev-install.json", "1970-01-01T00:00:00+00:00"):
