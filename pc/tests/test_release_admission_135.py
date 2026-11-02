@@ -199,8 +199,14 @@ class SourceOnlySequenceTests(unittest.TestCase):
         normal = QualifiedCycleCandidate(
             DEV, NEXT_CYCLE, CycleOrigin.NORMAL_WAKE, self.session,
         )
+        normal_status = lambda: {
+            "state": "USB_SYNC", "releaseCycleId": NEXT_CYCLE,
+            "releaseCycleOrigin": "NORMAL_WAKE",
+            "rtcCorrectionPending": False,
+        }
         result2 = self.seq.normal_cycle(
             candidate=normal, verify_current_cycle=lambda c, t: True,
+            read_current_status=normal_status,
         )
         self.assertTrue(result2.success)
         with self.fence.cycles.serialized():
@@ -210,6 +216,7 @@ class SourceOnlySequenceTests(unittest.TestCase):
         self.assertEqual(
             self.seq.normal_cycle(
                 candidate=normal, verify_current_cycle=lambda c, t: True,
+                read_current_status=normal_status,
             ).reason,
             "PRECONDITION_BLOCKED",
         )

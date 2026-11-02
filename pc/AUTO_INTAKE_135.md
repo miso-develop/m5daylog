@@ -580,3 +580,15 @@ pending-audit compatibility. This is not physical acceptance or a positive
 release permit. Existing CLI/watch continue to block Release, and real
 owner-grant/PCM/manifest/RTC/USB, deployed older-sender exclusion, exact
 Windows hardware and Human Gate remain unqualified.
+
+## R3 normal-cycle live pair gate (source-only)
+
+`SourceOnlyReleaseSequence.normal_cycle` now requires a current `GET_STATUS`
+reader before consuming the normal `NORMAL_WAKE` release attempt, and again
+after RTC mutation while the existing ordinary CDC I/O gate is open.
+A missing or changed frozen pair, non-USB_SYNC state, unknown RTC field,
+or transport uncertainty blocks release and irrevocably consumes an already
+reserved attempt. This preserves one canonical coordinator/CDC sender.
+The external current-cycle proof remains mandatory; Device status text alone
+cannot attest current boot, PCM, manifest, RTC or host custody. CLI/watch
+remain release-disabled; all tests use synthetic endpoints.

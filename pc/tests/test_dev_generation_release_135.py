@@ -163,8 +163,11 @@ class SdbGenerationReleaseTests(unittest.TestCase):
         normal = QualifiedCycleCandidate(
             DEV, NEXT_CYCLE, CycleOrigin.NORMAL_WAKE, self.session
         )
+        self.status["releaseCycleId"] = NEXT_CYCLE
+        self.status["releaseCycleOrigin"] = "NORMAL_WAKE"
         out = self.seq.normal_cycle(
-            candidate=normal, verify_current_cycle=lambda c, target: True
+            candidate=normal, verify_current_cycle=lambda c, target: True,
+            read_current_status=self.current,
         )
         self.assertTrue(out.success)
         with self.fence.cycles.serialized():
@@ -172,9 +175,49 @@ class SdbGenerationReleaseTests(unittest.TestCase):
                 DEV, NEXT_CYCLE, out.attempt_id
             )
         self.assertEqual(self.seq.normal_cycle(
-            candidate=normal, verify_current_cycle=lambda c, target: True
+            candidate=normal, verify_current_cycle=lambda c, target: True,
+            read_current_status=self.current,
         ).reason, "PRECONDITION_BLOCKED")
         self.assertEqual(len(self.port.sent), 2)
+
+    def test_normal_current_pair_must_be_live_before_and_after_rtc(self):
+        self.assertTrue(self.attempt().success)
+        self.events.clear()
+        normal = QualifiedCycleCandidate(
+            DEV, NEXT_CYCLE, CycleOrigin.NORMAL_WAKE, self.session
+        )
+        # Old supervised origin cannot authorize a new NORMAL_WAKE release.
+        first = self.seq.normal_cycle(
+            candidate=normal, verify_current_cycle=lambda c, t: True,
+            read_current_status=self.current,
+        )
+        self.assertEqual(first.reason, "PRECONDITION_BLOCKED")
+        self.assertNotIn("rtc", self.events)
+        self.assertEqual(self.port.sent, [ATTEMPT])
+        self.status["releaseCycleId"] = NEXT_CYCLE
+        self.status["releaseCycleOrigin"] = "NORMAL_WAKE"
+        def rtc():
+            self.events.append("rtc")
+            self.status["releaseCycleId"] = CYCLE
+        self.seq.cdc_mutations = rtc
+        self.events.clear()
+        second = self.seq.normal_cycle(
+            candidate=normal, verify_current_cycle=lambda c, t: True,
+            read_current_status=self.current,
+        )
+        self.assertEqual(second.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.events.count("get_status"), 2)
+        self.assertNotIn("lock", self.events)
+        self.assertEqual(self.port.sent, [ATTEMPT])
+        # A consumed normal tuple cannot retry after RTC uncertainty.
+        self.status["releaseCycleId"] = NEXT_CYCLE
+        self.seq.cdc_mutations = lambda: self.events.append("rtc")
+        again = self.seq.normal_cycle(
+            candidate=normal, verify_current_cycle=lambda c, t: True,
+            read_current_status=self.current,
+        )
+        self.assertEqual(again.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [ATTEMPT])
 
     def test_wrong_live_origin_epoch_or_external_denial_sends_zero_bytes(self):
         self.status["releaseCycleOrigin"] = "NORMAL_WAKE"
@@ -310,7 +353,12 @@ class SdbGenerationReleaseTests(unittest.TestCase):
         )
         self.assertEqual(
             old_seq.normal_cycle(
-                candidate=old_candidate, verify_current_cycle=lambda c, t: True
+                candidate=old_candidate, verify_current_cycle=lambda c, t: True,
+                read_current_status=lambda: {
+                    "state": "USB_SYNC", "releaseCycleId": NEXT_CYCLE,
+                    "releaseCycleOrigin": "NORMAL_WAKE",
+                    "rtcCorrectionPending": False,
+                },
             ).reason, "PRECONDITION_BLOCKED"
         )
         self.assertNotIn("rtc", old_port.events)

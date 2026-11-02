@@ -245,6 +245,7 @@ class SourceOnlyReleaseSequence:
     def normal_cycle(
         self, *, candidate: QualifiedCycleCandidate,
         verify_current_cycle: ExternalNormalProof,
+        read_current_status: Callable[[], Mapping[str, object]],
     ) -> ReleaseOutcome:
         """R3 enrolled NORMAL_WAKE. DEV first-use evidence is not reusable."""
         self._check_inputs()
@@ -252,11 +253,28 @@ class SourceOnlyReleaseSequence:
                 or candidate.release_cycle_origin is not CycleOrigin.NORMAL_WAKE
                 or candidate.binding != self.session
                 or candidate.device_id != self.session.target.expected_device_id
-                or not callable(verify_current_cycle)):
+                or not callable(verify_current_cycle)
+                or not callable(read_current_status)):
             raise PreconditionBlocked("normal release cycle unqualified")
+
+        def current_pair(target: EjectTarget) -> Mapping[str, object]:
+            self._target(target)
+            try:
+                status = read_current_status()
+            except Exception:
+                raise PreconditionBlocked("NORMAL current status unavailable") from None
+            if (not isinstance(status, Mapping)
+                    or status.get("state") != "USB_SYNC"
+                    or status.get("releaseCycleId") != candidate.release_cycle_id
+                    or status.get("releaseCycleOrigin") != "NORMAL_WAKE"
+                    or type(status.get("rtcCorrectionPending")) is not bool):
+                raise PreconditionBlocked("NORMAL frozen origin/cycle invalid")
+            self._target(target)
+            return status
 
         def reserve(attempt: str, target: EjectTarget) -> None:
             self._target(target)
+            current_pair(target)
             if verify_current_cycle(candidate, target) is not True:
                 raise PreconditionBlocked("current cycle external proof missing")
             self.fence.cycles.reserve_locked(
@@ -269,4 +287,7 @@ class SourceOnlyReleaseSequence:
                 candidate.device_id, candidate.release_cycle_id, attempt,
             )
 
-        return self._run(reserve=reserve, verify=verify)
+        return self._run(
+            reserve=reserve, verify=verify,
+            after_mutation_check=lambda target: current_pair(target),
+        )
