@@ -20,6 +20,7 @@ from unittest.mock import patch
 from m5daylog.dev_install_release_fence import DevInstallReceipt, DevInstallReleaseFence
 from m5daylog.host_preflight_147 import (
     HpreStatus, inspect_current_user_hpre, inspect_hpre_locked,
+    _inspect_clean_h0_presence,
 )
 from m5daylog.release_cycle_fence import CycleAttemptFence, WindowsRegistryAnchor
 from test_release_cycle_fence_143 import (
@@ -40,6 +41,59 @@ class HpreSourceTests(unittest.TestCase):
         self.dev_anchor = FileFakeAnchor(self.root / "dev-anchor.json")
         # Mirror the production for_current_user() DEV cutover binding.
         self.fence.bind_dev_cutover_witness(self.dev_database, self.dev_anchor)
+
+    def clean_candidate(self):
+        return _inspect_clean_h0_presence(
+            self.root, r3_anchor=self.fence.anchor,
+            dev_anchor=self.dev_anchor,
+        )
+
+    def test_clean_h0_absence_probe_does_not_create_lock_or_stores(self):
+        before = sorted(p.name for p in self.root.iterdir())
+        with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                   side_effect=AssertionError("presence probe must not open SQLite")):
+            result = self.clean_candidate()
+        self.assertEqual(result.status, HpreStatus.ABSENT_OR_UNPROVEN_H0)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), before)
+        self.assertFalse((self.root / "release_cycle_r3.lock").exists())
+        self.assertIsNone(result.lineage_digest)
+
+    def test_clean_h0_witness_or_sidecar_presence_is_not_positive(self):
+        filenames = (
+            "release_cycle_r3.sqlite",
+            "dev_install_release_v1.sqlite",
+            "release_cycle_r3.lock",
+            "release_cycle_r3.sqlite-journal",
+            "dev_install_release_v1.sqlite-wal",
+        )
+        for filename in filenames:
+            with self.subTest(filename=filename):
+                path = self.root / filename
+                path.write_bytes(b"fixture")
+                self.assertEqual(
+                    self.clean_candidate().status, HpreStatus.UNREADABLE_OR_UNKNOWN,
+                )
+                self.assertEqual(path.read_bytes(), b"fixture")
+                path.unlink()
+        for anchor in (self.fence.anchor, self.dev_anchor):
+            with self.subTest(anchor=anchor):
+                anchor.write({"fixture": True})
+                self.assertEqual(
+                    self.clean_candidate().status, HpreStatus.UNREADABLE_OR_UNKNOWN,
+                )
+                self.assertEqual(anchor.read(), {"fixture": True})
+                anchor.path.unlink()
+
+    def test_clean_h0_redirected_canonical_path_is_not_positive(self):
+        target = self.root / "missing-redirect.sqlite"
+        source = self.root / "release_cycle_r3.sqlite"
+        try:
+            source.symlink_to(target)
+        except (NotImplementedError, OSError):
+            self.skipTest("fixture cannot create symlink")
+        self.assertEqual(self.clean_candidate().status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertTrue(source.is_symlink())
+        self.assertFalse(target.exists())
 
     def inspect(self, device=DEVICE):
         with self.fence.serialized():
