@@ -230,19 +230,23 @@ class WindowsArrivalProvider:
 
 
 def notify_action_required(notice: dict[str, object], *, user32=None) -> None:
-    """Explicit local Windows notification, no shell, telemetry or tray icon.
+    """Explicit sanitized local Windows outcome, no shell or telemetry.
 
-    A modal warning is deliberate: this release-blocked intake is not a safe
-    USB-eject success. The operator must acknowledge the blocked condition.
+    Safe-release confirmation requires the canonical accepted-response plus
+    exact-disappearance result; it never asserts Device NVS SHUTDOWN_ARMED.
     """
     if os.name != "nt":
         return
     status = notice.get("sync_release")
-    reason = notice.get("reason")
-    if status == "RELEASE_BLOCKED" and reason == "AUTO_RELEASE_NOT_QUALIFIED":
-        message = ("WAV import completed. Automatic USB release has not been "
-                   "qualified. Keep the USB cable connected; no safe-release "
-                   "or SHUTDOWN_ARMED state has been proven.")
+    if (status == "SYNCED_RELEASED"
+            and notice.get("safe_to_leave_usb_connected") is True):
+        message = ("WAV import and host USB release succeeded. The USB cable "
+                   "may remain connected. Device SHUTDOWN_ARMED and continued "
+                   "USB charging have not been independently verified.")
+    elif status == "RELEASE_BLOCKED":
+        message = ("WAV import may have succeeded, but safe USB release was "
+                   "not proven. Keep the USB cable connected and check "
+                   "M5Daylog status before further action.")
     elif status == "SYNC_FAILED":
         message = ("WAV import failed or was incomplete. Device release has "
                    "not been performed. Keep the USB cable connected.")
