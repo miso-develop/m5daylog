@@ -181,18 +181,17 @@ class SourceOnlyReleaseSequence:
             if attempt != receipt.first_release_attempt_id:
                 raise PreconditionBlocked("H0 attempt mismatch")
             status = current_pair(target)
-            # Both writers share the same OS lock through the #89 sender.
-            # The external owner verifier must pass BEFORE the first write.
-            try:
-                approved = verify_external(
-                    receipt, candidate, status, self.session, target
-                ) is True
-            except Exception:
-                raise PreconditionBlocked("H0 independent grant unavailable") from None
-            if not approved:
-                raise PreconditionBlocked("H0 independent grant unqualified")
+            # Verify external owner authority at the actual one-shot writer,
+            # not via a tautological receipt-equality callback.
+            def approved(r: DevInstallReceipt) -> bool:
+                try:
+                    return verify_external(
+                        r, candidate, status, self.session, target
+                    ) is True
+                except Exception:
+                    raise PreconditionBlocked("H0 independent grant unavailable") from None
             self.fence.consume_locked(
-                receipt, verify_external=lambda r: r == receipt,
+                receipt, verify_external=approved,
             )
             # No historical V1 tuple exists on clean H0. Establish seq=1
             # already consumed, rather than enrolling an empty journal.
