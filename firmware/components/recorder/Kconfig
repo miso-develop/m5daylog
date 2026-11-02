@@ -34,12 +34,12 @@ menu "M5Daylog development-only admission"
             On any failure or partial result the unit shuts down; it never
             self-repairs and never enters recorder or TinyUSB.
     config M5DAYLOG_SDB11_EXPECTED_CID_SERIAL
-        hex "Exact selected SD CID serial (DEV installer only)"
-        depends on M5DAYLOG_SDB11_INSTALLER_MODE
+        hex "Exact selected SD CID serial (all DEV images)"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
         default 0x0
     config M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT
-        int "Exact selected SD logical sector count (DEV installer only)"
-        depends on M5DAYLOG_SDB11_INSTALLER_MODE
+        int "Exact selected SD logical sector count (all DEV images)"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
         range 0 2147483647
         default 0
 endmenu
