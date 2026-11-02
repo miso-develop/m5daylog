@@ -97,6 +97,75 @@ class HpreSourceTests(unittest.TestCase):
         self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
         self.assertIsNone(result.lineage_digest)
 
+    def test_er_135_hpre_02_dangling_alias_before_binding_is_nonpositive(self):
+        # The original failing condition: Path.resolve() hides a dangling
+        # symlink to an absent DEV store before Hpre checks is_symlink().
+        self.prepared()
+        before = self.snapshot()
+        missing_target = self.root / "previous-dev-store-missing.sqlite"
+        try:
+            self.dev_database.symlink_to(missing_target)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"host cannot create disposable symlink: {type(error).__name__}")
+        rebound = make_fence(self.root)
+        rebound.bind_dev_cutover_witness(self.dev_database, self.dev_anchor)
+        self.assertEqual(rebound._dev_cutover_database, missing_target)
+        self.assertEqual(rebound._dev_cutover_source_path, self.dev_database)
+        with rebound.serialized():
+            with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                       side_effect=AssertionError("aliased DEV must deny before SQLite")):
+                result = inspect_hpre_locked(
+                    rebound, expected_previous_device_id=DEVICE,
+                )
+        self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertIsNone(result.lineage_digest)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(self.dev_database.readlink(), missing_target)
+        self.assertFalse(missing_target.exists())
+        self.assertIsNone(self.dev_anchor.read())
+
+    def test_er_135_hpre_02_alias_check_is_platform_independent(self):
+        # This exercises production Hpre denial on Windows CI even when
+        # creating real NTFS symlinks requires privileges.
+        self.prepared()
+        before = self.snapshot()
+        real_is_symlink = Path.is_symlink
+        def simulated_alias(candidate):
+            return candidate == self.dev_database or real_is_symlink(candidate)
+        with patch.object(Path, "is_symlink", simulated_alias):
+            with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                       side_effect=AssertionError("aliased DEV must deny before SQLite")):
+                result = self.inspect()
+        self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertIsNone(result.lineage_digest)
+        self.assertEqual(before, self.snapshot())
+        self.assertFalse(self.dev_database.exists())
+        self.assertIsNone(self.dev_anchor.read())
+
+    def test_er_135_hpre_02_parent_alias_before_binding_is_nonpositive(self):
+        self.prepared()
+        before = self.snapshot()
+        parent_alias = self.root / "dev-parent-alias"
+        missing_parent = self.root / "old-dev-root-missing"
+        try:
+            parent_alias.symlink_to(missing_parent, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"host cannot create disposable symlink: {type(error).__name__}")
+        source = parent_alias / "dev_install_release_v1.sqlite"
+        rebound = make_fence(self.root)
+        rebound.bind_dev_cutover_witness(source, self.dev_anchor)
+        with rebound.serialized():
+            with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                       side_effect=AssertionError("parent alias must deny before SQLite")):
+                result = inspect_hpre_locked(
+                    rebound, expected_previous_device_id=DEVICE,
+                )
+        self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertIsNone(result.lineage_digest)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(parent_alias.readlink(), missing_parent)
+        self.assertFalse(missing_parent.exists())
+
     def test_spent_dev_first_use_and_valid_v1_never_qualifies_p0(self):
         # Reproduce SEC-135-HPRE-01 using the actual source-only DEV first-use
         # consumption + R3 initial-cycle APIs (synthetic verifier, no Device).
