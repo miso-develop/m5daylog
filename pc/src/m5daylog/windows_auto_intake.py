@@ -119,6 +119,24 @@ class WindowsArrivalProvider:
         self.status = status or self.api.read_status
         self.preflight = preflight or self._canonical_preflight
         self._epochs: dict[tuple[str, str, str], str] = {}
+        # The same PnP/COM/volume names may be reused between two polls
+        # across distinct R5 recording cycles. The pair is a freshness hint
+        # for raw intake, never a release authorization or boot attestation.
+        self._cycle_tokens: dict[tuple[str, str, str], tuple[str, str] | None] = {}
+
+    @staticmethod
+    def _cycle_token(status: dict[str, object]) -> tuple[str, str] | None:
+        cycle = status.get("releaseCycleId")
+        origin = status.get("releaseCycleOrigin")
+        if (type(cycle) is not str or type(origin) is not str
+                or origin not in ("NORMAL_WAKE", "SUPERVISED_FIRST_USE")):
+            return None
+        try:
+            if str(uuid.UUID(cycle)) != cycle:
+                return None
+        except (ValueError, TypeError, AttributeError):
+            return None
+        return cycle, origin
 
     def _canonical_preflight(self, root: str) -> str:
         device = inspect_device(root, contracts_dir=self.port.contracts_dir)
@@ -145,6 +163,7 @@ class WindowsArrivalProvider:
                 raise OSError("Windows CDC parent resolution incomplete")
         except Exception:
             self._epochs.clear()
+            self._cycle_tokens.clear()
             raise
         for root in roots:
             try:
@@ -173,6 +192,12 @@ class WindowsArrivalProvider:
                 if not session_port.volume_available(target):
                     continue
                 key = (target.volume_guid, target.usb_physical_instance_id, com)
+                token = self._cycle_token(result)
+                if key in self._cycle_tokens and self._cycle_tokens[key] != token:
+                    # A different frozen recording cycle must not inherit
+                    # PollingMonitor._handled from a previously imported day.
+                    self._epochs.pop(key, None)
+                self._cycle_tokens[key] = token
                 epoch = self._epochs.setdefault(key, str(uuid.uuid4()))
                 candidates.append(Arrival(VerifiedSession(target, com, epoch), True))
             except Exception:
@@ -193,6 +218,9 @@ class WindowsArrivalProvider:
              a.binding.cdc_port) for a in safe
         }
         self._epochs = {key: value for key, value in self._epochs.items() if key in active}
+        self._cycle_tokens = {
+            key: value for key, value in self._cycle_tokens.items() if key in active
+        }
         return safe
 
     def current_epoch(self) -> str:
