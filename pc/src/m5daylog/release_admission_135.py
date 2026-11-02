@@ -179,9 +179,9 @@ class SourceOnlyReleaseSequence:
         aliases/sidecars and old writers/senders for the exact user/profile,
         plus separately approved P0/P1 and current Device evidence. It must
         not misrepresent a historical-unknown host as proven never-enrolled.
-        The external verifier must independently establish clean host H0,
-        distinct exact-target P0/P1 owner grants, current installed Device,
-        GPIO/NVS first boot, real finalized PCM/RTC and #51 SYNCED. A fake
+        Distinct exact-target P0/P1 grants, current installed Device,
+        GPIO/NVS first boot, real finalized PCM/RTC and #51 SYNCED remain
+        independently required. A fake
         callback or the GET_STATUS pair is never permission for a live sender.
         This source-only seam must not be connected to CLI/watch until that
         verifier and separately approved physical gates exist.
@@ -240,8 +240,9 @@ class SourceOnlyReleaseSequence:
             self.fence.consume_locked(
                 receipt, verify_external=approved,
             )
-            # No historical V1 tuple exists on clean H0. Establish seq=1
-            # already consumed, rather than enrolling an empty journal.
+            # No *current* R3 V1 tuple may exist at admission. Historical
+            # enrollment is UNKNOWN and separately risk-accepted; never
+            # reconstruct or assert an old chain. Consume new seq=1 directly.
             self.fence.cycles.initialize_first_cycle_locked(
                 receipt.device_id, cycle, attempt,
             )
