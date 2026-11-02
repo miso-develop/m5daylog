@@ -245,7 +245,7 @@ esp_err_t sd_mount_recordings(void) {
 
 #if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL && \
     (!defined(CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE) || !CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE)
-    // FAT may be mounted, but not one directory / manifest / WAV may be
+    // FAT may be mounted, but no directory or WAV may be
     // created until installed generation readback passes against actual APP card.
     if (!dev_sdb11_media_readback_matches(
             CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION,
