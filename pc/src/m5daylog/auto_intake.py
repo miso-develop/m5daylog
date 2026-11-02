@@ -231,8 +231,16 @@ class IntakeCoordinator:
                         "RELEASE_BLOCKED", "STALE_SESSION",
                         summary.copied, summary.reused, capacity,
                     )
-                session_port.revalidate_target(target, binding.cdc_port)
-                outcome = self._qualified_release(binding, current_session_epoch)
+                try:
+                    session_port.revalidate_target(target, binding.cdc_port)
+                    outcome = self._qualified_release(binding, current_session_epoch)
+                except Exception:
+                    # A successful #51 commit must not be misreported as an
+                    # intake failure when only the release stage is uncertain.
+                    return IntakeResult(
+                        "RELEASE_BLOCKED", "RELEASE_NOT_CONFIRMED",
+                        summary.copied, summary.reused, capacity,
+                    )
                 if (type(outcome) is not ReleaseOutcome or not outcome.success
                         or outcome.target != target or not outcome.attempt_id):
                     return IntakeResult(
