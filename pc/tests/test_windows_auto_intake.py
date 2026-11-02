@@ -146,6 +146,69 @@ class ProviderTests(unittest.TestCase):
         self.port.present = False
         self.assertEqual(self.provider.scan(), [])
 
+    def test_new_r5_cycle_rearms_same_usb_parent_without_observed_gap(self):
+        # The Device may complete an entire detach/reboot/re-attach interval
+        # between two polls. Windows can reuse the same GUID, parent and COM.
+        # A new frozen recording cycle must get a new monitor epoch, or the
+        # prior PollingMonitor._handled suppresses the next day's raw intake.
+        coordinator = RecordingIntake()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        first_cycle = "aaaaaaaa-0000-4000-8000-000000000001"
+        next_cycle = "aaaaaaaa-0000-4000-8000-000000000002"
+        self.status.update(
+            releaseCycleId=first_cycle,
+            releaseCycleOrigin="SUPERVISED_FIRST_USE",
+        )
+        monitor.poll_once()
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+        first_epoch = coordinator.sessions[0][0]
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+
+        # No intervening scan reports absence and the host topology is
+        # unchanged. The R5 cycle/origin pair is the only changed witness.
+        self.status.update(
+            releaseCycleId=next_cycle, releaseCycleOrigin="NORMAL_WAKE",
+        )
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+        second_epoch = self.provider.current_epoch()
+        self.assertNotEqual(first_epoch, second_epoch)
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 2)
+        self.assertEqual(coordinator.sessions[-1], (second_epoch, second_epoch))
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 2)
+        self.assertTrue(all(
+            notice["safe_to_leave_usb_connected"] is False for notice in notices
+        ))
+        self.assertTrue(all(
+            notice["sync_release"] != "SYNCED_RELEASED" for notice in notices
+        ))
+
+    def test_unqualified_pair_never_becomes_release_authority(self):
+        # Intake remains compatible with an origin-unaware read-only status.
+        # The optional R5 pair is used only to invalidate an old intake epoch.
+        self.status.update(
+            releaseCycleId="aaaaaaaa-0000-4000-8000-000000000003",
+            releaseCycleOrigin="NORMAL_WAKE",
+        )
+        initial = self.provider.scan()[0].binding.session_epoch
+        self.status["releaseCycleOrigin"] = "UNKNOWN"
+        fallback = self.provider.scan()[0].binding.session_epoch
+        self.assertNotEqual(initial, fallback)
+        self.assertEqual(fallback, self.provider.scan()[0].binding.session_epoch)
+        self.assertNotEqual(self.provider.current_epoch(), initial)
+        self.status["releaseCycleOrigin"] = "NORMAL_WAKE"
+        restored = self.provider.scan()[0].binding.session_epoch
+        self.assertNotEqual(fallback, restored)
+        self.assertEqual(self.provider.scan()[0].binding.session_epoch, restored)
+
     def test_disappearance_invalidates_epoch(self):
         earlier = self.provider.scan()[0].binding.session_epoch
         self.status["state"] = "RECORDING"
