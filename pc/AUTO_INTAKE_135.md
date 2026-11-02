@@ -592,3 +592,20 @@ reserved attempt. This preserves one canonical coordinator/CDC sender.
 The external current-cycle proof remains mandatory; Device status text alone
 cannot attest current boot, PCM, manifest, RTC or host custody. CLI/watch
 remain release-disabled; all tests use synthetic endpoints.
+
+## ER-135-POSTOBS-01 — final frozen-pair check after pre-seal I/O (source-only)
+
+The final live R5 `GET_STATUS` is now performed **after** the last
+`before_seal_observation` callback and before the canonical #89 gate seal.
+A pre-seal MSC/capacity observation can outlive the post-RTC observation and
+invalidate the Device cycle/origin. A check before that callback is insufficient.
+The final status read uses ordinary CDC I/O admission under the same cooperating
+OS lock; no ordinary CDC is read after seal or volume lock/dismount.
+
+The original failing sequence (healthy pair at RTC -> altered cycle/origin
+*during* pre-seal observation -> legacy stale-pair send) is now denied for both
+DEV-generation first release and ordinary NORMAL_WAKE. A failed final status
+transport similarly blocks before volume lock/CDC release; the pre-mutation
+attempt stays durably consumed and cannot be retried. Synthetic fake-host tests
+do not establish atomic Device/RTC/PCM provenance, a live Windows/USB release
+permit or physical acceptance. CLI and watcher remain release-disabled.
