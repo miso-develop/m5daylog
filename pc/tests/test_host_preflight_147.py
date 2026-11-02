@@ -17,12 +17,13 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
+from m5daylog.dev_install_release_fence import DevInstallReceipt, DevInstallReleaseFence
 from m5daylog.host_preflight_147 import (
     HpreStatus, inspect_current_user_hpre, inspect_hpre_locked,
 )
 from m5daylog.release_cycle_fence import CycleAttemptFence, WindowsRegistryAnchor
 from test_release_cycle_fence_143 import (
-    DEVICE, CYCLE1, ATTEMPT1, make_fence,
+    DEVICE, CYCLE1, ATTEMPT1, FileFakeAnchor, make_fence,
 )
 
 OTHER_DEVICE = "00000000-0000-4000-8000-000000000099"
@@ -35,6 +36,10 @@ class HpreSourceTests(unittest.TestCase):
         self.root = Path(t.name)
         (self.root / "device_media").mkdir()
         self.fence = make_fence(self.root)
+        self.dev_database = self.root / "dev_install_release_v1.sqlite"
+        self.dev_anchor = FileFakeAnchor(self.root / "dev-anchor.json")
+        # Mirror the production for_current_user() DEV cutover binding.
+        self.fence.bind_dev_cutover_witness(self.dev_database, self.dev_anchor)
 
     def inspect(self, device=DEVICE):
         with self.fence.serialized():
@@ -80,6 +85,95 @@ class HpreSourceTests(unittest.TestCase):
         for suffix in ("-wal", "-shm", "-journal"):
             self.assertFalse((self.fence.database.parent /
                               (self.fence.database.name + suffix)).exists())
+
+    def test_unbound_direct_fence_cannot_be_a_p0_candidate(self):
+        self.prepared()
+        # Direct helpers must not bypass the canonical DEV witness requirement.
+        unbound = make_fence(self.root)
+        with unbound.serialized():
+            result = inspect_hpre_locked(
+                unbound, expected_previous_device_id=DEVICE,
+            )
+        self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertIsNone(result.lineage_digest)
+
+    def test_spent_dev_first_use_and_valid_v1_never_qualifies_p0(self):
+        # Reproduce SEC-135-HPRE-01 using the actual source-only DEV first-use
+        # consumption + R3 initial-cycle APIs (synthetic verifier, no Device).
+        receipt = DevInstallReceipt(
+            device_id=DEVICE,
+            generation_id="00000000-0000-4000-8000-000000000021",
+            first_release_attempt_id=ATTEMPT1,
+            physical_target_digest="1" * 64,
+            host_lineage_digest="2" * 64,
+            image_set_digest="3" * 64,
+            partition_layout_digest="4" * 64,
+            nvs_write_set_digest="5" * 64,
+            admission_inventory_digest="6" * 64,
+            external_permit_digest="7" * 64,
+            media_branch="R",
+        )
+        dev = DevInstallReleaseFence(
+            cycles=self.fence, database=self.dev_database,
+            device_root=self.root / "device_media", anchor=self.dev_anchor,
+        )
+        with self.fence.serialized():
+            dev.consume_locked(receipt, verify_external=lambda _: True)
+            dev.initialize_first_dev_cycle_locked(
+                receipt,
+                status={"releaseCycleId": CYCLE1,
+                        "releaseCycleOrigin": "SUPERVISED_FIRST_USE",
+                        "rtcCorrectionPending": False, "state": "USB_SYNC"},
+                cycle_attempt_id="00000000-0000-4000-8000-000000000022",
+                verify_first_wake=lambda *_: True,
+            )
+        # Both independent stores of each ledger now match, with R3 V1 seq=1,
+        # yet the next SAME_HOST DEV first use cannot consume the spent DEV.
+        with self.fence.serialized():
+            self.assertEqual(self.fence.read_enrolled_state_locked(DEVICE)["seq"], 1)
+            dev.verify_consumed_locked(receipt)
+        before = (self.snapshot(), self.dev_database.read_bytes(),
+                  self.dev_anchor.path.read_bytes())
+        with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                   side_effect=AssertionError("spent DEV must deny before SQLite")):
+            result = self.inspect()
+        self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertIsNone(result.lineage_digest)
+        self.assertEqual(before, (self.snapshot(), self.dev_database.read_bytes(),
+                                  self.dev_anchor.path.read_bytes()))
+
+    def test_partial_dev_witness_and_recovery_sidecar_block_read_only(self):
+        self.prepared()
+        baseline = self.snapshot()
+        sidecar = self.dev_database.with_name(self.dev_database.name + "-journal")
+        for case in ("dev_db_only", "dev_anchor_only", "sidecar_only"):
+            with self.subTest(case=case):
+                if case == "dev_db_only":
+                    self.dev_database.write_bytes(b"synthetic-consumed")
+                elif case == "dev_anchor_only":
+                    self.dev_anchor.write({"state": "CONSUMED"})
+                else:
+                    sidecar.write_bytes(b"uncertain-recovery")
+                before = (self.snapshot(),
+                          self.dev_database.read_bytes() if self.dev_database.exists() else None,
+                          self.dev_anchor.path.read_bytes() if self.dev_anchor.path.exists() else None,
+                          sidecar.read_bytes() if sidecar.exists() else None)
+                with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                           side_effect=AssertionError("ambiguous DEV must deny before SQLite")):
+                    result = self.inspect()
+                self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+                self.assertIsNone(result.lineage_digest)
+                self.assertEqual(before, (
+                    self.snapshot(),
+                    self.dev_database.read_bytes() if self.dev_database.exists() else None,
+                    self.dev_anchor.path.read_bytes() if self.dev_anchor.path.exists() else None,
+                    sidecar.read_bytes() if sidecar.exists() else None,
+                ))
+                self.dev_database.unlink(missing_ok=True)
+                self.dev_anchor.path.unlink(missing_ok=True)
+                sidecar.unlink(missing_ok=True)
+        self.assertEqual(self.snapshot(), baseline)
+        self.assertEqual(self.inspect().status, HpreStatus.HEALTHY_V1_MATCHING_SEQ_GE_1)
 
     def test_v1_seq_zero_is_not_a_p0_candidate(self):
         self.prepared(consumed=False)
@@ -177,12 +271,17 @@ class NativeWindowsHpreTests(unittest.TestCase):
             self.root / "release.sqlite", self.root / "release.lock",
             self.root / "device_media", anchor,
         )
+        self.dev_registry_key = self.registry_key + "_Dev"
+        dev_anchor = WindowsRegistryAnchor()
+        dev_anchor.KEY = self.dev_registry_key
+        self.fence.bind_dev_cutover_witness(self.root / "dev.sqlite", dev_anchor)
 
     def _clean_registry(self):
-        try:
-            self.winreg.DeleteKey(self.winreg.HKEY_CURRENT_USER, self.registry_key)
-        except FileNotFoundError:
-            pass
+        for key in (self.registry_key, self.dev_registry_key):
+            try:
+                self.winreg.DeleteKey(self.winreg.HKEY_CURRENT_USER, key)
+            except FileNotFoundError:
+                pass
 
     def test_readonly_native_hkcu_and_db_no_flush_or_db_mutation(self):
         self.fence.enroll(DEVICE, supervised=True)
