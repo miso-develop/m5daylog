@@ -94,6 +94,33 @@ class LegacyCliR5ExclusionTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue().strip(),
                          "error: sync-release requires Windows")
 
+    def test_h0_presence_cli_reports_only_candidate_never_grant(self):
+        from m5daylog.host_preflight_147 import HpreResult, HpreStatus
+        cases = (
+            (HpreStatus.ABSENT_OR_UNPROVEN_H0, 0),
+            (HpreStatus.UNREADABLE_OR_UNKNOWN, 3),
+        )
+        for observed, expected_code in cases:
+            with (
+                self.subTest(observed=observed),
+                patch.object(cli.sys, "platform", "win32"),
+                patch(
+                    "m5daylog.host_preflight_147.inspect_current_user_clean_h0_presence",
+                    return_value=HpreResult(observed),
+                ) as inspector,
+                patch("m5daylog.windows_release.NativeWin32DeviceApi") as native,
+                patch("m5daylog.release.SyncReleaseCoordinator.run") as sender,
+            ):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    status = cli.main(["h0-presence"])
+                self.assertEqual(status, expected_code)
+                self.assertIn(f"state={observed.value}", stdout.getvalue())
+                self.assertIn("authorization=NOT_GRANTED", stdout.getvalue())
+                inspector.assert_called_once_with()
+                native.assert_not_called()
+                sender.assert_not_called()
+
     def test_read_only_explicit_sync_command_is_unchanged(self):
         stdout = io.StringIO()
         with (
