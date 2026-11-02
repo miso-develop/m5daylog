@@ -181,8 +181,13 @@ class CycleAttemptFence:
 
     def __init__(self, database: Path, lock_file: Path, device_root: Path,
                  anchor: Anchor) -> None:
-        self.database = Path(database).expanduser().resolve()
-        self.lock_file = Path(lock_file).expanduser().resolve()
+        # Keep the caller's original host paths for read-only Hpre. A
+        # symlink/junction existing BEFORE construction must not disappear
+        # merely because the active release journal resolves its target.
+        self._database_source_path = Path(database).expanduser().absolute()
+        self._lock_source_path = Path(lock_file).expanduser().absolute()
+        self.database = self._database_source_path.resolve()
+        self.lock_file = self._lock_source_path.resolve()
         root = Path(device_root).expanduser().resolve()
         for path in (self.database, self.lock_file):
             if path == root or root in path.parents:

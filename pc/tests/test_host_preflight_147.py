@@ -166,6 +166,100 @@ class HpreSourceTests(unittest.TestCase):
         self.assertEqual(parent_alias.readlink().name, missing_parent.name)
         self.assertFalse(missing_parent.exists())
 
+    def test_er_135_hpre_03_r3_file_alias_before_binding_is_nonpositive(self):
+        # Original counterexample: a valid consumed R3 chain is moved, and
+        # the nominal R3 path becomes a symlink BEFORE fence construction.
+        self.prepared()
+        before = self.snapshot()
+        nominal = self.fence._database_source_path
+        moved = self.root / "old-r3-store-moved.sqlite"
+        nominal.rename(moved)
+        try:
+            nominal.symlink_to(moved)
+        except (OSError, NotImplementedError) as error:
+            moved.rename(nominal)
+            self.skipTest(f"host cannot create disposable symlink: {type(error).__name__}")
+        rebound = make_fence(self.root)
+        rebound.bind_dev_cutover_witness(self.dev_database, self.dev_anchor)
+        self.assertEqual(rebound.database, moved.resolve())
+        self.assertEqual(rebound._database_source_path, nominal)
+        with rebound.serialized():
+            with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                       side_effect=AssertionError("aliased R3 must deny before SQLite")):
+                result = inspect_hpre_locked(
+                    rebound, expected_previous_device_id=DEVICE,
+                )
+        self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertIsNone(result.lineage_digest)
+        self.assertEqual(moved.read_bytes(), before[0])
+        self.assertEqual(self.fence.anchor.path.read_bytes(), before[1])
+        self.assertEqual(moved.stat().st_mtime_ns, before[2])
+        self.assertEqual(nominal.readlink().name, moved.name)
+        self.assertIsNone(self.dev_anchor.read())
+
+    def test_er_135_hpre_03_r3_alias_denial_on_all_ci_platforms(self):
+        # Privilege-independent coverage for Windows runners without symlink
+        # creation privileges. Neither valid R3 nor HKCU can be promoted.
+        self.prepared()
+        before = self.snapshot()
+        real_is_symlink = Path.is_symlink
+
+        def simulated_alias(candidate):
+            return (candidate == self.fence._database_source_path
+                    or real_is_symlink(candidate))
+
+        with patch.object(Path, "is_symlink", simulated_alias):
+            with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                       side_effect=AssertionError("aliased R3 must deny before SQLite")):
+                result = self.inspect()
+        self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertIsNone(result.lineage_digest)
+        self.assertEqual(self.snapshot(), before)
+        self.assertIsNone(self.dev_anchor.read())
+
+    def test_er_135_hpre_03_r3_parent_alias_before_binding_is_nonpositive(self):
+        self.prepared()
+        before = self.snapshot()
+        alias = self.root / "r3-parent-alias"
+        try:
+            alias.symlink_to(self.root, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"host cannot create disposable parent alias: {type(error).__name__}")
+        rebound = CycleAttemptFence(
+            alias / "ledger.sqlite", self.root / "global.lock",
+            self.root / "device_media",
+            FileFakeAnchor(self.root / "outside-anchor.json"),
+        )
+        rebound.bind_dev_cutover_witness(self.dev_database, self.dev_anchor)
+        self.assertEqual(rebound.database, self.fence.database)
+        with rebound.serialized():
+            with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                       side_effect=AssertionError("parent-aliased R3 must deny")):
+                result = inspect_hpre_locked(
+                    rebound, expected_previous_device_id=DEVICE,
+                )
+        self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertIsNone(result.lineage_digest)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(alias.readlink().name, self.root.name)
+
+    def test_er_135_hpre_03_lock_alias_is_never_a_positive_candidate(self):
+        self.prepared()
+        before = self.snapshot()
+        real_is_symlink = Path.is_symlink
+
+        def simulated_alias(candidate):
+            return (candidate == self.fence._lock_source_path
+                    or real_is_symlink(candidate))
+
+        with patch.object(Path, "is_symlink", simulated_alias):
+            with patch("m5daylog.host_preflight_147.sqlite3.connect",
+                       side_effect=AssertionError("aliased lock must deny")):
+                result = self.inspect()
+        self.assertEqual(result.status, HpreStatus.UNREADABLE_OR_UNKNOWN)
+        self.assertIsNone(result.lineage_digest)
+        self.assertEqual(self.snapshot(), before)
+
     def test_spent_dev_first_use_and_valid_v1_never_qualifies_p0(self):
         # Reproduce SEC-135-HPRE-01 using the actual source-only DEV first-use
         # consumption + R3 initial-cycle APIs (synthetic verifier, no Device).

@@ -52,6 +52,23 @@ def _unchanged_signature(path: Path) -> tuple[int, int, int]:
     return s.st_size, s.st_mtime_ns, s.st_ctime_ns
 
 
+def _canonical_unaliased_path(source: Path, resolved: Path) -> bool:
+    """Reject a redirected nominal production path, including its parents.
+
+    source is retained before Path.resolve() at fence construction/binding.
+    This is a read-only Hpre proof; ordinary R3 ledger transactions are
+    unchanged. Windows directory junctions count as aliases (Python 3.12+).
+    """
+    try:
+        for component in (source, *source.parents):
+            if (component.is_symlink()
+                    or (os.name == "nt" and component.is_junction())):
+                return False
+        return source.resolve() == resolved
+    except (OSError, RuntimeError):
+        return False
+
+
 def _unspent_dev_witness_locked(fence: CycleAttemptFence) -> bool:
     """Only an unused, canonical-bound DEV one-shot can precede P0.
 
@@ -66,18 +83,8 @@ def _unspent_dev_witness_locked(fence: CycleAttemptFence) -> bool:
     anchor = fence._dev_cutover_anchor
     if database is None or source is None or anchor is None:
         return False  # No positive path via a direct, unbound fixture fence.
-    try:
-        # resolve() at binding time can erase a dangling DEV symlink. Check
-        # the original nominal path AND every parent before trusting absence.
-        # On Windows, directory junctions are aliases too (Python 3.12+).
-        for component in (source, *source.parents):
-            if (component.is_symlink()
-                    or (os.name == "nt" and component.is_junction())):
-                return False
-        if source.resolve() != database:
-            return False  # Path changed since the fixed DEV witness was bound.
-    except (OSError, RuntimeError):
-        return False
+    if not _canonical_unaliased_path(source, database):
+        return False  # Alias/drift from the original fixed DEV witness.
     if (_sqlite_recovery_sidecars_present(database)
             or database.exists() or database.is_symlink()):
         return False
@@ -105,6 +112,14 @@ def inspect_hpre_locked(
     try:
         old = _hash(_uuid(expected_previous_device_id))
         database = fence.database
+        # R3's source path used to be lost in __init__ by resolve(). A
+        # redirect to a healthy historical ledger must not become a positive
+        # P0 candidate; also refuse an aliased cooperating-lock pathname.
+        if (not _canonical_unaliased_path(
+                fence._database_source_path, database)
+                or not _canonical_unaliased_path(
+                    fence._lock_source_path, fence.lock_file)):
+            return unknown
         # Do not manufacture a lock file or directory for this observation.
         if (not fence.lock_file.is_file() or
                 (os.name == "nt" and fence.lock_file.stat().st_size < 1)):
@@ -153,6 +168,10 @@ def inspect_hpre_locked(
                 return HpreResult(HpreStatus.SPLIT_OR_ROLLED_BACK)
 
         if (_sqlite_recovery_sidecars_present(database)
+                or not _canonical_unaliased_path(
+                    fence._database_source_path, database)
+                or not _canonical_unaliased_path(
+                    fence._lock_source_path, fence.lock_file)
                 or not _unspent_dev_witness_locked(fence)
                 or _unchanged_signature(database) != signature
                 or fence.anchor.read() != state):
@@ -189,7 +208,8 @@ def inspect_current_user_hpre(*, expected_previous_device_id: str) -> HpreResult
     state_dir = Path(os.environ["LOCALAPPDATA"]) / "M5Daylog" / "state"
     lock = state_dir / "release_cycle_r3.lock"
     try:
-        if not lock.is_file() or lock.stat().st_size < 1:
+        if (not lock.is_file() or lock.stat().st_size < 1
+                or not _canonical_unaliased_path(lock.absolute(), lock.resolve())):
             return unknown
         # Device path is a never-accessed sentinel, not an actual media root.
         # The fixed per-user R3 factory still selects real DB/HKCU/lock paths.
