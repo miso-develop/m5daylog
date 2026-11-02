@@ -147,15 +147,15 @@ def cmd_sync(
 def cmd_h0_presence() -> int:
     """Read only canonical Windows-user R3/DEV witness presence; no authorization."""
     if sys.platform != "win32":
-        print("h0: state=UNREADABLE_OR_UNKNOWN authorization=NOT_GRANTED")
+        print("h0: state=UNREADABLE_OR_UNKNOWN grant=NOT_ISSUED")
         return 3
     try:
         from .host_preflight_147 import inspect_current_user_clean_h0_presence
         observed = inspect_current_user_clean_h0_presence()
-        print(f"h0: state={observed.status.value} authorization=NOT_GRANTED")
+        print(f"h0: state={observed.status.value} grant=NOT_ISSUED")
         return 0 if observed.status.value == "ABSENT_OR_UNPROVEN_H0" else 3
     except Exception:
-        print("h0: state=UNREADABLE_OR_UNKNOWN authorization=NOT_GRANTED")
+        print("h0: state=UNREADABLE_OR_UNKNOWN grant=NOT_ISSUED")
         return 3
 
 
