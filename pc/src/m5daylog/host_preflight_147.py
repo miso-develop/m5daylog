@@ -24,7 +24,8 @@ from urllib.parse import quote
 
 from .release import PreconditionBlocked
 from .release_cycle_fence import (
-    CycleAttemptFence, _hash, _sqlite_recovery_sidecars_present, _uuid,
+    Anchor, CycleAttemptFence, WindowsRegistryAnchor, _hash,
+    _sqlite_recovery_sidecars_present, _uuid,
 )
 
 
@@ -224,3 +225,58 @@ def inspect_current_user_hpre(*, expected_previous_device_id: str) -> HpreResult
             )
     except (PreconditionBlocked, OSError, ValueError):
         return unknown
+
+
+def _inspect_clean_h0_presence(
+    state_dir: Path, *, r3_anchor: Anchor, dev_anchor: Anchor,
+) -> HpreResult:
+    """Read-only R3/DEV/lock *absence candidate*, not positive H0 evidence.
+
+    No OS lock is manufactured. This cannot prove old-writer exclusion,
+    Windows-user deployment history or lack of whole-profile rollback.
+    Only a separate owner/process/history corroboration can lift H0_UNPROVEN.
+    """
+    unknown = HpreResult(HpreStatus.UNREADABLE_OR_UNKNOWN)
+    files = (
+        state_dir / "release_cycle_r3.sqlite",
+        state_dir / "dev_install_release_v1.sqlite",
+        state_dir / "release_cycle_r3.lock",
+    )
+    try:
+        if not _canonical_unaliased_path(state_dir.absolute(), state_dir.resolve()):
+            return unknown
+        for path in files:
+            if not _canonical_unaliased_path(path.absolute(), path.resolve()):
+                return unknown
+        def absent() -> bool:
+            return (all(
+                not (path.exists() or path.is_symlink()
+                     or _sqlite_recovery_sidecars_present(path))
+                for path in files
+            ) and r3_anchor.read() is None and dev_anchor.read() is None)
+        if not absent():
+            return unknown
+        # An unlocked presence-only probe can race another process. Check
+        # again, but never turn this into a release authorization.
+        if not absent():
+            return unknown
+        return HpreResult(HpreStatus.ABSENT_OR_UNPROVEN_H0)
+    except (OSError, ValueError, TypeError, RuntimeError, PreconditionBlocked):
+        return unknown
+
+
+def inspect_current_user_clean_h0_presence() -> HpreResult:
+    """Current-user Windows read-only inventory without Device/USB actions.
+
+    The result only names absent canonical local witnesses. In particular,
+    ABSENT_OR_UNPROVEN_H0 is NOT H0 approval and must never enable P0/P1.
+    """
+    unknown = HpreResult(HpreStatus.UNREADABLE_OR_UNKNOWN)
+    if os.name != "nt" or not os.environ.get("LOCALAPPDATA"):
+        return unknown
+    from .dev_install_release_fence import DevInstallRegistryAnchor
+    return _inspect_clean_h0_presence(
+        Path(os.environ["LOCALAPPDATA"]) / "M5Daylog" / "state",
+        r3_anchor=WindowsRegistryAnchor(),
+        dev_anchor=DevInstallRegistryAnchor(),
+    )
