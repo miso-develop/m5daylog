@@ -620,6 +620,22 @@ void app_main(void) {
         recorder_shutdown_armed_now();
         return;
     }
+    // Source-level selected original-card check BEFORE first-use hold/NVS
+    // consumption, before normal WAKE permit use, and before any recorder
+    // FAT directory/manifest writes or USB publication. A missing/wrong card,
+    // substituted generation or non-pristine first-use baseline is a hard STOP.
+    if (sd_mount_dev_verify_selected_baseline(
+            (uint32_t)CONFIG_M5DAYLOG_SDB11_EXPECTED_CID_SERIAL,
+            (uint64_t)CONFIG_M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256,
+            dev_boot_policy == DEV_SDB11_BOOT_NEEDS_HOLD) != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: dev-card, result: mismatch-or-read-error, action: shutdown");
+        recorder_shutdown_armed_now();
+        return;
+    }
     if (dev_boot_policy == DEV_SDB11_BOOT_NEEDS_HOLD) {
         // A short, interrupted or unmeasurable physical hold never consumes
         // NVS. Do not start recording merely because the DEV SD is blank.
