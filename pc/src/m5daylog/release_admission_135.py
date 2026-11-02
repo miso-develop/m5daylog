@@ -73,15 +73,17 @@ class SourceOnlyReleaseSequence:
 
         def before_seal(target: EjectTarget, gate: UsbSessionIoGate) -> bool:
             self._target(target)
-            # Read live CDC status after RTC mutation while ordinary I/O is
-            # still open. Never query status once the release gate is sealed.
+            if self.before_seal_observation(target, gate) is not True:
+                return False
+            self._target(target)
+            # The frozen R5 pair must be the LAST ordinary pre-seal
+            # observation. A prior check cannot cover an MSC/capacity
+            # observation that races with a Device cycle/ownership change.
+            # Keep ordinary CDC admission open here; never read after seal.
             if after_mutation_check is not None:
                 with gate.ordinary("cdc"):
                     after_mutation_check(target)
                 self._target(target)
-            if self.before_seal_observation(target, gate) is not True:
-                return False
-            self._target(target)
             return True
 
         with self.fence.cycles.serialized():
