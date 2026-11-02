@@ -681,6 +681,28 @@ void app_main(void) {
         &s_wake_recovery,
         action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
 
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    if (dev_first_boot) {
+        // SDB-1.1 starts in NORMAL, so the #87 manual-WAKE recovery hook
+        // cannot establish its boot-local RTC proof. Reuse the existing #50
+        // BM8563 read/VL/calendar/settimeofday/teardown validation BEFORE
+        // any recorder task starts. An initially provisioned DEV generation
+        // must have no pending RTC audit: with no pending record this hook
+        // only reads RTC and never touches the (not yet mounted) SD.
+        // A failed RTC read returns OK from the best-effort recovery hook;
+        // therefore the explicit RAM proof is required as well.
+        if (rtc_correction_init() != ESP_OK ||
+            rtc_correction_is_pending() ||
+            rtc_correction_flush_pending_event(RECORDER_EVENTS_PATH) != ESP_OK ||
+            !rtc_correction_cycle_status_qualified()) {
+            ESP_LOGE(TAG,
+                     "stage: dev-first-boot, result: rtc-unverified, action: shutdown");
+            recorder_shutdown_armed_now();
+            return;  // Intent stays USED; never retry this boot or reset NVS.
+        }
+    }
+#endif
+
     // Manual-WAKE recovery needs the durable RTC pending record before
     // main.c reaches the Device-owned manifest/recovery seam. Normal boot does
     // not: keep #87's proven recorder startup path free of RTC/I2C bring-up and
