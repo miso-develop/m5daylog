@@ -6,8 +6,9 @@ This Draft candidate implements the **safe subset** of #135: an injectable,
 two-scan arrival coalescer, prior user allowlist admission, revalidation of an
 already-verified MSC/CDC physical parent and current `USB_SYNC` session proof,
 #51's canonical raw WAV/SQLite sync, process-level local intake exclusion,
-and #137's pre-seal read-only SD-capacity result. Every post-sync result is
-`RELEASE_BLOCKED` with `AUTO_RELEASE_NOT_QUALIFIED` (or a narrower error).
+and #137's pre-seal read-only SD-capacity result. The installed watcher still returns
+`RELEASE_BLOCKED` with `AUTO_RELEASE_NOT_QUALIFIED` (or a narrower error)
+without an independently supplied qualified release integration.
 
 A Windows-only observer is now provided in `windows_auto_intake.py`. It polls
 removable Windows drive roots, validates canonical metadata and manifest,
@@ -23,11 +24,14 @@ a Human Gate without separate approval**. A per-user Startup shortcut may
 eventually launch the same module after logon; no installer, service or
 elevation is added. Status is written as one sanitized local JSON snapshot
 (`%LOCALAPPDATA%/M5Daylog/state/auto_intake_status.json`) and optionally
-printed in the foreground. A native local Windows warning dialog is displayed
-after completed-but-unreleased intake or failed sync, without host/device
-identifiers or external dependencies. This is a **blocking/action-required**
-notification, never a successful safe-eject notice. Auto-release remains
-blocked; therefore this is **not** full daily UX.
+printed in the foreground. A native local Windows dialog distinguishes completed-but-unreleased intake,
+failed sync, and a verified canonical host-release outcome without including
+host/device identifiers. The public `run_monitor` CLI supplies **no** release
+callback, so safe release stays blocked and this is **not** full daily UX.
+The internal `run_monitor(qualified_release=...)` entrypoint can pass an
+independently verified #89/#143 one-shot integration into `IntakeCoordinator`;
+a Python callback, a config file, or an arrival status is **not itself** release
+authority, and no production verifier or owner P0/P1 issuance is yet wired.
 
 The user must create a private, locally stored
 `%LOCALAPPDATA%/M5Daylog/monitor.json` containing the explicit opt-in
