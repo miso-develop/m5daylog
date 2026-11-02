@@ -12,12 +12,21 @@ from m5daylog.release import (
     EjectTarget, PreconditionBlocked, ReleaseIndeterminate,
     SyncReleaseCoordinator,
 )
-from m5daylog.release_admission_135 import SourceOnlyReleaseSequence
+from m5daylog.release_admission_135 import (
+    Sdb14RiskDecision, SourceOnlyReleaseSequence,
+)
 from m5daylog.release_cycle_candidate import QualifiedCycleCandidate
 from m5daylog.sync import SyncSummary
 from test_dev_install_release_fence_135 import DEV, ATTEMPT, CYCLE, make, receipt
 
 NEXT_CYCLE = "00000000-0000-4000-8000-000000000012"
+_MISSING = object()
+
+
+def sdb14_decision():
+    # Synthetic descriptor only. A real independently approved record and
+    # separate P0/P1/custody evidence are never minted by source fixtures.
+    return Sdb14RiskDecision("8" * 64, receipt().fingerprint())
 TARGET = EjectTarget(
     DEV, "E:\\",
     "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\",
@@ -123,7 +132,8 @@ class SourceOnlySequenceTests(unittest.TestCase):
             verify_first_wake=verify or (lambda r, s, sess, target: True),
         )
 
-    def h0_first(self, *, status=None, verifier=None):
+    def h0_first(self, *, status=None, verifier=None, risk=_MISSING,
+                 risk_verifier=None):
         status = status if status is not None else {
             "state": "USB_SYNC",
             "rtcCorrectionPending": False,
@@ -137,7 +147,70 @@ class SourceOnlySequenceTests(unittest.TestCase):
             receipt=receipt(), candidate=candidate,
             read_current_status=lambda: dict(status),
             verify_external=verifier or (lambda r, c, s, binding, target: True),
+            risk_decision=sdb14_decision() if risk is _MISSING else risk,
+            verify_risk_decision=(risk_verifier if risk_verifier is not None
+                                  else lambda b, r, binding, target: True),
         )
+
+    def test_sdb14_requires_distinct_scoped_risk_approval_before_spending(self):
+        bad = (
+            None,
+            Sdb14RiskDecision("8" * 64, "0" * 64),
+            Sdb14RiskDecision("8" * 64, receipt().fingerprint(),
+                              "H0_PROVEN"),
+            Sdb14RiskDecision("not-a-digest", receipt().fingerprint()),
+        )
+        for decision in bad:
+            with self.subTest(decision=type(decision).__name__):
+                with self.assertRaises(PreconditionBlocked):
+                    self.h0_first(risk=decision)
+                self.assertEqual(self.port.sent, [])
+                self.assertFalse(self.fence.database.exists())
+                self.assertFalse(self.fence.cycles.database.exists())
+        denied = self.h0_first(risk_verifier=lambda *args: False)
+        self.assertEqual(denied.reason, "PRECONDITION_BLOCKED")
+        self.assertNotIn("rtc", self.events)
+        self.assertEqual(self.port.sent, [])
+        self.assertFalse(self.fence.database.exists())
+        self.assertFalse(self.fence.cycles.database.exists())
+
+    def test_sdb14_risk_proof_is_independent_of_p0_p1_and_checked_under_lock(self):
+        checked = []
+
+        def inspect_b(decision, item, session, target):
+            checked.append("B")
+            self.assertEqual(decision.bound_receipt_fingerprint,
+                             item.fingerprint())
+            self.assertEqual(session, self.session)
+            self.assertEqual(target, TARGET)
+            self.assertTrue(getattr(self.fence.cycles._serialized_thread,
+                                    "held", False))
+            return True
+
+        denied = self.h0_first(risk_verifier=inspect_b,
+                               verifier=lambda *args: False)
+        self.assertEqual(checked, ["B"])
+        self.assertEqual(denied.reason, "PRECONDITION_BLOCKED")
+        self.assertFalse(self.fence.database.exists())
+        self.assertFalse(self.fence.cycles.database.exists())
+        self.assertEqual(self.port.sent, [])
+        accepted = self.h0_first(risk_verifier=inspect_b)
+        self.assertTrue(accepted.success)
+        self.assertEqual(checked, ["B", "B"])
+        self.assertEqual(self.port.sent, [ATTEMPT])
+        self.assertEqual(self.h0_first().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [ATTEMPT])
+
+    def test_sdb14_risk_verifier_exception_blocks_without_writing(self):
+        def unavailable(*args):
+            raise OSError("unavailable private approval")
+
+        outcome = self.h0_first(risk_verifier=unavailable)
+        self.assertEqual(outcome.reason, "PRECONDITION_BLOCKED")
+        self.assertNotIn("rtc", self.events)
+        self.assertEqual(self.port.sent, [])
+        self.assertFalse(self.fence.database.exists())
+        self.assertFalse(self.fence.cycles.database.exists())
 
     def test_h0_consumes_dev_and_r3_seq1_before_single_release_then_normal(self):
         first = self.h0_first()
