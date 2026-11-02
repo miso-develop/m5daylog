@@ -18,6 +18,7 @@
 #if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
 #include <dirent.h>
 #include "dev_sdb11_media_readback.h"
+#include "device_identity.h"
 #include "esp_vfs_fat.h"
 #endif
 
@@ -48,10 +49,6 @@ static bool s_dev_preflight_passed;
 static bool s_dev_first_boot_preflight;
 static bool dev_sd_same_selected_card(const sdmmc_card_t *card,
                                       uint32_t serial, uint64_t sectors);
-static bool dev_sdb11_media_readback_matches(const char *generation,
-                                     const char *device_id,
-                                     const char *binding,
-                                     bool first_boot);
 #endif
 
 static esp_err_t ensure_recording_dirs(void) {
