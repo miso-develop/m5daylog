@@ -123,6 +123,116 @@ class SourceOnlySequenceTests(unittest.TestCase):
             verify_first_wake=verify or (lambda r, s, sess, target: True),
         )
 
+    def h0_first(self, *, status=None, verifier=None):
+        status = status if status is not None else {
+            "state": "USB_SYNC",
+            "rtcCorrectionPending": False,
+            "releaseCycleId": CYCLE,
+            "releaseCycleOrigin": "SUPERVISED_FIRST_USE",
+        }
+        candidate = QualifiedCycleCandidate(
+            DEV, CYCLE, CycleOrigin.SUPERVISED_FIRST_USE, self.session,
+        )
+        return self.seq.h0_first_recording_release(
+            receipt=receipt(), candidate=candidate,
+            read_current_status=lambda: dict(status),
+            verify_external=verifier or (lambda r, c, s, binding, target: True),
+        )
+
+    def test_h0_consumes_dev_and_r3_seq1_before_single_release_then_normal(self):
+        first = self.h0_first()
+        self.assertTrue(first.success)
+        self.assertEqual(first.attempt_id, ATTEMPT)
+        self.assertEqual(self.port.sent, [ATTEMPT])
+        self.assertLess(self.events.index("sync"), self.events.index("rtc"))
+        self.assertLess(self.events.index("rtc"), self.events.index("lock"))
+        self.assertLess(self.events.index("lock"), self.events.index("release"))
+        with self.fence.cycles.serialized():
+            self.fence.verify_consumed_locked(receipt())
+            self.fence.cycles.verify_reserved_locked(DEV, CYCLE, ATTEMPT)
+            state = self.fence.cycles.read_enrolled_state_locked(DEV)
+            self.assertEqual(state["v"], 1)
+            self.assertEqual(state["seq"], 1)
+        self.assertEqual(self.h0_first().reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [ATTEMPT])
+
+        normal_cycle = QualifiedCycleCandidate(
+            DEV, NEXT_CYCLE, CycleOrigin.NORMAL_WAKE, self.session,
+        )
+        normal = self.seq.normal_cycle(
+            candidate=normal_cycle,
+            verify_current_cycle=lambda c, target: True,
+            read_current_status=lambda: {
+                "state": "USB_SYNC",
+                "releaseCycleId": NEXT_CYCLE,
+                "releaseCycleOrigin": "NORMAL_WAKE",
+                "rtcCorrectionPending": False,
+            },
+        )
+        self.assertTrue(normal.success)
+        with self.fence.cycles.serialized():
+            self.fence.cycles.verify_reserved_locked(
+                DEV, NEXT_CYCLE, normal.attempt_id,
+            )
+        self.assertEqual(len(self.port.sent), 2)
+
+    def test_h0_requires_independent_grant_and_current_first_origin(self):
+        denied = self.h0_first(verifier=lambda *args: False)
+        self.assertEqual(denied.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [])
+        self.assertNotIn("rtc", self.events)
+        self.assertFalse(self.fence.database.exists())
+        self.assertFalse(self.fence.cycles.database.exists())
+
+        invalid = self.h0_first(status={
+            "state": "USB_SYNC",
+            "rtcCorrectionPending": False,
+            "releaseCycleId": CYCLE,
+            "releaseCycleOrigin": "NORMAL_WAKE",
+        })
+        self.assertEqual(invalid.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [])
+        self.assertFalse(self.fence.database.exists())
+
+    def test_h0_split_dev_or_r3_commit_never_retries(self):
+        for anchor in ("dev", "r3"):
+            with self.subTest(anchor=anchor), tempfile.TemporaryDirectory() as d:
+                self.root = Path(d)
+                (self.root / "device").mkdir()
+                self.fence = make(self.root)
+                self.port = FakePort()
+                self.events = self.port.events
+                self.seq = self.sequence()
+                broken = (self.fence.anchor if anchor == "dev"
+                          else self.fence.cycles.anchor)
+                broken.fail_write = True
+                first = self.h0_first()
+                self.assertEqual(first.reason, "PRECONDITION_BLOCKED")
+                self.assertEqual(self.port.sent, [])
+                self.assertNotIn("rtc", self.events)
+                broken.fail_write = False
+                second = self.h0_first()
+                self.assertEqual(second.reason, "PRECONDITION_BLOCKED")
+                self.assertEqual(self.port.sent, [])
+
+    def test_h0_changed_pair_after_rtc_blocks_without_resend(self):
+        status = {
+            "state": "USB_SYNC",
+            "rtcCorrectionPending": False,
+            "releaseCycleId": CYCLE,
+            "releaseCycleOrigin": "SUPERVISED_FIRST_USE",
+        }
+        self.seq.cdc_mutations = lambda: status.update(
+            releaseCycleId=NEXT_CYCLE,
+        )
+        first = self.h0_first(status=status)
+        self.assertEqual(first.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [])
+        self.assertNotIn("lock", self.events)
+        status["releaseCycleId"] = CYCLE
+        self.assertEqual(self.h0_first(status=status).reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(self.port.sent, [])
+
     def test_first_dev_attempt_is_pinned_consumed_before_rtc_and_sent_once(self):
         result = self.dev_first()
         self.assertTrue(result.success)
