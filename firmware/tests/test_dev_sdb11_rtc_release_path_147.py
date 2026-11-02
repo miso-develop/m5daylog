@@ -48,6 +48,7 @@ def test_prod_qualified_first_rtc_witness_exposes_pair_and_admits_canonical_rele
 #include <stddef.h>
 #include <sys/time.h>
 #include <time.h>
+#define CONFIG_M5DAYLOG_SDB11_DEV_INSTALL 1
 typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_FAIL 1
@@ -107,7 +108,7 @@ static bool host_owned = true;
 static bool command_admission = true;
 static bool boot_qualified = true;
 static bool fence_host_owned = true;
-static const char *token = "11111111-1111-4111-8111-111111111111";
+static const char *cycle_uuid = "11111111-1111-4111-8111-111111111111";
 static const char *origin = "SUPERVISED_FIRST_USE";
 static bool accepted;
 static bool sd_mount_is_mounted(void) { return card_mounted; }
@@ -119,7 +120,7 @@ static bool release_cycle_fence_boot_qualified(void) { return boot_qualified; }
 static bool release_cycle_fence_host_owned_qualified(void) {
     return fence_host_owned;
 }
-static const char *release_cycle_witness_frozen_id(void) { return token; }
+static const char *release_cycle_witness_frozen_id(void) { return cycle_uuid; }
 static const char *release_cycle_fence_current_origin(void) { return origin; }
 typedef enum {
     USB_MSC_RELEASE_STORAGE_ACCEPTED,
@@ -155,7 +156,7 @@ int main(void) {
     rtc_sync_system_clock_best_effort_locked();
     assert(rtc_correction_cycle_status_qualified());
     assert(recorder_cdc_status(&status, NULL));
-    assert(status.release_cycle_id == token);
+    assert(status.release_cycle_id == cycle_uuid);
     assert(status.release_cycle_origin == origin);
     /* Subsequent successful SET_TIME retains the same frozen pair. */
     rtc_cycle_note_set_time_started_locked();
@@ -163,7 +164,7 @@ int main(void) {
     rtc_cycle_note_set_time_committed_locked();
     s_pending = true;
     assert(recorder_cdc_status(&status, NULL));
-    assert(status.release_cycle_id == token);
+    assert(status.release_cycle_id == cycle_uuid);
     assert(status.release_cycle_origin == origin);
     assert(recorder_cdc_release_accept("attempt", NULL) == USB_CDC_RELEASE_ACCEPTED);
     assert(accepted);
