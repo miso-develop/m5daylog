@@ -120,11 +120,7 @@ class HpreSourceTests(unittest.TestCase):
         self.fence.anchor.path.write_bytes(old_anchor)
         self.assertEqual(self.inspect().status, HpreStatus.SPLIT_OR_ROLLED_BACK)
 
-        # Restore the anchor to match, then damage only the hash-chain row.
-        with self.fence.serialized():
-            # Existing writable verifier intentionally cannot repair a split;
-            # take the already-consumed SQLite state directly from fixture.
-            pass
+        # Chain corruption remains blocked independently of split anchor.
         with sqlite3.connect(self.fence.database) as db:
             db.execute("UPDATE consumed SET attempt=? WHERE seq=1", ("0" * 64,))
             db.commit()
@@ -172,7 +168,7 @@ class NativeWindowsHpreTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         (self.root / "device_media").mkdir()
-        self.registry_key = r"Software\\M5DaylogHpreTest_" + uuid.uuid4().hex
+        self.registry_key = "Software" + chr(92) + "M5DaylogHpreTest_" + uuid.uuid4().hex
         self.addCleanup(self._clean_registry)
         anchor = WindowsRegistryAnchor()
         anchor.KEY = self.registry_key
