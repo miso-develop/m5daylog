@@ -116,7 +116,7 @@ class LegacyCliR5ExclusionTests(unittest.TestCase):
                     status = cli.main(["h0-presence"])
                 self.assertEqual(status, expected_code)
                 self.assertIn(f"state={observed.value}", stdout.getvalue())
-                self.assertIn("authorization=NOT_GRANTED", stdout.getvalue())
+                self.assertIn("grant=NOT_ISSUED", stdout.getvalue())
                 inspector.assert_called_once_with()
                 native.assert_not_called()
                 sender.assert_not_called()
