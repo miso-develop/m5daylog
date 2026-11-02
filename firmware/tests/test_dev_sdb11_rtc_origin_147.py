@@ -45,7 +45,7 @@ def test_real_dev_initial_recorder_boot_validates_rtc_before_recording():
         "xTaskCreate(recorder_base_task,")
     assert app.index("rtc_correction_flush_pending_event(RECORDER_EVENTS_PATH)") < (
         app.index("rtc_correction_init() != ESP_OK", app.index(
-            "action == SHUTDOWN_ARMED_BOOT_NORMAL")))
+            "if (action == SHUTDOWN_ARMED_BOOT_NORMAL &&")))
     # The reused #50 hook must return before any SD audit when !s_pending.
     hook = _source_slice(rtc, "esp_err_t rtc_correction_flush_pending_event(",
                          "#else  // !ESP_PLATFORM")
