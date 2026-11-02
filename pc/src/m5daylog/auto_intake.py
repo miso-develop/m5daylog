@@ -1,9 +1,8 @@
-"""#135 fail-closed, source-only automatic-intake coordination.
+"""#135 fail-closed automatic intake and a gated canonical-release seam.
 
-This module intentionally has no CDC release sender. The existing manual
-sync-release command has no shared durable release-attempt fence, so enabling
-unattended RELEASE_STORAGE here would violate D-031. Arrival providers must
-prove the exact USB_SYNC MSC/CDC session before this code copies any WAV.
+The installed Windows watcher remains intake-only. A future separately
+authorized owner workflow may bind the existing #89/#143 coordinator here;
+this module never issues CDC commands or creates release authority itself.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from pathlib import Path
 from typing import Callable, Iterator, Protocol, Sequence
 
 from .capacity import CapacityResult, CapacityStatus, VerifiedSession, probe_capacity
-from .release import EjectTarget, UsbSessionIoGate
+from .release import EjectTarget, ReleaseOutcome, UsbSessionIoGate
 from .sync import (
     SyncSummary, _contracts_dir, _load_manifest, _preflight, inspect_device,
     sync_device,
@@ -57,7 +56,7 @@ class IntakeResult:
             "copied": self.copied,
             "reused": self.reused,
             "capacity": capacity,
-            "safe_to_leave_usb_connected": False,
+            "safe_to_leave_usb_connected": self.status == "SYNCED_RELEASED",
             "device_shutdown_armed_proven": False,
         }
 
@@ -125,9 +124,15 @@ class IntakeCoordinator:
         preflight: Callable[[str], str] | None = None,
         sync: Callable[[str], SyncSummary] | None = None,
         port_factory: Callable[[], AdmissionPort] | None = None,
+        qualified_release: Callable[
+            [VerifiedSession, Callable[[], str]], ReleaseOutcome
+        ] | None = None,
     ) -> None:
         self.port = port
         self._port_factory = port_factory or (lambda: port)
+        # Must be independently supplied by the approved host/Device release
+        # workflow. An opt-in monitor config is NOT an authorization source.
+        self._qualified_release = qualified_release
         self.capacity_reader = capacity_reader
         self.trusted_device_ids = trusted_device_ids
         self.local_lock_file = Path(local_lock_file)
@@ -213,8 +218,29 @@ class IntakeCoordinator:
                         "RELEASE_BLOCKED", "POST_SYNC_IDENTITY_UNVERIFIED",
                         summary.copied, summary.reused, capacity,
                     )
+                if self._qualified_release is None:
+                    return IntakeResult(
+                        "RELEASE_BLOCKED", "AUTO_RELEASE_NOT_QUALIFIED",
+                        summary.copied, summary.reused, capacity,
+                    )
+                # Same local intake lock excludes a second watcher while the
+                # qualified callback's #143 global lock excludes the CLI and
+                # protects the canonical #89 single sender across restarts.
+                if current_session_epoch() != epoch:
+                    return IntakeResult(
+                        "RELEASE_BLOCKED", "STALE_SESSION",
+                        summary.copied, summary.reused, capacity,
+                    )
+                session_port.revalidate_target(target, binding.cdc_port)
+                outcome = self._qualified_release(binding, current_session_epoch)
+                if (type(outcome) is not ReleaseOutcome or not outcome.success
+                        or outcome.target != target or not outcome.attempt_id):
+                    return IntakeResult(
+                        "RELEASE_BLOCKED", "RELEASE_NOT_CONFIRMED",
+                        summary.copied, summary.reused, capacity,
+                    )
                 return IntakeResult(
-                    "RELEASE_BLOCKED", "AUTO_RELEASE_NOT_QUALIFIED",
+                    "SYNCED_RELEASED", "RELEASED",
                     summary.copied, summary.reused, capacity,
                 )
         except Exception:
