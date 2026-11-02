@@ -194,6 +194,21 @@ class SourceOnlySequenceTests(unittest.TestCase):
         self.assertEqual(self.port.sent, [])
         self.assertFalse(self.fence.database.exists())
 
+    def test_h0_external_verifier_error_cannot_spend_or_send(self):
+        calls = []
+
+        def failing_verifier(*args):
+            calls.append(1)
+            raise RuntimeError("synthetic private evidence unavailable")
+
+        outcome = self.h0_first(verifier=failing_verifier)
+        self.assertEqual(outcome.reason, "PRECONDITION_BLOCKED")
+        self.assertEqual(calls, [1])
+        self.assertEqual(self.port.sent, [])
+        self.assertNotIn("rtc", self.events)
+        self.assertFalse(self.fence.database.exists())
+        self.assertFalse(self.fence.cycles.database.exists())
+
     def test_h0_split_dev_or_r3_commit_never_retries(self):
         for anchor in ("dev", "r3"):
             with self.subTest(anchor=anchor), tempfile.TemporaryDirectory() as d:
