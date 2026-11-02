@@ -17,10 +17,12 @@ import time
 import uuid
 from ctypes import wintypes
 from pathlib import Path
+from typing import Callable
 
 from .auto_intake import Arrival, IntakeCoordinator, PollingMonitor
 from .capacity import VerifiedSession
 from .db import resolve_db_path
+from .release import ReleaseOutcome
 from .sync import _contracts_dir, _load_manifest, _preflight, inspect_device
 from .windows_capacity import WindowsCapacityReader
 from .windows_release import NativeWin32DeviceApi, WindowsHostReleasePort
@@ -266,8 +268,18 @@ def notify_action_required(notice: dict[str, object], *, user32=None) -> None:
         return
 
 
-def run_monitor(*, once: bool = False, output=None) -> int:
-    """Entry point is inert without a pre-existing opt-in file."""
+def run_monitor(
+    *, once: bool = False, output=None,
+    qualified_release: Callable[
+        [VerifiedSession, Callable[[], str]], ReleaseOutcome
+    ] | None = None,
+) -> int:
+    """Opt-in watcher; native release remains OFF in the public CLI.
+
+    The callback is not a permit. Only a separately approved owner-local
+    integration may supply a verifier-backed #89/#143 coordinator; a config
+    file or arrival observation must never enable release by itself.
+    """
     if os.name != "nt":
         return 2
     try:
@@ -287,6 +299,7 @@ def run_monitor(*, once: bool = False, output=None) -> int:
             library_root=Path.home() / "Documents" / "M5Daylog",
             db_path=resolve_db_path(data_dir=str(root.parent)),
             port_factory=lambda: WindowsHostReleasePort(api),
+            qualified_release=qualified_release,
         )
         def report(notice: dict[str, object]) -> None:
             # One bounded, sanitized local status file. Never log the root,
