@@ -504,7 +504,7 @@ class NormalCycleCompositionTests(unittest.TestCase):
         self.port = mock.Mock()
         self.port.contracts_dir = None
         self.reader = mock.Mock()
-        self.fence = mock.Mock()
+        self.fence = mock.MagicMock()
         self.epoch = lambda: self.session.session_epoch
 
     def call(self):
