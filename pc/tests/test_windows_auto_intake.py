@@ -558,7 +558,7 @@ class NormalCycleCompositionTests(unittest.TestCase):
             self.port.set_time.assert_called_once()
             self.assertRegex(
                 self.port.set_time.call_args.args[1],
-                r"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$",
+                r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
             )
             self.assertEqual(capacity.call_count, 1)
 
