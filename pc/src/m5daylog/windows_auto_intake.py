@@ -268,6 +268,91 @@ def notify_action_required(notice: dict[str, object], *, user32=None) -> None:
         return
 
 
+
+def qualified_normal_cycle_release(
+    session: VerifiedSession, current_session_epoch: Callable[[], str], *,
+    api: NativeWin32DeviceApi, port: WindowsHostReleasePort,
+    capacity_reader: WindowsCapacityReader,
+    library_root: Path, db_path: Path,
+) -> ReleaseOutcome:
+    """Compose the existing R3/#89 NORMAL_WAKE path, without issuing authority.
+
+    This is a source-only owner-integration seam, NOT the installed watcher's
+    default callback. In particular, initial DEV enrollment, original-media
+    custody, and physical approval cannot be inferred from opt-in or GET_STATUS.
+    Only a separately authorized caller may bind this after installation.
+    """
+    from datetime import datetime, timezone
+
+    from .capacity import probe_capacity
+    from .dev_install_release_fence import DevInstallReleaseFence
+    from .first_use_admission import CycleOrigin
+    from .release import PreconditionBlocked, SyncReleaseCoordinator
+    from .release_admission_135 import SourceOnlyReleaseSequence
+    from .release_cycle_candidate import inspect_release_cycle_candidate
+    from .sync import sync_device
+
+    if type(session) is not VerifiedSession or not callable(current_session_epoch):
+        raise PreconditionBlocked("normal release session missing")
+
+    target = session.target
+    fence = DevInstallReleaseFence.for_current_user(
+        device_root=Path(target.mount_root),
+    )
+
+    def current_candidate():
+        return inspect_release_cycle_candidate(
+            session=session, port=port, status_reader=api.read_status,
+            current_session_epoch=current_session_epoch,
+            contracts_dir=port.contracts_dir,
+        )
+
+    # Observation alone does not spend an attempt; the canonical sender
+    # performs a fresh source/host check under its own shared lock before RTC.
+    with fence.cycles.serialized():
+        fence.cycles.check_locked(target.expected_device_id)
+        candidate = current_candidate()
+        if candidate.release_cycle_origin is not CycleOrigin.NORMAL_WAKE:
+            raise PreconditionBlocked("normal WAKE origin not established")
+
+    def verify_current_cycle(observed, frozen_target):
+        if frozen_target != target or observed != candidate:
+            return False
+        fence.cycles.check_locked(target.expected_device_id)
+        return current_candidate() == candidate
+
+    def preseal_capacity(frozen_target, gate):
+        if frozen_target != target:
+            return False
+        result = probe_capacity(
+            session, gate=gate, validator=port,
+            reader=capacity_reader, durable_sync_complete=lambda: True,
+            current_session_epoch=current_session_epoch,
+        )
+        return result.release_blocked is False
+
+    sequence = SourceOnlyReleaseSequence(
+        fence=fence, coordinator=SyncReleaseCoordinator(port),
+        session=session,
+        # The canonical #89 coordinator performs its own #51 barrier after
+        # intake, instead of trusting an unbound watcher-success Boolean.
+        sync=lambda: sync_device(
+            target.mount_root, library_root=library_root,
+            db_path=db_path, contracts_dir=port.contracts_dir,
+        ),
+        current_epoch=current_session_epoch,
+        cdc_mutations=lambda: port.set_time(
+            session.cdc_port,
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ),
+        before_seal_observation=preseal_capacity,
+    )
+    return sequence.normal_cycle(
+        candidate=candidate, verify_current_cycle=verify_current_cycle,
+        read_current_status=lambda: api.read_status(session.cdc_port),
+    )
+
+
 def run_monitor(
     *, once: bool = False, output=None,
     qualified_release: Callable[
