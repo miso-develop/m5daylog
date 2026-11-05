@@ -482,6 +482,140 @@ class OutcomeNoticeTests(unittest.TestCase):
             self.assertEqual(ui.MessageBoxW.call_count, 2)
 
 
+class NormalCycleCompositionTests(unittest.TestCase):
+    """No live Win32, filesystem or CDC interaction in these tests."""
+
+    def setUp(self):
+        from m5daylog.capacity import VerifiedSession
+        from m5daylog.first_use_admission import CycleOrigin
+        from m5daylog.release_cycle_candidate import QualifiedCycleCandidate
+
+        self.session = VerifiedSession(TARGET, "COM7", "qualified-epoch")
+        self.candidate = QualifiedCycleCandidate(
+            DEVICE, "00000000-0000-4000-8000-000000000002",
+            CycleOrigin.NORMAL_WAKE, self.session,
+        )
+        self.api = mock.Mock()
+        self.api.read_status.return_value = {
+            "state": "USB_SYNC", "rtcCorrectionPending": False,
+            "releaseCycleId": self.candidate.release_cycle_id,
+            "releaseCycleOrigin": "NORMAL_WAKE",
+        }
+        self.port = mock.Mock()
+        self.port.contracts_dir = None
+        self.reader = mock.Mock()
+        self.fence = mock.Mock()
+        self.epoch = lambda: self.session.session_epoch
+
+    def call(self):
+        from m5daylog.windows_auto_intake import qualified_normal_cycle_release
+        return qualified_normal_cycle_release(
+            self.session, self.epoch, api=self.api, port=self.port,
+            capacity_reader=self.reader, library_root=Path("synthetic-raw"),
+            db_path=Path("synthetic-state.sqlite"),
+        )
+
+    def test_existing_normal_sender_receives_live_host_and_cycle_checks(self):
+        from m5daylog.release import ReleaseOutcome
+        expected = ReleaseOutcome(
+            "SYNC_COMPLETE_RELEASED", "RELEASED", "synthetic-attempt", TARGET
+        )
+        with (
+            mock.patch(
+                "m5daylog.dev_install_release_fence."
+                "DevInstallReleaseFence.for_current_user",
+                return_value=self.fence,
+            ),
+            mock.patch(
+                "m5daylog.release_cycle_candidate."
+                "inspect_release_cycle_candidate",
+                return_value=self.candidate,
+            ) as inspect,
+            mock.patch(
+                "m5daylog.release_admission_135.SourceOnlyReleaseSequence"
+            ) as sequence,
+            mock.patch(
+                "m5daylog.capacity.probe_capacity"
+            ) as capacity,
+        ):
+            capacity.return_value.release_blocked = False
+
+            def run(*, candidate, verify_current_cycle, read_current_status):
+                self.assertEqual(candidate, self.candidate)
+                self.assertTrue(verify_current_cycle(candidate, TARGET))
+                self.assertEqual(read_current_status(), self.api.read_status.return_value)
+                args = sequence.call_args.kwargs
+                args["cdc_mutations"]()
+                self.assertTrue(args["before_seal_observation"](
+                    TARGET, mock.sentinel.io_gate,
+                ))
+                return expected
+
+            sequence.return_value.normal_cycle.side_effect = run
+            self.assertEqual(self.call(), expected)
+            self.assertEqual(self.fence.cycles.check_locked.call_count, 2)
+            self.assertEqual(inspect.call_count, 2)
+            self.port.set_time.assert_called_once()
+            self.assertRegex(
+                self.port.set_time.call_args.args[1],
+                r"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$",
+            )
+            self.assertEqual(capacity.call_count, 1)
+
+    def test_missing_host_continuity_blocks_before_candidate_or_sender(self):
+        from m5daylog.release import PreconditionBlocked
+        self.fence.cycles.check_locked.side_effect = PreconditionBlocked(
+            "missing enrolled release ledger"
+        )
+        with (
+            mock.patch(
+                "m5daylog.dev_install_release_fence."
+                "DevInstallReleaseFence.for_current_user",
+                return_value=self.fence,
+            ),
+            mock.patch(
+                "m5daylog.release_cycle_candidate."
+                "inspect_release_cycle_candidate",
+            ) as inspect,
+            mock.patch(
+                "m5daylog.release_admission_135.SourceOnlyReleaseSequence"
+            ) as sequence,
+        ):
+            with self.assertRaises(PreconditionBlocked):
+                self.call()
+            inspect.assert_not_called()
+            sequence.assert_not_called()
+            self.port.set_time.assert_not_called()
+
+    def test_supervised_first_use_cannot_become_normal_auto_release(self):
+        from m5daylog.first_use_admission import CycleOrigin
+        from m5daylog.release import PreconditionBlocked
+        from m5daylog.release_cycle_candidate import QualifiedCycleCandidate
+        first = QualifiedCycleCandidate(
+            DEVICE, self.candidate.release_cycle_id,
+            CycleOrigin.SUPERVISED_FIRST_USE, self.session,
+        )
+        with (
+            mock.patch(
+                "m5daylog.dev_install_release_fence."
+                "DevInstallReleaseFence.for_current_user",
+                return_value=self.fence,
+            ),
+            mock.patch(
+                "m5daylog.release_cycle_candidate."
+                "inspect_release_cycle_candidate",
+                return_value=first,
+            ),
+            mock.patch(
+                "m5daylog.release_admission_135.SourceOnlyReleaseSequence"
+            ) as sequence,
+        ):
+            with self.assertRaises(PreconditionBlocked):
+                self.call()
+            sequence.assert_not_called()
+            self.port.set_time.assert_not_called()
+
+
 class MonitorReleaseWiringTests(unittest.TestCase):
     """The real public monitor CLI never supplies physical release authority."""
 
