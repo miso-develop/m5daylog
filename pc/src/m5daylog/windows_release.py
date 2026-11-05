@@ -646,7 +646,8 @@ class NativeWin32DeviceApi:
             else:
                 raise ReleaseIndeterminate("CDC response deadline or length exceeded")
             try:
-                obj = json.loads(reply.decode("utf-8"))
+                obj = json.loads(reply.decode("utf-8"),
+                                 object_pairs_hook=_unique_json_object)
                 if obj.get("id") == request_id and obj.get("ok") is False:
                     raise ReleaseRejected("CDC release rejected")
                 result = obj["result"]
@@ -791,7 +792,8 @@ class NativeWin32DeviceApi:
             else:
                 raise ReleaseIndeterminate("RTC CDC response incomplete")
             try:
-                response = json.loads(reply.decode("utf-8"))
+                response = json.loads(reply.decode("utf-8"),
+                                 object_pairs_hook=_unique_json_object)
             except (ValueError, UnicodeError):
                 raise ReleaseIndeterminate("RTC CDC response malformed") from None
             if not isinstance(response, dict) or response.get("id") != request_id:
