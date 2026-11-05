@@ -1,0 +1,430 @@
+"""#135/#147 source-only composition of the canonical #89 release coordinator.
+
+No CLI/watcher/Device caller imports this adapter. It is NOT a release permit,
+external proof issuer, or Human Gate result. Injected callbacks are NOT
+authentication; a future authorized integration must independently qualify
+their backing evidence before enabling any real Windows/USB sender.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Mapping
+
+from .capacity import VerifiedSession
+from .dev_install_release_fence import DevInstallReceipt, DevInstallReleaseFence
+from .first_use_admission import CycleOrigin
+from .release import (
+    EjectTarget, ObservationFn, PreconditionBlocked, ReleaseOutcome,
+    SyncFn, SyncReleaseCoordinator, UsbSessionIoGate,
+)
+from .release_cycle_candidate import QualifiedCycleCandidate
+
+ExternalDevProof = Callable[[DevInstallReceipt, VerifiedSession, EjectTarget], bool]
+ExternalWakeProof = Callable[
+    [DevInstallReceipt, Mapping[str, object], VerifiedSession, EjectTarget], bool
+]
+ExternalNormalProof = Callable[[QualifiedCycleCandidate, EjectTarget], bool]
+
+
+@dataclass(frozen=True, repr=False)
+class Sdb14RiskDecision:
+    """One-generation Option B evidence reference, never a release permit.
+
+    The recorded owner decision is independently verified by the caller;
+    neither this descriptor nor the GitHub risk decision approves P0/P1.
+    Binding to the entire DEV receipt prevents a scoped approval from being
+    reused for another device, card, Windows profile, image, or attempt.
+    """
+
+    approval_record_digest: str
+    bound_receipt_fingerprint: str
+    admission: str = "H0_PRESENCE_CLEAR_HISTORY_UNKNOWN"
+
+    def matches(self, receipt: DevInstallReceipt) -> bool:
+        def digest(value: object) -> bool:
+            return (type(value) is str and len(value) == 64
+                    and all(ch in "0123456789abcdef" for ch in value))
+
+        return (type(receipt) is DevInstallReceipt
+                and self.admission == "H0_PRESENCE_CLEAR_HISTORY_UNKNOWN"
+                and digest(self.approval_record_digest)
+                and digest(self.bound_receipt_fingerprint)
+                and self.bound_receipt_fingerprint == receipt.fingerprint())
+
+
+@dataclass
+class SourceOnlyReleaseSequence:
+    """Two distinct first-use consumptions plus later R3 cycles, one #89 sender.
+
+    The same R3 cooperating OS lock spans the entire canonical coordinator
+    call, including RTC, volume lock/dismount, CDC and disappearance. All
+    invocations in v0.1 are TEST-ONLY fake ports. No public entrypoint uses it.
+    """
+
+    fence: DevInstallReleaseFence
+    coordinator: SyncReleaseCoordinator
+    session: VerifiedSession
+    sync: SyncFn
+    current_epoch: Callable[[], str]
+    cdc_mutations: Callable[[], None]
+    before_seal_observation: ObservationFn
+
+    def _target(self, target: EjectTarget) -> None:
+        if (type(self.session) is not VerifiedSession
+                or type(target) is not EjectTarget
+                or target != self.session.target
+                or not self.session.cdc_port
+                or not self.session.session_epoch
+                or self.current_epoch() != self.session.session_epoch):
+            raise PreconditionBlocked("release target or session changed")
+
+    def _check_inputs(self) -> None:
+        if (not isinstance(self.fence, DevInstallReleaseFence)
+                or not isinstance(self.coordinator, SyncReleaseCoordinator)
+                or not callable(self.sync)
+                or not callable(self.current_epoch)
+                or not callable(self.cdc_mutations)
+                or not callable(self.before_seal_observation)):
+            raise PreconditionBlocked("release admission inputs unavailable")
+        self._target(self.session.target)
+
+    def _run(
+        self, *,
+        reserve: Callable[[str, EjectTarget], None],
+        verify: Callable[[str, EjectTarget], None],
+        fixed_attempt: str | None = None,
+        after_mutation_check: Callable[[EjectTarget], None] | None = None,
+    ) -> ReleaseOutcome:
+        self._check_inputs()
+
+        def before_seal(target: EjectTarget, gate: UsbSessionIoGate) -> bool:
+            self._target(target)
+            if self.before_seal_observation(target, gate) is not True:
+                return False
+            self._target(target)
+            # The frozen R5 pair must be the LAST ordinary pre-seal
+            # observation. A prior check cannot cover an MSC/capacity
+            # observation that races with a Device cycle/ownership change.
+            # Keep ordinary CDC admission open here; never read after seal.
+            if after_mutation_check is not None:
+                with gate.ordinary("cdc"):
+                    after_mutation_check(target)
+                self._target(target)
+            return True
+
+        with self.fence.cycles.serialized():
+            # Never create a second sender or a lock scoped only to CDC.
+            return self.coordinator.run(
+                mount_root=self.session.target.mount_root,
+                cdc_port=self.session.cdc_port,
+                device_id=lambda: self.session.target.expected_device_id,
+                sync=self.sync, gate=UsbSessionIoGate(),
+                cdc_mutations=self.cdc_mutations,
+                before_cdc_mutations=reserve,
+                before_seal_observation=before_seal,
+                before_release_send=verify,
+                release_attempt_id=fixed_attempt,
+            )
+
+    def dev_first_release(
+        self, *, receipt: DevInstallReceipt,
+        verify_external: ExternalDevProof,
+    ) -> ReleaseOutcome:
+        """FI2-I2: consume the generation-bound FIRST permit before RTC/CDC."""
+        self._check_inputs()
+        if (type(receipt) is not DevInstallReceipt
+                or receipt.device_id != self.session.target.expected_device_id
+                or not callable(verify_external)):
+            raise PreconditionBlocked("DEV initial-release evidence missing")
+
+        def reserve(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            if attempt != receipt.first_release_attempt_id:
+                raise PreconditionBlocked("DEV first-release attempt mismatch")
+            self.fence.consume_locked(
+                receipt, verify_external=lambda r:
+                verify_external(r, self.session, target) is True,
+            )
+
+        def verify(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            if attempt != receipt.first_release_attempt_id:
+                raise PreconditionBlocked("DEV first-release attempt mismatch")
+            self.fence.verify_consumed_locked(receipt)
+
+        return self._run(
+            reserve=reserve, verify=verify,
+            fixed_attempt=receipt.first_release_attempt_id,
+        )
+
+    def h0_first_recording_release(
+        self, *, receipt: DevInstallReceipt,
+        candidate: QualifiedCycleCandidate,
+        read_current_status: Callable[[], Mapping[str, object]],
+        verify_external: Callable[
+            [DevInstallReceipt, QualifiedCycleCandidate, Mapping[str, object],
+             VerifiedSession, EjectTarget], bool
+        ],
+        risk_decision: Sdb14RiskDecision,
+        verify_risk_decision: Callable[
+            [Sdb14RiskDecision, DevInstallReceipt, VerifiedSession, EjectTarget], bool
+        ],
+    ) -> ReleaseOutcome:
+        """SDB-1.4: consume DEV and first R3 seq=1 before any CDC mutation.
+
+        SDB-1.4 changes only the affirmative never-R3-history prerequisite.
+        A separate approved one-generation B risk record is mandatory; its
+        descriptor is not a credential and must be independently verified.
+        The external verifier must establish absent present-day R3/DEV stores,
+        aliases/sidecars and old writers/senders for the exact user/profile,
+        plus separately approved P0/P1 and current Device evidence. It must
+        not misrepresent a historical-unknown host as proven never-enrolled.
+        Distinct exact-target P0/P1 grants, current installed Device,
+        GPIO/NVS first boot, real finalized PCM/RTC and #51 SYNCED remain
+        independently required. A fake
+        callback or the GET_STATUS pair is never permission for a live sender.
+        This source-only seam must not be connected to CLI/watch until that
+        verifier and separately approved physical gates exist.
+        """
+        self._check_inputs()
+        if (type(receipt) is not DevInstallReceipt
+                or type(candidate) is not QualifiedCycleCandidate
+                or candidate.release_cycle_origin is not CycleOrigin.SUPERVISED_FIRST_USE
+                or candidate.binding != self.session
+                or candidate.device_id != receipt.device_id
+                or candidate.device_id != self.session.target.expected_device_id
+                or not callable(read_current_status)
+                or not callable(verify_external)
+                or type(risk_decision) is not Sdb14RiskDecision
+                or not callable(verify_risk_decision)
+                or not risk_decision.matches(receipt)):
+            raise PreconditionBlocked("SDB-1.4 bounded risk decision unavailable")
+        cycle = candidate.release_cycle_id
+
+        def current_pair(target: EjectTarget) -> Mapping[str, object]:
+            self._target(target)
+            try:
+                status = read_current_status()
+            except Exception:
+                raise PreconditionBlocked("H0 current status unavailable") from None
+            if (not isinstance(status, Mapping)
+                    or status.get("state") != "USB_SYNC"
+                    or status.get("releaseCycleId") != cycle
+                    or status.get("releaseCycleOrigin") != "SUPERVISED_FIRST_USE"
+                    or type(status.get("rtcCorrectionPending")) is not bool):
+                raise PreconditionBlocked("H0 current origin/cycle invalid")
+            self._target(target)
+            return status
+
+        def reserve(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            if attempt != receipt.first_release_attempt_id:
+                raise PreconditionBlocked("H0 attempt mismatch")
+            status = current_pair(target)
+            # Verify external owner authority at the actual one-shot writer,
+            # not via a tautological receipt-equality callback.
+            def approved(r: DevInstallReceipt) -> bool:
+                try:
+                    # The owner's B approval and the P0/P1/current-device
+                    # authorization are distinct checks. Both must succeed
+                    # inside the same OS lock BEFORE irreversible DEV consume.
+                    if verify_risk_decision(
+                        risk_decision, r, self.session, target
+                    ) is not True:
+                        return False
+                    return verify_external(
+                        r, candidate, status, self.session, target
+                    ) is True
+                except Exception:
+                    raise PreconditionBlocked("SDB-1.4 independent proof unavailable") from None
+            self.fence.consume_locked(
+                receipt, verify_external=approved,
+            )
+            # No *current* R3 V1 tuple may exist at admission. Historical
+            # enrollment is UNKNOWN and separately risk-accepted; never
+            # reconstruct or assert an old chain. Consume new seq=1 directly.
+            self.fence.cycles.initialize_first_cycle_locked(
+                receipt.device_id, cycle, attempt,
+            )
+            self.fence.verify_consumed_locked(receipt)
+            self.fence.cycles.verify_reserved_locked(
+                receipt.device_id, cycle, attempt,
+            )
+
+        def verify(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            if attempt != receipt.first_release_attempt_id:
+                raise PreconditionBlocked("H0 attempt mismatch")
+            self.fence.verify_consumed_locked(receipt)
+            self.fence.cycles.verify_reserved_locked(
+                receipt.device_id, cycle, attempt,
+            )
+
+        return self._run(
+            reserve=reserve, verify=verify,
+            fixed_attempt=receipt.first_release_attempt_id,
+            after_mutation_check=lambda target: current_pair(target),
+        )
+
+    def dev_generation_first_release(
+        self, *, receipt: DevInstallReceipt, previous_device_id: str,
+        candidate: QualifiedCycleCandidate,
+        read_current_status: Callable[[], Mapping[str, object]],
+        verify_external: Callable[
+            [DevInstallReceipt, QualifiedCycleCandidate, Mapping[str, object],
+             VerifiedSession, EjectTarget], bool
+        ],
+    ) -> ReleaseOutcome:
+        """SDB-1.1 initial REAL recording boot, not a post-release WAKE.
+
+        Source-only seam; no CLI/watch caller enables or qualifies this path.
+        A live, atomic-pair GET_STATUS implementation is mandatory and its
+        JSON alone is not proof of release authority.
+        """
+        self._check_inputs()
+        if (type(receipt) is not DevInstallReceipt
+                or type(candidate) is not QualifiedCycleCandidate
+                or candidate.release_cycle_origin is not CycleOrigin.SUPERVISED_FIRST_USE
+                or candidate.binding != self.session
+                or candidate.device_id != receipt.device_id
+                or candidate.device_id != self.session.target.expected_device_id
+                or not isinstance(previous_device_id, str)
+                or not callable(read_current_status)
+                or not callable(verify_external)):
+            raise PreconditionBlocked("DEV generation initial cycle unqualified")
+        live_cycle = candidate.release_cycle_id
+
+        def current_pair(target: EjectTarget) -> Mapping[str, object]:
+            # Frozen GET_STATUS pairing is necessary, not an external
+            # qualification of the real Device boot, RTC or PCM evidence.
+            self._target(target)
+            try:
+                status = read_current_status()
+            except Exception:
+                raise PreconditionBlocked("DEV current status unavailable") from None
+            if (not isinstance(status, Mapping)
+                    or status.get("releaseCycleId") != live_cycle
+                    or status.get("releaseCycleOrigin") != "SUPERVISED_FIRST_USE"
+                    or status.get("state") != "USB_SYNC"
+                    or type(status.get("rtcCorrectionPending")) is not bool):
+                raise PreconditionBlocked("DEV current atomic pair invalid")
+            self._target(target)
+            return status
+
+        def reserve(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            if attempt != receipt.first_release_attempt_id:
+                raise PreconditionBlocked("DEV generation attempt mismatch")
+            # Inside shared lock, after #51 sync and before irreversible RTC.
+            status = current_pair(target)
+            self.fence.consume_new_generation_locked(
+                receipt, previous_device_id=previous_device_id, status=status,
+                verify_external=lambda r, s: verify_external(
+                    r, candidate, s, self.session, target
+                ) is True,
+            )
+
+        def verify(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            if attempt != receipt.first_release_attempt_id:
+                raise PreconditionBlocked("DEV generation attempt mismatch")
+            self.fence.verify_consumed_locked(receipt, generation=True)
+            self.fence.cycles.verify_dev_generation_locked(
+                receipt.device_id, receipt.generation_id,
+                receipt.external_permit_digest, live_cycle, attempt,
+            )
+
+        return self._run(
+            reserve=reserve, verify=verify,
+            fixed_attempt=receipt.first_release_attempt_id,
+            # Failed/changed post-RTC status burns the attempt, never sends.
+            # A pending RTC audit bit may stay true if independently qualified.
+            after_mutation_check=lambda target: current_pair(target),
+        )
+
+    def first_supervised_cycle(
+        self, *, receipt: DevInstallReceipt,
+        candidate: QualifiedCycleCandidate,
+        status: Mapping[str, object],
+        verify_first_wake: ExternalWakeProof,
+    ) -> ReleaseOutcome:
+        """FI2-I3: independently verified first WAKE, then distinct R3 tuple."""
+        self._check_inputs()
+        if (type(receipt) is not DevInstallReceipt
+                or type(candidate) is not QualifiedCycleCandidate
+                or candidate.release_cycle_origin is not CycleOrigin.SUPERVISED_FIRST_USE
+                or candidate.binding != self.session
+                or candidate.device_id != receipt.device_id
+                or candidate.device_id != self.session.target.expected_device_id
+                or not isinstance(status, Mapping)
+                or status.get("releaseCycleId") != candidate.release_cycle_id
+                or status.get("releaseCycleOrigin") != "SUPERVISED_FIRST_USE"
+                or not callable(verify_first_wake)):
+            raise PreconditionBlocked("first supervised cycle unqualified")
+
+        def reserve(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            self.fence.initialize_first_dev_cycle_locked(
+                receipt, status=status, cycle_attempt_id=attempt,
+                verify_first_wake=lambda r, s:
+                verify_first_wake(r, s, self.session, target) is True,
+            )
+
+        def verify(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            self.fence.verify_consumed_locked(receipt)
+            self.fence.cycles.verify_reserved_locked(
+                candidate.device_id, candidate.release_cycle_id, attempt,
+            )
+
+        return self._run(reserve=reserve, verify=verify)
+
+    def normal_cycle(
+        self, *, candidate: QualifiedCycleCandidate,
+        verify_current_cycle: ExternalNormalProof,
+        read_current_status: Callable[[], Mapping[str, object]],
+    ) -> ReleaseOutcome:
+        """R3 enrolled NORMAL_WAKE. DEV first-use evidence is not reusable."""
+        self._check_inputs()
+        if (type(candidate) is not QualifiedCycleCandidate
+                or candidate.release_cycle_origin is not CycleOrigin.NORMAL_WAKE
+                or candidate.binding != self.session
+                or candidate.device_id != self.session.target.expected_device_id
+                or not callable(verify_current_cycle)
+                or not callable(read_current_status)):
+            raise PreconditionBlocked("normal release cycle unqualified")
+
+        def current_pair(target: EjectTarget) -> Mapping[str, object]:
+            self._target(target)
+            try:
+                status = read_current_status()
+            except Exception:
+                raise PreconditionBlocked("NORMAL current status unavailable") from None
+            if (not isinstance(status, Mapping)
+                    or status.get("state") != "USB_SYNC"
+                    or status.get("releaseCycleId") != candidate.release_cycle_id
+                    or status.get("releaseCycleOrigin") != "NORMAL_WAKE"
+                    or type(status.get("rtcCorrectionPending")) is not bool):
+                raise PreconditionBlocked("NORMAL frozen origin/cycle invalid")
+            self._target(target)
+            return status
+
+        def reserve(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            current_pair(target)
+            if verify_current_cycle(candidate, target) is not True:
+                raise PreconditionBlocked("current cycle external proof missing")
+            self.fence.cycles.reserve_locked(
+                candidate.device_id, candidate.release_cycle_id, attempt,
+            )
+
+        def verify(attempt: str, target: EjectTarget) -> None:
+            self._target(target)
+            self.fence.cycles.verify_reserved_locked(
+                candidate.device_id, candidate.release_cycle_id, attempt,
+            )
+
+        return self._run(
+            reserve=reserve, verify=verify,
+            after_mutation_check=lambda target: current_pair(target),
+        )

@@ -1,0 +1,683 @@
+"""#135 Windows observer and opt-in tests with synthetic Win32 ports only."""
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from m5daylog.auto_intake import IntakeResult, PollingMonitor
+from m5daylog.windows_auto_intake import (
+    WindowsArrivalProvider, enumerate_com_ports, read_opt_in,
+    notify_action_required, run_monitor, main,
+)
+from m5daylog.windows_release import CdcInterface
+from m5daylog.release import EjectTarget
+
+DEVICE = "00000000-0000-4000-8000-000000000135"
+TARGET = EjectTarget(
+    DEVICE, "E:\\", "\\\\?\\Volume{00000000-0000-0000-0000-000000000135}\\",
+    1, "disk", "removable", "parent",
+)
+
+
+class StubWin32:
+    def __init__(self):
+        self.calls = []
+        self.mapping = {
+            "COM7": CdcInterface("synthetic-path", "cdc7", "parent"),
+            "COM8": CdcInterface("other-path", "cdc8", "other-parent"),
+        }
+
+    def cdc_interface(self, name):
+        self.calls.append(name)
+        if name not in self.mapping:
+            raise OSError("no such synthetic port")
+        return self.mapping[name]
+
+
+class StubReleasePort:
+    contracts_dir = None
+
+    def __init__(self):
+        self.calls = []
+        self.present = True
+
+    def resolve_target(self, root, device_id):
+        self.calls.append("resolve")
+        if root != "E:\\" or device_id != DEVICE:
+            raise ValueError("wrong root")
+        return TARGET
+
+    def revalidate_target(self, target, cdc):
+        self.calls.append("revalidate")
+        if target != TARGET or cdc != "COM7":
+            raise ValueError("wrong CDC")
+
+    def volume_available(self, target):
+        self.calls.append("available")
+        return self.present
+
+
+class SyntheticSerialRegistry:
+    """Fake Win32 EnumValue with explicit EOF, partial I/O errors and a cap."""
+
+    HKEY_LOCAL_MACHINE = object()
+
+    def __init__(self, values):
+        self.values = list(values)
+        self.fail_at = None
+        self.fail_winerror = 5
+
+    def OpenKey(self, hive, path):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def EnumValue(self, key, index):
+        if index == self.fail_at:
+            error = OSError("synthetic non-EOF registry error")
+            error.winerror = self.fail_winerror
+            raise error
+        if index >= len(self.values):
+            error = OSError("synthetic end of registry enumeration")
+            error.winerror = 259  # ERROR_NO_MORE_ITEMS
+            raise error
+        return (f"serial{index}", self.values[index], 1)
+
+
+class RecordingIntake:
+    def __init__(self):
+        self.sessions = []
+
+    def _authorized(self, arrival):
+        return arrival.usb_sync_confirmed
+
+    def intake(self, arrival, *, current_session_epoch):
+        self.sessions.append((
+            arrival.binding.session_epoch, current_session_epoch(),
+        ))
+        return IntakeResult("RELEASE_BLOCKED", "AUTO_RELEASE_NOT_QUALIFIED")
+
+
+class ProviderTests(unittest.TestCase):
+    def setUp(self):
+        self.api = StubWin32()
+        self.port = StubReleasePort()
+        self.status = {"state": "USB_SYNC", "rtcCorrectionPending": False}
+        self.device_id = DEVICE
+        self.coms = ["COM7", "COM8"]
+        self.provider = WindowsArrivalProvider(
+            trusted=frozenset({DEVICE}), api=self.api, port=self.port,
+            roots=lambda: ["E:\\"], ports=lambda: self.coms,
+            status=lambda com: dict(self.status),
+            preflight=lambda root: self.device_id,
+        )
+
+    def test_one_authorized_exact_session_and_stable_epoch(self):
+        first = self.provider.scan()
+        second = self.provider.scan()
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0].binding.target, TARGET)
+        self.assertTrue(first[0].usb_sync_confirmed)
+        self.assertEqual(first[0].binding.session_epoch,
+                         second[0].binding.session_epoch)
+        self.assertEqual(self.provider.current_epoch(),
+                         first[0].binding.session_epoch)
+
+    def test_unknown_device_and_non_usb_sync_never_emits_arrival(self):
+        self.device_id = "untrusted"
+        self.assertEqual(self.provider.scan(), [])
+        self.assertEqual(self.port.calls, [])
+        self.device_id = DEVICE
+        for bad in ("RECORDING", "SHUTDOWN_ARMED", "HOST_UNRESOLVED", None):
+            with self.subTest(state=bad):
+                self.status["state"] = bad
+                self.assertEqual(self.provider.scan(), [])
+
+    def test_ambiguous_cdc_binding_or_missing_target_denied(self):
+        self.api.mapping["COM8"] = CdcInterface("synthetic-second", "cdc8", "parent")
+        self.assertEqual(self.provider.scan(), [])
+        self.api.mapping["COM8"] = CdcInterface("synthetic-second", "cdc8", "other-parent")
+        self.port.present = False
+        self.assertEqual(self.provider.scan(), [])
+
+    def test_new_r5_cycle_rearms_same_usb_parent_without_observed_gap(self):
+        # The Device may complete an entire detach/reboot/re-attach interval
+        # between two polls. Windows can reuse the same GUID, parent and COM.
+        # A new frozen recording cycle must get a new monitor epoch, or the
+        # prior PollingMonitor._handled suppresses the next day's raw intake.
+        coordinator = RecordingIntake()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        first_cycle = "aaaaaaaa-0000-4000-8000-000000000001"
+        next_cycle = "aaaaaaaa-0000-4000-8000-000000000002"
+        self.status.update(
+            releaseCycleId=first_cycle,
+            releaseCycleOrigin="SUPERVISED_FIRST_USE",
+        )
+        monitor.poll_once()
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+        first_epoch = coordinator.sessions[0][0]
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+
+        # No intervening scan reports absence and the host topology is
+        # unchanged. The R5 cycle/origin pair is the only changed witness.
+        self.status.update(
+            releaseCycleId=next_cycle, releaseCycleOrigin="NORMAL_WAKE",
+        )
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+        second_epoch = self.provider.current_epoch()
+        self.assertNotEqual(first_epoch, second_epoch)
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 2)
+        self.assertEqual(coordinator.sessions[-1], (second_epoch, second_epoch))
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 2)
+        self.assertTrue(all(
+            notice["safe_to_leave_usb_connected"] is False for notice in notices
+        ))
+        self.assertTrue(all(
+            notice["sync_release"] != "SYNCED_RELEASED" for notice in notices
+        ))
+
+    def test_unqualified_pair_never_becomes_release_authority(self):
+        # Intake remains compatible with an origin-unaware read-only status.
+        # The optional R5 pair is used only to invalidate an old intake epoch.
+        self.status.update(
+            releaseCycleId="aaaaaaaa-0000-4000-8000-000000000003",
+            releaseCycleOrigin="NORMAL_WAKE",
+        )
+        initial = self.provider.scan()[0].binding.session_epoch
+        self.status["releaseCycleOrigin"] = "UNKNOWN"
+        fallback = self.provider.scan()[0].binding.session_epoch
+        self.assertNotEqual(initial, fallback)
+        self.assertEqual(fallback, self.provider.scan()[0].binding.session_epoch)
+        self.assertNotEqual(self.provider.current_epoch(), initial)
+        self.status["releaseCycleOrigin"] = "NORMAL_WAKE"
+        restored = self.provider.scan()[0].binding.session_epoch
+        self.assertNotEqual(fallback, restored)
+        self.assertEqual(self.provider.scan()[0].binding.session_epoch, restored)
+
+    def test_disappearance_invalidates_epoch(self):
+        earlier = self.provider.scan()[0].binding.session_epoch
+        self.status["state"] = "RECORDING"
+        self.assertEqual(self.provider.scan(), [])
+        self.status["state"] = "USB_SYNC"
+        later = self.provider.scan()[0].binding.session_epoch
+        self.assertNotEqual(earlier, later)
+
+    def test_enumeration_failure_revokes_epoch_before_polling_recovery(self):
+        # Real Provider.scan + PollingMonitor.poll_once path, with synthetic
+        # Windows endpoints only. No physical USB/CDC or release sender.
+        class Coordinator:
+            def __init__(self):
+                self.sessions = []
+
+            def _authorized(self, arrival):
+                return arrival.usb_sync_confirmed
+
+            def intake(self, arrival, *, current_session_epoch):
+                self.sessions.append((
+                    arrival.binding.session_epoch, current_session_epoch(),
+                ))
+                return IntakeResult("RELEASE_BLOCKED", "AUTO_RELEASE_NOT_QUALIFIED")
+
+        coordinator = Coordinator()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        monitor.poll_once()
+        self.assertEqual(coordinator.sessions, [])
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+        initial_epoch = coordinator.sessions[-1][0]
+
+        # COM enumeration failure must not preserve an old observer epoch,
+        # even when every PnP/mount key appears identical on the next scan.
+        def fail_ports():
+            raise OSError("synthetic serial enumeration failure")
+
+        self.provider.ports = fail_ports
+        monitor.poll_once()
+        self.assertEqual(self.provider.current_epoch(), "")
+        self.assertEqual(len(coordinator.sessions), 1)
+        self.provider.ports = lambda: list(self.coms)
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 1)
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 2)
+        after_ports = coordinator.sessions[-1][0]
+        self.assertNotEqual(initial_epoch, after_ports)
+
+        # A drive iterator may fail after yielding a plausible first root.
+        # Its partial enumeration must not retain or reissue an old epoch.
+        def fail_roots():
+            yield "E:\\"
+            raise OSError("synthetic removable-root enumeration failure")
+
+        self.provider.roots = fail_roots
+        monitor.poll_once()
+        self.assertEqual(self.provider.current_epoch(), "")
+        self.assertEqual(len(coordinator.sessions), 2)
+        self.provider.roots = lambda: ["E:\\"]
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 2)
+        monitor.poll_once()
+        self.assertEqual(len(coordinator.sessions), 3)
+        self.assertNotEqual(after_ports, coordinator.sessions[-1][0])
+        self.assertTrue(all(stored == current for stored, current in coordinator.sessions))
+        self.assertTrue(all(n["safe_to_leave_usb_connected"] is False
+                            for n in notices))
+        self.assertIn(
+            "ARRIVAL_OBSERVATION_ERROR",
+            [n["reason"] for n in notices],
+        )
+
+    def test_actual_registry_partial_failure_denies_ambiguous_binding_and_rearms(self):
+        # Exercise the production EnumValue -> Provider.scan -> Monitor path.
+        # A partial COM list must never make two same-parent CDCs look unique.
+        registry = SyntheticSerialRegistry(["COM7", "COM8"])
+        self.provider.ports = enumerate_com_ports
+        coordinator = RecordingIntake()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        with mock.patch.dict(sys.modules, {"winreg": registry}):
+            monitor.poll_once()
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            old_epoch = coordinator.sessions[-1][0]
+
+            self.api.mapping["COM8"] = CdcInterface(
+                "synthetic-second", "cdc8", "parent",
+            )
+            registry.fail_at = 1  # COM7 returned; COM8 hidden by WinError 5
+            monitor.poll_once()
+            self.assertEqual(self.provider.current_epoch(), "")
+            self.assertEqual(len(coordinator.sessions), 1)
+            self.assertEqual(notices[-1]["reason"], "ARRIVAL_OBSERVATION_ERROR")
+
+            registry.fail_at = None  # complete, genuinely ambiguous enumeration
+            monitor.poll_once()
+            self.assertEqual(self.provider.current_epoch(), "")
+            self.assertEqual(len(coordinator.sessions), 1)
+
+            self.api.mapping["COM8"] = CdcInterface(
+                "other-path", "cdc8", "other-parent",
+            )
+            monitor.poll_once()  # only the first stable recovered observation
+            self.assertEqual(len(coordinator.sessions), 1)
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 2)
+            self.assertNotEqual(old_epoch, coordinator.sessions[-1][0])
+        self.assertTrue(all(
+            stored == current for stored, current in coordinator.sessions
+        ))
+        self.assertTrue(all(
+            notice["safe_to_leave_usb_connected"] is False
+            for notice in notices
+        ))
+
+    def test_actual_registry_cap_requires_eof_not_a_truncated_subset(self):
+        registry = SyntheticSerialRegistry(["COM7", "COM8"])
+        self.provider.ports = enumerate_com_ports
+        coordinator = RecordingIntake()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        with mock.patch.dict(sys.modules, {"winreg": registry}):
+            self.assertEqual(enumerate_com_ports(), ["COM7", "COM8"])
+            monitor.poll_once()
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            old_epoch = coordinator.sessions[-1][0]
+
+            registry.values = ["COM7"] + ["COM8"] * 128
+            monitor.poll_once()  # 129th registry entry proves the cap truncates
+            self.assertEqual(self.provider.current_epoch(), "")
+            self.assertEqual(len(coordinator.sessions), 1)
+            self.assertEqual(notices[-1]["reason"], "ARRIVAL_OBSERVATION_ERROR")
+
+            registry.values = ["COM7"] + ["COM8"] * 127
+            self.assertEqual(enumerate_com_ports(), ["COM7", "COM8"])
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 2)
+            self.assertNotEqual(old_epoch, coordinator.sessions[-1][0])
+        self.assertTrue(all(
+            notice["safe_to_leave_usb_connected"] is False
+            for notice in notices
+        ))
+
+    def test_unresolved_com_parent_blocks_even_with_complete_registry_list(self):
+        # The registry enumerator completes, but COM8's parent is unknown.
+        # A successful COM7 mapping alone cannot prove one same-parent CDC.
+        registry = SyntheticSerialRegistry(["COM7", "COM8"])
+        self.provider.ports = enumerate_com_ports
+        self.api.mapping["COM8"] = CdcInterface(
+            "synthetic-second", "cdc8", "parent",
+        )
+        coordinator = RecordingIntake()
+        notices = []
+        monitor = PollingMonitor(
+            self.provider, coordinator, self.provider.current_epoch,
+            notices.append,
+        )
+        actual_lookup = self.api.cdc_interface
+
+        def fail_com8(com):
+            if com == "COM8":
+                raise OSError("synthetic SetupAPI parent-resolution failure")
+            return actual_lookup(com)
+
+        with mock.patch.dict(sys.modules, {"winreg": registry}):
+            with mock.patch.object(self.api, "cdc_interface", side_effect=fail_com8):
+                monitor.poll_once()
+                monitor.poll_once()
+                self.assertEqual(coordinator.sessions, [])
+                self.assertEqual(self.provider.current_epoch(), "")
+                self.assertTrue(all(
+                    n["reason"] == "ARRIVAL_OBSERVATION_ERROR"
+                    for n in notices
+                ))
+
+            # Full resolution exposes actual same-parent ambiguity, still denied.
+            monitor.poll_once()
+            self.assertEqual(coordinator.sessions, [])
+            self.assertEqual(self.provider.current_epoch(), "")
+
+            # Even a returned endpoint with unknown parent must not qualify.
+            self.api.mapping["COM8"] = CdcInterface(
+                "synthetic-second", "cdc8", "",
+            )
+            monitor.poll_once()
+            self.assertEqual(coordinator.sessions, [])
+            self.assertEqual(self.provider.current_epoch(), "")
+            self.assertEqual(notices[-1]["reason"], "ARRIVAL_OBSERVATION_ERROR")
+
+            # A fully resolved unrelated COM8 makes the ordinary target unique.
+            self.api.mapping["COM8"] = CdcInterface(
+                "unrelated-path", "cdc8", "other-parent",
+            )
+            monitor.poll_once()
+            self.assertEqual(coordinator.sessions, [])
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            first_epoch = coordinator.sessions[-1][0]
+
+            # Failure after a handled arrival revokes the epoch and requires a
+            # fresh two-scan admission, rather than retaining old admission.
+            with mock.patch.object(self.api, "cdc_interface", side_effect=fail_com8):
+                monitor.poll_once()
+                self.assertEqual(len(coordinator.sessions), 1)
+                self.assertEqual(self.provider.current_epoch(), "")
+                self.assertEqual(notices[-1]["reason"], "ARRIVAL_OBSERVATION_ERROR")
+
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 1)
+            monitor.poll_once()
+            self.assertEqual(len(coordinator.sessions), 2)
+            self.assertNotEqual(first_epoch, coordinator.sessions[-1][0])
+        self.assertTrue(all(
+            stored == current for stored, current in coordinator.sessions
+        ))
+        self.assertTrue(all(
+            n["safe_to_leave_usb_connected"] is False for n in notices
+        ))
+
+    def test_invalid_status_response_does_not_admit(self):
+        for value in (None, {}, {"state": "USB_SYNC"}, {"state": "USB_SYNC",
+                        "rtcCorrectionPending": "false"}):
+            with self.subTest(value=value):
+                self.provider.status = lambda name, value=value: value
+                self.assertEqual(self.provider.scan(), [])
+
+
+class OutcomeNoticeTests(unittest.TestCase):
+    def test_release_success_and_uncertainty_are_distinct_local_notices(self):
+        from types import SimpleNamespace
+
+        ui = SimpleNamespace(MessageBoxW=mock.Mock(return_value=1))
+        with mock.patch("m5daylog.windows_auto_intake.os.name", "nt"):
+            notify_action_required({
+                "sync_release": "SYNCED_RELEASED",
+                "safe_to_leave_usb_connected": True,
+            }, user32=ui)
+            self.assertEqual(ui.MessageBoxW.call_count, 1)
+            self.assertIn("USB release succeeded", ui.MessageBoxW.call_args.args[1])
+            self.assertIn("not been independently verified",
+                          ui.MessageBoxW.call_args.args[1])
+
+            notify_action_required({
+                "sync_release": "RELEASE_BLOCKED",
+                "reason": "RELEASE_NOT_CONFIRMED",
+            }, user32=ui)
+            self.assertEqual(ui.MessageBoxW.call_count, 2)
+            self.assertIn("not proven", ui.MessageBoxW.call_args.args[1])
+            self.assertNotIn("safe to unplug", ui.MessageBoxW.call_args.args[1])
+
+            notify_action_required({
+                "sync_release": "SYNCED_RELEASED",
+                "safe_to_leave_usb_connected": False,
+            }, user32=ui)
+            self.assertEqual(ui.MessageBoxW.call_count, 2)
+
+
+class NormalCycleCompositionTests(unittest.TestCase):
+    """No live Win32, filesystem or CDC interaction in these tests."""
+
+    def setUp(self):
+        from m5daylog.capacity import VerifiedSession
+        from m5daylog.first_use_admission import CycleOrigin
+        from m5daylog.release_cycle_candidate import QualifiedCycleCandidate
+
+        self.session = VerifiedSession(TARGET, "COM7", "qualified-epoch")
+        self.candidate = QualifiedCycleCandidate(
+            DEVICE, "00000000-0000-4000-8000-000000000002",
+            CycleOrigin.NORMAL_WAKE, self.session,
+        )
+        self.api = mock.Mock()
+        self.api.read_status.return_value = {
+            "state": "USB_SYNC", "rtcCorrectionPending": False,
+            "releaseCycleId": self.candidate.release_cycle_id,
+            "releaseCycleOrigin": "NORMAL_WAKE",
+        }
+        self.port = mock.Mock()
+        self.port.contracts_dir = None
+        self.reader = mock.Mock()
+        self.fence = mock.MagicMock()
+        self.epoch = lambda: self.session.session_epoch
+
+    def call(self):
+        from m5daylog.windows_auto_intake import qualified_normal_cycle_release
+        return qualified_normal_cycle_release(
+            self.session, self.epoch, api=self.api, port=self.port,
+            capacity_reader=self.reader, library_root=Path("synthetic-raw"),
+            db_path=Path("synthetic-state.sqlite"),
+        )
+
+    def test_existing_normal_sender_receives_live_host_and_cycle_checks(self):
+        from m5daylog.release import ReleaseOutcome
+        expected = ReleaseOutcome(
+            "SYNC_COMPLETE_RELEASED", "RELEASED", "synthetic-attempt", TARGET
+        )
+        with (
+            mock.patch(
+                "m5daylog.dev_install_release_fence."
+                "DevInstallReleaseFence.for_current_user",
+                return_value=self.fence,
+            ),
+            mock.patch(
+                "m5daylog.release_cycle_candidate."
+                "inspect_release_cycle_candidate",
+                return_value=self.candidate,
+            ) as inspect,
+            mock.patch(
+                "m5daylog.release_admission_135.SourceOnlyReleaseSequence"
+            ) as sequence,
+            mock.patch(
+                "m5daylog.capacity.probe_capacity"
+            ) as capacity,
+        ):
+            capacity.return_value.release_blocked = False
+
+            def run(*, candidate, verify_current_cycle, read_current_status):
+                self.assertEqual(candidate, self.candidate)
+                self.assertTrue(verify_current_cycle(candidate, TARGET))
+                self.assertEqual(read_current_status(), self.api.read_status.return_value)
+                args = sequence.call_args.kwargs
+                args["cdc_mutations"]()
+                self.assertTrue(args["before_seal_observation"](
+                    TARGET, mock.sentinel.io_gate,
+                ))
+                return expected
+
+            sequence.return_value.normal_cycle.side_effect = run
+            self.assertEqual(self.call(), expected)
+            self.assertEqual(self.fence.cycles.check_locked.call_count, 2)
+            self.assertEqual(inspect.call_count, 2)
+            self.port.set_time.assert_called_once()
+            self.assertRegex(
+                self.port.set_time.call_args.args[1],
+                r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+            )
+            self.assertEqual(capacity.call_count, 1)
+
+    def test_missing_host_continuity_blocks_before_candidate_or_sender(self):
+        from m5daylog.release import PreconditionBlocked
+        self.fence.cycles.check_locked.side_effect = PreconditionBlocked(
+            "missing enrolled release ledger"
+        )
+        with (
+            mock.patch(
+                "m5daylog.dev_install_release_fence."
+                "DevInstallReleaseFence.for_current_user",
+                return_value=self.fence,
+            ),
+            mock.patch(
+                "m5daylog.release_cycle_candidate."
+                "inspect_release_cycle_candidate",
+            ) as inspect,
+            mock.patch(
+                "m5daylog.release_admission_135.SourceOnlyReleaseSequence"
+            ) as sequence,
+        ):
+            with self.assertRaises(PreconditionBlocked):
+                self.call()
+            inspect.assert_not_called()
+            sequence.assert_not_called()
+            self.port.set_time.assert_not_called()
+
+    def test_supervised_first_use_cannot_become_normal_auto_release(self):
+        from m5daylog.first_use_admission import CycleOrigin
+        from m5daylog.release import PreconditionBlocked
+        from m5daylog.release_cycle_candidate import QualifiedCycleCandidate
+        first = QualifiedCycleCandidate(
+            DEVICE, self.candidate.release_cycle_id,
+            CycleOrigin.SUPERVISED_FIRST_USE, self.session,
+        )
+        with (
+            mock.patch(
+                "m5daylog.dev_install_release_fence."
+                "DevInstallReleaseFence.for_current_user",
+                return_value=self.fence,
+            ),
+            mock.patch(
+                "m5daylog.release_cycle_candidate."
+                "inspect_release_cycle_candidate",
+                return_value=first,
+            ),
+            mock.patch(
+                "m5daylog.release_admission_135.SourceOnlyReleaseSequence"
+            ) as sequence,
+        ):
+            with self.assertRaises(PreconditionBlocked):
+                self.call()
+            sequence.assert_not_called()
+            self.port.set_time.assert_not_called()
+
+
+class MonitorReleaseWiringTests(unittest.TestCase):
+    """The real public monitor CLI never supplies physical release authority."""
+
+    def test_runner_callback_is_explicit_not_derived_from_opt_in(self):
+        from types import SimpleNamespace
+
+        def independently_qualified_release(session, epoch):
+            raise AssertionError("must not run during monitor setup")
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("m5daylog.windows_auto_intake.os",
+                       SimpleNamespace(name="nt")),
+            mock.patch("m5daylog.windows_auto_intake.local_config_path",
+                       return_value=Path(directory) / "monitor.json"),
+            mock.patch("m5daylog.windows_auto_intake.read_opt_in",
+                       return_value=frozenset({DEVICE})) as opt_in,
+            mock.patch("m5daylog.windows_auto_intake.NativeWin32DeviceApi") as native,
+            mock.patch("m5daylog.windows_auto_intake.WindowsHostReleasePort"),
+            mock.patch("m5daylog.windows_auto_intake.WindowsCapacityReader"),
+            mock.patch("m5daylog.windows_auto_intake.resolve_db_path",
+                       return_value=Path(directory) / "status.sqlite"),
+            mock.patch("m5daylog.windows_auto_intake.IntakeCoordinator") as intake,
+            mock.patch("m5daylog.windows_auto_intake.PollingMonitor") as monitor,
+            mock.patch("m5daylog.windows_auto_intake.time.sleep"),
+        ):
+            self.assertEqual(run_monitor(
+                once=True, qualified_release=independently_qualified_release
+            ), 0)
+            self.assertIs(
+                intake.call_args.kwargs["qualified_release"],
+                independently_qualified_release,
+            )
+            native.assert_called_once()
+            opt_in.assert_called_once()
+            self.assertEqual(monitor.return_value.poll_once.call_count, 2)
+
+            intake.reset_mock()
+            self.assertEqual(main(["--once"]), 0)
+            self.assertIsNone(intake.call_args.kwargs["qualified_release"])
+
+class ConsentTests(unittest.TestCase):
+    def test_disabled_missing_or_bad_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "monitor.json"
+            with self.assertRaises(ValueError):
+                read_opt_in(path)
+            for invalid in (
+                {}, {"enabled": False, "trustedDeviceIds": [DEVICE]},
+                {"enabled": True, "trustedDeviceIds": []},
+                {"enabled": True, "trustedDeviceIds": ["not-a-uuid"]},
+                {"enabled": True, "trustedDeviceIds": [DEVICE, DEVICE]},
+            ):
+                with self.subTest(invalid=invalid):
+                    path.write_text(json.dumps(invalid), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        read_opt_in(path)
+            path.write_text(json.dumps({
+                "enabled": True, "trustedDeviceIds": [DEVICE],
+            }), encoding="utf-8")
+            self.assertEqual(read_opt_in(path), frozenset({DEVICE}))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,424 @@
+"""#135 opt-in Windows arrival observer for intake-only operation.
+
+There is deliberately NO automatic RELEASE_STORAGE call. This observer uses
+read-only CDC GET_STATUS and #89 MSC/CDC binding to admit known USB_SYNC
+sessions, then delegates raw copying to #51 through auto_intake.py.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+import re
+import sys
+import time
+import uuid
+from ctypes import wintypes
+from pathlib import Path
+from typing import Callable
+
+from .auto_intake import Arrival, IntakeCoordinator, PollingMonitor
+from .capacity import VerifiedSession
+from .db import resolve_db_path
+from .release import ReleaseOutcome
+from .sync import _contracts_dir, _load_manifest, _preflight, inspect_device
+from .windows_capacity import WindowsCapacityReader
+from .windows_release import NativeWin32DeviceApi, WindowsHostReleasePort
+
+_COM = re.compile(r"COM[1-9][0-9]{0,3}\Z", re.IGNORECASE)
+_DRIVE_REMOVABLE = 2
+_CONFIG_MAX_BYTES = 65536
+
+
+def local_config_path() -> Path:
+    """No persistent Windows service, machine-wide config or elevated install."""
+    local = os.environ.get("LOCALAPPDATA")
+    if os.name != "nt" or not local:
+        raise OSError("Windows per-user LOCALAPPDATA required")
+    return Path(local) / "M5Daylog" / "monitor.json"
+
+
+def read_opt_in(path: Path) -> frozenset[str]:
+    """A missing, disabled, malformed, or empty allowlist stops all observation."""
+    try:
+        if path.stat().st_size > _CONFIG_MAX_BYTES:
+            raise ValueError("config too large")
+        document = json.loads(path.read_text(encoding="utf-8"))
+        ids = document["trustedDeviceIds"]
+        if (not isinstance(document, dict) or document.get("enabled") is not True
+                or not isinstance(ids, list) or not 1 <= len(ids) <= 16):
+            raise ValueError("monitor not explicitly opted in")
+        trusted = frozenset(str(uuid.UUID(s)) for s in ids if isinstance(s, str))
+        if len(trusted) != len(ids):
+            raise ValueError("invalid or duplicate authorization")
+        return trusted
+    except (OSError, KeyError, ValueError, TypeError) as exc:
+        # Do not expose the contents/paths of user configuration.
+        raise ValueError("MONITOR_OPT_IN_NOT_QUALIFIED") from None
+
+
+def enumerate_removable_roots(kernel32: object) -> list[str]:
+    """Only mounted drive roots; never discover or inspect a fixed PC disk."""
+    get_strings = kernel32.GetLogicalDriveStringsW
+    get_strings.argtypes = [wintypes.DWORD, wintypes.LPWSTR]
+    get_strings.restype = wintypes.DWORD
+    get_type = kernel32.GetDriveTypeW
+    get_type.argtypes = [wintypes.LPCWSTR]
+    get_type.restype = wintypes.UINT
+    buffer = ctypes.create_unicode_buffer(4096)
+    chars = get_strings(len(buffer), buffer)
+    if not chars or chars >= len(buffer):
+        raise OSError("Windows volume enumeration failed")
+    return sorted(
+        root for root in buffer[:chars].split("\0")
+        if re.fullmatch(r"[A-Za-z]:\\", root) and get_type(root) == _DRIVE_REMOVABLE
+    )
+
+
+def enumerate_com_ports() -> list[str]:
+    """Only a complete registry enumeration can authorize a CDC candidate."""
+    import winreg
+    try:
+        handle = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM"
+        )
+    except FileNotFoundError:
+        # No SERIALCOMM mapping means no candidates, never a partial set.
+        return []
+    with handle:
+        values = []
+        # Probe one past the 128-value bound to prove actual exhaustion.
+        for index in range(129):
+            try:
+                _, value, _ = winreg.EnumValue(handle, index)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 259:  # ERROR_NO_MORE_ITEMS
+                    return sorted(set(values))
+                raise OSError("Windows COM enumeration failed") from None
+            if index == 128:
+                raise OSError("Windows COM enumeration incomplete")
+            if isinstance(value, str) and _COM.fullmatch(value):
+                values.append(value.upper())
+    raise OSError("Windows COM enumeration incomplete")
+
+
+class WindowsArrivalProvider:
+    """Admission-only observer; every ambiguity blocks rather than guesses."""
+
+    def __init__(
+        self, *, trusted: frozenset[str], api: NativeWin32DeviceApi,
+        port: WindowsHostReleasePort,
+        roots=None, ports=None, status=None, preflight=None, port_factory=None,
+    ) -> None:
+        self.trusted = trusted
+        self.api = api
+        self.port = port
+        self.port_factory = port_factory or (lambda: port)
+        self.roots = roots or (lambda: enumerate_removable_roots(self.api.k))
+        self.ports = ports or enumerate_com_ports
+        self.status = status or self.api.read_status
+        self.preflight = preflight or self._canonical_preflight
+        self._epochs: dict[tuple[str, str, str], str] = {}
+        # The same PnP/COM/volume names may be reused between two polls
+        # across distinct R5 recording cycles. The pair is a freshness hint
+        # for raw intake, never a release authorization or boot attestation.
+        self._cycle_tokens: dict[tuple[str, str, str], tuple[str, str] | None] = {}
+
+    @staticmethod
+    def _cycle_token(status: dict[str, object]) -> tuple[str, str] | None:
+        cycle = status.get("releaseCycleId")
+        origin = status.get("releaseCycleOrigin")
+        if (type(cycle) is not str or type(origin) is not str
+                or origin not in ("NORMAL_WAKE", "SUPERVISED_FIRST_USE")):
+            return None
+        try:
+            if str(uuid.UUID(cycle)) != cycle:
+                return None
+        except (ValueError, TypeError, AttributeError):
+            return None
+        return cycle, origin
+
+    def _canonical_preflight(self, root: str) -> str:
+        device = inspect_device(root, contracts_dir=self.port.contracts_dir)
+        manifest = _load_manifest(Path(root), _contracts_dir(self.port.contracts_dir))
+        _preflight(Path(root), device, manifest)
+        return device["deviceId"]
+
+    def scan(self) -> list[Arrival]:
+        candidates: list[Arrival] = []
+        # An observer enumeration failure leaves the USB epoch unknown. Drop
+        # the prior epoch before propagating the error to PollingMonitor, which
+        # also clears its stable-scan/handled state. Materialize the roots first
+        # so a failing enumerator cannot leave a partly refreshed epoch map.
+        try:
+            com_ports = tuple(self.ports())
+            roots = tuple(self.roots())
+            # A port whose parent cannot be resolved might be a second CDC on
+            # the selected MSC's parent. Never treat unknown as unrelated.
+            resolved_ports = tuple(
+                (com, self.api.cdc_interface(com)) for com in com_ports
+            )
+            if any(not getattr(endpoint, "physical_usb_instance_id", None)
+                   for _, endpoint in resolved_ports):
+                raise OSError("Windows CDC parent resolution incomplete")
+        except Exception:
+            self._epochs.clear()
+            self._cycle_tokens.clear()
+            raise
+        for root in roots:
+            try:
+                device_id = self.preflight(root)
+                if device_id not in self.trusted:
+                    continue
+                session_port = self.port_factory()
+                target = session_port.resolve_target(root, device_id)
+                # Require exactly one current CDC on the same USB physical parent.
+                matched = [
+                    com for com, endpoint in resolved_ports
+                    if endpoint.physical_usb_instance_id == target.usb_physical_instance_id
+                ]
+                if len(matched) != 1:
+                    continue
+                com = matched[0]
+                session_port.revalidate_target(target, com)
+                if not session_port.volume_available(target):
+                    continue
+                result = self.status(com)
+                if (not isinstance(result, dict)
+                        or result.get("state") != "USB_SYNC"
+                        or not isinstance(result.get("rtcCorrectionPending"), bool)):
+                    continue
+                session_port.revalidate_target(target, com)
+                if not session_port.volume_available(target):
+                    continue
+                key = (target.volume_guid, target.usb_physical_instance_id, com)
+                token = self._cycle_token(result)
+                if key in self._cycle_tokens and self._cycle_tokens[key] != token:
+                    # A different frozen recording cycle must not inherit
+                    # PollingMonitor._handled from a previously imported day.
+                    self._epochs.pop(key, None)
+                self._cycle_tokens[key] = token
+                epoch = self._epochs.setdefault(key, str(uuid.uuid4()))
+                candidates.append(Arrival(VerifiedSession(target, com, epoch), True))
+            except Exception:
+                # Untrusted media or OS failures must not cause any write.
+                continue
+        # More than one MSC mapping to one physical parent is ambiguous.
+        by_parent: dict[str, int] = {}
+        for a in candidates:
+            parent = a.binding.target.usb_physical_instance_id
+            by_parent[parent] = by_parent.get(parent, 0) + 1
+        safe = [
+            a for a in candidates
+            if by_parent[a.binding.target.usb_physical_instance_id] == 1
+        ]
+        active = {
+            (a.binding.target.volume_guid,
+             a.binding.target.usb_physical_instance_id,
+             a.binding.cdc_port) for a in safe
+        }
+        self._epochs = {key: value for key, value in self._epochs.items() if key in active}
+        self._cycle_tokens = {
+            key: value for key, value in self._cycle_tokens.items() if key in active
+        }
+        return safe
+
+    def current_epoch(self) -> str:
+        if len(self._epochs) != 1:
+            return ""
+        return next(iter(self._epochs.values()))
+
+
+def notify_action_required(notice: dict[str, object], *, user32=None) -> None:
+    """Explicit sanitized local Windows outcome, no shell or telemetry.
+
+    Safe-release confirmation requires the canonical accepted-response plus
+    exact-disappearance result; it never asserts Device NVS SHUTDOWN_ARMED.
+    """
+    if os.name != "nt":
+        return
+    status = notice.get("sync_release")
+    if (status == "SYNCED_RELEASED"
+            and notice.get("safe_to_leave_usb_connected") is True):
+        message = ("WAV import and host USB release succeeded. The USB cable "
+                   "may remain connected. Device SHUTDOWN_ARMED and continued "
+                   "USB charging have not been independently verified.")
+    elif status == "RELEASE_BLOCKED":
+        message = ("WAV import may have succeeded, but safe USB release was "
+                   "not proven. Keep the USB cable connected and check "
+                   "M5Daylog status before further action.")
+    elif status == "SYNC_FAILED":
+        message = ("WAV import failed or was incomplete. Device release has "
+                   "not been performed. Keep the USB cable connected.")
+    else:
+        return
+    try:
+        if user32 is None:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+        message_box = user32.MessageBoxW
+        message_box.argtypes = [
+            wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT,
+        ]
+        message_box.restype = ctypes.c_int
+        message_box(None, message, "M5Daylog - action required", 0x30)
+    except Exception:
+        # Status file remains the independent notification fallback.
+        return
+
+
+
+def qualified_normal_cycle_release(
+    session: VerifiedSession, current_session_epoch: Callable[[], str], *,
+    api: NativeWin32DeviceApi, port: WindowsHostReleasePort,
+    capacity_reader: WindowsCapacityReader,
+    library_root: Path, db_path: Path,
+) -> ReleaseOutcome:
+    """Compose the existing R3/#89 NORMAL_WAKE path, without issuing authority.
+
+    This is a source-only owner-integration seam, NOT the installed watcher's
+    default callback. In particular, initial DEV enrollment, original-media
+    custody, and physical approval cannot be inferred from opt-in or GET_STATUS.
+    Only a separately authorized caller may bind this after installation.
+    """
+    from datetime import datetime, timezone
+
+    from .capacity import probe_capacity
+    from .dev_install_release_fence import DevInstallReleaseFence
+    from .first_use_admission import CycleOrigin
+    from .release import PreconditionBlocked, SyncReleaseCoordinator
+    from .release_admission_135 import SourceOnlyReleaseSequence
+    from .release_cycle_candidate import inspect_release_cycle_candidate
+    from .sync import sync_device
+
+    if type(session) is not VerifiedSession or not callable(current_session_epoch):
+        raise PreconditionBlocked("normal release session missing")
+
+    target = session.target
+    fence = DevInstallReleaseFence.for_current_user(
+        device_root=Path(target.mount_root),
+    )
+
+    def current_candidate():
+        return inspect_release_cycle_candidate(
+            session=session, port=port, status_reader=api.read_status,
+            current_session_epoch=current_session_epoch,
+            contracts_dir=port.contracts_dir,
+        )
+
+    # Observation alone does not spend an attempt; the canonical sender
+    # performs a fresh source/host check under its own shared lock before RTC.
+    with fence.cycles.serialized():
+        fence.cycles.check_locked(target.expected_device_id)
+        candidate = current_candidate()
+        if candidate.release_cycle_origin is not CycleOrigin.NORMAL_WAKE:
+            raise PreconditionBlocked("normal WAKE origin not established")
+
+    def verify_current_cycle(observed, frozen_target):
+        if frozen_target != target or observed != candidate:
+            return False
+        fence.cycles.check_locked(target.expected_device_id)
+        return current_candidate() == candidate
+
+    def preseal_capacity(frozen_target, gate):
+        if frozen_target != target:
+            return False
+        result = probe_capacity(
+            session, gate=gate, validator=port,
+            reader=capacity_reader, durable_sync_complete=lambda: True,
+            current_session_epoch=current_session_epoch,
+        )
+        return result.release_blocked is False
+
+    sequence = SourceOnlyReleaseSequence(
+        fence=fence, coordinator=SyncReleaseCoordinator(port),
+        session=session,
+        # The canonical #89 coordinator performs its own #51 barrier after
+        # intake, instead of trusting an unbound watcher-success Boolean.
+        sync=lambda: sync_device(
+            target.mount_root, library_root=library_root,
+            db_path=db_path, contracts_dir=port.contracts_dir,
+        ),
+        current_epoch=current_session_epoch,
+        cdc_mutations=lambda: port.set_time(
+            session.cdc_port,
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ),
+        before_seal_observation=preseal_capacity,
+    )
+    return sequence.normal_cycle(
+        candidate=candidate, verify_current_cycle=verify_current_cycle,
+        read_current_status=lambda: api.read_status(session.cdc_port),
+    )
+
+
+def run_monitor(
+    *, once: bool = False, output=None,
+    qualified_release: Callable[
+        [VerifiedSession, Callable[[], str]], ReleaseOutcome
+    ] | None = None,
+) -> int:
+    """Opt-in watcher; native release remains OFF in the public CLI.
+
+    The callback is not a permit. Only a separately approved owner-local
+    integration may supply a verifier-backed #89/#143 coordinator; a config
+    file or arrival observation must never enable release by itself.
+    """
+    if os.name != "nt":
+        return 2
+    try:
+        root = local_config_path()
+        trusted = read_opt_in(root)
+        api = NativeWin32DeviceApi()
+        port = WindowsHostReleasePort(api)
+        provider = WindowsArrivalProvider(
+            trusted=trusted, api=api, port=port,
+            port_factory=lambda: WindowsHostReleasePort(api),
+        )
+        local_state = root.parent / "state"
+        coordinator = IntakeCoordinator(
+            port=port, capacity_reader=WindowsCapacityReader(),
+            trusted_device_ids=trusted,
+            local_lock_file=local_state / "intake.lock",
+            library_root=Path.home() / "Documents" / "M5Daylog",
+            db_path=resolve_db_path(data_dir=str(root.parent)),
+            port_factory=lambda: WindowsHostReleasePort(api),
+            qualified_release=qualified_release,
+        )
+        def report(notice: dict[str, object]) -> None:
+            # One bounded, sanitized local status file. Never log the root,
+            # serial, Device ID, audio, username or raw Win32 exception.
+            serialized = json.dumps(notice, ensure_ascii=False, sort_keys=True)
+            tmp = local_state / "auto_intake_status.tmp"
+            dst = local_state / "auto_intake_status.json"
+            local_state.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(serialized + "\n", encoding="utf-8")
+            tmp.replace(dst)
+            if output is not None:
+                output(serialized)
+            notify_action_required(notice)
+        monitor = PollingMonitor(
+            provider, coordinator, provider.current_epoch, report
+        )
+        if once:
+            monitor.poll_once()
+            time.sleep(2)
+            monitor.poll_once()
+        else:
+            monitor.run_forever()
+        return 0
+    except (OSError, ValueError):
+        # No echo of sensitive config or Windows exception data.
+        return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="M5Daylog user opt-in intake-only monitor")
+    parser.add_argument("--once", action="store_true", help="One bounded synthetic/diagnostic scan")
+    args = parser.parse_args(argv)
+    return run_monitor(once=args.once, output=print)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

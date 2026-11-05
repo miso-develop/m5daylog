@@ -1,0 +1,319 @@
+"""#147 FI2-I2: independent, source-only DEV first-release consumption.
+
+This is NOT a permit issuer, installed release sender, proof of H0, or
+physical-host persistence certification. Only a separately verified private
+DEV_FRESH_INSTALL receipt can be considered by a future authorized caller.
+Neither the CLI nor watcher imports this module. It never accesses Device media.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import uuid
+from contextlib import closing
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Mapping
+from urllib.parse import quote
+
+from .release import PreconditionBlocked
+from .release_cycle_fence import (
+    Anchor, CycleAttemptFence, WindowsRegistryAnchor,
+    _sqlite_recovery_sidecars_present,
+)
+
+_HEX = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _uuid(value: str) -> str:
+    if type(value) is not str:
+        raise PreconditionBlocked("DEV receipt UUID invalid")
+    try:
+        parsed = str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError):
+        raise PreconditionBlocked("DEV receipt UUID invalid") from None
+    if value != parsed:
+        raise PreconditionBlocked("DEV receipt UUID noncanonical")
+    return parsed
+
+
+def _digest(value: str) -> str:
+    if type(value) is not str or not _HEX.fullmatch(value):
+        raise PreconditionBlocked("DEV receipt digest invalid")
+    return value
+
+
+@dataclass(frozen=True, repr=False)
+class DevInstallReceipt:
+    """Private receipt *descriptor*, NOT authority or a self-issued permit.
+
+    Digests name independently acquired material; they do not validate it.
+    A verifier for the actual independently approved private evidence is
+    deliberately not implemented here. Synthetic verifiers are test-only.
+    """
+    device_id: str
+    generation_id: str
+    first_release_attempt_id: str
+    physical_target_digest: str
+    host_lineage_digest: str
+    image_set_digest: str
+    partition_layout_digest: str
+    nvs_write_set_digest: str
+    admission_inventory_digest: str
+    external_permit_digest: str
+    media_branch: str
+
+    def fingerprint(self) -> str:
+        if self.media_branch not in ("C", "R", "A"):
+            raise PreconditionBlocked("DEV media branch not qualified")
+        values = [
+            _uuid(self.device_id), _uuid(self.generation_id),
+            _uuid(self.first_release_attempt_id),
+            _digest(self.physical_target_digest),
+            _digest(self.host_lineage_digest),
+            _digest(self.image_set_digest),
+            _digest(self.partition_layout_digest),
+            _digest(self.nvs_write_set_digest),
+            _digest(self.admission_inventory_digest),
+            _digest(self.external_permit_digest), self.media_branch,
+        ]
+        return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+class DevInstallRegistryAnchor(WindowsRegistryAnchor):
+    """Separate HKCU continuity witness, not the normal R3 cycle anchor."""
+    KEY = r"Software\M5Daylog\DevInstallReleaseV1"
+    VALUE = "ConsumedV1"
+
+
+class DevInstallReleaseFence:
+    """One new installation-generation attempt, burned before any CDC send.
+
+    Shares the existing #143 R3 OS-wide coordinator lock, but uses a
+    separate SQLite journal and independent HKCU anchor. A single-store
+    rollback, partial commit or missing store blocks without auto-repair.
+    Matched whole-host rollback remains outside the approved R3 Option A model.
+
+    This primitive is intentionally UNWIRED. A truthful external validator,
+    selected-APP and GPIO/RTC/PCM/manifest/ownership evidence, and canonical
+    #89 sender coupling are not supplied by a Python receipt descriptor.
+    """
+
+    def __init__(self, *, cycles: CycleAttemptFence, database: Path,
+                 device_root: Path, anchor: Anchor) -> None:
+        self.cycles = cycles
+        self.database = Path(database).expanduser().resolve()
+        root = Path(device_root).expanduser().resolve()
+        if (self.database == root or root in self.database.parents
+                or self.database in (cycles.database, cycles.lock_file)
+                or anchor is cycles.anchor):
+            raise PreconditionBlocked("DEV ledger/anchor isolation invalid")
+        self.anchor = anchor
+        # The global R3 reserve/pre-send paths must see DEV's independent
+        # consumed witness, even if the R3 V2 append never began.
+        self.cycles.bind_dev_cutover_witness(self.database, self.anchor)
+
+    @classmethod
+    def for_current_user(cls, *, device_root: Path) -> "DevInstallReleaseFence":
+        cycles = CycleAttemptFence.for_current_user(device_root=device_root)
+        return cls(cycles=cycles,
+                   database=cycles.database.with_name("dev_install_release_v1.sqlite"),
+                   device_root=device_root, anchor=DevInstallRegistryAnchor())
+
+    def _require_lock(self) -> None:
+        if not getattr(self.cycles._serialized_thread, "held", False):
+            raise PreconditionBlocked("shared release OS lock required")
+
+    @staticmethod
+    def _state(receipt: DevInstallReceipt, *, generation: bool = False) -> dict[str, object]:
+        kind = ("SAME_HOST_DEV_GENERATION_FIRST_RELEASE" if generation
+                else "DEV_FRESH_INSTALL_FIRST_RELEASE")
+        return {"v": 1, "kind": kind,
+                "state": "CONSUMED", "receipt": receipt.fingerprint()}
+
+    def _read(self) -> dict[str, object]:
+        if _sqlite_recovery_sidecars_present(self.database):
+            raise PreconditionBlocked("DEV release SQLite recovery uncertain")
+        if not self.database.is_file():
+            raise PreconditionBlocked("DEV release consumption absent")
+        try:
+            with closing(sqlite3.connect(
+                    "file:" + quote(self.database.as_posix(), safe="/:") + "?mode=ro",
+                    uri=True,
+                    timeout=0.25)) as db:
+                if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    raise PreconditionBlocked("DEV release ledger corrupt")
+                rows = db.execute("SELECT v, kind, state, receipt FROM dev_consumed").fetchall()
+            if len(rows) != 1:
+                raise PreconditionBlocked("DEV release ledger ambiguous")
+            v, kind, state, receipt = rows[0]
+            if (type(v) is not int or v != 1
+                    or kind not in ("DEV_FRESH_INSTALL_FIRST_RELEASE",
+                                    "SAME_HOST_DEV_GENERATION_FIRST_RELEASE")
+                    or state != "CONSUMED"
+                    or type(receipt) is not str or not _HEX.fullmatch(receipt)):
+                raise PreconditionBlocked("DEV release ledger invalid")
+            return {"v": v, "kind": kind, "state": state, "receipt": receipt}
+        except (sqlite3.Error, OSError, ValueError):
+            raise PreconditionBlocked("DEV release ledger unreadable") from None
+
+    def verify_consumed_locked(self, receipt: DevInstallReceipt, *,
+                               generation: bool = False) -> None:
+        """Observe the exact separately consumed #1 attempt, never re-arm it.
+
+        This check can later correlate the first enrolled R3 cycle, but is
+        not a standalone proof of Device first-use origin or a send permit.
+        """
+        self._require_lock()
+        expected = self._state(receipt, generation=generation)
+        local = self._read()
+        try:
+            remote = self.anchor.read()
+        except (OSError, ValueError):
+            raise PreconditionBlocked("DEV release anchor unreadable") from None
+        if remote != expected or local != expected:
+            raise PreconditionBlocked("DEV first release continuity mismatch")
+
+    def consume_locked(self, receipt: DevInstallReceipt, *,
+                       verify_external: Callable[[DevInstallReceipt], bool]) -> None:
+        """Irreversibly consume #1 under an already-held #143 OS-wide lock.
+
+        The external verifier MUST independently authenticate/approve the
+        private H0 + exact-install/target/branch/generation/first-release
+        record; no default verifier or public fixture can grant authority.
+        Use before any possible RTC/CDC mutation, never as a retry primitive.
+        """
+        self._require_lock()
+        if type(receipt) is not DevInstallReceipt or not callable(verify_external):
+            raise PreconditionBlocked("DEV release external permit unavailable")
+        expected = self._state(receipt)
+        if verify_external(receipt) is not True:
+            raise PreconditionBlocked("DEV release external permit unqualified")
+        # Confirm actual R3 H0 two-store absence before the first consume.
+        # This check alone is never evidence of never-enrolled history.
+        self.cycles.check_unenrolled_locked()
+        self._commit_dev_store_locked(receipt)
+
+    def _commit_dev_store_locked(self, receipt: DevInstallReceipt, *,
+                                 generation: bool = False) -> None:
+        """One irreversible DEV attempt, after caller's external authorization."""
+        self._require_lock()
+        expected = self._state(receipt, generation=generation)
+        try:
+            local_exists = self.database.exists()
+            remote = self.anchor.read()
+            if (local_exists or _sqlite_recovery_sidecars_present(self.database)
+                    or remote is not None):
+                raise PreconditionBlocked("DEV release generation already used or uncertain")
+            self.database.parent.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(self.database, isolation_level=None)) as db:
+                db.execute("PRAGMA journal_mode=DELETE")
+                db.execute("PRAGMA synchronous=FULL")
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("CREATE TABLE dev_consumed (v INTEGER NOT NULL, "
+                           "kind TEXT NOT NULL, state TEXT NOT NULL, receipt TEXT NOT NULL)")
+                db.execute("INSERT INTO dev_consumed VALUES (?,?,?,?)",
+                           tuple(expected[k] for k in ("v", "kind", "state", "receipt")))
+                db.execute("COMMIT")
+            # A crash after SQLite and before HKCU flush blocks permanently.
+            self.anchor.write(expected)
+            self.verify_consumed_locked(receipt, generation=generation)
+        except (sqlite3.Error, OSError, ValueError):
+            raise PreconditionBlocked("DEV first release persistence uncertain") from None
+
+    def consume_new_generation_locked(
+        self, receipt: DevInstallReceipt, *, previous_device_id: str,
+        status: Mapping[str, object],
+        verify_external: Callable[[DevInstallReceipt, Mapping[str, object]], bool],
+    ) -> None:
+        """SDB-1.1: enrolled-host DEV generation and first tuple pre-send.
+
+        This is UNWIRED source-only logic. An approved private one-use grant,
+        running firmware, physical WAKE, exact installed generation/media,
+        valid current final PCM/SHA/RTC, status origin and host custody MUST
+        be independently verified by the future caller. A Python callback
+        or a bare local hash cannot authenticate those facts.
+        """
+        self._require_lock()
+        if (type(receipt) is not DevInstallReceipt
+                or not isinstance(status, Mapping)
+                or not callable(verify_external)):
+            raise PreconditionBlocked("DEV generation evidence missing")
+        # Same deviceId cannot distinguish the old R3 origin from a new DEV
+        # generation. Reject before spending the independent DEV receipt.
+        if _uuid(previous_device_id) == _uuid(receipt.device_id):
+            raise PreconditionBlocked("DEV generation requires a new device identity")
+        if (status.get("releaseCycleOrigin") != "SUPERVISED_FIRST_USE"
+                or status.get("state") != "USB_SYNC"
+                or type(status.get("rtcCorrectionPending")) is not bool):
+            raise PreconditionBlocked("DEV initial recording origin unqualified")
+        cycle = _uuid(status.get("releaseCycleId"))
+        old = self.cycles.read_enrolled_state_locked(previous_device_id)
+        if old["v"] != 1 or old["seq"] < 1:
+            raise PreconditionBlocked("DEV prior host lineage not established")
+        digest = hashlib.sha256(json.dumps(
+            old, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")).hexdigest()
+        if digest != receipt.host_lineage_digest:
+            raise PreconditionBlocked("DEV private grant host lineage mismatch")
+        # Verify external authority before any new host-state write.
+        try:
+            granted = verify_external(receipt, status) is True
+        except Exception:
+            raise PreconditionBlocked("DEV generation external grant unavailable") from None
+        if not granted:
+            raise PreconditionBlocked("DEV generation external grant unqualified")
+
+        # One OS-wide lock spans both independently persistent writers and
+        # the full #89 coordinator. Split/unknown commit is permanently spent.
+        # Reversing these writes is forbidden: the first attempt is burned.
+        self._commit_dev_store_locked(receipt, generation=True)
+        self.cycles.append_dev_generation_first_cycle_locked(
+            previous_device_id=previous_device_id,
+            new_device_id=receipt.device_id,
+            generation_id=receipt.generation_id,
+            grant_digest=receipt.external_permit_digest,
+            prior_state_digest=receipt.host_lineage_digest,
+            release_cycle_id=cycle,
+            attempt_id=receipt.first_release_attempt_id,
+        )
+        self.verify_consumed_locked(receipt, generation=True)
+        self.cycles.verify_dev_generation_locked(
+            receipt.device_id, receipt.generation_id,
+            receipt.external_permit_digest, cycle,
+            receipt.first_release_attempt_id,
+        )
+
+    def initialize_first_dev_cycle_locked(
+        self, receipt: DevInstallReceipt, *, status: Mapping[str, object],
+        cycle_attempt_id: str,
+        verify_first_wake: Callable[[DevInstallReceipt, Mapping[str, object]], bool],
+    ) -> None:
+        """Model #147 FI2-I3: distinct first-cycle consumption after #1.
+
+        This is source-only and UNWIRED. The independent external verifier
+        must establish first #105 accepted release/disappearance, Device
+        SHUTDOWN_ARMED, physically authorized manual WAKE, terminal current
+        PCM/manifest, RTC, exact USB parent, #51 SYNCED and H0 lineage.
+        A fake status/proof callback must NEVER authorize a live CDC sender.
+        """
+        self._require_lock()
+        self.verify_consumed_locked(receipt)
+        # R3 enrollment must STILL be absent; DEV journal is independent.
+        self.cycles.check_unenrolled_locked()
+        if not isinstance(status, Mapping) or not callable(verify_first_wake):
+            raise PreconditionBlocked("DEV first-WAKE evidence unavailable")
+        cycle = _uuid(status.get("releaseCycleId"))
+        attempt = _uuid(cycle_attempt_id)
+        if (status.get("releaseCycleOrigin") != "SUPERVISED_FIRST_USE"
+                or status.get("state") != "USB_SYNC"
+                or type(status.get("rtcCorrectionPending")) is not bool
+                or attempt == receipt.first_release_attempt_id):
+            raise PreconditionBlocked("DEV first cycle status invalid")
+        if verify_first_wake(receipt, status) is not True:
+            raise PreconditionBlocked("DEV first-WAKE external proof invalid")
+        self.cycles.initialize_first_cycle_locked(receipt.device_id, cycle, attempt)
+        self.cycles.verify_reserved_locked(receipt.device_id, cycle, attempt)

@@ -1,0 +1,615 @@
+# PC Task #135 — source-only intake core (NOT production auto-release)
+
+## Scope and operational state
+
+This Draft candidate implements the **safe subset** of #135: an injectable,
+two-scan arrival coalescer, prior user allowlist admission, revalidation of an
+already-verified MSC/CDC physical parent and current `USB_SYNC` session proof,
+#51's canonical raw WAV/SQLite sync, process-level local intake exclusion,
+and #137's pre-seal read-only SD-capacity result. The installed watcher still returns
+`RELEASE_BLOCKED` with `AUTO_RELEASE_NOT_QUALIFIED` (or a narrower error)
+without an independently supplied qualified release integration.
+
+A Windows-only observer is now provided in `windows_auto_intake.py`. It polls
+removable Windows drive roots, validates canonical metadata and manifest,
+requires the user-allowlisted Device ID, pairs **exactly one** CDC endpoint to
+the same MSC physical USB parent via the canonical #89 Win32 adapter, and
+reads current `USB_SYNC` via bounded read-only `GET_STATUS`. The observer
+uses a fresh validation port per session. All errors or ambiguity fail closed.
+
+An opt-in background/foreground process can run as
+`python -m m5daylog.windows_auto_intake` (or `--once` for one bounded
+observation), but **must not be run against the existing physical Device as
+a Human Gate without separate approval**. A per-user Startup shortcut may
+eventually launch the same module after logon; no installer, service or
+elevation is added. Status is written as one sanitized local JSON snapshot
+(`%LOCALAPPDATA%/M5Daylog/state/auto_intake_status.json`) and optionally
+printed in the foreground. A native local Windows dialog distinguishes completed-but-unreleased intake,
+failed sync, and a verified canonical host-release outcome without including
+host/device identifiers. The public `run_monitor` CLI supplies **no** release
+callback, so safe release stays blocked and this is **not** full daily UX.
+The internal `run_monitor(qualified_release=...)` entrypoint can pass an
+independently verified #89/#143 one-shot integration into `IntakeCoordinator`;
+a Python callback, a config file, or an arrival status is **not itself** release
+authority, and no production verifier or owner P0/P1 issuance is yet wired.
+
+The user must create a private, locally stored
+`%LOCALAPPDATA%/M5Daylog/monitor.json` containing the explicit opt-in
+and trusted Device ID:
+```json
+{
+  "enabled": true,
+  "trustedDeviceIds": ["00000000-0000-4000-8000-000000000000"]
+}
+```
+This is an **illustrative synthetic UUID**, never copy an actual user-specific
+Device identifier into a public file. `enabled:false` or removing the
+configuration disables observation. Do not place user identifiers in CLI
+arguments, public logs, Issues or screenshots. A stale/missing configuration
+causes no Device read/copy.
+
+## Explicit safety boundaries
+
+- The provided Windows `ArrivalProvider` verifies the same present MSC/CDC
+  physical parent, a fresh host observation epoch, current `USB_SYNC` via
+  `GET_STATUS`, and the configured user's known Device identity. A supplied
+  `Arrival` from a fake/test provider is never itself proof of those facts.
+  A host-minted epoch is **not** a durable Device session/release authorization
+  or a defense against spoofed USB devices.
+- The coordinator verifies that the claimed exact target is in its trusted
+  device-ID allowlist, invokes the same #89 target/CDC revalidation port,
+  validates canonical metadata/manifest/recording path containment, then
+  revalidates before invoking #51 `sync_device` on the selected root.
+- A local lock prevents two cooperating monitors from copying concurrently.
+  The `sync_device` source remains the only raw-sync implementation; repeat
+  intake after a process restart is non-destructive and hash/idempotency
+  checked by #51.
+- `probe_capacity` runs after #51 normal return with the same
+  `VerifiedSession` and open MSC I/O gate, and independently reports
+  `READY_FOR_NEXT_16H`, `ACTION_REQUIRED` or `UNKNOWN`. Identity change
+  blocks the next operation. A capacity API-only failure is advisory.
+- No code path in this module calls `gate.seal()`, `SET_TIME`,
+  `RELEASE_STORAGE`, lock/dismount or shell/PnP eject. Neither the local
+  intake mutex nor a new epoch is a crash-safe release-attempt fence. The
+  shared manual `sync-release` entrypoint still has no such fence.
+- No output claims Device `SHUTDOWN_ARMED`, safe USB detachment, guaranteed
+  next-day storage, successful overnight charging, or released ownership.
+  Output contains only status, safe reason code, sync counts, and advisory
+  capacity fields; it excludes device/COM names, local paths, serials, audio.
+- No ACK, AI, raw deletion, automatic retention, cloud, firmware or schema
+  changes. No privileged service, no persistent Device I/O.
+
+## #135 source-only release prerequisites added (not wired to auto-release)
+
+The canonical `release.py::SyncReleaseCoordinator` now validates the exact
+MSC/CDC target **before** any optional RTC CDC mutation, supports an optional
+`before_seal_observation(target, gate)` callback after #51 sync and before
+the final identity revalidation/seal, and supports
+`before_release_send(attempt_id, target)` **inside** the volume lock/dismount
+lease and **before** the first possible `RELEASE_STORAGE` send. Failure of
+either callback blocks the send; historical #89 manual callers without these
+new hooks remain unchanged. This is an interface seam, not release clearance.
+A capacity-only API error may be advisory, but a changed/unverified session
+must veto release.
+
+The canonical Windows adapter now supports bounded `SET_TIME` with an
+exact previously frozen CDC endpoint and strict matching response, including
+`eventPending:true`. Invalid timestamp, changed endpoint, negative response,
+or indeterminate transport cannot produce RTC success. **No automatic consumer
+or existing manual CLI has yet been wired to call this mutation**; merely
+having the source does not satisfy the RTC prerequisite.
+
+`release_fence.py::DeviceAttemptFence` implements an intentionally
+conservative SQLite `synchronous=FULL`, process-serialized, durable
+pre-send reservation **on host media only**. It stores hashes instead of
+plain Device IDs and rejects duplicates or any uncertain journal outcome.
+Its key is **Device-scoped for all time**, NOT a fabricated USB session key.
+A second process, power-cycle or restart cannot claim the same Device after
+a potentially sent command. **This cannot provide repeatable daily release**,
+and it must not be adopted as a permanent v0.1 workflow or automatically reset
+without a separately approved, provable new Device session. It is only a
+source-only fail-closed building block tested with fake objects. It is not
+currently wired into the manual or automated command. The existing CLI
+overlap with paused PR #110 has been permitted by Integration for narrow
+future coordination; **no CLI behavior has been changed in this iteration**.
+
+**Blocking product/spec issue:** CDC v1 `GET_INFO` reports deviceId, and
+`GET_STATUS` reports USB_SYNC and RTC pending, but neither reports a
+durable unique fresh session generation. The host's random
+`VerifiedSession.session_epoch`, COM number, Volume GUID, or new
+`releaseAttemptId` cannot distinguish a genuinely new Device session
+from a re-enumeration after a possibly accepted release. A safe repeatable
+daily automatic release therefore requires a Specification decision and
+an independently approved cross-domain session authority or equivalent
+proof. Until then, do not enable the release sender, clear the journal or
+claim PC-A03/V01-RELEASE acceptance.
+
+## Next work required before reviewable end-to-end auto-release
+
+1. Qualify the new Windows-only observer, opt-in/at-login startup, session
+   refresh and operator-visible warning on the approved host in a separate
+   exact-HEAD Human Gate. A nonmodal notification alternative may require a
+   later bounded decision; source-only tests do not establish physical PC-A01/A05.
+2. Integrate the smallest shared #89 coordinator seam after durable #51 sync
+   and exact target validation, before sealing, for #137 capacity observation.
+   Preserve native lock/dismount and dedicated CDC release control.
+3. Supply the **real** qualified #21/#50 `SET_TIME` operation before the
+   release I/O cutoff; no optional empty callback can serve as success.
+4. Coordinate `cli.py` with PR #110's existing reservation and provide a
+   durable cross-process, crash/restart-safe pre-send attempt fence that is
+   effective for all relevant release senders, including the manual CLI.
+   Re-enumeration/port change does not prove a fresh Device session.
+5. Add an exact-HEAD Linux and Windows Python 3.12 regression run, simultaneous
+   process/kill/restart/RTC/identity/volume fault matrix, independent
+   Engineering and Security reviews, then Integration. #119/#130 provenance
+   and the real exact-device Human Gates remain **BLOCKED / NOT_RUN**.
+
+## Current test boundary
+
+`pc/tests/test_auto_intake.py` and `pc/tests/test_windows_auto_intake.py`
+use only synthetic callbacks and temporary host directories. They check
+denial before copying, conflicting/outdated identity, a competing local
+lock, idempotent repeated sync model, #137 advisory/error, USB_SYNC/MSC/CDC
+parent matching, opt-in, poll coalescing and status redaction. Existing
+#51/#89/#137 test suites remain normative. This candidate has **not** been qualified with a real Windows
+arrival, physical USB, CDC or Device.
+
+The correct completion state of #135 after this limited patch remains
+**IN PROGRESS**, not V01-AUTO/V01-RELEASE PASS.
+
+## #143 R3 source-only continuation: cycle witness + dual local continuity
+
+Human-approved #143 R3 Option A replaces the earlier *device-scoped-for-life*
+placeholder as the **future** normal-path release design. The older
+`DeviceAttemptFence` class remains unused for compatibility with existing
+source-only tests; it is **not** a daily-session authority.
+
+- `windows_release.py::read_status` now recognizes optional
+  `GET_STATUS.result.releaseCycleId` only when a strictly lowercase canonical
+  UUID. Missing or malformed tokens permit independent read-only intake but
+  provide **zero release authorization**. This parse step does not establish
+  Device current-WAKE provenance, final nonzero PCM, durable manifest binding,
+  or valid session ownership: all remain mandatory before use.
+- `release_cycle_fence.py::CycleAttemptFence` is an **unwired** host-owned
+  release-cycle reservation prototype. It has a SQLite `synchronous=FULL`,
+  sequence + SHA-256 chain of hashed consumed tuples, a separately stored
+  per-user Windows HKCU continuity anchor with `RegFlushKey`, explicit
+  nonautomatic supervised-initialization entrypoint, and a cooperating
+  per-user OS file lock. The canonical Windows factory selects a single fixed
+  LOCALAPPDATA ledger/lock for future CLI and watcher integration. If either
+  witness is absent, corrupt, rewound alone, or mismatched after a partial
+  commit, normal release is blocked without auto-repair. A consumed tuple is
+  not cleared after no-send exceptions, lost response or a new host epoch.
+- Synthetic unit tests cover two distinct eligible IDs, duplicate denial,
+  independent process competition, each one-sided rollback, interrupted
+  anchor update, missing anchor, corrupted chain, and optional CDC status
+  decoding. They **do not** establish Windows physical power-loss durability.
+
+**Not yet implemented / STOP:** Neither this new ledger nor the existing
+`release.py` pre-send hook is wired into `sync-release` or the monitor.
+The current manual command has no R3 cycle gate; the Draft PR must not merge
+as a release-capable change while this bypass exists. The Device-side
+releaseCycleId producer is #144, and no accepted Device proof is available
+yet. Canonical manifest/witness binding, RTC-before-seal failure journal,
+CLI+watcher shared full-lifetime coordinator lock, pre-send consumed
+reservation, supervised enrollment/recovery UX, positive two-day integration,
+real Windows HKCU/SQLite flush/crash qualification and exact-Device Human
+Gates remain outstanding. **Auto-release stays OFF, all watcher post-sync
+results remain RELEASE_BLOCKED, and no CDC release or real Device operation
+was exercised.**
+
+The approved Option A security boundary is deliberately bounded to one
+cooperative enrolled Windows user and physically controlled known Device.
+Matched whole-host rollback, malicious same-user bypass, and hostile USB
+impersonation are **excluded limitations**, not security tests passed or
+cryptographic guarantees. No user/device identifiers or private paths may be
+logged or embedded in public evidence.
+
+
+## #143 R5-FU bounded first-use preflight (source-only, no release sender)
+
+\`first_use_admission.py\` models only a **negative admission check** for the
+independently reviewed and Integration-adopted R5-FU *single #119 Device* initial
+enrollment design. It accepts synthetic evidence bundles representing a
+separately authorized supervised staging intent, exact prior #105 maintenance
+attempt/accepted host and Device release witnesses, an independently verified
+never-enrolled host, and a distinct subsequent qualified first-use recording
+boot. Its result is a planning tuple, **not** enrollment, permission, durable
+intent consumption, or authorization to transmit a CDC command.
+
+- An R5-capable host must distinguish \`SUPERVISED_FIRST_USE\` from
+  \`NORMAL_WAKE\`. Unknown/missing origin and legacy cycleId-only status cannot
+  authorize an unattended release. The enum names here are **provisional
+  source-only fixtures**, pending Integration-owned exact CDC wire freeze.
+- A pre-existing enrolled, mismatched, indeterminate or partially restored host
+  cannot enroll again, including when both host witnesses appear absent. An
+  independently retained supervised never-enrolled receipt is required.
+- A consumed/uncertain intent, absent human permit, unqualified running image,
+  unverified protected-media state, wrong maintenance attempt/session,
+  unaccepted release, missing durable SHUTDOWN_ARMED, stale/uncorrelated
+  subsequent session, non-final PCM, invalid RTC, or incomplete sync fails
+  closed. Host status booleans/strings alone are **not provenance**: the
+  integrator must establish all positive fields from independent evidence.
+- The R5 preflight deliberately has **no filesystem, Registry, USB, CDC, NVS or
+  Device-media IO**, does not call \`CycleAttemptFence.enroll\`, and is **not
+  wired** to the watcher or existing manual CLI. Source-only tests
+  (\`test_first_use_admission_143.py\`) use synthetic identifiers only.
+
+**Remaining mandatory implementation** (not silently complete): persist and
+single-use-consume exact host intent/approved attempt; durably initialize/re-read
+the SQLite and independent Windows continuity witnesses and consume the first
+cycle tuple **under the same global lock before any possible CDC send**;
+distinguish already-enrolled *on transaction entry* from the state created by
+the supervised first-enrollment transaction; fail permanently closed on
+split/unknown commits, restart, one-sided rollback and uncertain CDC response.
+Implement and independently review the shared manual CLI+watcher guard,
+frozen source-only CDC origin compatibility, real Windows fault/durability tests and
+Device-side qualified first-use source. Do not use this prototype as evidence
+for PC-A03, physical #119 operations, RELEASE_STORAGE, merge or unattended
+release. #119/#130 firmware provenance and separately permitted physical Human
+Gates remain BLOCKED / NOT_RUN; the canonical \`#134\` daily objective is unchanged.
+
+
+## R5-FU initial host transaction — isolated source-only model
+
+The new `first_use_transaction.py` is NOT installed into the watcher,
+`sync-release`, release sender, or real supervised enrollment process.
+It consumes an **externally issued** one-use #119-bound host-intent file
+and invokes `CycleAttemptFence.initialize_first_cycle_locked` under
+the existing R3 cooperating OS-wide lock. The latter initializes SQLite
+with the **first consumed cycle tuple in the same database commit**, then
+flushes/re-reads the independent anchor. This prevents a locally created
+first enrollment from being misclassified as a pre-existing one and avoids
+an unfenced empty-ledger window. No new R3 ledger schema, CDC contract, or
+Device/media mutation is introduced. The legacy `enroll(supervised=True)`
+remains a separate unwired R3 placeholder; it must not serve as the R5
+initial-enrollment transaction.
+
+The source-only ordering is:
+
+1. Lock, check actual SQLite/anchor absence **and independently verified
+   never-enrolled history**, original Device/Human/#119 evidence, and strict
+   provisional first-use origin and manifest/RTC/target proof. Empty stores
+   alone are **never** a permission or independent continuity proof.
+2. Read the externally supplied persisted intent, require exact original
+   #119 Device/physical-parent/session/maintenance-attempt binding and an
+   unconsumed one-shot state. The production-grade supervised *issuer*,
+   current running-image/custody attestation and exact operator permit remain
+   unimplemented. Host-local SHA-256 fields only avoid exposing raw IDs in
+   the prototype; they are not signatures, encrypted receipts, or guarantees
+   against malicious same-user writers.
+3. Consume the intent via an exclusively created, fsynced pending-replacement
+   marker; any stale partial marker, missing/invalid receipt, uncertain write
+   or post-consumption crash blocks without self-repair or automatic retry.
+   A deliberately separate intent file is not the independent HKCU continuity
+   witness. A source-only file fsync/rename is **not** qualified Windows
+   power-failure durability.
+4. Initialize the SQLite chain with the first consumed
+   `(deviceId, releaseCycleId, releaseAttemptId)` tuple, update/flush HKCU
+   anchor, reread both and verify exactly the same tuple before a return.
+   A SQLite/anchor split, process crash, previous enrollment, rollback of
+   either witness, or competing process blocks; no recovery or second
+   first-use authorization is inferred. The synthetic model returns **no
+   authorization token** and does not transmit SET_TIME/RELEASE_STORAGE.
+
+`test_first_use_transaction_143.py` exercises the positive *synthetic*
+first-cycle state, a distinct subsequent R3 tuple, missing or consumed
+receipt, stale #119 attempt, invalid origin/PCM/RTC predicates, already
+enrolled/corrupt host states, interruption after intent consumption,
+SQLite/anchor split commit, crash after both writes, one-sided SQLite
+rollback, and two independently spawned contending processes. The fixtures
+stage a sample intent directly and use a fake file anchor; **they do not
+provide a real #119 supervised receipt, real HKCU/RegFlushKey power-loss
+qualification, actual Windows at-login UX, current Device firmware or a
+Human Gate**. Additional fault tests at actual Windows persistence/USB/CDC
+boundaries remain mandatory for production release acceptance.
+
+**STOP lines unchanged:** #143's R5 CDC v1 origin-pair contract is
+frozen for source-only compatibility, NOT for release deployment. No caller
+may treat the source
+model or its caller-provided `*_verified` booleans as independent proof.
+Real Device #144, #119/#130 preservation/provenance, exact manifest
+terminal-segment/RTC validation, CLI+watch single full-call coordinator,
+unattended release sender, Windows crash durability, exact-head independent
+Engineering/Security and separately authorized physical Human Gates are
+outstanding. PR #142 remains Draft; watcher `RELEASE_BLOCKED` is unchanged;
+no merge, CDC release, RTC/SD/NVS action or claimed PC-A03 PASS is permitted.
+
+## R5 CDC v1 origin-pair compatibility (read-only source milestone)
+
+The frozen source-only CDC contract in #143 requires releaseCycleId and
+releaseCycleOrigin to be present together in one matched GET_STATUS result.
+The normalized Windows decoder preserves the pair only when the cycle is
+strictly lowercase canonical UUID and the origin is exactly NORMAL_WAKE or
+SUPERVISED_FIRST_USE. Missing, malformed, unknown, legacy cycle-only and
+one-sided values produce no release witness; independent read-only WAV
+intake remains possible. Duplicate JSON keys fail the entire status parse
+instead of silently taking the last value. A stale envelope ID or CDC endpoint
+still blocks the status observation.
+
+The read-only manifest candidate now carries the source-owned CycleOrigin
+enum, so a future caller MUST route NORMAL_WAKE through a previously-enrolled
+ordinary flow and SUPERVISED_FIRST_USE through the supervised never-enrolled
+flow; it must reject missing/unknown origins without fallback. Source-only
+candidate generation is never a permit to send or enroll. A successful
+in-session SET_TIME may leave rtcCorrectionPending=true with the frozen pair;
+the bit in either state does NOT prove RTC validity, Device boot lineage,
+terminal current-run PCM, manifest hash/sync, or physically qualified custody.
+
+Fake-port tests cover paired and legacy/one-sided/null/noncanonical values,
+invalid origin casing and whitespace, duplicate envelope/result keys, stale
+response IDs, changed endpoints, stale epochs, ordinary versus supervised
+candidate tagging and positive pending-audit observation. No actual CDC
+SET_TIME/RELEASE_STORAGE command was added. At this *earlier decoder-only
+milestone*, the change did not yet disable the legacy manual sender. The later
+CLI exclusion below now blocks the sender in the **current source HEAD**.
+Previously installed origin-unaware executables can still ignore the new field
+and require separate deployment exclusion. Full shared CLI/watch admission,
+externally issued one-time intent, current-running Device R5 producer,
+Windows durability and exact physical Human Gates remain blocked. PR stays
+Draft; watcher RELEASE_BLOCKED; no merged release authority.
+
+## R5 manual `sync-release` fail-closed exclusion (source-only milestone)
+
+Under the #135 Integration-owned `cli.py` release-entrypoint carve-out, the
+existing manual command and argument syntax remain parseable, but its release
+branch is explicitly **disabled**: on Windows it emits the sanitized
+`release: status=RELEASE_BLOCKED reason=R5_ADMISSION_NOT_QUALIFIED`
+diagnostic and exits with code `3`, before opening any Device/Windows volume,
+reading a CDC status, calling raw sync, writing a journal or invoking the
+original #89 `SyncReleaseCoordinator.run`. Outside Windows, its original
+Windows-only error (exit `1`) is unchanged. `--force` is unsupported; no
+caller-provided opt-in, environment variable, UUID or claimed pair overrides
+this negative gate. No positive release sender or new coordinator was added.
+
+This temporary gate addresses the *legacy executable bypass* of #143's frozen
+R5 `releaseCycleId` + `releaseCycleOrigin` no-downgrade rule. A paired CDC
+status is **not sufficient**: positive release still needs independently
+qualified Device current-boot/RTC/PCM evidence, precise MSC/CDC identity and
+custody, #51 durable raw sync, the correct ordinary or separately receipted
+#119 supervised origin route, and one committed Device/cycle/attempt fence
+shared by CLI and watcher **before any possible CDC mutation**. Those real
+proof producers and real Windows power-loss durability tests are not wired;
+therefore *even a syntactically valid pair* is blocked rather than treated as
+authority. The explicit `m5daylog sync` raw-only command is unaffected; the
+opt-in Windows watcher still performs intake only and reports
+`RELEASE_BLOCKED` after verified sync. For an independently required raw
+transfer, use `sync`, not `sync-release`.
+
+`test_cli_release_gate_135.py` supplies synthetic variants (legacy-only,
+one-sided, malformed, unknown, NORMAL and SUPERVISED candidate) and instruments
+the original coordinator, Windows native adapter, RTC/CDC release methods and
+raw-copy entrypoint to prove **zero release, time mutation, Windows target or
+copy calls from the blocked command**. These tests deliberately prove only
+the negative CLI boundary, *not* actual Device response parsing, normal or
+supervised enrollment, positive CLI/watch race safety, or physical Windows
+lock/dismount; those are separate mandatory #135/#143 acceptance gates.
+#119/#130 provenance, #131/#132 no-safe-route, independent exact-head Review,
+Security and Human Gate requirements remain unchanged. PR #142 remains Draft;
+no release, merge or human/device operation is authorized.
+
+## Native Windows offline continuity evidence (test-only milestone)
+
+`test_windows_cycle_fence_native_135.py` exercises the **actual Windows
+HKCU Registry APIs**, `RegFlushKey`, SQLite commits/reopens and `msvcrt`
+cross-process locking; it skips on Linux. Each test uses a uniquely named
+temporary HKCU key and off-Device temporary SQLite/lock files, with cleanup,
+and never modifies the canonical M5Daylog user anchor or live Device.
+Synthetic test enrollment/receipt inputs are not valid #119 permission.
+
+The regression covers competing real Windows processes, lock exclusion while
+held, durable consumed-cycle re-read, same-cycle replay rejection, missing/
+invalid HKCU anchor, independent SQLite and Registry rollback, and a
+deterministically injected failure after SQLite commit but before independent
+Registry flush. It also exercises source-only first-use intent consumption,
+partial-intent interruption and ambiguous initial enrollment. All outcomes
+must fail closed without repair, extra release sender or CDC bytes. This is
+**offline Windows API fault-injection evidence**, not a physical host power-loss
+test, actual supervised receipt issuance or real Device/USB/RTC qualification.
+
+Release status remains `RELEASE_BLOCKED`; `NO_CDC_SEND`,
+`NO_RELEASE_ENABLED`, `HUMAN_GATE_NOT_RUN`. A real Windows power-loss test,
+future canonical shared CLI/watch coordinator, R5 first-use authenticity,
+independent exact-head review/Security and all physical Device gates remain
+mandatory before any product release or PR merge.
+
+
+## #147 DEV_FRESH_INSTALL v2 — two separate host consumptions (source-only)
+
+The adopted #147 v2 design permits a narrowly scoped developer fresh-image/NVS
+partition rebaseline, **not** unconditional recovery of the original live USB
+session, automatic enrollment, release, or any Device/media/Registry operation.
+The actual C/R/A SD and H0 external preflight candidates belong exclusively
+to #148; Device NVS/SD boot behavior belongs to #144/PR #146.
+
+This increment adds `dev_install_release_fence.py`, intentionally **unwired**:
+
+- `DevInstallReceipt` is a *descriptor* of one externally validated private
+  receipt, bound to exact Device UUID, physical target, host lineage, chosen
+  install generation, exact image bundle, partition/NVS write set, C/R/A
+  branch, admission evidence and **one** supervised first-release attempt.
+  SHA-256 fields identify inputs; they are **not** signatures, proof of
+  H0/custody, or authority. The module does not issue an authorization.
+- `DevInstallReleaseFence` serializes under the **existing R3 OS-wide
+  `CycleAttemptFence.serialized()` lock** shared by future CLI and watcher.
+  It checks both absent normal R3 enrollment witnesses at H0 entry, then
+  commits one `CONSUMED` first-release receipt to separate SQLite FULL-sync
+  state and a distinct HKCU/RegFlushKey anchor. Only an independently
+  supplied external receipt verifier can be considered; no verifier or real
+  first-release sender is implemented. A source-only test verifier that
+  returns true is not a production authorization.
+- Both witnesses must match exactly on restart. Duplicate attempt, different
+  generation/target/host/image/partition/branch, one-sided missing state,
+  corruption, pending SQLite journal, or interruption between SQLite commit
+  and HKCU flush fail closed; no self-heal, reset or second send. This is a
+  distinct FI2-I2 **installation intent**, **not** an R3 release-cycle token.
+- `initialize_first_dev_cycle_locked` models FI2-I3 only *after* #1 has been
+  independently consumed; under the same lock it additionally requires the
+  frozen atomic `SUPERVISED_FIRST_USE` origin/cycle pair and independent
+  first-release/manual-WAKE/current PCM/RTC/manifest/raw-sync proof before
+  the later R3 first-enrollment+cycle-consumption transaction. It refuses
+  reuse of the #1 attempt ID. Positive callback tests are synthetic only.
+- New `test_dev_install_release_fence_135.py` covers state/restart/replay,
+  shared-lock enforcement, H0 prior-enrollment denial, independent-store loss
+  and split commit, receipt mismatch and tampering, distinct first-cycle
+  admission and two-process contention. These are **offline synthetic
+  source-path tests**; no physical USB, CDC, RTC, flash, NVS, SD or real HKCU
+  mutation is part of the test.
+
+**Still blocking a positive sender:** external private receipt authentication
+and independently established never-enrolled H0/old writer exclusion, actual
+pinned Device image/first hold/boot/PCM/RTC/USB identity, #148 C/R/A private
+evidence, #144 current firmware pair, exact #51 sync and canonical #89/#105
+mutations, RTC and release outcome verification, old installed origin-unaware
+CLI/watch exclusion, native Windows flush/power-loss qualification and a
+separately authorized Human Gate. The existing `sync-release` remains
+`R5_ADMISSION_NOT_QUALIFIED`; watcher remains `RELEASE_BLOCKED`. Neither
+new method is wired into a sender. An ambiguity or partial commit burns an
+attempt rather than granting a retry. Approved #143 Option A exclusions
+(matched whole-host rollback, malicious same-user actor, hostile USB) remain
+explicit limitations, not claimed mitigations.
+
+**This is a bounded implementation checkpoint, not full #135 acceptance,
+merge clearance or approval of a physical operation.**
+
+
+## SDB-1.1 single-host DEV generation source-only increment (#147 / #135)
+
+The current Draft branch contains a **non-installed** SDB-1.1 generation
+continuation candidate. The previous **enrolled** R3 SQLite chain and its
+independent HKCU witness must be read back and agree before any DEV admission.
+A single domain-separated V2 generation marker is appended to the existing
+chain, binding the externally granted generation and the **first already
+consumed** `SUPERVISED_FIRST_USE` tuple in one SQLite transaction. Its V2
+continuity state is flushed to the **same** independent HKCU anchor and both
+stores are reread. V1 consumed rows/receipts are never deleted, rekeyed or
+treated as H0. A second generation, old-device reuse, duplicate cycle,
+one-sided rollback or crash between SQLite/HKCU commits blocks without repair.
+
+The separate DEV first-attempt ledger is consumed **before** the R3 append,
+under the same cooperating OS lock. A split between those irreversible writes
+remains spent and blocks all release, rather than providing a retry path.
+`SourceOnlyReleaseSequence.dev_generation_first_release` uses the canonical
+#89 coordinator, a fresh status read during that lock and pre-RTC consumption;
+its input callbacks and private receipt descriptors **cannot issue or
+authenticate real Human/Device evidence**. The legacy H0/old-first-WAKE source
+fixtures remain for regression only; neither CLI nor watcher imports this
+adapter or is enabled to transmit an unattended release.
+
+The tests use synthetic IDs, disposable SQLite and fake hosts. Windows CI
+additionally checks native disposable HKCU/RegFlushKey, two-process contention,
+single-sided rollback and a partial anchor flush. Actual PC shutdown/power-loss
+durability, installed old-client exclusion, genuine USB/CDC/RTC/PCM/manifest
+binding, authenticated owner grant, image/G proof, Device-side origin producer,
+two real daily cycles and exact-device Human Gate remain **NOT_RUN /
+RELEASE_BLOCKED**. This source increment is not PC-A03/A05 acceptance,
+automatic release clearance, or merge approval.
+
+## SDB-1.1 bounded Engineering correction — old identity / two-writer split
+
+This source-only correction addresses ER-135-SDB-01/02 without enabling a
+release sender:
+
+- An enrolled DEV generation transition requires a **different new deviceId**
+  from the previously enrolled deviceId. The DEV entrypoint rejects equality
+  before consuming the separate DEV receipt; the R3 append itself rejects it
+  independently, and R3 V2 chain validation rejects a forged same-ID marker.
+  The prior V1 chain remains unchanged on denial. A generation UUID alone
+  cannot distinguish the old identity or authorize a rebaseline.
+- Distinct host DEV consumption kinds preserve the old regression-only H0
+  first-use path versus the **previously enrolled** SDB-1.1 DEV generation.
+  A consumed `SAME_HOST_DEV_GENERATION_FIRST_RELEASE` witness with an
+  otherwise healthy R3 V1 ledger is a **spent and blocked partial cutover**.
+  The cooperating R3 `reserve_locked`, `verify_reserved_locked`, and
+  `check_locked` paths must inspect the independently persisted DEV
+  SQLite+anchor pair; a missing, rolled-back, corrupted or split witness
+  fails closed. The canonical per-user R3 factory binds this check even when
+  a caller does not instantiate the DEV adapter. A completed V2 transition
+  must still prove its immutable chain and both host witnesses.
+- The new negative regression injects failure **after DEV SQLite/HKCU commit
+  but before the R3 generation transaction begins**, then confirms the
+  new DEV retry, old-device direct R3 reservation/pre-send proof and the
+  existing source-only canonical coordinator's old normal-cycle route all
+  transmit **zero** RTC/release bytes. A separate disposable native Windows
+  HKCU/SQLite test observes denial after reconstructing a new R3 object.
+  An independently interrupted first writer or R3 anchor flush is also
+  fail-closed, not auto-repaired.
+- These guards apply to cooperating source clients. Old installed,
+  origin-unaware standalone executables are **not** retroactively controlled
+  and remain an explicit pre-activation exclusion gate. Neither synthetic
+  receipt assertions nor Windows-runner HKCU tests constitute an owner grant,
+  current-run/PCM/RTC/MSC+CDC proof, physical power-loss qualification or
+  permission to call `RELEASE_STORAGE`.
+
+`RELEASE_BLOCKED` remains mandatory. PC-A03/A05/A07, real USB/Device
+execution, two daily cycles and Human Gate remain NOT_RUN; PR #142 stays Draft.
+
+## Canonical Windows R3 factory regression — still no installed release
+
+The native Windows regression `test_native_canonical_factory_blocks_dev_split_without_adapter`
+creates a healthy V1 host ledger using disposable per-user state/HKCU keys,
+consumes the independent DEV generation witness, and deliberately stops before
+R3 V2 append. A **new** `CycleAttemptFence.for_current_user` instance (with
+**no** `DevInstallReleaseFence` adapter instantiated for that restart)
+reads the canonical DEV witness and rejects old-generation `reserve_locked`,
+`verify_reserved_locked` and `check_locked`. It preserves the historical
+V1 consumed tuple. Existing `test_cli_release_gate_135.py` independently
+asserts the actual manual `sync-release` entrypoint performs zero host/CDC
+I/O even when supplied an apparently valid R5 status; the watcher is still
+intake-only. The test uses fabricated receipt evidence, not a real grant.
+
+This is a **source-only, default-disabled construction-boundary proof**, not
+positive release admission. An independently authenticated owner grant,
+current Device PCM/manifest/RTC and atomic R5 pair, original host volume/CDC
+identity, installed legacy sender exclusion, actual lock/dismount/one-send
+ordering and physical `SHUTDOWN_ARMED` remain outstanding. Do not allow a
+manually instantiated/unbound R3 fence or an older binary to become an
+installed alternative sender. Exact Windows host qualification, required
+Engineering/Security reviews, Human Gate and merge remain blocked.
+
+## SDB-1.1 frozen status recheck after RTC (source-only)
+
+`SourceOnlyReleaseSequence.dev_generation_first_release` re-reads the
+same live atomic `(releaseCycleId, SUPERVISED_FIRST_USE)` `GET_STATUS`
+after the one-shot host consumption and RTC callback, while ordinary CDC
+I/O remains open and **before** pre-seal observation, volume lock/dismount
+and possible `RELEASE_STORAGE`. Missing/changed pair, non-`USB_SYNC`,
+unknown RTC field or transport uncertainty fails closed. The attempt remains
+consumed; the caller must not retry. `rtcCorrectionPending=true` still
+requires separate independent RTC qualification and is not itself proof.
+
+Source-only fake-port regression covers post-RTC cycle/origin/state changes,
+one-sided fields, uncertain status transport, consumed retry denial and
+pending-audit compatibility. This is not physical acceptance or a positive
+release permit. Existing CLI/watch continue to block Release, and real
+owner-grant/PCM/manifest/RTC/USB, deployed older-sender exclusion, exact
+Windows hardware and Human Gate remain unqualified.
+
+## R3 normal-cycle live pair gate (source-only)
+
+`SourceOnlyReleaseSequence.normal_cycle` now requires a current `GET_STATUS`
+reader before consuming the normal `NORMAL_WAKE` release attempt, and again
+after RTC mutation while the existing ordinary CDC I/O gate is open.
+A missing or changed frozen pair, non-USB_SYNC state, unknown RTC field,
+or transport uncertainty blocks release and irrevocably consumes an already
+reserved attempt. This preserves one canonical coordinator/CDC sender.
+The external current-cycle proof remains mandatory; Device status text alone
+cannot attest current boot, PCM, manifest, RTC or host custody. CLI/watch
+remain release-disabled; all tests use synthetic endpoints.
+
+## ER-135-POSTOBS-01 — final frozen-pair check after pre-seal I/O (source-only)
+
+The final live R5 `GET_STATUS` is now performed **after** the last
+`before_seal_observation` callback and before the canonical #89 gate seal.
+A pre-seal MSC/capacity observation can outlive the post-RTC observation and
+invalidate the Device cycle/origin. A check before that callback is insufficient.
+The final status read uses ordinary CDC I/O admission under the same cooperating
+OS lock; no ordinary CDC is read after seal or volume lock/dismount.
+
+The original failing sequence (healthy pair at RTC -> altered cycle/origin
+*during* pre-seal observation -> legacy stale-pair send) is now denied for both
+DEV-generation first release and ordinary NORMAL_WAKE. A failed final status
+transport similarly blocks before volume lock/CDC release; the pre-mutation
+attempt stays durably consumed and cannot be retried. Synthetic fake-host tests
+do not establish atomic Device/RTC/PCM provenance, a live Windows/USB release
+permit or physical acceptance. CLI and watcher remain release-disabled.
