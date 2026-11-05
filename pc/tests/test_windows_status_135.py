@@ -60,6 +60,11 @@ class FakeKernel:
             response["result"]["releaseCycleOrigin"] = ""
         elif self.mode == "orphan-cycle":
             response["result"].pop("releaseCycleId")
+        if self.request["cmd"] == "RELEASE_STORAGE":
+            response["result"] = {
+                "releaseAttemptId": self.request["args"]["releaseAttemptId"],
+                "accepted": True,
+            }
         if self.request["cmd"] == "SET_TIME":
             response["result"] = {
                 "time": self.request["args"]["time"], "eventPending": True,
@@ -90,6 +95,17 @@ class FakeKernel:
             encoded = encoded.replace('"ok": true', '"ok": false, "ok": true', 1)
         elif self.mode == "duplicate-state":
             encoded = encoded.replace('"state": ', '"state": "NORMAL", "state": ', 1)
+        elif self.mode == "duplicate-accepted":
+            encoded = encoded.replace('"accepted": true',
+                                      '"accepted": false, "accepted": true', 1)
+        elif self.mode == "duplicate-attempt":
+            encoded = encoded.replace('"releaseAttemptId": ',
+                                      '"releaseAttemptId": "other", "releaseAttemptId": ', 1)
+        elif self.mode == "duplicate-time":
+            encoded = encoded.replace('"time": ', '"time": "other", "time": ', 1)
+        elif self.mode == "duplicate-pending":
+            encoded = encoded.replace('"eventPending": true',
+                                      '"eventPending": false, "eventPending": true', 1)
         self.reply = (encoded + "\n").encode("ascii")
         ctypes.cast(written, ctypes.POINTER(wintypes.DWORD)).contents.value = count
         return 1
@@ -200,6 +216,32 @@ class ReadOnlyStatusTests(unittest.TestCase):
 
 
 
+class ReleaseResponseTests(unittest.TestCase):
+    make_api = ReadOnlyStatusTests.make_api
+
+    def test_release_duplicate_json_keys_fail_closed(self):
+        from m5daylog.release import ReleaseIndeterminate
+
+        attempt = "00000000-0000-4000-8000-000000000001"
+        binding = CdcInterface("synthetic-cdc-interface", "cdc7", "parent")
+        for mode in ("duplicate-envelope", "duplicate-accepted",
+                     "duplicate-attempt"):
+            with self.subTest(mode=mode):
+                api, kernel = self.make_api(mode)
+                with self.assertRaises(ReleaseIndeterminate):
+                    api.release_cdc("COM7", attempt, binding)
+                self.assertEqual(kernel.request["cmd"], "RELEASE_STORAGE")
+                self.assertEqual(kernel.closed, 1)
+
+    def test_unambiguous_release_response_is_accepted(self):
+        attempt = "00000000-0000-4000-8000-000000000001"
+        binding = CdcInterface("synthetic-cdc-interface", "cdc7", "parent")
+        api, kernel = self.make_api()
+        api.release_cdc("COM7", attempt, binding)
+        self.assertEqual(kernel.request["cmd"], "RELEASE_STORAGE")
+        self.assertEqual(kernel.closed, 1)
+
+
 class RtcAdapterTests(unittest.TestCase):
     make_api = ReadOnlyStatusTests.make_api
     """#50 RTC write frame is synthetic; no native COM connection is opened."""
@@ -231,6 +273,17 @@ class RtcAdapterTests(unittest.TestCase):
                 "COM7", CdcInterface("another", "changed", "parent"), self.UTC
             )
         self.assertIsNone(kernel.request)
+
+    def test_duplicate_rtc_response_keys_fail_closed(self):
+        from m5daylog.release import ReleaseIndeterminate
+        for mode in ("duplicate-envelope", "duplicate-time",
+                     "duplicate-pending"):
+            with self.subTest(mode=mode):
+                api, kernel = self.make_api(mode)
+                with self.assertRaises(ReleaseIndeterminate):
+                    api.set_time("COM7", self.frozen(), self.UTC)
+                self.assertEqual(kernel.request["cmd"], "SET_TIME")
+                self.assertEqual(kernel.closed, 1)
 
     def test_rejected_and_uncertain_rtc_never_prove_completion(self):
         from m5daylog.release import ReleaseIndeterminate, ReleaseRejected
