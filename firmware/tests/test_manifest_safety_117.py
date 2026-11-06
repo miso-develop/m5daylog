@@ -200,7 +200,7 @@ def native_manifest(tmp_path_factory):
     for source in ("device_manifest.c", "device_identity.c", "sha256.c"):
         obj = work / (source + ".o")
         subprocess.run(
-            [cc, "-std=c11", "-fPIC", "-O0", "-I", str(INCLUDE),
+            [cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-fPIC", "-O0", "-I", str(INCLUDE),
              "-DDEVICE_MANIFEST_NATIVE_SYNC_TEST",
              "-Drename=manifest_test_rename",
              "-Dfflush=manifest_test_fflush",

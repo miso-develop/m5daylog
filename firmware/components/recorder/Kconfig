@@ -1,0 +1,54 @@
+menu "M5Daylog development-only admission"
+    config M5DAYLOG_SDB11_SD_ID_PROBE_MODE
+        bool "Development-only read-only SD card identity probe"
+        depends on !M5DAYLOG_SDB11_DEV_INSTALL
+        default n
+        help
+            Dedicated diagnostic image, never the recorder or DEV installer.
+            Read only SD CID serial and logical sector count via SPI before
+            NVS startup; do not mount FAT, enable MSC/CDC, or format media.
+            Flashing/running this image requires a separate physical gate.
+    config M5DAYLOG_SDB11_DEV_INSTALL
+        bool "Compile DEV SDB-1.1 first-boot candidate NVS transaction"
+        default n
+        help
+            Source-only development path. This does not wire startup,
+            authorize installation, format SD, or permit release. Normal
+            builds cannot call the mutating implementation.
+    config M5DAYLOG_SDB11_EXPECTED_GENERATION
+        string "Pinned DEV installation generation UUID"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
+        default ""
+        help
+            Exact supervised install generation. Empty blocks DEV startup.
+    config M5DAYLOG_SDB11_EXPECTED_DEVICE_ID
+        string "Pinned DEV device UUID"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
+        default ""
+        help
+            Exact installed NVS and SD device ID; UUID is not a grant.
+    config M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256
+        string "Pinned DEV image/partition/card baseline SHA-256"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
+        default ""
+        help
+            Lowercase 64-hex baseline binding read back from NVS. Empty blocks.
+    config M5DAYLOG_SDB11_INSTALLER_MODE
+        bool "One-shot DEV installer image (never record or publish USB)"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
+        default n
+        help
+            A separately built/approved installer image only. A genuine
+            GPIO42 10-second hold is required before any state/media write.
+            On any failure or partial result the unit shuts down; it never
+            self-repairs and never enters recorder or TinyUSB.
+    config M5DAYLOG_SDB11_EXPECTED_CID_SERIAL
+        hex "Exact selected SD CID serial (all DEV images)"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
+        default 0x0
+    config M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT
+        int "Exact selected SD logical sector count (all DEV images)"
+        depends on M5DAYLOG_SDB11_DEV_INSTALL
+        range 0 2147483647
+        default 0
+endmenu

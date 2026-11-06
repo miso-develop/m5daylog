@@ -60,6 +60,13 @@ typedef struct {
     int battery_mv;
     bool battery_valid;
     bool rtc_correction_pending;
+    // Optional, already frozen and qualified by Device owner; NULL=omit.
+    // This field alone never grants release authority.
+    const char *release_cycle_id;
+    // R5 CDC v1: atomically publish ID + an exact, qualified boot origin.
+    // Never infer the origin from status, RTC pending, or a host claim.
+    // Both pointers NULL means no release candidate.
+    const char *release_cycle_origin;
 } usb_cdc_protocol_status_t;
 
 typedef bool (*usb_cdc_protocol_status_provider_t)(

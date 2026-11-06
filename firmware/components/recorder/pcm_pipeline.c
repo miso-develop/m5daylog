@@ -88,6 +88,25 @@ size_t pcm_pipeline_produce(pcm_pipeline_t *pipeline, const uint8_t *data,
     return len - offset;
 }
 
+size_t pcm_pipeline_seal_partial(pcm_pipeline_t *pipeline) {
+    size_t sealed = 0;
+    unsigned i;
+    if (pipeline == NULL) {
+        return 0;
+    }
+    // Only the terminal consumer calls this, after CAPTURE_DONE. A slot
+    // becomes visible to peek/release without discarding valid short PCM.
+    for (i = 0; i < RECORDER_BUFFER_SLOTS; ++i) {
+        if (!pipeline->full[i] && pipeline->fill[i] != 0 &&
+            pipeline->fill[i] < RECORDER_BUFFER_BYTES &&
+            (pipeline->fill[i] % RECORDER_BYTES_PER_SAMPLE) == 0) {
+            pipeline->full[i] = true;
+            sealed += pipeline->fill[i];
+        }
+    }
+    return sealed;
+}
+
 bool pcm_pipeline_has_full(const pcm_pipeline_t *pipeline) {
     if (pipeline == NULL) {
         return false;
@@ -108,7 +127,7 @@ const uint8_t *pcm_pipeline_peek_full(const pcm_pipeline_t *pipeline,
         }
     }
     if (out_len != NULL) {
-        *out_len = RECORDER_BUFFER_BYTES;
+        *out_len = pipeline->fill[index];
     }
     return pipeline->slot[index];
 }

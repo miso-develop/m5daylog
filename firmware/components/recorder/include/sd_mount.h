@@ -8,6 +8,7 @@
 // leaves Device FAT/VFS unmounted until a later manual-WAKE fresh boot.
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef ESP_PLATFORM
 #include "esp_err.h"
@@ -23,6 +24,42 @@ typedef int esp_err_t;
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Diagnostic-only, one-shot SD CID and sector-count observation. Requires a
+// separately authorized, exact-image physical action. This function is
+// compiled as a stub outside the dedicated read-only probe build, never
+// mounts FAT, creates MSC/CDC, initializes NVS, or changes card filesystem.
+// CID+capacity alone are NOT proof of original media or installed APP.
+esp_err_t sd_mount_dev_observe_identity(uint32_t *cid_serial,
+                                        uint64_t *sector_count);
+
+// SDB-1.1 DEV-ONLY, explicitly supervised destructive rebaseline of the
+// selected, already inserted card. NEVER invoked by normal recorder startup,
+// TinyUSB MSC, CDC or PC. This helper does not establish external approval,
+// installed APP/ROM identity, NVS readiness or a release permit.
+// The caller must have independently pinned this same card (CID serial AND
+// capacity), cut off old host writers and consumed the one-use owner grant.
+// On an ambiguous result, treat that grant as SPENT; never silently retry.
+// Only compiled with CONFIG_M5DAYLOG_SDB11_DEV_INSTALL=1.
+esp_err_t sd_mount_dev_rebaseline_selected(bool owner_grant_consumed,
+                                           uint32_t expected_cid_serial,
+                                           uint64_t expected_sector_count);
+
+// DEV recorder boot preflight: read the selected card identity, exact generation
+// marker and canonical device identity before first-use intent, WAV/APP setup,
+// or USB publication. On first boot, require the pristine installed index.
+// Does NOT format, repair, create directories or expose MSC.
+esp_err_t sd_mount_dev_verify_selected_baseline(uint32_t expected_cid_serial,
+                                                uint64_t expected_sector_count,
+                                                const char *generation,
+                                                const char *device_id,
+                                                const char *binding,
+                                                bool first_boot);
+
+// Read-only check against the APP-owned mounted card. DEV-only logic
+// additionally proves that the same pinned card was remounted after format.
+bool sd_mount_dev_card_matches(uint32_t expected_cid_serial,
+                               uint64_t expected_sector_count);
 
 esp_err_t sd_mount_recordings(void);
 esp_err_t sd_mount_ensure_date_dir(const char *date_yyyy_mm_dd);

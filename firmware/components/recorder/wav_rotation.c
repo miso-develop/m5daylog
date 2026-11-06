@@ -11,9 +11,40 @@
 // double close and no double rename.
 
 #include "wav_rotation.h"
+#include "recorder_terminal_gate.h"
 
 #include <stdio.h>
 #include <string.h>
+
+bool recorder_terminal_may_drain(const recorder_terminal_gate_t *gate,
+                                 const pcm_pipeline_t *pipeline) {
+    const recorder_counters_t *counts;
+    if (gate == NULL || pipeline == NULL ||
+        !gate->capture_started || !gate->capture_done ||
+        !gate->writer_io_ok || !gate->app_storage_owned) {
+        return false;
+    }
+    counts = pcm_pipeline_counters(pipeline);
+    // A prior uncertain SD write/checkpoint is not safely retryable.
+    return counts != NULL && counts->sd_write_errors == 0;
+}
+
+bool recorder_terminal_can_finalize(const recorder_terminal_gate_t *gate,
+                                    const pcm_pipeline_t *pipeline) {
+    const recorder_counters_t *counts;
+    if (!recorder_terminal_may_drain(gate, pipeline) ||
+        !gate->lifecycle_healthy) {
+        return false;
+    }
+    counts = pcm_pipeline_counters(pipeline);
+    // A completed I2S read with a timeout but no loss is not a fault.
+    // DMA/staging loss must remain visibly ERROR. Staged good samples can
+    // still be salvaged to .part without making a healthy WAV/manifest.
+    return counts->dma_overrun_events == 0 &&
+           counts->dma_drop_bytes == 0 &&
+           counts->buffer_overflow == 0 &&
+           counts->buffer_drop_bytes == 0;
+}
 
 static bool is_digit(char c) {
     return c >= '0' && c <= '9';

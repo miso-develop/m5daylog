@@ -23,6 +23,24 @@ static adc_oneshot_unit_handle_t s_adc_unit = NULL;
 static adc_cali_handle_t s_adc_cali = NULL;
 static bool s_power_ready = false;
 
+// Sample the physical WAKE button during the first HOLD assertion, before
+// recorder_nvs_init() can delay the later shutdown-armed boot decision.
+// Only a real active-low GPIO sample grants this latch; no USB or timer
+// event may substitute for physical WAKE. A cold boot resets both statics.
+static bool s_boot_wake_sampled = false;
+static bool s_boot_wake_pressed = false;
+
+static esp_err_t recorder_power_config_wake_input(void) {
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << RECORDER_WAKE_BUTTON_PIN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&cfg);
+}
+
 static void recorder_power_cleanup(void) {
     if (s_adc_cali != NULL) {
         (void)adc_cali_delete_scheme_curve_fitting(s_adc_cali);
@@ -68,7 +86,21 @@ esp_err_t recorder_power_enable_hold(void) {
     if (err != ESP_OK) {
         return err;
     }
-    return gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, 1);
+    err = gpio_set_level((gpio_num_t)RECORDER_POWER_HOLD_PIN, 1);
+    if (err != ESP_OK) {
+        return err;
+    }
+    // First power-on observation is sticky: a three-second manual press
+    // must not be lost while NVS/RTC initialization is still running.
+    // If early GPIO configuration fails, retain the original late read
+    // path rather than inventing an asserted button.
+    if (!s_boot_wake_sampled &&
+        recorder_power_config_wake_input() == ESP_OK) {
+        s_boot_wake_pressed =
+            gpio_get_level((gpio_num_t)RECORDER_WAKE_BUTTON_PIN) == 0;
+        s_boot_wake_sampled = true;
+    }
+    return ESP_OK;
 }
 
 esp_err_t recorder_power_release_hold(void) {
@@ -89,24 +121,19 @@ esp_err_t recorder_power_release_hold(void) {
 }
 
 esp_err_t recorder_power_manual_wake_asserted(bool *asserted) {
-    gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << RECORDER_WAKE_BUTTON_PIN,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
     esp_err_t err;
+    bool pressed_now;
 
     if (asserted == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     *asserted = false;
-    err = gpio_config(&cfg);
+    err = recorder_power_config_wake_input();
     if (err != ESP_OK) {
         return err;
     }
-    *asserted = gpio_get_level((gpio_num_t)RECORDER_WAKE_BUTTON_PIN) == 0;
+    pressed_now = gpio_get_level((gpio_num_t)RECORDER_WAKE_BUTTON_PIN) == 0;
+    *asserted = s_boot_wake_pressed || pressed_now;
     return ESP_OK;
 }
 

@@ -22,6 +22,15 @@ static void recorder_task49_delete(TaskHandle_t task);
 #undef app_main
 
 #include "shutdown_armed.h"
+#include "release_cycle_fence.h"
+#include "release_cycle_button.h"
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+#include "dev_sdb11_first_boot.h"
+#include "dev_sdb11_installer.h"
+#include "esp_timer.h"
+#endif
+#include "release_cycle_witness.h"
+#include "tusb.h"
 #include "rtc_correction.h"
 #include "recorder_nvs.h"
 #include "task87_wake_recovery.h"
@@ -49,6 +58,13 @@ extern bool device_manifest_sync_wav_dir(const char *recordings_dir,
 
 static task87_wake_recovery_t s_wake_recovery;
 static TaskHandle_t s_usb_event_task = NULL;
+static bool s_first_use_attempted;
+static bool s_first_use_button_ready;
+
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+static bool
+recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx);
+#endif
 
 static usb_cdc_release_result_t recorder_cdc_release_accept(
     const char *release_attempt_id,
@@ -56,9 +72,24 @@ static usb_cdc_release_result_t recorder_cdc_release_accept(
     usb_msc_release_storage_result_t result;
     (void)ctx;
 
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    // SDB-1.1 DEV installed generations cannot use legacy origin-unaware
+    // canonical release. Validate the SAME actual RAM-only status predicate
+    // as GET_STATUS before any potentially accepted CDC release bytes.
+    // This is a Device-side denial, NOT proof of the host's durable grant.
+    usb_cdc_protocol_status_t observed = {0};
+    if (!recorder_cdc_status(&observed, NULL) ||
+        observed.release_cycle_id == NULL ||
+        observed.release_cycle_origin == NULL ||
+        !release_cycle_fence_host_owned_qualified()) {
+        return USB_CDC_RELEASE_CONFLICT;
+    }
+#endif
     result = usb_msc_ownership_accept_release_storage(release_attempt_id);
     switch (result) {
         case USB_MSC_RELEASE_STORAGE_ACCEPTED:
+            // Exactly the existing CDC D-031 acceptance, not SCSI/DETACH.
+            release_cycle_fence_note_canonical_release_accepted();
             return USB_CDC_RELEASE_ACCEPTED;
         case USB_MSC_RELEASE_STORAGE_INVALID_ARGS:
             return USB_CDC_RELEASE_INVALID_ARGS;
@@ -84,6 +115,8 @@ static bool recorder_cdc_command_admission_open(void *ctx) {
 
 static void recorder_cdc_physical_session_cutoff(void *ctx) {
     (void)ctx;
+    release_cycle_button_note_session_cutoff();
+    release_cycle_fence_note_physical_session_cutoff();
     usb_cdc_protocol_close_session();
 }
 
@@ -107,6 +140,24 @@ static bool recorder_cdc_status(usb_cdc_protocol_status_t *out, void *ctx) {
     out->battery_mv = battery_mv;
     out->battery_valid = battery_mv > 0;
     out->rtc_correction_pending = rtc_correction_is_pending();
+    // Writer and USB tasks are serialized by the finalization/ownership
+    // barrier: status reads only the immutable terminal current-run UUID.
+    out->release_cycle_id = NULL;
+    out->release_cycle_origin = NULL;
+    if (state == RECORDER_STATE_USB_SYNC &&
+        rtc_correction_cycle_status_qualified() &&
+        !sd_mount_is_mounted() &&
+        usb_msc_ownership_is_host_owned() &&
+        usb_msc_ownership_release_command_admission_open() &&
+        release_cycle_fence_boot_qualified() &&
+        release_cycle_fence_host_owned_qualified()) {
+        const char *const frozen = release_cycle_witness_frozen_id();
+        const char *const origin = release_cycle_fence_current_origin();
+        if (frozen != NULL && origin != NULL) {
+            out->release_cycle_id = frozen;
+            out->release_cycle_origin = origin;
+        }
+    }
     return out->state != NULL && out->reason != NULL;
 }
 
@@ -269,6 +320,49 @@ static void recorder_flush_usb_scsi_trace(void) {
     }
 }
 
+static void recorder_first_use_monitor_poll(void) {
+    uint32_t epoch = 0u;
+    bool custody;
+    esp_err_t err;
+
+    if (s_first_use_attempted || !s_first_use_button_ready) return;
+    custody = recorder_current_state() == RECORDER_STATE_USB_SYNC &&
+        !sd_mount_is_mounted() &&
+        usb_msc_ownership_is_host_owned() &&
+        usb_msc_ownership_release_command_admission_open() &&
+        tud_mounted();
+
+    // Proof is a *continuous* GPIO42-low observation; physical release edges
+    // are counted by an ISR. USB callback session cuts invalidate the clock.
+    if (!release_cycle_button_poll(custody, &epoch)) return;
+    s_first_use_attempted = true;  // never retry uncertain NVS writes
+    // Recheck the physical low/ISR edge generation, not only USB epoch.
+    // An interrupted hold must never reach the FU_STAGED NVS transaction.
+    if (!custody || !release_cycle_button_witness_still_valid(epoch)) return;
+
+    // The API additionally requires a positively provisioned UNQUALIFIED NVS
+    // fence and durable HOST_UNRESOLVED; erased/legacy NVS never bootstraps.
+    err = release_cycle_fence_stage_first_use();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+            "stage: first-use, result: staging-unqualified, action: release-blocked");
+        return;
+    }
+    // A disconnect concurrent with the NVS transaction burns the stage.
+    // A durable FU_STAGED marker alone can never grant a boot permit.
+    if (!release_cycle_button_witness_still_valid(epoch) ||
+        recorder_current_state() != RECORDER_STATE_USB_SYNC ||
+        !usb_msc_ownership_release_command_admission_open() ||
+        !usb_msc_ownership_is_host_owned() || !tud_mounted()) {
+        release_cycle_fence_cancel_first_use_staging();
+        ESP_LOGW(TAG,
+            "stage: first-use, result: witness-lost, action: release-blocked");
+        return;
+    }
+    ESP_LOGI(TAG,
+        "stage: first-use, result: intent-durable, release-authority: none");
+}
+
 static void recorder_handle_usb_host_owned(void) {
     if (recorder_current_state() != RECORDER_STATE_USB_PREPARE ||
         sd_mount_is_mounted() ||
@@ -282,6 +376,22 @@ static void recorder_handle_usb_host_owned(void) {
         return;
     }
 
+    // R3 adds a separate PC-owned witness; it never authorizes release alone.
+    if (release_cycle_fence_boot_qualified() &&
+        release_cycle_fence_note_host_owned() != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "stage: release-cycle, result: ownership-witness-error, action: witness-disabled");
+    }
+
+    // A failed physical GPIO interrupt setup cannot synthesize a 10s press.
+    if (!s_first_use_attempted && !s_first_use_button_ready) {
+        s_first_use_button_ready = release_cycle_button_init() == ESP_OK;
+        if (!s_first_use_button_ready) {
+            s_first_use_attempted = true;
+            ESP_LOGW(TAG,
+                "stage: first-use, result: gpio-unavailable, action: disabled");
+        }
+    }
     // D-031 command admission opens only after PC ownership / USB_SYNC.
     usb_cdc_protocol_open_session();
     recorder_flush_usb_scsi_trace();
@@ -328,6 +438,21 @@ static void recorder_handle_usb_release(void) {
     // fail-closed and never reaches HOLD release.
     if (usb_msc_ownership_complete_release_quiesce() != ESP_OK) {
         recorder_enter_error(RECORDER_REASON_USB);
+        return;
+    }
+
+    // R3 boot admission is deliberately separate from the existing release
+    // authority. A failed next-day re-arm cannot undo an accepted release;
+    // it must remain a visible fail-closed condition, never a retry.
+    // Loss of the optional host-owned NVS witness withholds the R5 status
+    // pair and next-day re-arm; it must not prevent the already accepted
+    // D-031 quiesce/SHUTDOWN_ARMED from reaching functional shutdown.
+    if (release_cycle_fence_rearm_required(
+            release_cycle_witness_frozen_id() != NULL) &&
+        release_cycle_fence_note_release_completed() != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: release-cycle, result: nvs-rearm-error, action: fail-closed");
+        recorder_enter_error(RECORDER_REASON_INTERNAL);
         return;
     }
 
@@ -381,13 +506,45 @@ static void recorder_usb_event_task(void *arg) {
                 break;
         }
         recorder_flush_usb_scsi_trace();
+        recorder_first_use_monitor_poll();
     }
 }
+
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+// Only the dedicated DEV install image can enter this gate; it executes
+// before recorder_base_task, SD access, TinyUSB install or USB publication.
+// The existing button ISR detects release/repress even between 20ms polls.
+static bool recorder_dev_wait_for_first_hold(uint32_t *out_epoch) {
+    const int64_t k_window_us = INT64_C(30000000);
+    int64_t start, now;
+    uint32_t epoch = 0u;
+    if (out_epoch == NULL ||
+        release_cycle_button_init() != ESP_OK) return false;
+    *out_epoch = 0u;
+    start = esp_timer_get_time();
+    if (start < 0) return false;
+    for (;;) {
+        now = esp_timer_get_time();
+        if (now < start || now - start >= k_window_us) return false;
+        if (release_cycle_button_poll(true, &epoch) &&
+            release_cycle_button_witness_still_valid(epoch)) {
+            *out_epoch = epoch;
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+#endif
 
 void app_main(void) {
     bool manual_wake = false;
     usb_cdc_protocol_config_t cdc_config;
     shutdown_armed_boot_action_t action = SHUTDOWN_ARMED_BOOT_STAY_SHUTDOWN;
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    dev_sdb11_boot_policy_t dev_boot_policy;
+    bool dev_first_boot = false;
+    uint32_t dev_hold_epoch = 0u;
+#endif
 
     // Maintain power before any persistent-state inspection. On an armed boot,
     // only the physical active-low WAKE button may authorize fresh recovery.
@@ -395,6 +552,24 @@ void app_main(void) {
     if (recorder_power_enable_hold() != ESP_OK) {
         return;
     }
+#if defined(CONFIG_M5DAYLOG_SDB11_SD_ID_PROBE_MODE) && CONFIG_M5DAYLOG_SDB11_SD_ID_PROBE_MODE
+    // Exactly one diagnostic SPI initialization on this boot. The probe does
+    // not open NVS, mount FAT, publish MSC/CDC or start a recorder. Identity
+    // values remain in the operator's PRIVATE serial receipt, not GitHub.
+    uint32_t cid_serial = 0;
+    uint64_t sector_count = 0;
+    const esp_err_t probe = sd_mount_dev_observe_identity(
+        &cid_serial, &sector_count);
+    if (probe == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "stage: dev-sd-probe, result: observed, cid: 0x%08lx, sectors: %llu",
+                 (unsigned long)cid_serial, (unsigned long long)sector_count);
+    } else {
+        ESP_LOGE(TAG, "stage: dev-sd-probe, result: blocked");
+    }
+    (void)recorder_power_shutdown();
+    return;
+#endif
     // Establish the single default-NVS lifetime before any recorder worker
     // task can run. Recorder-owned NVS users share recorder_nvs' mutex and no
     // recorder path deinitializes the partition during this process lifetime.
@@ -404,6 +579,31 @@ void app_main(void) {
         recorder_shutdown_armed_now();
         return;
     }
+#if defined(CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE) && CONFIG_M5DAYLOG_SDB11_INSTALLER_MODE
+    // A standalone DEV installer image never starts recorder_base_task or
+    // TinyUSB. The operator must independently consume the exact selected
+    // board/card/image one-use grant and cut off all old host writers before
+    // this binary is installed. This actual ISR-backed 10s hold is an
+    // additional local interlock, not a substitute for owner authorization.
+    uint32_t installer_epoch = 0u;
+    if (!recorder_dev_wait_for_first_hold(&installer_epoch) ||
+        !release_cycle_button_witness_still_valid(installer_epoch) ||
+        dev_sdb11_install_baseline(
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256,
+            (uint32_t)CONFIG_M5DAYLOG_SDB11_EXPECTED_CID_SERIAL,
+            (uint64_t)CONFIG_M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT,
+            true) != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: dev-install, result: unqualified-or-failed, action: shutdown");
+    } else {
+        ESP_LOGI(TAG,
+                 "stage: dev-install, result: baseline-ready, release-authority: none");
+    }
+    recorder_shutdown_armed_now();
+    return;  // NEVER record or publish USB in the installer image
+#endif
     if (recorder_power_manual_wake_asserted(&manual_wake) != ESP_OK ||
         shutdown_armed_boot_action(manual_wake, &action) != ESP_OK) {
         ESP_LOGE(TAG,
@@ -423,9 +623,103 @@ void app_main(void) {
         recorder_shutdown_armed_now();
         return;
     }
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    // DEV-only pinning intentionally blocks an empty/mismatched install,
+    // partially consumed intent, unexpected restart or replay. The NORMAL
+    // next-day path is allowed only after a real accepted release has
+    // established both SHUTDOWN_ARMED and READY_AFTER_RELEASE.
+    dev_boot_policy = dev_sdb11_probe_boot(
+        CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION,
+        CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID,
+        CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256);
+    if (dev_boot_policy == DEV_SDB11_BOOT_BLOCKED) {
+        ESP_LOGE(TAG,
+                 "stage: dev-first-boot, result: unqualified, action: shutdown");
+        recorder_shutdown_armed_now();
+        return;
+    }
+    // Source-level selected original-card check BEFORE first-use hold/NVS
+    // consumption, before normal WAKE permit use, and before any recorder
+    // FAT directory/manifest writes or USB publication. A missing/wrong card,
+    // substituted generation or non-pristine first-use baseline is a hard STOP.
+    if (sd_mount_dev_verify_selected_baseline(
+            (uint32_t)CONFIG_M5DAYLOG_SDB11_EXPECTED_CID_SERIAL,
+            (uint64_t)CONFIG_M5DAYLOG_SDB11_EXPECTED_SECTOR_COUNT,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID,
+            CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256,
+            dev_boot_policy == DEV_SDB11_BOOT_NEEDS_HOLD) != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: dev-card, result: mismatch-or-read-error, action: shutdown");
+        recorder_shutdown_armed_now();
+        return;
+    }
+    if (dev_boot_policy == DEV_SDB11_BOOT_NEEDS_HOLD) {
+        // A short, interrupted or unmeasurable physical hold never consumes
+        // NVS. Do not start recording merely because the DEV SD is blank.
+        if (!recorder_dev_wait_for_first_hold(&dev_hold_epoch) ||
+            !release_cycle_button_witness_still_valid(dev_hold_epoch) ||
+            dev_sdb11_consume_boot_intent(
+                CONFIG_M5DAYLOG_SDB11_EXPECTED_GENERATION,
+                CONFIG_M5DAYLOG_SDB11_EXPECTED_DEVICE_ID,
+                CONFIG_M5DAYLOG_SDB11_EXPECTED_BASELINE_SHA256,
+                true) != ESP_OK ||
+            !release_cycle_button_witness_still_valid(dev_hold_epoch)) {
+            ESP_LOGE(TAG,
+                     "stage: dev-first-boot, result: hold-or-consume-failed, action: shutdown");
+            recorder_shutdown_armed_now();
+            return;
+        }
+        dev_first_boot = true;
+    }
+#endif
+    // The R3 release witness is optional and never changes legacy recorder
+    // recovery or enables CDC release on its own. Consume the durable ready
+    // marker BEFORE #87 can commit WAKE_RECOVERY_PENDING or NORMAL.
+    if (release_cycle_fence_begin_boot(manual_wake) != ESP_OK) {
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+        // DEV installation has no optional-bypass: incomplete NVS proof is
+        // a hard stop before recording/MSC (not an unsigned cycle).
+        recorder_shutdown_armed_now();
+        return;
+#else
+        ESP_LOGW(TAG,
+                 "stage: release-cycle, result: boot-fence-error, action: witness-disabled");
+#endif
+    }
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    if (dev_first_boot && release_cycle_fence_admit_dev_first_boot() != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "stage: dev-first-boot, result: origin-unqualified, action: shutdown");
+        recorder_shutdown_armed_now();
+        return;
+    }
+#endif
     task87_wake_recovery_init(
         &s_wake_recovery,
         action == SHUTDOWN_ARMED_BOOT_MANUAL_RESUME);
+
+#if defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+    if (dev_first_boot) {
+        // SDB-1.1 starts in NORMAL, so the #87 manual-WAKE recovery hook
+        // cannot establish its boot-local RTC proof. Reuse the existing #50
+        // BM8563 read/VL/calendar/settimeofday/teardown validation BEFORE
+        // any recorder task starts. An initially provisioned DEV generation
+        // must have no pending RTC audit: with no pending record this hook
+        // only reads RTC and never touches the (not yet mounted) SD.
+        // A failed RTC read returns OK from the best-effort recovery hook;
+        // therefore the explicit RAM proof is required as well.
+        if (rtc_correction_init() != ESP_OK ||
+            rtc_correction_is_pending() ||
+            rtc_correction_flush_pending_event(RECORDER_EVENTS_PATH) != ESP_OK ||
+            !rtc_correction_cycle_status_qualified()) {
+            ESP_LOGE(TAG,
+                     "stage: dev-first-boot, result: rtc-unverified, action: shutdown");
+            recorder_shutdown_armed_now();
+            return;  // Intent stays USED; never retry this boot or reset NVS.
+        }
+    }
+#endif
 
     // Manual-WAKE recovery needs the durable RTC pending record before
     // main.c reaches the Device-owned manifest/recovery seam. Normal boot does
@@ -484,6 +778,14 @@ void app_main(void) {
         recorder_cdc_release_response_complete;
     cdc_config.command_admission_open =
         recorder_cdc_command_admission_open;
+
+    // Complete the boot-local origin proof only after successful RTC and
+    // recorder recovery; status publication still additionally requires a
+    // finalized current-boot PCM/manifest witness (not yet connected).
+    if (release_cycle_fence_note_recorder_ready() != ESP_OK) {
+        ESP_LOGD(TAG,
+                 "stage: release-cycle, result: recorder-origin-unqualified");
+    }
 
     if (usb_msc_ownership_init() != ESP_OK ||
         usb_msc_ownership_set_physical_session_cutoff(

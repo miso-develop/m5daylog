@@ -42,6 +42,17 @@ esp_err_t rtc_correction_init(void);
 // persistence. A second SET_TIME must return BUSY while this is true.
 bool rtc_correction_is_pending(void);
 
+// Cached origin proof of a successful BM8563 read plus settimeofday in the
+// current manual-WAKE recovery. Immutable boot origin: an in-session
+// SET_TIME cannot create this proof or replace the frozen cycle identity.
+bool rtc_correction_boot_clock_verified(void);
+
+// RAM-only current-session release-cycle RTC predicate. Requires verified
+// boot RTC origin plus no failed/indeterminate SET_TIME; a current-session
+// successful commit may leave #50's audit rtcCorrectionPending=true.
+// Does not perform RTC/SD/NVS I/O or grant a missing boot origin.
+bool rtc_correction_cycle_status_qualified(void);
+
 // Validate an offset-bearing ISO-8601 instant, normalize it to UTC seconds,
 // write BM8563 + system time, then commit one pending correction to NVS.
 // `normalized` receives `YYYY-MM-DDTHH:MM:SS+00:00` on success.

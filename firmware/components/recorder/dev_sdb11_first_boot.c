@@ -1,0 +1,312 @@
+#include "dev_sdb11_first_boot.h"
+#if defined(ESP_PLATFORM) && defined(CONFIG_M5DAYLOG_SDB11_DEV_INSTALL) && CONFIG_M5DAYLOG_SDB11_DEV_INSTALL
+
+#include <stdint.h>
+#include <string.h>
+#include "nvs.h"
+#include "esp_random.h"
+#include "device_identity.h"
+#include "recorder_nvs.h"
+#include "dev_fresh_install_nvs.h"
+
+// All values are explicit and are NOT defaults for absent NVS keys.
+enum {
+    DEV_READY_UNSPENT = 0xa2u,
+    DEV_INTENT_STAGED = 0xa3u,
+    DEV_FIRST_BOOT_USED = 0xa4u,
+    FENCE_UNQUALIFIED = 0x51u,
+    FENCE_BOOT_ACTIVE = 0x52u,
+    LIFECYCLE_NORMAL = 0u,
+};
+static bool s_attempted; // process-local; no retry after an uncertain write
+static bool s_consumed;
+
+static bool sha256_lower_hex(const char *s) {
+    if (s == NULL || strlen(s) != 64u) return false;
+    for (size_t i = 0u; i < 64u; ++i) {
+        if (!((s[i] >= '0' && s[i] <= '9') ||
+              (s[i] >= 'a' && s[i] <= 'f'))) return false;
+    }
+    return true;
+}
+
+static bool s_ready_attempted;
+
+esp_err_t dev_sdb11_mark_baseline_ready(const char *expected_generation,
+                                        const char *expected_device_id,
+                                        const char *expected_binding_sha256,
+                                        bool sd_baseline_readback_passed) {
+    nvs_handle_t h = 0;
+    uint8_t state = 0, fence = 0, lifecycle = 0xffu;
+    char id[RECORDER_UUID_STR_LEN] = {0};
+    char gen[RECORDER_UUID_STR_LEN] = {0};
+    char bind[65] = {0};
+    size_t id_len = sizeof(id), gen_len = sizeof(gen), bind_len = sizeof(bind);
+    uint64_t nonce = 0u;
+    esp_err_t err;
+    if (!sd_baseline_readback_passed || s_ready_attempted ||
+        !device_identity_is_valid_uuid(expected_generation) ||
+        !device_identity_is_valid_uuid(expected_device_id) ||
+        !sha256_lower_hex(expected_binding_sha256)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // RTC unqualified and all previously provisioned initial NVS fields are
+    // checked with the existing production readback helper. Do not repair
+    // its error by erasing a namespace or minting a new UUID.
+    err = dev_fresh_install_nvs_readback_matches(expected_device_id);
+    if (err != ESP_OK) return err;
+    s_ready_attempted = true; // reject any in-process ambiguous retry
+
+    err = recorder_nvs_lock();
+    if (err != ESP_OK) return err;
+    err = nvs_open("m5daylog", NVS_READWRITE, &h);
+    if (err != ESP_OK) goto ready_done;
+    err = nvs_get_str(h, "device_id", id, &id_len);
+    if (err == ESP_OK) err = nvs_get_u8(h, "release_boot", &fence);
+    if (err == ESP_OK) err = nvs_get_u8(h, "shutdown_armed", &lifecycle);
+    if (err != ESP_OK || id_len != RECORDER_UUID_STR_LEN ||
+        strcmp(id, expected_device_id) != 0 ||
+        fence != FENCE_UNQUALIFIED || lifecycle != LIFECYCLE_NORMAL) {
+        err = ESP_ERR_INVALID_STATE;
+        goto ready_done;
+    }
+    // A partially committed old install or first-use attempt cannot be
+    // repeated, including if only one of several NVS keys survived.
+    err = nvs_get_u8(h, "dev_state", &state);
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+        if (err == ESP_OK) err = ESP_ERR_INVALID_STATE;
+        goto ready_done;
+    }
+    err = nvs_get_str(h, "dev_gen", gen, &gen_len);
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+        if (err == ESP_OK) err = ESP_ERR_INVALID_STATE;
+        goto ready_done;
+    }
+    err = nvs_get_str(h, "dev_bind", bind, &bind_len);
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+        if (err == ESP_OK) err = ESP_ERR_INVALID_STATE;
+        goto ready_done;
+    }
+    err = nvs_get_u64(h, "dev_nonce", &nonce);
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+        if (err == ESP_OK) err = ESP_ERR_INVALID_STATE;
+        goto ready_done;
+    }
+
+    // Two unidirectional commits. NVS is not a multi-key atomic transaction;
+    // a partial/inaccurate result stays permanently non-ready. External
+    // consumed owner authorization prohibits any retry from a fresh boot.
+    err = nvs_set_u8(h, "dev_state", 0xa1u /* INSTALL_INCOMPLETE */);
+    if (err == ESP_OK) err = nvs_commit(h);
+    if (err != ESP_OK) goto ready_done;
+    err = nvs_get_u8(h, "dev_state", &state);
+    if (err != ESP_OK) goto ready_done;
+    if (state != 0xa1u) {
+        err = ESP_ERR_INVALID_STATE;
+        goto ready_done;
+    }
+
+    err = nvs_set_str(h, "dev_gen", expected_generation);
+    if (err == ESP_OK) err = nvs_set_str(h, "dev_bind", expected_binding_sha256);
+    if (err == ESP_OK) err = nvs_set_u8(h, "dev_state", DEV_READY_UNSPENT);
+    if (err == ESP_OK) err = nvs_commit(h);
+    if (err != ESP_OK) goto ready_done;
+    gen_len = sizeof(gen); bind_len = sizeof(bind);
+    err = nvs_get_str(h, "dev_gen", gen, &gen_len);
+    if (err == ESP_OK) err = nvs_get_str(h, "dev_bind", bind, &bind_len);
+    if (err == ESP_OK) err = nvs_get_u8(h, "dev_state", &state);
+    if (err == ESP_OK && (gen_len != RECORDER_UUID_STR_LEN ||
+                          bind_len != 65u ||
+                          strcmp(gen, expected_generation) != 0 ||
+                          strcmp(bind, expected_binding_sha256) != 0 ||
+                          state != DEV_READY_UNSPENT)) {
+        err = ESP_ERR_INVALID_STATE;
+    }
+
+ready_done:
+    if (h != 0) nvs_close(h);
+    recorder_nvs_unlock();
+    return err;
+}
+
+dev_sdb11_boot_policy_t dev_sdb11_probe_boot(const char *expected_generation,
+                                               const char *expected_device_id,
+                                               const char *expected_binding_sha256) {
+    nvs_handle_t h = 0;
+    char generation[RECORDER_UUID_STR_LEN] = {0};
+    char id[RECORDER_UUID_STR_LEN] = {0};
+    char binding[65] = {0};
+    size_t gen_len = sizeof(generation), id_len = sizeof(id);
+    size_t bind_len = sizeof(binding);
+    uint8_t state = 0, fence = 0, lifecycle = 0xffu;
+    uint64_t nonce = 0;
+    esp_err_t err, nonce_err;
+    dev_sdb11_boot_policy_t result = DEV_SDB11_BOOT_BLOCKED;
+
+    // Empty/invalid pinned parameters fail BEFORE touching media.
+    if (!device_identity_is_valid_uuid(expected_generation) ||
+        !device_identity_is_valid_uuid(expected_device_id) ||
+        !sha256_lower_hex(expected_binding_sha256)) {
+        return DEV_SDB11_BOOT_BLOCKED;
+    }
+    err = recorder_nvs_lock();
+    if (err != ESP_OK) return DEV_SDB11_BOOT_BLOCKED;
+    err = nvs_open("m5daylog", NVS_READONLY, &h);
+    if (err != ESP_OK) goto policy_done;
+    err = nvs_get_str(h, "dev_gen", generation, &gen_len);
+    if (err == ESP_OK) err = nvs_get_str(h, "device_id", id, &id_len);
+    if (err == ESP_OK) err = nvs_get_str(h, "dev_bind", binding, &bind_len);
+    if (err == ESP_OK) err = nvs_get_u8(h, "dev_state", &state);
+    if (err == ESP_OK) err = nvs_get_u8(h, "release_boot", &fence);
+    if (err == ESP_OK) err = nvs_get_u8(h, "shutdown_armed", &lifecycle);
+    if (err != ESP_OK || gen_len != RECORDER_UUID_STR_LEN ||
+        id_len != RECORDER_UUID_STR_LEN || bind_len != 65u ||
+        strcmp(generation, expected_generation) != 0 ||
+        strcmp(id, expected_device_id) != 0 ||
+        strcmp(binding, expected_binding_sha256) != 0) goto policy_done;
+
+    nonce_err = nvs_get_u64(h, "dev_nonce", &nonce);
+    if (state == DEV_READY_UNSPENT && fence == FENCE_UNQUALIFIED &&
+        lifecycle == LIFECYCLE_NORMAL &&
+        nonce_err == ESP_ERR_NVS_NOT_FOUND && !s_attempted) {
+        result = DEV_SDB11_BOOT_NEEDS_HOLD;
+    } else if (state == DEV_FIRST_BOOT_USED &&
+               fence == 0x53u /* READY_AFTER_RELEASE */ &&
+               lifecycle == 1u /* SHUTDOWN_ARMED */ &&
+               nonce_err == ESP_OK && nonce != 0u) {
+        // Only the real release acceptance/quiesce path may create the
+        // READY_AFTER_RELEASE marker. The normal R3 manual WAKE gate
+        // independently consumes it; this is NOT a first-use replay.
+        result = DEV_SDB11_BOOT_NORMAL_CYCLE;
+    }
+
+policy_done:
+    if (h != 0) nvs_close(h);
+    recorder_nvs_unlock();
+    return result;
+}
+
+bool dev_sdb11_boot_intent_consumed_this_boot(void) {
+    return s_consumed;
+}
+
+esp_err_t dev_sdb11_consume_boot_intent(const char *expected_generation,
+                                       const char *expected_device_id,
+                                       const char *expected_binding_sha256,
+                                       bool physical_hold_proven) {
+    nvs_handle_t h = 0;
+    char generation[RECORDER_UUID_STR_LEN] = {0};
+    char device_id[RECORDER_UUID_STR_LEN] = {0};
+    char binding[65] = {0};
+    size_t generation_len = sizeof(generation);
+    size_t id_len = sizeof(device_id);
+    size_t binding_len = sizeof(binding);
+    uint8_t state = 0, lifecycle = 0xffu, fence = 0;
+    uint64_t nonce = 0u, read_nonce = 0u;
+    esp_err_t err;
+
+    if (!physical_hold_proven ||
+        !device_identity_is_valid_uuid(expected_generation) ||
+        !device_identity_is_valid_uuid(expected_device_id) ||
+        !sha256_lower_hex(expected_binding_sha256) ||
+        s_attempted) return ESP_ERR_INVALID_STATE;
+    // This latch is set even if a later read or write fails. A reboot must
+    // NOT reconstruct it from STAGED, USED, BOOT_ACTIVE, UUID or nonce.
+    s_attempted = true;
+    s_consumed = false;
+    err = recorder_nvs_lock();
+    if (err != ESP_OK) return err;
+    err = nvs_open("m5daylog", NVS_READWRITE, &h);
+    if (err != ESP_OK) goto done;
+    err = nvs_get_str(h, "dev_gen", generation, &generation_len);
+    if (err != ESP_OK) goto done;
+    err = nvs_get_str(h, "device_id", device_id, &id_len);
+    if (err != ESP_OK) goto done;
+    err = nvs_get_str(h, "dev_bind", binding, &binding_len);
+    if (err != ESP_OK) goto done;
+    err = nvs_get_u8(h, "dev_state", &state);
+    if (err != ESP_OK) goto done;
+    err = nvs_get_u8(h, "release_boot", &fence);
+    if (err != ESP_OK) goto done;
+    err = nvs_get_u8(h, "shutdown_armed", &lifecycle);
+    if (err != ESP_OK) goto done;
+    // Any surviving nonce may represent a partially committed prior attempt.
+    err = nvs_get_u64(h, "dev_nonce", &read_nonce);
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+        if (err == ESP_OK) err = ESP_ERR_INVALID_STATE;
+        goto done;
+    }
+    if (generation_len != RECORDER_UUID_STR_LEN ||
+        id_len != RECORDER_UUID_STR_LEN || binding_len != 65u ||
+        strcmp(generation, expected_generation) != 0 ||
+        strcmp(device_id, expected_device_id) != 0 ||
+        strcmp(binding, expected_binding_sha256) != 0 ||
+        state != DEV_READY_UNSPENT || fence != FENCE_UNQUALIFIED ||
+        lifecycle != LIFECYCLE_NORMAL) {
+        err = ESP_ERR_INVALID_STATE;
+        goto done;
+    }
+
+    // Two one-way persistent commits. Neither multi-key commit nor an
+    // ESP_ERR_* result provides rollback/atomicity. External *already spent*
+    // owner intent must prohibit an operator retry after an uncertain result.
+    err = nvs_set_u8(h, "dev_state", DEV_INTENT_STAGED);
+    if (err == ESP_OK) err = nvs_commit(h);
+    if (err != ESP_OK) goto done;
+    err = nvs_get_u8(h, "dev_state", &state);
+    if (err != ESP_OK) goto done;
+    if (state != DEV_INTENT_STAGED) {
+        err = ESP_ERR_INVALID_STATE;
+        goto done;
+    }
+    nonce = ((uint64_t)esp_random() << 32) | esp_random();
+    if (nonce == 0u) {
+        err = ESP_ERR_INVALID_STATE;
+        goto done;
+    }
+    err = nvs_set_u64(h, "dev_nonce", nonce);
+    if (err == ESP_OK) err = nvs_set_u8(h, "dev_state", DEV_FIRST_BOOT_USED);
+    if (err == ESP_OK) err = nvs_set_u8(h, "release_boot", FENCE_BOOT_ACTIVE);
+    if (err == ESP_OK) err = nvs_commit(h);
+    if (err != ESP_OK) goto done;
+    state = 0; fence = 0;
+    err = nvs_get_u8(h, "dev_state", &state);
+    if (err == ESP_OK) err = nvs_get_u8(h, "release_boot", &fence);
+    if (err == ESP_OK) err = nvs_get_u64(h, "dev_nonce", &read_nonce);
+    if (err == ESP_OK && (state != DEV_FIRST_BOOT_USED ||
+                          fence != FENCE_BOOT_ACTIVE ||
+                          read_nonce != nonce)) {
+        err = ESP_ERR_INVALID_STATE;
+    }
+    if (err == ESP_OK) s_consumed = true;
+
+done:
+    if (h != 0) nvs_close(h);
+    recorder_nvs_unlock();
+    return err;
+}
+
+#else
+esp_err_t dev_sdb11_mark_baseline_ready(const char *generation,
+                                        const char *device_id,
+                                        const char *binding,
+                                        bool sd_baseline_readback_passed) {
+    (void)generation; (void)device_id; (void)binding;
+    (void)sd_baseline_readback_passed;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+dev_sdb11_boot_policy_t dev_sdb11_probe_boot(const char *generation,
+                                              const char *device_id,
+                                              const char *binding) {
+    (void)generation; (void)device_id; (void)binding;
+    return DEV_SDB11_BOOT_BLOCKED;
+}
+bool dev_sdb11_boot_intent_consumed_this_boot(void) { return false; }
+esp_err_t dev_sdb11_consume_boot_intent(const char *generation,
+                                       const char *device_id,
+                                       const char *binding,
+                                       bool physical_hold_proven) {
+    (void)generation; (void)device_id; (void)binding; (void)physical_hold_proven;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+#endif
