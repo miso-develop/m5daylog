@@ -225,5 +225,16 @@ jobs:
                 fi
                 printf "SDB11_DEV_%s_COMPILE=PASS\n" "$mode"
               done
+              # Third compile in the SAME existing job: probe mode must be
+              # independent of the destructive DEV installer and normal app.
+              probe_defaults="sdkconfig.defaults.sdb11-ci-probe"
+              echo "CONFIG_M5DAYLOG_SDB11_SD_ID_PROBE_MODE=y" > "$probe_defaults"
+              idf.py -B "build-sdb11-probe" \
+                -DSDKCONFIG="sdkconfig.sdb11-ci-probe" \
+                -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;$probe_defaults" \
+                build
+              grep -q "^CONFIG_M5DAYLOG_SDB11_SD_ID_PROBE_MODE=y$" "sdkconfig.sdb11-ci-probe"
+              grep -q "^# CONFIG_M5DAYLOG_SDB11_DEV_INSTALL is not set$" "sdkconfig.sdb11-ci-probe"
+              printf "SD_ID_PROBE_COMPILE=PASS\n"
             '
-          printf 'SDB-1.1 DEV installer + recorder compiled in ESP-IDF v5.5.5 with synthetic config only. No flash or physical action.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'SDB-1.1 DEV installer, recorder and separate read-only SD identity probe compiled in ESP-IDF v5.5.5 with synthetic config only. No flash or physical action.\n' >> "$GITHUB_STEP_SUMMARY"
