@@ -552,6 +552,24 @@ void app_main(void) {
     if (recorder_power_enable_hold() != ESP_OK) {
         return;
     }
+#if defined(CONFIG_M5DAYLOG_SDB11_SD_ID_PROBE_MODE) && CONFIG_M5DAYLOG_SDB11_SD_ID_PROBE_MODE
+    // Exactly one diagnostic SPI initialization on this boot. The probe does
+    // not open NVS, mount FAT, publish MSC/CDC or start a recorder. Identity
+    // values remain in the operator's PRIVATE serial receipt, not GitHub.
+    uint32_t cid_serial = 0;
+    uint64_t sector_count = 0;
+    const esp_err_t probe = sd_mount_dev_observe_identity(
+        &cid_serial, &sector_count);
+    if (probe == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "stage: dev-sd-probe, result: observed, cid: 0x%08lx, sectors: %llu",
+                 (unsigned long)cid_serial, (unsigned long long)sector_count);
+    } else {
+        ESP_LOGE(TAG, "stage: dev-sd-probe, result: blocked");
+    }
+    (void)recorder_power_shutdown();
+    return;
+#endif
     // Establish the single default-NVS lifetime before any recorder worker
     // task can run. Recorder-owned NVS users share recorder_nvs' mutex and no
     // recorder path deinitializes the partition during this process lifetime.
