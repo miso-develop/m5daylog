@@ -274,6 +274,98 @@ esp_err_t sd_mount_recordings(void) {
     return ESP_OK;
 }
 
+// Dedicated diagnostic image: one read-only SD SPI probe before any NVS,
+// FAT, TinyUSB or recorder startup. No media block read/write and no auto
+// retry. Production/installer builds link a fail-closed stub instead.
+#if defined(CONFIG_M5DAYLOG_SDB11_SD_ID_PROBE_MODE) && CONFIG_M5DAYLOG_SDB11_SD_ID_PROBE_MODE
+static bool s_dev_sd_probe_attempted;
+
+esp_err_t sd_mount_dev_observe_identity(uint32_t *cid_serial,
+                                        uint64_t *sector_count) {
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    sdspi_device_config_t dev = SDSPI_DEVICE_CONFIG_DEFAULT();
+    spi_bus_config_t bus = {
+        .mosi_io_num = RECORDER_SD_MOSI_PIN,
+        .miso_io_num = RECORDER_SD_MISO_PIN,
+        .sclk_io_num = RECORDER_SD_CLK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    const spi_host_device_t spi_host = SDSPI_DEFAULT_HOST;
+    sdspi_dev_handle_t handle = -1;
+    sdmmc_card_t card = {0};
+    bool bus_ready = false;
+    bool host_ready = false;
+    bool device_ready = false;
+    bool card_ready = false;
+    uint32_t observed_serial = 0;
+    uint64_t observed_sectors = 0;
+    esp_err_t err;
+
+    if (cid_serial == NULL || sector_count == NULL) return ESP_ERR_INVALID_ARG;
+    *cid_serial = 0;
+    *sector_count = 0;
+    if (s_dev_sd_probe_attempted || s_storage != NULL || s_mounted ||
+        s_bus_init || s_sdspi_init || s_device_init || s_msc_driver_init) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_dev_sd_probe_attempted = true;
+
+    err = spi_bus_initialize(spi_host, &bus, SDSPI_DEFAULT_DMA);
+    if (err != ESP_OK) goto cleanup;
+    bus_ready = true;
+    err = sdspi_host_init();
+    if (err != ESP_OK) goto cleanup;
+    host_ready = true;
+    dev.host_id = spi_host;
+    dev.gpio_cs = RECORDER_SD_CS_PIN;
+    err = sdspi_host_init_device(&dev, &handle);
+    if (err != ESP_OK) goto cleanup;
+    device_ready = true;
+    host.slot = handle;
+    err = sdmmc_card_init(&host, &card);
+    if (err != ESP_OK) goto cleanup;
+    card_ready = true;
+    observed_serial = card.cid.serial;
+    observed_sectors = (uint64_t)card.csd.capacity;
+    // Kconfig's sector-count upper bound is signed 32-bit. An empty/default
+    // CID or an unrepresentable capacity is not a flashable target pin.
+    if (observed_serial == 0u || observed_sectors == 0u ||
+        observed_sectors > INT32_MAX) err = ESP_ERR_INVALID_RESPONSE;
+
+cleanup:
+    if (card_ready) {
+        esp_err_t done = sdmmc_card_deinit(&card);
+        if (err == ESP_OK && done != ESP_OK) err = done;
+    }
+    if (device_ready) {
+        esp_err_t done = sdspi_host_remove_device(handle);
+        if (err == ESP_OK && done != ESP_OK) err = done;
+    }
+    if (host_ready) {
+        esp_err_t done = sdspi_host_deinit();
+        if (err == ESP_OK && done != ESP_OK) err = done;
+    }
+    if (bus_ready) {
+        esp_err_t done = spi_bus_free(spi_host);
+        if (err == ESP_OK && done != ESP_OK) err = done;
+    }
+    if (err == ESP_OK) {
+        *cid_serial = observed_serial;
+        *sector_count = observed_sectors;
+    }
+    return err;
+}
+#else
+esp_err_t sd_mount_dev_observe_identity(uint32_t *cid_serial,
+                                        uint64_t *sector_count) {
+    if (cid_serial != NULL) *cid_serial = 0;
+    if (sector_count != NULL) *sector_count = 0;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+#endif
+
 // SDB-1.1 intentionally destructive installer primitive. The source-only
 // entrypoint is NOT reachable from ordinary app_main or any CDC/MSC command.
 // Only the exact already-mounted, Device-owned SPI card is targeted; a GPIO,
