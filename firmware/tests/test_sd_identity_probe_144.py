@@ -31,7 +31,8 @@ def test_probe_uses_only_sd_spi_identity_and_fails_closed_on_cleanup():
     assert "sdmmc_card_init(&host, &card)" in probe
     assert "card.cid.serial" in probe
     assert "card.csd.capacity" in probe
-    assert "sdmmc_card_deinit(&card)" in probe
+    assert "host.slot = handle;" in probe
+    assert "sdmmc_card_deinit" not in probe.split("cleanup:")[1]
     assert "sdspi_host_remove_device(handle)" in probe
     assert "sdspi_host_deinit()" in probe
     assert "spi_bus_free(spi_host)" in probe
