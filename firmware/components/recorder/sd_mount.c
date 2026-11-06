@@ -298,7 +298,6 @@ esp_err_t sd_mount_dev_observe_identity(uint32_t *cid_serial,
     bool bus_ready = false;
     bool host_ready = false;
     bool device_ready = false;
-    bool card_ready = false;
     uint32_t observed_serial = 0;
     uint64_t observed_sectors = 0;
     esp_err_t err;
@@ -326,7 +325,6 @@ esp_err_t sd_mount_dev_observe_identity(uint32_t *cid_serial,
     host.slot = handle;
     err = sdmmc_card_init(&host, &card);
     if (err != ESP_OK) goto cleanup;
-    card_ready = true;
     observed_serial = card.cid.serial;
     observed_sectors = (uint64_t)card.csd.capacity;
     // Kconfig's sector-count upper bound is signed 32-bit. An empty/default
@@ -335,10 +333,9 @@ esp_err_t sd_mount_dev_observe_identity(uint32_t *cid_serial,
         observed_sectors > INT32_MAX) err = ESP_ERR_INVALID_RESPONSE;
 
 cleanup:
-    if (card_ready) {
-        esp_err_t done = sdmmc_card_deinit(&card);
-        if (err == ESP_OK && done != ESP_OK) err = done;
-    }
+    // ESP-IDF v5.5.5 has no sdmmc_card_deinit(). In SPI mode card_init
+    // does not allocate the SDMMC-only aligned buffer; removing the SDSPI
+    // device/host/bus releases every resource used by this identity probe.
     if (device_ready) {
         esp_err_t done = sdspi_host_remove_device(handle);
         if (err == ESP_OK && done != ESP_OK) err = done;
