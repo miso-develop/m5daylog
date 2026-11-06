@@ -25,6 +25,14 @@ typedef int esp_err_t;
 extern "C" {
 #endif
 
+// Diagnostic-only, one-shot SD CID and sector-count observation. Requires a
+// separately authorized, exact-image physical action. This function is
+// compiled as a stub outside the dedicated read-only probe build, never
+// mounts FAT, creates MSC/CDC, initializes NVS, or changes card filesystem.
+// CID+capacity alone are NOT proof of original media or installed APP.
+esp_err_t sd_mount_dev_observe_identity(uint32_t *cid_serial,
+                                        uint64_t *sector_count);
+
 // SDB-1.1 DEV-ONLY, explicitly supervised destructive rebaseline of the
 // selected, already inserted card. NEVER invoked by normal recorder startup,
 // TinyUSB MSC, CDC or PC. This helper does not establish external approval,
