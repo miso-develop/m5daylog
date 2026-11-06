@@ -1,4 +1,13 @@
 menu "M5Daylog development-only admission"
+    config M5DAYLOG_SDB11_SD_ID_PROBE_MODE
+        bool "Development-only read-only SD card identity probe"
+        depends on !M5DAYLOG_SDB11_DEV_INSTALL
+        default n
+        help
+            Dedicated diagnostic image, never the recorder or DEV installer.
+            Read only SD CID serial and logical sector count via SPI before
+            NVS startup; do not mount FAT, enable MSC/CDC, or format media.
+            Flashing/running this image requires a separate physical gate.
     config M5DAYLOG_SDB11_DEV_INSTALL
         bool "Compile DEV SDB-1.1 first-boot candidate NVS transaction"
         default n
